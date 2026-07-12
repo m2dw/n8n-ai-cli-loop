@@ -2,6 +2,11 @@
 
 A workflow template for queuing GitHub Issues and running local CLI agents sequentially from n8n.
 
+> **Note:** This is a public snapshot mirror. Development happens on a private
+> repository, and the automation loop runs only against that private repository
+> — nothing on this mirror is processed automatically. The mirror is updated
+> periodically.
+
 [![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fm2dw%2Fn8n-ai-cli-loop%2Fmain%2Fdocs%2Fmetrics%2Fbadges%2Fcoverage.json)](docs/metrics/latest.md)
 [![ts-loc](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fm2dw%2Fn8n-ai-cli-loop%2Fmain%2Fdocs%2Fmetrics%2Fbadges%2Fts-loc.json)](docs/metrics/latest.md)
 [![tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fm2dw%2Fn8n-ai-cli-loop%2Fmain%2Fdocs%2Fmetrics%2Fbadges%2Ftests.json)](docs/metrics/latest.md)
