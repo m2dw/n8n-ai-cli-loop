@@ -1,0 +1,572 @@
+import type { AgentId } from "./task.js";
+
+export interface SessionDefaults {
+  implementationAgent: AgentId;
+  reviewAgent: AgentId;
+  researchAgent?: AgentId;
+}
+
+export type VerificationCommands = Record<string, string>;
+
+export interface SessionLabels {
+  active: string;
+  blocked: string;
+  readyForHuman: string;
+  [name: string]: string;
+}
+
+export interface ReviewLoopConfig {
+  /** Maximum number of needs_fix cycles before escalating to human. Default: 3. */
+  maxCycles?: number;
+}
+
+export interface ConflictResolutionLoopConfig {
+  /**
+   * Maximum number of same-kind verification-failure attempts before escalating
+   * to human. Defaults to 2 (first failure records; second escalates).
+   */
+  maxAttempts?: number;
+  /**
+   * Maximum number of review→conflict_resolution→review cycles before
+   * escalating to human. Defaults to 2.
+   */
+  maxReviewCycles?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Per-issue worktrees (docs/per-issue-worktrees.md, issue #400)
+//
+// Opt-in isolation: when enabled, each issue/work-item runs in its own durable
+// git worktree (keyed by session + issue) instead of contending on the shared
+// session checkout. Disabled by default so a session without this block (or with
+// `enabled: false`) keeps today's shared-`repoRoot` behavior unchanged.
+// ---------------------------------------------------------------------------
+
+export interface WorktreeConfig {
+  /** Master switch. Defaults to off; when false the shared session checkout is used. */
+  enabled: boolean;
+  /**
+   * Optional override for the managed worktree state root for this session. When
+   * absent the runtime resolves it from the `N8N_AI_WORKTREE_ROOT` env var, then
+   * the global default `~/.local/state/n8n-ai-cli-loop/worktrees`. Must be an
+   * absolute path; it is never placed inside committed source.
+   */
+  root?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Dependency sync (docs/tool-request-and-dependency-sync.md §3)
+//
+// Handler-owned, session-configured regeneration of lockfiles / dependency
+// metadata after the agent edits a manifest such as `package.json`. The
+// mutating dependency command runs OUTSIDE the agent permission surface — it is
+// never added to the Claude `allowedTools` set — so a manifest change that needs
+// a lockfile update does not have to become a Tool Request handoff.
+//
+// Disabled unless a session opts in (`enabled: true`). The command is the exact,
+// session-pinned string the handler may run; it is never derived from agent
+// output, issue text, or any other untrusted source.
+// ---------------------------------------------------------------------------
+
+export interface DependencySyncConfig {
+  /** Master switch. Defaults to off; when false no sync ever runs. */
+  enabled: boolean;
+  /** Manifest paths (repo-relative) whose change makes the sync eligible. */
+  triggerPaths: string[];
+  /** Files the command is expected to produce/update (e.g. package-lock.json). */
+  expectedOutputs: string[];
+  /**
+   * The exact command string the handler may run. Not a pattern or prefix. In
+   * the default safe mode it must be a lockfile-only, no-lifecycle-script form
+   * (for npm, `npm install --package-lock-only --ignore-scripts`).
+   */
+  command: string;
+  /**
+   * Explicit acknowledgement that this sync may execute arbitrary lifecycle-script
+   * code influenced by agent-edited manifest content. Defaults to off (false).
+   */
+  allowLifecycleScripts?: boolean;
+  /** Bounded execution budget in milliseconds. */
+  timeoutMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Environment prepare (docs/environment-prepare-contract.md, issue #510)
+//
+// Runner-owned, session-configured installation of the full runtime dependency
+// tree (e.g. `npm ci` → node_modules) before a phase or verification runs.
+// This is distinct from dependencySync, which only regenerates lockfiles.
+//
+// Disabled unless a session opts in (`enabled: true`). The command is the
+// exact, session-pinned string the runner may execute; it is never derived from
+// agent output, issue text, or repository auto-detection. See the contract
+// document for stamp/caching rules and failure semantics.
+// ---------------------------------------------------------------------------
+
+export interface EnvironmentPrepareConfig {
+  /** Master switch. Defaults to off; when false no environment preparation ever runs. */
+  enabled: boolean;
+  /** The exact command string the runner may execute. Not a pattern or prefix. */
+  command: string;
+  /**
+   * Repo-relative paths whose content hash contributes to the prepare stamp.
+   * A change to any listed file invalidates the stamp and triggers a fresh run.
+   */
+  cacheKeyFiles?: string[];
+  /**
+   * Explicit acknowledgement that this prepare command may execute arbitrary
+   * lifecycle-script code (e.g. `npm ci` runs `postinstall` scripts defined in
+   * dependencies). Defaults to off (false). In safe mode the runner should prefer
+   * commands that skip lifecycle scripts (e.g. `--ignore-scripts`). Set to `true`
+   * only when the operator has reviewed and accepted the lifecycle-script risk for
+   * the configured command.
+   */
+  allowLifecycleScripts?: boolean;
+  /** Bounded execution budget in milliseconds. Defaults to 120000 (2 minutes). */
+  timeoutMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Codex runtime capabilities (docs/codex-context-mode.md)
+//
+// Codex-specific runtime knobs that apply only when an agent invocation runs the
+// `codex` CLI (implementation `codex exec`, review `codex review`). They never
+// affect Claude or Gemini/Antigravity runs.
+//
+// context-mode is delivered as operator-supplied, verified Codex invocation
+// state rather than a key this workflow guesses: the `config`/`profile` form a
+// session declares is passed verbatim to `codex exec`/`codex review`, so a
+// Codex CLI/plugin change cannot silently send an unverified config key. When
+// `enabled` is false/absent the Codex argv is unchanged.
+// ---------------------------------------------------------------------------
+
+export interface CodexContextModeConfig {
+  /**
+   * Master switch. When false/absent the Codex command argv is unchanged and the
+   * resolved profile records context-mode as `unset`.
+   */
+  enabled: boolean;
+  /**
+   * Operator-verified Codex config overrides applied as `-c <entry>` to both
+   * `codex exec` and `codex review` when enabled. Each entry is a literal
+   * `key=value` string the operator has confirmed against their Codex build, so
+   * the workflow never guesses the context-mode config key. At least one of
+   * `config` or `profile` must be present when `enabled` is true.
+   */
+  config?: string[];
+  /**
+   * Optional Codex profile to select via `--profile <name>` when context-mode is
+   * delivered through a Codex profile/plugin rather than plain `-c` overrides.
+   */
+  profile?: string;
+}
+
+export interface CodexConfig {
+  /** Context-mode runtime capability for Codex agent invocations. */
+  contextMode?: CodexContextModeConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Research configuration (issue #493)
+//
+// Optional per-session model configuration for the Antigravity (Gemini/agy)
+// research agent. When absent the default CLI model is used unchanged.
+// ---------------------------------------------------------------------------
+
+export interface AntigravityResearchConfig {
+  /**
+   * Antigravity model name passed as `--model <model>` to `agy` when set.
+   * The effort suffix is part of the model display name (e.g. "Gemini 3.1 Pro (Low)").
+   * When absent the CLI default model is used.
+   */
+  model?: string;
+}
+
+export interface ResearchConfig {
+  /** Antigravity-specific research model configuration. */
+  antigravity?: AntigravityResearchConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Assignment profiles & flow rules (docs/assignment-profiles.md)
+//
+// Configurable per-phase agent assignment. A session may declare named flows
+// (assignment profiles) plus the trusted flow rules that select a flow from
+// trusted labels. The resolved assignment is computed once at intake /
+// task-creation time and persisted into task context (see core/assignment.ts),
+// so later edits to sessions.json never silently change an existing task's
+// agents.
+//
+// All three fields are optional: a session that omits them preserves today's
+// behavior — the built-in `code` flow (implementation: claude, review: codex,
+// conflict_resolution: claude, research: existing behavior), derived from the
+// session `defaults`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps each phase role to a concrete agent for a flow. `implementation` and
+ * `review` are required; `conflict_resolution` and `research` are optional and
+ * fall back to the session defaults when absent (so partial profiles are valid).
+ */
+export interface AssignmentProfile {
+  implementation: AgentId;
+  review: AgentId;
+  conflict_resolution?: AgentId;
+  research?: AgentId;
+}
+
+/**
+ * A trusted flow-selection rule. Either matches when ALL `labels` are present,
+ * or is the single terminal `default: true` fallback. Rules are evaluated in
+ * order; the first match wins.
+ */
+export interface FlowRule {
+  /** Flow name to resolve; must have an entry in `assignmentProfiles`. */
+  flow: string;
+  /** Trusted labels; the rule matches when all are present. */
+  labels?: string[];
+  /** Marks the terminal fallback rule. Exactly one flow rule must set this. */
+  default?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Provider configuration
+//
+// Selects the work-item tracker and repository host backing a session, plus the
+// auth strategy each uses. The shape follows docs/provider-architecture.md.
+//
+// Only `github-issues` (work items) and `github` (repo host) over `gh`-CLI auth
+// are implemented today; the other identifiers are recognized so future
+// providers can be declared explicitly without a config-format change. No
+// provider API beyond the current `gh` path is wired in by this config.
+//
+// `gitea-issues` additionally carries a documented non-secret connection shape
+// (issue #362): a self-/co-hosted Gitea instance has no implicit base URL or
+// `owner/name` derivable from `githubRepo`, so those are declared explicitly in
+// a sibling `gitea` block. The runtime provider is still unimplemented; a
+// session that selects it fails closed (never silently reads GitHub) because the
+// validator requires `api-token` auth, which no GitHub `gh`/App runner accepts.
+//
+// Secrets are NEVER stored here: auth references credentials by indirection
+// only — either an environment-variable name (`*Env`) or a credential
+// key / keychain reference (`*Key`) that the auth strategy resolves at runtime.
+// Each secret is referenced by exactly one of the two forms.
+// `validateSession` rejects configs that inline raw key material.
+// ---------------------------------------------------------------------------
+
+/**
+ * Recognized work-item tracker providers. Only `github-issues` has a wired
+ * runtime backend today; `gitea-issues` has a documented config/auth shape
+ * (issue #362) but no runtime provider yet; the rest are reserved identifiers.
+ */
+export type WorkItemProviderKind =
+  | "github-issues"
+  | "gitea-issues"
+  | "jira"
+  | "azure-devops"
+  | "bitbucket";
+
+/**
+ * Recognized repository-host providers. `github` (over `gh`/`github-app`) is the
+ * default backend; `gitea` has a wired runtime `RepoHostProvider` (issue #365)
+ * reached over the Gitea REST API with `api-token` auth; the rest are reserved
+ * identifiers.
+ */
+export type RepoHostProviderKind = "github" | "gitea" | "azure-devops" | "bitbucket";
+
+/** Auth strategy for a provider. Secrets are referenced by indirection, never inlined. */
+export type ProviderAuthMode = "gh" | "github-app" | "api-token";
+
+/** `gh`-CLI auth: relies on the operator's already-authenticated `gh` session. Carries no secret. */
+export interface GhAuthConfig {
+  mode: "gh";
+}
+
+/**
+ * GitHub App auth. Each credential is referenced by indirection via its `*Env`
+ * (environment-variable name) form; the auth strategy resolves the value at
+ * runtime. The sibling `*Key` (credential-key / keychain reference) form is
+ * reserved but not yet wired to a runtime resolver, so the session validator
+ * currently rejects it for `github-app` auth — use `*Env` until a resolver lands.
+ */
+export interface GitHubAppAuthConfig {
+  mode: "github-app";
+  /** Env var name holding the GitHub App id. */
+  appIdEnv?: string;
+  /** Credential-key / keychain reference holding the GitHub App id (not yet supported). */
+  appIdKey?: string;
+  /** Env var name holding the installation id. */
+  installationIdEnv?: string;
+  /** Credential-key / keychain reference holding the installation id (not yet supported). */
+  installationIdKey?: string;
+  /** Env var name holding the path to the App private key (`.pem`). */
+  privateKeyPathEnv?: string;
+  /** Credential-key / keychain reference holding the App private key path (not yet supported). */
+  privateKeyPathKey?: string;
+}
+
+/**
+ * API-token auth (e.g. Jira). Token and optional account email are referenced by
+ * indirection: exactly one of the `*Env` or `*Key` form per secret.
+ */
+export interface ApiTokenAuthConfig {
+  mode: "api-token";
+  /** Env var name holding the API token. */
+  tokenEnv?: string;
+  /** Credential-key / keychain reference holding the API token. */
+  tokenKey?: string;
+  /** Env var name holding the account email/username, when the provider needs one. */
+  emailEnv?: string;
+  /** Credential-key / keychain reference holding the account email/username. */
+  emailKey?: string;
+}
+
+export type ProviderAuthConfig = GhAuthConfig | GitHubAppAuthConfig | ApiTokenAuthConfig;
+
+/**
+ * Label/status mapping strategy for a Gitea work-item provider. Selects how the
+ * provider-neutral coarse workflow state maps onto a Gitea instance. Only
+ * `labels` (state as a Gitea label add/remove, mirroring the GitHub provider) is
+ * recognized today; the field exists so a future native-status strategy can be
+ * declared without a config-format change.
+ */
+export type GiteaLabelMappingStrategy = "labels";
+
+/**
+ * Non-secret connection settings for a Gitea (`gitea-issues`) work-item
+ * provider. Gitea is self-/co-hosted, so — unlike GitHub — it has no implicit
+ * base URL or `owner/name` derivable from `githubRepo`: the instance location
+ * and target repository are declared explicitly here. This block carries NO
+ * secret material; the API token is referenced by indirection through the
+ * sibling `auth` block (`api-token`). Only the `tokenEnv` form is wired for Gitea
+ * today; `validateSession` rejects `tokenKey` for `gitea-issues` (no production
+ * credential-key resolver yet), and it rejects a `baseUrl` that embeds
+ * credentials (`user:password@host`).
+ */
+export interface GiteaWorkItemConfig {
+  /** Base URL of the Gitea instance, e.g. `https://gitea.example.com`. http(s) only, no embedded credentials. */
+  baseUrl: string;
+  /** Owning organization or user that holds the repository. */
+  owner: string;
+  /** Repository name within `owner`. */
+  repo: string;
+  /**
+   * Optional API base path. Defaults to `/api/v1` when omitted, so an instance
+   * mounted under a non-standard prefix or pinned to a specific API version can
+   * be addressed without a code change. Must be an absolute path (`/…`).
+   */
+  apiPath?: string;
+  /**
+   * Optional label/status mapping strategy. Defaults to `labels`. See
+   * {@link GiteaLabelMappingStrategy}.
+   */
+  labelMapping?: GiteaLabelMappingStrategy;
+}
+
+/** Work-item tracker selection for a session. */
+export interface WorkItemProviderConfig {
+  provider: WorkItemProviderKind;
+  auth: ProviderAuthConfig;
+  /**
+   * Gitea connection settings. Required when `provider` is `gitea-issues` and
+   * rejected for every other provider (GitHub derives its target from
+   * `githubRepo`). Carries no secrets — see {@link GiteaWorkItemConfig}.
+   */
+  gitea?: GiteaWorkItemConfig;
+}
+
+/**
+ * Non-secret connection settings for a Gitea (`gitea`) repository-host provider.
+ *
+ * This is the **repo-host** sibling of {@link GiteaWorkItemConfig}, and they are
+ * deliberately separate: a Gitea repo host addresses pull requests on a *code*
+ * repository, so it carries no work-item-only concern such as `labelMapping`.
+ * The two may even point at different Gitea repositories (a private work-item
+ * repo vs. the code repo), so the connection block is declared independently on
+ * each provider rather than shared.
+ *
+ * Like the work-item block, Gitea is self-/co-hosted, so the instance location
+ * and target repository have no implicit value derivable from `githubRepo` and
+ * are declared explicitly here. This block carries NO secret material; the API
+ * token is referenced by indirection through the sibling `auth` block
+ * (`api-token` with `tokenEnv` / `tokenKey`). `validateSession` rejects a
+ * `baseUrl` that embeds credentials (`user:password@host`).
+ */
+export interface GiteaRepoHostConfig {
+  /** Base URL of the Gitea instance, e.g. `https://gitea.example.com`. http(s) only, no embedded credentials. */
+  baseUrl: string;
+  /** Owning organization or user that holds the code repository. */
+  owner: string;
+  /** Repository name within `owner`. */
+  repo: string;
+  /**
+   * Optional API base path. Defaults to `/api/v1` when omitted, so an instance
+   * mounted under a non-standard prefix or pinned to a specific API version can
+   * be addressed without a code change. Must be an absolute path (`/…`).
+   */
+  apiPath?: string;
+}
+
+/** Repository-host selection for a session. */
+export interface RepoHostProviderConfig {
+  provider: RepoHostProviderKind;
+  auth: ProviderAuthConfig;
+  /**
+   * Gitea connection settings. Required when `provider` is `gitea` and rejected
+   * for every other provider (GitHub derives its target from `githubRepo`).
+   * Carries no secrets — see {@link GiteaRepoHostConfig}.
+   */
+  gitea?: GiteaRepoHostConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Notification settings (issue #465)
+//
+// Opt-in notification providers that fire on specific task transitions. Only
+// `ready_for_human` transitions are covered by this first iteration; additional
+// triggers (failed, tool_request, quota backoff) can be added later without a
+// config-format change.
+//
+// Secrets are NEVER stored here. The Slack webhook URL is referenced by the
+// name of an environment variable (`webhookUrlEnv`), resolved at dispatch time.
+// ---------------------------------------------------------------------------
+
+export interface SlackNotificationsConfig {
+  /** Master switch. When false/absent no Slack notifications are sent. */
+  enabled: boolean;
+  /**
+   * Name of the environment variable that holds the Slack incoming webhook URL.
+   * Never the URL itself — the URL is resolved from the env at dispatch time so no
+   * secret is persisted in sessions.json or the SQLite outbox.
+   */
+  webhookUrlEnv: string;
+}
+
+export interface NotificationsConfig {
+  /** Slack incoming webhook notification settings. Optional and disabled by default. */
+  slack?: SlackNotificationsConfig;
+}
+
+export interface SessionConfig {
+  sessionId: string;
+  /**
+   * Optional compact numeric reference for the session, e.g. an n8n tag or
+   * Config value like `2`. Must be a unique positive integer across all
+   * sessions when present. Resolved to the canonical `sessionId` by the session
+   * reference resolver; never used in place of `sessionId` for DB state,
+   * context records, task rows, lock files, artifacts, or diagnostics.
+   */
+  sessionNo?: number;
+  /**
+   * Optional string aliases for the session, e.g. `["addon", "tar"]`. Each
+   * alias must be unique across all sessions and must not collide with another
+   * session's `sessionId` or `sessionNo`. Resolved to the canonical `sessionId`
+   * by the session reference resolver.
+   */
+  aliases?: string[];
+  repoKey: string;
+  repoRoot: string;
+  githubRepo: string;
+  artifactDir: string;
+  /** Branch to base new implementation branches on. Defaults to "main". */
+  baseBranch?: string;
+  defaults: SessionDefaults;
+  verification: VerificationCommands;
+  labels: SessionLabels;
+  reviewLoop?: ReviewLoopConfig;
+  conflictResolutionLoop?: ConflictResolutionLoopConfig;
+  /**
+   * Per-issue worktree isolation (issue #400). Optional and disabled by default:
+   * a session without it runs every phase in the shared `repoRoot` checkout,
+   * preserving today's behavior.
+   */
+  worktrees?: WorktreeConfig;
+  /**
+   * Handler-owned dependency sync. Optional and disabled by default: a session
+   * without it (or with `enabled: false`) never runs a dependency-sync command,
+   * preserving today's behavior.
+   */
+  dependencySync?: DependencySyncConfig;
+  /**
+   * Runner-owned environment preparation (issue #510). Optional and disabled by
+   * default: a session without it (or with `enabled: false`) uses the worktree
+   * as-is without running a prepare command. See docs/environment-prepare-contract.md
+   * for stamp/caching rules, timing, and failure semantics.
+   */
+  environmentPrepare?: EnvironmentPrepareConfig;
+  /**
+   * Codex-specific runtime capabilities (e.g. context-mode). Optional and a no-op
+   * for non-Codex agents; a session without it preserves today's Codex behavior.
+   */
+  codex?: CodexConfig;
+  /**
+   * Research-phase agent configuration. Optional and a no-op when absent: a
+   * session without it uses the CLI default model for the research agent,
+   * preserving today's behavior.
+   */
+  research?: ResearchConfig;
+  /**
+   * Named assignment profiles keyed by flow name. Optional: when absent the
+   * built-in `code` profile (derived from `defaults`) is used.
+   */
+  assignmentProfiles?: Record<string, AssignmentProfile>;
+  /**
+   * Ordered flow-selection rules. Optional: when absent every task resolves to
+   * the `code` flow. Exactly one rule must be the `default: true` fallback.
+   */
+  flowRules?: FlowRule[];
+  /**
+   * Convenience name of the default flow; when present it must agree with the
+   * `default: true` flow rule.
+   */
+  defaultFlow?: string;
+  /**
+   * Work-item tracker provider. Optional: a session without it defaults to
+   * GitHub Issues over `gh`, preserving today's behavior.
+   */
+  workItemProvider?: WorkItemProviderConfig;
+  /**
+   * Repository-host provider. Optional: a session without it defaults to
+   * GitHub over `gh`, preserving today's behavior.
+   */
+  repoHostProvider?: RepoHostProviderConfig;
+  /**
+   * Notification provider settings. Optional and a no-op when absent: a session
+   * without this block sends no external notifications, preserving today's behavior.
+   */
+  notifications?: NotificationsConfig;
+}
+
+export interface ResolvedSession extends SessionConfig {
+  artifactRoot: string;
+  githubOwner: string;
+  githubName: string;
+  /** Always resolved: defaults to GitHub Issues over `gh` when not configured. */
+  workItemProvider: WorkItemProviderConfig;
+  /** Always resolved: defaults to GitHub over `gh` when not configured. */
+  repoHostProvider: RepoHostProviderConfig;
+  /**
+   * Whether the operator explicitly declared `repoHostProvider` in the raw
+   * session config (vs. the registry-supplied default). Resolution erases the
+   * raw optionality — `repoHostProvider` above is always populated — so this flag
+   * preserves the one bit outbox dispatch needs: an explicit repo-host config
+   * must route public PR comments under its own credentials even when it happens
+   * to match the default `github`/`gh` shape, which a value-only comparison
+   * cannot distinguish from omission.
+   */
+  repoHostProviderConfigured: boolean;
+}
+
+export interface SessionRegistry {
+  getSessionById(sessionId: string): Promise<ResolvedSession | undefined>;
+  getSessionByRepoKey(repoKey: string): Promise<ResolvedSession | undefined>;
+  listSessions(): Promise<ResolvedSession[]>;
+  /**
+   * Resolve a user-facing session reference to the canonical `sessionId`. A
+   * reference may be an exact `sessionId`, a numeric `sessionNo` (as a string),
+   * or a string alias. Rejects unknown references with a clear error. Ambiguous
+   * references are rejected at registry construction time, so resolution here is
+   * always unambiguous.
+   */
+  resolveSessionRef(ref: string): Promise<string>;
+}

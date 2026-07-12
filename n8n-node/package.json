@@ -1,0 +1,33 @@
+{
+  "name": "n8n-nodes-ai-cli-loop",
+  "version": "0.1.0",
+  "description": "Private n8n node package for AI Dev Loop operations (Dispatch Outbox)",
+  "keywords": [
+    "n8n-community-node-package"
+  ],
+  "license": "Apache-2.0",
+  "private": true,
+  "main": "dist/AiCliLoop.node.js",
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [],
+    "nodes": [
+      "dist/AiCliLoop.node.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "n8n-workflow": "^1.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "n8n-workflow": ">=1.0.0"
+  }
+}

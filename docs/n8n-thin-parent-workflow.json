@@ -1,0 +1,304 @@
+{
+  "name": "AI Dev Loop — Parent Workflow",
+  "nodes": [
+    {
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [
+        -1000,
+        160
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "schedule-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [
+        -1000,
+        320
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "workflow-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "position": [
+        -720,
+        240
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg-session-ref",
+              "name": "sessionRef",
+              "value": "ai-cli-loop",
+              "type": "string"
+            },
+            {
+              "id": "cfg-repo-key-ref",
+              "name": "repoKeyReference",
+              "value": "(resolved from sessions.json by sessionId)",
+              "type": "string"
+            },
+            {
+              "id": "cfg-repo-root-ref",
+              "name": "repoRootReference",
+              "value": "(resolved from sessions.json by sessionId)",
+              "type": "string"
+            },
+            {
+              "id": "cfg-github-repo-ref",
+              "name": "githubRepoReference",
+              "value": "(resolved from sessions.json by sessionId)",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "typeVersion": 3
+    },
+    {
+      "id": "create-context",
+      "name": "Create Context",
+      "type": "n8n-nodes-base.executeCommand",
+      "position": [
+        -440,
+        240
+      ],
+      "parameters": {
+        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/admin.js' context create --json --execution-id \" + $execution.id + \" --session-ref '\" + String($(\"Config\").first().json.sessionRef).replace(/'/g, \"'\\\\''\") + \"'\" }}"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "acquire-repo-lock",
+      "name": "Acquire Repo Lock",
+      "type": "n8n-nodes-base.executeCommand",
+      "position": [
+        -160,
+        240
+      ],
+      "parameters": {
+        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/admin.js' repo-lock acquire --json --context-id \" + JSON.parse($(\"Create Context\").first().json.stdout).contextId }}"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "if-locked",
+      "name": "IF Locked",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        120,
+        240
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "lock-check",
+              "leftValue": "={{ JSON.parse($(\"Acquire Repo Lock\").first().json.stdout).locked }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "call-phase-runner",
+      "name": "Call Phase Runner",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "position": [
+        400,
+        240
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "workflowId": "ai-dev-loop-thin-phase-runner",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "contextId": "={{ JSON.parse($(\"Create Context\").first().json.stdout).contextId }}"
+          }
+        },
+        "options": {}
+      },
+      "typeVersion": 1.3
+    },
+    {
+      "id": "release-repo-lock",
+      "name": "Release Repo Lock",
+      "type": "n8n-nodes-base.executeCommand",
+      "position": [
+        680,
+        240
+      ],
+      "parameters": {
+        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/admin.js' repo-lock release --json --context-id \" + JSON.parse($(\"Create Context\").first().json.stdout).contextId }}"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "release-repo-lock-err",
+      "name": "Release Repo Lock on Error",
+      "type": "n8n-nodes-base.executeCommand",
+      "position": [
+        680,
+        400
+      ],
+      "parameters": {
+        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/admin.js' repo-lock release --json --context-id \" + JSON.parse($(\"Create Context\").first().json.stdout).contextId }}"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "stop-and-error",
+      "name": "Stop and Error",
+      "type": "n8n-nodes-base.stopAndError",
+      "position": [
+        960,
+        400
+      ],
+      "parameters": {
+        "errorMessage": "Child workflow (Phase Runner) reported a failure."
+      },
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Create Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Context": {
+      "main": [
+        [
+          {
+            "node": "Acquire Repo Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acquire Repo Lock": {
+      "main": [
+        [
+          {
+            "node": "IF Locked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Locked": {
+      "main": [
+        [
+          {
+            "node": "Call Phase Runner",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Call Phase Runner": {
+      "main": [
+        [
+          {
+            "node": "Release Repo Lock",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Repo Lock on Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Release Repo Lock on Error": {
+      "main": [
+        [
+          {
+            "node": "Stop and Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "parent-v1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "id": "ai-dev-loop-thin-parent",
+  "tags": []
+}

@@ -1,0 +1,143 @@
+{
+  "name": "AI Dev Loop — Phase Runner (Private Node — SHADOW TEST)",
+  "nodes": [
+    {
+      "id": "phase-runner-trigger",
+      "name": "When Called by Parent",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "position": [
+        -560,
+        240
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "github-intake",
+      "name": "GitHub Intake",
+      "type": "CUSTOM.aiCliLoop",
+      "position": [
+        -280,
+        240
+      ],
+      "parameters": {
+        "operation": "githubIntake",
+        "contextId": "={{ $(\"When Called by Parent\").first().json.contextId }}",
+        "supportedPhases": "implementation,review,conflict_resolution,research"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "run-one-phase",
+      "name": "Run One Phase",
+      "type": "CUSTOM.aiCliLoop",
+      "position": [
+        0,
+        240
+      ],
+      "parameters": {
+        "operation": "runOnePhase",
+        "contextId": "={{ $(\"When Called by Parent\").first().json.contextId }}",
+        "runId": "={{ $execution.id || (\"run-\" + $now.toMillis()) }}",
+        "supportedPhases": "implementation,review,conflict_resolution,research"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "dispatch-outbox",
+      "name": "Dispatch Outbox",
+      "type": "CUSTOM.aiCliLoop",
+      "position": [
+        280,
+        240
+      ],
+      "parameters": {
+        "operation": "dispatchOutbox",
+        "contextId": "={{ $(\"When Called by Parent\").first().json.contextId }}"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "return-context",
+      "name": "Return Context",
+      "type": "n8n-nodes-base.set",
+      "position": [
+        560,
+        240
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ret-context-id",
+              "name": "contextId",
+              "value": "={{ $(\"When Called by Parent\").first().json.contextId }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "typeVersion": 3
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When Called by Parent": {
+      "main": [
+        [
+          {
+            "node": "GitHub Intake",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub Intake": {
+      "main": [
+        [
+          {
+            "node": "Run One Phase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run One Phase": {
+      "main": [
+        [
+          {
+            "node": "Dispatch Outbox",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch Outbox": {
+      "main": [
+        [
+          {
+            "node": "Return Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "private-node-child-v1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "id": "ai-dev-loop-private-node-phase-runner",
+  "tags": []
+}

@@ -1,0 +1,4 @@
+node_modules/
+.n8n-artifacts/
+dist/
+coverage/

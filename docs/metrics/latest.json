@@ -1,0 +1,26 @@
+{
+  "generated": "2026-07-11T01:06:51.358Z",
+  "src": {
+    "files": 74,
+    "lines": 45235,
+    "nonBlankLines": 42177
+  },
+  "tests": {
+    "files": 87,
+    "suites": 661,
+    "cases": 3547
+  },
+  "coverage": {
+    "lines": 73.62,
+    "statements": 73.62,
+    "functions": 77.21,
+    "branches": 84
+  },
+  "dependencies": {
+    "circularCycles": 1,
+    "filesInCycles": [
+      "core/outbox-effects",
+      "core/outbox-visibility"
+    ]
+  }
+}

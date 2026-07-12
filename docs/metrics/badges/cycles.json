@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "label": "circular deps",
+  "message": "1 cycle",
+  "color": "orange"
+}

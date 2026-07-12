@@ -1,0 +1,4503 @@
+import { mkdtempSync, rmSync, readFileSync, existsSync, lstatSync, writeFileSync, chmodSync, mkdirSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { execFileSync } from 'child_process';
+import { createReviewHandler } from '../dist/handlers/review.js';
+import { SqliteTaskStore, runNextPhase } from '../dist/index.js';
+
+const CLI = new URL('../dist/cli/run-one-phase.js', import.meta.url).pathname;
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+let tmpDir;
+let repoRoot;
+let artifactRoot;
+
+const SESSION = (overrides = {}) => ({
+  sessionId: 'addon-dev',
+  repoKey: 'test-repo',
+  repoRoot,
+  githubRepo: 'm2dw/test-repo',
+  artifactDir: '.n8n-artifacts',
+  artifactRoot,
+  githubOwner: 'm2dw',
+  githubName: 'test-repo',
+  defaults: { implementationAgent: 'claude', reviewAgent: 'codex', researchAgent: 'gemini' },
+  verification: { test: 'npm test' },
+  labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
+  ...overrides,
+});
+
+const CONTEXT = (overrides = {}) => ({
+  session: SESSION(),
+  runId: 'run-review-1',
+  workerId: 'worker-test',
+  ...overrides,
+});
+
+function makeTask(overrides = {}) {
+  return {
+    sessionId: 'addon-dev',
+    issueNumber: 77,
+    status: 'running',
+    phase: 'review',
+    priority: 'normal',
+    reviewAgent: 'codex',
+    attempts: {},
+    context: {
+      title: 'Add login rate limiting',
+      url: 'https://github.com/m2dw/test-repo/issues/77',
+      prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+      branch: 'ai/issue-77-run-impl-1',
+      labels: ['agent:codex', 'status:needs-review'],
+    },
+    createdAt: '2026-06-07T00:00:00.000Z',
+    updatedAt: '2026-06-07T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+// Multi-step runner: each call consumes one result.
+// Happy-path order: status(0) checkout-main(1) pull(2) gh-pr-checkout(3)
+//                   npm-test(4) codex-review(5)
+function sequenceRunner(steps) {
+  const calls = [];
+  let i = 0;
+  return {
+    calls,
+    run(cmd, args, opts) {
+      const result = steps[i] ?? { stdout: '', stderr: 'unexpected call', exitCode: 1 };
+      calls.push({ cmd, args, opts, result });
+      i++;
+      return result;
+    },
+  };
+}
+
+function happyRunner() {
+  return sequenceRunner([
+    { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
+    { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+    { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+    { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout 99
+    { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+    { stdout: '', stderr: '', exitCode: 0 },              // git diff main...HEAD (codex diff classification, issue #506)
+    { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+  ]);
+}
+
+beforeEach(() => {
+  tmpDir = mkdtempSync(join(tmpdir(), 'review-handler-test-'));
+  repoRoot = join(tmpDir, 'repo');
+  artifactRoot = join(tmpDir, 'artifacts');
+});
+
+afterEach(() => {
+  rmSync(tmpDir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Artifacts
+// ---------------------------------------------------------------------------
+
+describe('review handler — artifacts', () => {
+  test('creates artifact dir under artifactRoot/runs/<runId>', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    expect(existsSync(join(artifactRoot, 'runs', 'run-review-1'))).toBe(true);
+  });
+
+  test('writes review-context.json, review-output.md, review-result.json', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const dir = join(artifactRoot, 'runs', 'run-review-1');
+    expect(existsSync(join(dir, 'review-context.json'))).toBe(true);
+    expect(existsSync(join(dir, 'review-output.md'))).toBe(true);
+    expect(existsSync(join(dir, 'review-result.json'))).toBe(true);
+  });
+
+  test('writes verification log for each session.verification command', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const dir = join(artifactRoot, 'runs', 'run-review-1');
+    expect(existsSync(join(dir, 'review-verification-test.log'))).toBe(true);
+  });
+
+  test('review-context.json includes prUrl and branch', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const raw = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8');
+    const ctx = JSON.parse(raw);
+    expect(ctx).toMatchObject({ prUrl: 'https://github.com/m2dw/test-repo/pull/99', branch: 'ai/issue-77-run-impl-1' });
+  });
+
+  test('review-result.json marks success: true on happy path', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const raw = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-result.json'), 'utf8');
+    expect(JSON.parse(raw)).toMatchObject({ success: true });
+  });
+
+  test('artifacts written even when codex fails', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },   // verification passes
+      { stdout: '', stderr: '', exitCode: 0 },   // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '', stderr: 'codex error', exitCode: 1 }, // codex fails
+    ]);
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(existsSync(join(artifactRoot, 'runs', 'run-review-1', 'review-result.json'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Post-review worktree cleanup
+// ---------------------------------------------------------------------------
+
+describe('review handler — post-review worktree cleanup', () => {
+  function dirtyAfterReviewRunner({ diffOutput = '--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-old\n+new', cleanupExitCode = 0 } = {}) {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },           // git status — clean (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },           // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },           // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },           // gh pr checkout 99
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },           // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Missing null check', stderr: '', exitCode: 0 }, // codex review
+      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status — dirty after review
+      { stdout: diffOutput, stderr: '', exitCode: 0 },   // git diff HEAD
+      { stdout: '', stderr: '', exitCode: cleanupExitCode }, // git reset --hard HEAD
+      { stdout: '', stderr: '', exitCode: 0 },            // git clean -fd
+      // recheck: clean tree on successful cleanup, still dirty when cleanup failed
+      { stdout: cleanupExitCode === 0 ? '' : ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status — recheck
+    ]);
+  }
+
+  test('runs git status after codex review to detect residue', async () => {
+    const runner = dirtyAfterReviewRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const statusCalls = runner.calls.filter(c => c.cmd === 'git' && c.args[0] === 'status');
+    expect(statusCalls).toHaveLength(3); // preflight + post-review + post-cleanup recheck
+  });
+
+  test('when dirty after review, runs git diff HEAD to capture residue', async () => {
+    const runner = dirtyAfterReviewRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const diffCall = runner.calls.find(c => c.cmd === 'git' && c.args[0] === 'diff' && c.args.includes('HEAD'));
+    expect(diffCall).toBeDefined();
+    expect(diffCall.args).toContain('HEAD');
+  });
+
+  test('when dirty after review, fully resets and cleans the worktree', async () => {
+    const runner = dirtyAfterReviewRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const resetCall = runner.calls.find(c => c.cmd === 'git' && c.args[0] === 'reset');
+    expect(resetCall).toBeDefined();
+    expect(resetCall.args).toEqual(['reset', '--hard', 'HEAD']);
+    const cleanCall = runner.calls.find(c => c.cmd === 'git' && c.args[0] === 'clean');
+    expect(cleanCall).toBeDefined();
+    expect(cleanCall.args).toEqual(['clean', '-fd']);
+  });
+
+  test('when dirty after review, writes review-residue.diff artifact', async () => {
+    const runner = dirtyAfterReviewRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(existsSync(join(artifactRoot, 'runs', 'run-review-1', 'review-residue.diff'))).toBe(true);
+  });
+
+  test('residue diff is included in needs_fix reviewFeedback', async () => {
+    const runner = dirtyAfterReviewRunner({ diffOutput: '--- a/src/foo.ts\n+++ b/src/foo.ts\n-old\n+new' });
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.reviewFeedback).toContain('[P1] Missing null check');
+    expect(result.context?.reviewFeedback).toContain('Suggested Changes');
+    expect(result.context?.reviewFeedback).toContain('+new');
+  });
+
+  test('reviewResidue is present in needs_fix context', async () => {
+    const runner = dirtyAfterReviewRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(typeof result.context?.reviewResidue).toBe('string');
+    expect(result.context?.reviewResidue.length).toBeGreaterThan(0);
+  });
+
+  test('when cleanup fails, returns blocked with reviewFeedback about dirty tree', async () => {
+    const runner = dirtyAfterReviewRunner({ cleanupExitCode: 1 });
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/cleanup failed/);
+    expect(result.context?.reviewFeedback).toMatch(/dirty working tree/);
+    expect(result.context?.reviewFeedback).toContain('src/foo.ts');
+  });
+
+  test('when cleanup fails, returns blocked (not needs_fix) to avoid stuck loop', async () => {
+    const runner = dirtyAfterReviewRunner({ cleanupExitCode: 1 });
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('blocked');
+  });
+
+  test('when clean after review (happy path), no cleanup commands are issued', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const resetCall = runner.calls.find(c => c.cmd === 'git' && c.args[0] === 'reset');
+    const cleanCall = runner.calls.find(c => c.cmd === 'git' && c.args[0] === 'clean');
+    expect(resetCall).toBeUndefined();
+    expect(cleanCall).toBeUndefined();
+  });
+
+  test('reviewResidue is absent from context when tree is clean after review', async () => {
+    const runner = happyRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.context?.reviewResidue).toBeUndefined();
+  });
+
+  // environmentPrepare sentinel lifecycle (issue #522)
+  //
+  // Review cleanup (git clean -fd) may delete prepare-created untracked files
+  // (e.g. node_modules/ not in .gitignore). The worktree-lifetime sentinel must
+  // be cleared so the next phase re-runs prepare rather than relying on a stamp
+  // that misrepresents the checkout state. When the tree is clean after review
+  // (no git clean runs), the sentinel must be preserved so the next phase can skip.
+
+  test('clears prepare sentinel after git clean during dirty review when environmentPrepare is enabled', async () => {
+    // Create the .git dir so the sentinel can be written by ensureEnvironmentPrepared.
+    mkdirSync(join(repoRoot, '.git'), { recursive: true });
+
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout 99
+      { stdout: '', stderr: '', exitCode: 0 },              // echo ok (environmentPrepare — writes sentinel)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: '[P1] Missing null check', stderr: '', exitCode: 0 }, // codex review
+      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status (dirty after review)
+      { stdout: '--- a/src/foo.ts\n+++ b/src/foo.ts', stderr: '', exitCode: 0 }, // git diff HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git reset --hard HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git clean -fd (would delete prepare files)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (recheck — clean)
+    ]);
+
+    const session = SESSION({ environmentPrepare: { enabled: true, command: 'echo ok' } });
+    await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+
+    // Sentinel must be gone: clearPrepareSentinel was called after git clean so the
+    // next phase re-runs prepare instead of skipping on a now-invalid stamp.
+    expect(existsSync(join(repoRoot, '.git', 'ai-env-prepared'))).toBe(false);
+  });
+
+  test('preserves prepare sentinel when review tree is clean after review', async () => {
+    // Create the .git dir so the sentinel can be written by ensureEnvironmentPrepared.
+    mkdirSync(join(repoRoot, '.git'), { recursive: true });
+
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout 99
+      { stdout: '', stderr: '', exitCode: 0 },              // echo ok (environmentPrepare — writes sentinel)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review — no findings
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (clean after review)
+    ]);
+
+    const session = SESSION({ environmentPrepare: { enabled: true, command: 'echo ok' } });
+    await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+
+    // Sentinel must still exist: no git clean ran, clearPrepareSentinel was not
+    // called, so the next phase can skip prepare cheaply.
+    expect(existsSync(join(repoRoot, '.git', 'ai-env-prepared'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Command execution
+// ---------------------------------------------------------------------------
+
+describe('review handler — command execution', () => {
+  test('uses session.repoRoot as cwd for all commands', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    for (const call of runner.calls) {
+      expect(call.opts.cwd).toBe(repoRoot);
+    }
+  });
+
+  test('executes preflight in order: status -> checkout main -> pull -> gh pr checkout', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(runner.calls[0]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
+    expect(runner.calls[1]).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
+    expect(runner.calls[2]).toMatchObject({ cmd: 'git', args: ['pull', '--ff-only'] });
+    expect(runner.calls[3]).toMatchObject({ cmd: 'gh', args: expect.arrayContaining(['pr', 'checkout']) });
+  });
+
+  test('uses PR number from prUrl for gh pr checkout', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const ghCall = runner.calls[3];
+    expect(ghCall.cmd).toBe('gh');
+    expect(ghCall.args).toContain('99'); // extracted from pull/99
+  });
+
+  test('falls back to branch as selector when no prUrl', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { branch: 'ai/issue-77-run-impl-1', prUrl: undefined, title: 'T' } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const ghCall = runner.calls[3];
+    expect(ghCall.cmd).toBe('gh');
+    // Branch is passed as the selector, not via --branch flag
+    expect(ghCall.args).toEqual(['pr', 'checkout', 'ai/issue-77-run-impl-1']);
+    expect(ghCall.args).not.toContain('--branch');
+  });
+
+  test('runs each session.verification command after checkout', async () => {
+    const session = SESSION({ verification: { test: 'npm test', build: 'npm run build' } });
+    const ctx = CONTEXT({ session });
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },  // git status
+      { stdout: '', stderr: '', exitCode: 0 },  // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },  // git pull
+      { stdout: '', stderr: '', exitCode: 0 },  // gh pr checkout
+      { stdout: '', stderr: '', exitCode: 0 },   // git diff main...HEAD (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'ok', stderr: '', exitCode: 0 }, // npm run build
+      { stdout: 'lgtm', stderr: '', exitCode: 0 }, // codex
+    ]);
+    await createReviewHandler(ctx, runner)(makeTask());
+    const cmds = runner.calls.map(c => `${c.cmd} ${c.args.join(' ')}`);
+    expect(cmds[5]).toContain('test');
+    expect(cmds[6]).toContain('build');
+  });
+
+  test('invokes codex review with --base main and --title', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const codexCall = runner.calls[6];
+    expect(codexCall.cmd).toBe('codex');
+    expect(codexCall.args).toContain('review');
+    expect(codexCall.args).toContain('--base');
+    expect(codexCall.args).toContain('main');
+    expect(codexCall.args).toContain('--title');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dependency-started PR review base (issue #208, #242)
+//
+// A dependency-started PR's branch was created from a blocker PR head, but a new
+// dependency-started PR targets the session base branch (`main`) like any other
+// PR. The review therefore diffs against `main`. To stay safe for PRs created
+// under the PRIOR stacked-base flow (whose live GitHub base may still be the
+// blocker branch), the handler first queries the live `baseRefName` whenever
+// `dependencyBase` metadata is present. If the PR still targets the blocker
+// branch — or the base cannot be confirmed — the review blocks for a human
+// instead of approving a PR that would merge into the blocker branch and hide
+// the dependent change from `main` (the #216/#217 trap, issue #242).
+// ---------------------------------------------------------------------------
+
+describe('review handler — dependency-started PR (issue #242)', () => {
+  const DEP_BASE = {
+    baseIssueNumber: 50,
+    basePrNumber: 88,
+    baseHeadRefName: 'ai/issue-50',
+    basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+  };
+
+  function stackedTask() {
+    return makeTask({
+      context: { ...makeTask().context, dependencyBase: DEP_BASE },
+    });
+  }
+
+  // Happy sequence for a dependency-started PR whose live base is already `main`.
+  // The live-base check (`gh pr view`) runs first, before the normal review steps.
+  function stackedHappyRunner(liveBase = 'main') {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ baseRefName: liveBase }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName
+      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+    ]);
+  }
+
+  test('reviews against the session base (main), not the blocker head', async () => {
+    const runner = stackedHappyRunner();
+    await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    const codexCall = runner.calls.find(c => c.cmd === 'codex');
+    expect(codexCall.args).toContain('--base');
+    expect(codexCall.args).toContain('main');
+    expect(codexCall.args).not.toContain('ai/issue-50');
+  });
+
+  test('queries the live PR base before reviewing', async () => {
+    // A PR created under the prior stacked-base flow may still target the blocker
+    // branch on GitHub. The handler confirms the live base is the session base
+    // before reviewing against `main` (issue #242).
+    const runner = stackedHappyRunner();
+    await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    const viewCalls = runner.calls.filter(c => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
+    expect(viewCalls).toHaveLength(1);
+    expect(viewCalls[0].args).toContain('baseRefName');
+    // The lookup must be scoped to the configured repo so a fork clone or a
+    // remote/default mismatch cannot query the wrong repository and block a
+    // valid dependency-started review as unconfirmable (issue #242 review).
+    const repoIdx = viewCalls[0].args.indexOf('--repo');
+    expect(repoIdx).toBeGreaterThanOrEqual(0);
+    expect(viewCalls[0].args[repoIdx + 1]).toBe('m2dw/test-repo');
+  });
+
+  test('passing review returns success (normal handoff, not blocked)', async () => {
+    const runner = stackedHappyRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    expect(result.result).toBe('success');
+  });
+
+  test('blocks when the live PR base still targets the blocker branch', async () => {
+    // The #216/#217 trap: a PR created under the prior stacked-base flow still
+    // targets the blocker head. Reviewing it against `main` and marking it ready
+    // would deliver the merge into the blocker branch and hide it from `main`.
+    const runner = stackedHappyRunner('ai/issue-50');
+    const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context?.livePrBase).toBe('ai/issue-50');
+    expect(result.message).toContain('ai/issue-50');
+    // The review must not proceed to codex once the live base is wrong.
+    expect(runner.calls.find(c => c.cmd === 'codex')).toBeUndefined();
+  });
+
+  test('blocks when the live PR base cannot be confirmed', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: 'pr not found', exitCode: 1 }, // gh pr view fails
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    expect(result.result).toBe('blocked');
+    expect(runner.calls.find(c => c.cmd === 'codex')).toBeUndefined();
+  });
+
+  test('a merge conflict routes to conflict resolution, not a human escalation', async () => {
+    // Because the PR targets main, a conflict is a conflict against main, which
+    // the conflict_resolution handler resolves by merging main into the PR branch.
+    // The review returns `conflict` (routed to the resolver), not `blocked`
+    // (issue #242).
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view
+      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull
+      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // codex review
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    expect(result.result).toBe('conflict');
+  });
+
+  test('does not fetch a base ref for a non-dependency PR', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const fetchCalls = runner.calls.filter(c => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetchCalls).toHaveLength(0);
+    const viewCalls = runner.calls.filter(c => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
+    expect(viewCalls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review input — issue/task requirement context (issue #174)
+// ---------------------------------------------------------------------------
+
+function titleArgOf(codexCall) {
+  const i = codexCall.args.indexOf('--title');
+  return i >= 0 ? codexCall.args[i + 1] : undefined;
+}
+
+describe('review handler — requirement context in review input', () => {
+  test('--title carries the issue body under an Issue Requirements heading', async () => {
+    const runner = happyRunner();
+    const task = makeTask({
+      context: { ...makeTask().context, body: 'Acceptance criteria: throttle login to 5 attempts/min per IP.' },
+    });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const title = titleArgOf(runner.calls[6]);
+    expect(title).toContain('## Issue Requirements');
+    expect(title).toContain('Acceptance criteria: throttle login to 5 attempts/min per IP.');
+  });
+
+  test('--title carries issue number, title, url, labels and PR url', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const title = titleArgOf(runner.calls[6]);
+    expect(title).toContain('Issue #77: Add login rate limiting');
+    expect(title).toContain('https://github.com/m2dw/test-repo/issues/77');
+    expect(title).toContain('status:needs-review');
+    expect(title).toContain('https://github.com/m2dw/test-repo/pull/99');
+  });
+
+  test('--title instructs the reviewer to check requirement fit and code quality', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const title = titleArgOf(runner.calls[6]);
+    expect(title).toMatch(/Requirement fit/i);
+    expect(title).toMatch(/acceptance criteri/i);
+    expect(title).toMatch(/code quality/i);
+  });
+
+  test('--title lists passing verification results', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const title = titleArgOf(runner.calls[6]);
+    expect(title).toContain('## Verification Results');
+    expect(title).toContain('- test: passed');
+  });
+
+  test('--title omits Issue Requirements heading when no body present', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const title = titleArgOf(runner.calls[6]);
+    expect(title).not.toContain('## Issue Requirements');
+  });
+
+  test('writes review-prompt.md artifact containing the issue body', async () => {
+    const runner = happyRunner();
+    const task = makeTask({
+      context: { ...makeTask().context, body: 'Must support OAuth refresh tokens.' },
+    });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const promptPath = join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md');
+    expect(existsSync(promptPath)).toBe(true);
+    expect(readFileSync(promptPath, 'utf8')).toContain('Must support OAuth refresh tokens.');
+  });
+
+  test('bounds an oversized issue body in the review input', async () => {
+    const runner = happyRunner();
+    const hugeBody = 'B'.repeat(20_000);
+    const task = makeTask({ context: { ...makeTask().context, body: hugeBody } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const title = titleArgOf(runner.calls[6]);
+    expect(title).toContain('…(issue body truncated for review context)');
+    expect(title.length).toBeLessThan(hugeBody.length);
+  });
+
+  test('a review finding that misses an acceptance criterion is treated as needs_fix', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: 'The implementation does not satisfy acceptance criterion: per-IP rate limiting is missing.', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.classification).toBe('needs_fix');
+    expect(result.context?.hasBlockingFindings).toBe(true);
+    expect(result.context?.reviewFeedback).toContain('acceptance criterion');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failure cases
+// ---------------------------------------------------------------------------
+
+describe('review handler — failure cases', () => {
+  test('returns failed for unsupported agent without spawning', async () => {
+    const runner = happyRunner();
+    const ctx = CONTEXT({
+      session: SESSION({ defaults: { implementationAgent: 'claude', reviewAgent: 'gemini', researchAgent: 'gemini' } }),
+    });
+    const result = await createReviewHandler(ctx, runner)(makeTask({ reviewAgent: 'gpt4' }));
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/Unsupported review agent/);
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  test('returns blocked when working tree is dirty, with reviewFeedback in context', async () => {
+    const runner = sequenceRunner([
+      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status — dirty
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/dirty/);
+    expect(result.message).toMatch(/escalating to human/i);
+    expect(result.context?.reviewFeedback).toMatch(/uncommitted/);
+    expect(result.context?.reviewFeedback).toContain('src/foo.ts');
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  test('returns failed when gh pr checkout fails', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'not found', exitCode: 1 }, // gh pr checkout fails
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/not found/);
+  });
+
+  test('returns failed when no prUrl and no branch in context', async () => {
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(
+      makeTask({ context: { title: 'T' } }),
+    );
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/No PR URL or branch/);
+  });
+
+  test('returns needs_fix when verification fails, with reviewFeedback in context', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: '', stderr: '3 tests failed', exitCode: 1 }, // npm test fails
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.message).toMatch(/Verification 'test' failed/);
+    expect(result.context?.reviewFeedback).toContain("Verification 'test' failed");
+    expect(result.context?.reviewFeedback).toContain('3 tests failed');
+    expect(result.context?.verificationFailure).toMatchObject({ name: 'test', exitCode: 1 });
+    expect(result.context?.verificationFailedStep).toBe('test');
+  });
+
+  test('reviewFeedback from verification failure is bounded to 20000 chars', async () => {
+    const largeVerOutput = 'Error: ' + 'y'.repeat(25_000);
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: largeVerOutput, stderr: '', exitCode: 1 }, // npm test fails with large output
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.reviewFeedback.length).toBeLessThanOrEqual(20_100);
+    expect(result.context?.reviewFeedback).toContain('…(truncated for storage)');
+    expect(result.context?.reviewFeedback).toContain("Verification 'test' failed");
+  });
+
+  test('returns failed when codex review fails', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '', stderr: 'codex: timeout', exitCode: 1 }, // codex fails
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/codex: timeout/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Result and transition
+// ---------------------------------------------------------------------------
+
+describe('review handler — result classification', () => {
+  // happyRunner codex stdout: 'No P1/P2 findings.' -> classifies as success
+  test('clean codex output -> result: success', async () => {
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    expect(result.result).toBe('success');
+  });
+
+  test('context includes prUrl and artifactDir', async () => {
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    expect(result.context?.prUrl).toBe('https://github.com/m2dw/test-repo/pull/99');
+    expect(result.context?.artifactDir).toContain('run-review-1');
+  });
+
+  test('context includes classification details', async () => {
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    expect(result.context?.classification).toBe('success');
+    expect(result.context?.hasBlockingFindings).toBe(false);
+  });
+
+  test('[P1] finding in codex output -> result: needs_fix with reviewFeedback in context', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Null pointer in auth handler', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    // needs_fix now returns result: "needs_fix" and captures review output
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.classification).toBe('needs_fix');
+    expect(result.context?.hasBlockingFindings).toBe(true);
+    expect(typeof result.context?.reviewFeedback).toBe('string');
+    expect(result.context?.reviewFeedback).toContain('[P1] Null pointer in auth handler');
+  });
+
+  test('reviewFeedback is bounded to 20000 chars when review output is very large', async () => {
+    const largeOutput = '[P1] ' + 'x'.repeat(25_000);
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: largeOutput, stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(typeof result.context?.reviewFeedback).toBe('string');
+    expect(result.context?.reviewFeedback.length).toBeLessThanOrEqual(20_100); // bound + truncation suffix
+    expect(result.context?.reviewFeedback).toContain('…(truncated for storage)');
+    expect(result.context?.reviewFeedback).toContain('[P1] ');
+  });
+
+  test('needs_fix result includes reviewOutputPath', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P2] Missing input validation', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(typeof result.context?.reviewOutputPath).toBe('string');
+    expect(result.context?.reviewOutputPath).toContain('review-output.md');
+  });
+
+  test('real Git conflict output -> result: conflict (routes to conflict-resolution lane)', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    // A real merge conflict routes to the conflict-resolution lane, not a human.
+    expect(result.result).toBe('conflict');
+    expect(result.context?.classification).toBe('conflict');
+    expect(result.context?.hasConflictSignal).toBe(true);
+  });
+
+  test('conflict with staged/untracked residue resets+cleans before queuing resolver', async () => {
+    // The review agent reports a conflict AND leaves staged + untracked residue.
+    // The downstream conflict-resolution handler rejects any dirty worktree, so
+    // the cleanup must fully reset and clean before returning `conflict`.
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },           // git status — clean (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },           // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },           // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },           // gh pr checkout 99
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },           // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // codex review
+      { stdout: 'A  staged.ts\n?? untracked.ts\n', stderr: '', exitCode: 0 }, // git status — dirty residue
+      { stdout: 'diff --git a/staged.ts', stderr: '', exitCode: 0 }, // git diff HEAD
+      { stdout: '', stderr: '', exitCode: 0 },           // git reset --hard HEAD
+      { stdout: '', stderr: '', exitCode: 0 },           // git clean -fd
+      { stdout: '', stderr: '', exitCode: 0 },           // git status — recheck (clean)
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('conflict');
+    const resetCall = runner.calls.find(c => c.cmd === 'git' && c.args[0] === 'reset');
+    expect(resetCall?.args).toEqual(['reset', '--hard', 'HEAD']);
+    const cleanCall = runner.calls.find(c => c.cmd === 'git' && c.args[0] === 'clean');
+    expect(cleanCall?.args).toEqual(['clean', '-fd']);
+  });
+
+  test('review output that merely discusses merge conflicts is reviewed normally (issue #168)', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      {
+        stdout: [
+          'review handler — result classification › merge conflict in codex output -> result: blocked',
+          'Expected: "blocked"',
+          'Received: "conflict"',
+          'phase: "conflict_resolution"',
+          'Otherwise the change looks correct. LGTM.',
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      },
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    // Generic conflict-related prose must NOT escalate as a real merge conflict.
+    expect(result.context?.classification).not.toBe('conflict');
+    expect(result.context?.hasConflictSignal).toBe(false);
+  });
+
+  test('empty codex output -> result: blocked', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '', stderr: '', exitCode: 0 }, // empty codex output
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('blocked');
+  });
+
+  test('review-result.json persists classification details', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const raw = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-result.json'), 'utf8');
+    const r = JSON.parse(raw);
+    expect(r).toMatchObject({ classification: 'success', hasBlockingFindings: false, success: true });
+  });
+
+  test('[P2] finding persisted in review-result.json', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P2] missing input validation', stderr: '', exitCode: 0 },
+    ]);
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const raw = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-result.json'), 'utf8');
+    const r = JSON.parse(raw);
+    expect(r).toMatchObject({ classification: 'needs_fix', hasBlockingFindings: true });
+  });
+});
+
+describe('review handler — phase transition', () => {
+  let store;
+
+  beforeEach(() => {
+    store = new SqliteTaskStore(join(tmpDir, 'test.db'));
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  test('successful review transitions to ready_for_human', async () => {
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 77, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T' },
+    });
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT(), happyRunner()) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'ready_for_human', phase: 'review' });
+  });
+
+  test('needs_fix review transitions task to queued implementation (auto-requeue)', async () => {
+    const needsFixRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Critical security vulnerability in auth', stderr: '', exitCode: 0 },
+    ]);
+
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 78, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T' },
+    });
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT({ session: SESSION() }), needsFixRunner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    // needs_fix -> queued implementation (auto-requeue)
+    expect(outcome.task).toMatchObject({ status: 'queued', phase: 'implementation' });
+    expect(outcome.result.context?.classification).toBe('needs_fix');
+    // reviewFeedback captured in task context for the next implementation run
+    expect(typeof outcome.task.context?.reviewFeedback).toBe('string');
+    expect(outcome.task.context?.reviewFeedback).toContain('[P1]');
+  });
+
+  test('task context preserves reviewFeedback for the next implementation run', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Null pointer dereference in login()', stderr: '', exitCode: 0 },
+    ]);
+
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 80, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/100', title: 'Fix login' },
+    });
+
+    await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-r1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT({ session: SESSION() }), runner) },
+    });
+
+    // The task is now queued for implementation — fetch it and check context
+    const task = await store.getTask({ sessionId: 'addon-dev', issueNumber: 80 });
+    expect(task?.status).toBe('queued');
+    expect(task?.phase).toBe('implementation');
+    expect(task?.context?.reviewFeedback).toContain('[P1] Null pointer dereference');
+    // Previous context (prUrl) should still be present
+    expect(task?.context?.prUrl).toBe('https://github.com/m2dw/test-repo/pull/100');
+  });
+
+  test('conflict review queues the conflict-resolution phase (resolver runs next, not a human)', async () => {
+    const conflictRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+    ]);
+
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 79, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T' },
+    });
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT({ session: SESSION() }), conflictRunner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    // conflict -> queued conflict_resolution (the resolver runs next, not a human)
+    expect(outcome.task).toMatchObject({ status: 'queued', phase: 'conflict_resolution' });
+    expect(outcome.result.result).toBe('conflict');
+    expect(outcome.result.context?.classification).toBe('conflict');
+  });
+
+  test('verification failure transitions task to queued implementation (auto-requeue)', async () => {
+    const verFailRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: '', stderr: '5 tests failed\nAssertionError: expected true', exitCode: 1 }, // npm test fails
+    ]);
+
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 81, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/101', title: 'Fix auth' },
+    });
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-vf', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT({ session: SESSION() }), verFailRunner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    // verification failure -> needs_fix -> queued implementation
+    expect(outcome.task).toMatchObject({ status: 'queued', phase: 'implementation' });
+    expect(outcome.result.context?.verificationFailedStep).toBe('test');
+    expect(typeof outcome.task.context?.reviewFeedback).toBe('string');
+    expect(outcome.task.context?.reviewFeedback).toContain("Verification 'test' failed");
+    expect(outcome.task.context?.reviewFeedback).toContain('5 tests failed');
+    // Previous context (prUrl) should still be present
+    expect(outcome.task.context?.prUrl).toBe('https://github.com/m2dw/test-repo/pull/101');
+  });
+
+  test('failed review transitions task to failed status', async () => {
+    const failRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'checkout error', exitCode: 1 }, // gh pr checkout fails
+    ]);
+
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 77, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T' },
+    });
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT(), failRunner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'failed' });
+    expect(outcome.task.lastError).toMatch(/checkout error/);
+  });
+
+  test('dependency-started PR: passing review transitions to ready_for_human (issue #233 — replaces #216/#227 stacked scenario)', async () => {
+    // Replacement for the #216/#227 scenario: issue B is dependent on blocker A.
+    // B's PR targets main (not the blocker branch). After the live-base check
+    // confirms main, the review succeeds and the task becomes ready_for_human.
+    // The task must NOT be held blocked merely because dependencyBase is present.
+    const DEP_BASE = {
+      baseIssueNumber: 50, basePrNumber: 88,
+      baseHeadRefName: 'ai/issue-50',
+      basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+    };
+
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 91, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/110', title: 'Dep', dependencyBase: DEP_BASE },
+    });
+
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view (live-base check)
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },
+    ]);
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-dep-review', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT(), runner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'ready_for_human', phase: 'review' });
+  });
+
+  test('dependency metadata alone does not suppress ready_for_human — no blocker merge/rebase proof required (issue #233 anti-regression guard)', async () => {
+    // Guard against reintroducing VCS-like blocker merge/rebase proof logic.
+    // The blocker PR (basePrNumber: 88) is intentionally still open. The system
+    // must not gate on its merge status or require ancestry proofs. The
+    // sequenceRunner provides exactly the calls for a normal dependency-started
+    // review; an extra gh call for blocker state would exhaust the sequence and
+    // return exitCode:1, causing the review to fail rather than hand off.
+    const DEP_BASE = {
+      baseIssueNumber: 50, basePrNumber: 88,
+      baseHeadRefName: 'ai/issue-50',
+      basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+    };
+
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 92, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/111', title: 'Dep guard', dependencyBase: DEP_BASE },
+    });
+
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },
+    ]);
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-dep-guard', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT(), runner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task.status).toBe('ready_for_human');
+    // Only two gh calls expected: gh pr view (live-base check) + gh pr checkout.
+    // Any extra call for blocker merge/ancestry proof would be caught above (failed review).
+    const ghCalls = runner.calls.filter(c => c.cmd === 'gh');
+    expect(ghCalls).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review loop cap — effort escalation and human handoff
+// ---------------------------------------------------------------------------
+
+describe('review handler — review loop cap', () => {
+  function needsFixRunner() {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Critical bug in auth handler', stderr: '', exitCode: 0 },
+    ]);
+  }
+
+  test('first needs_fix increments reviewCycles to 1 in result context', async () => {
+    const result = await createReviewHandler(CONTEXT(), needsFixRunner())(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.reviewCycles).toBe(1);
+  });
+
+  test('fourth needs_fix (reviewCycles=3) sets escalatedEffort: "high" in context (maxCycles=5)', async () => {
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 3 } });
+    const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.reviewCycles).toBe(4);
+    expect(result.context?.escalatedEffort).toBe('high');
+  });
+
+  test('fifth needs_fix (reviewCycles=4) hits cap, returns blocked with cap metadata (maxCycles=5)', async () => {
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.reviewLoopCapReached).toBe(true);
+    expect(result.context?.reviewCycles).toBe(5);
+    expect(result.context?.reviewLoopMaxCycles).toBe(5);
+  });
+
+  test('cap-reached result message describes cycle count', async () => {
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/5\/5/);
+    expect(result.message).toMatch(/escalating to human/i);
+  });
+
+  test('first needs_fix does NOT set escalatedEffort (below escalation threshold)', async () => {
+    const result = await createReviewHandler(CONTEXT(), needsFixRunner())(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.escalatedEffort).toBeUndefined();
+  });
+
+  test('custom maxCycles=2 caps on second needs_fix', async () => {
+    const session = SESSION({ reviewLoop: { maxCycles: 2 } });
+    const ctx = CONTEXT({ session });
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 1 } });
+    const result = await createReviewHandler(ctx, needsFixRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.reviewLoopCapReached).toBe(true);
+    expect(result.context?.reviewCycles).toBe(2);
+    expect(result.context?.reviewLoopMaxCycles).toBe(2);
+  });
+
+  test('custom maxCycles=2 sets escalatedEffort on first needs_fix', async () => {
+    const session = SESSION({ reviewLoop: { maxCycles: 2 } });
+    const ctx = CONTEXT({ session });
+    const result = await createReviewHandler(ctx, needsFixRunner())(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.escalatedEffort).toBe('high');
+    expect(result.context?.reviewCycles).toBe(1);
+  });
+
+  test('cap-reached preserves reviewFeedback in context', async () => {
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(typeof result.context?.reviewFeedback).toBe('string');
+    expect(result.context?.reviewFeedback).toContain('[P1] Critical bug in auth handler');
+  });
+
+  test('cap-reached carries diffClassification in blocked context (issue #506)', async () => {
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.reviewLoopCapReached).toBe(true);
+    // diffClassification must be present so the human-handoff PR summary can
+    // render the file/guardrail sections instead of showing them as unavailable.
+    expect(result.context?.diffClassification).toBeDefined();
+    expect(typeof result.context?.diffClassification).toBe('object');
+  });
+});
+
+describe('review handler — loop cap on verification failure', () => {
+  function verFailRunner() {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '5 tests failed', exitCode: 1 }, // verification fails
+    ]);
+  }
+
+  test('verification failure at cap returns blocked with cap metadata', async () => {
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const result = await createReviewHandler(CONTEXT(), verFailRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.reviewLoopCapReached).toBe(true);
+    expect(result.context?.reviewCycles).toBe(5);
+  });
+
+  test('verification failure below cap returns needs_fix with incremented reviewCycles', async () => {
+    const result = await createReviewHandler(CONTEXT(), verFailRunner())(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.reviewCycles).toBe(1);
+  });
+});
+
+describe('review handler — phase transition with loop cap', () => {
+  let store;
+
+  beforeEach(() => {
+    store = new SqliteTaskStore(join(tmpDir, 'test.db'));
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  test('cap-reached blocked result transitions task to ready_for_human', async () => {
+    const capRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Still failing after retries', stderr: '', exitCode: 0 },
+    ]);
+
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 82, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/102', title: 'Fix', reviewCycles: 4 },
+    });
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-cap-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(CONTEXT({ session: SESSION() }), capRunner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'ready_for_human', phase: 'review' });
+    expect(outcome.task.context?.reviewLoopCapReached).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLI — supported phase gating
+// ---------------------------------------------------------------------------
+
+describe('run-one-phase CLI — review gating', () => {
+  let sessionsPath;
+  let dbPath;
+
+  const SESSION_OBJ = {
+    sessionId: 'addon-dev',
+    repoKey: 'test-repo',
+    githubRepo: 'm2dw/test-repo',
+    artifactDir: '.n8n-artifacts',
+    defaults: { implementationAgent: 'claude', reviewAgent: 'codex', researchAgent: 'gemini' },
+    verification: { test: 'npm test' },
+    labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
+  };
+
+  function runCli(...args) {
+    try {
+      const stdout = execFileSync(process.execPath, [CLI, ...args], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${join(tmpDir, 'bin')}:${process.env.PATH}` },
+      });
+      return { code: 0, stdout };
+    } catch (err) {
+      return { code: err.status ?? 1, stdout: err.stdout ?? '' };
+    }
+  }
+
+  beforeEach(() => {
+    sessionsPath = join(tmpDir, 'sessions.json');
+    dbPath = join(tmpDir, 'cli.db');
+    const binDir = join(tmpDir, 'bin');
+    mkdirSync(binDir, { recursive: true });
+
+    // Fake git: clean status, succeeds on all subcommands
+    writeFileSync(join(binDir, 'git'), '#!/bin/sh\nexit 0\n', 'utf8');
+    chmodSync(join(binDir, 'git'), 0o755);
+
+    // Fake gh: succeeds (pr checkout + any other gh calls)
+    writeFileSync(join(binDir, 'gh'), '#!/bin/sh\nexit 0\n', 'utf8');
+    chmodSync(join(binDir, 'gh'), 0o755);
+
+    // Fake npm: succeeds (verification)
+    writeFileSync(join(binDir, 'npm'), '#!/bin/sh\necho "ok"\nexit 0\n', 'utf8');
+    chmodSync(join(binDir, 'npm'), 0o755);
+
+    // Fake codex: succeeds
+    writeFileSync(join(binDir, 'codex'), '#!/bin/sh\necho "No findings."\nexit 0\n', 'utf8');
+    chmodSync(join(binDir, 'codex'), 0o755);
+
+    const session = { ...SESSION_OBJ, repoRoot, artifactDir: '.n8n-artifacts' };
+    writeFileSync(sessionsPath, JSON.stringify({ sessions: [session] }), 'utf8');
+  });
+
+  test('review task stays queued with default --supported-phases (research only)', async () => {
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 77, phase: 'review',
+      now: '2026-06-07T00:00:00.000Z',
+    });
+    store.close();
+
+    const r = runCli('--session-id', 'addon-dev', '--run-id', 'r1', '--sessions-path', sessionsPath, '--db-path', dbPath);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout.trim())).toMatchObject({ ok: true, outcome: 'idle' });
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 77 });
+    store2.close();
+    expect(task?.status).toBe('queued');
+  });
+
+  test('review task processed with --supported-phases review, transitions to ready_for_human', async () => {
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 77, phase: 'review',
+      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T', labels: [] },
+    });
+    store.close();
+
+    const r = runCli(
+      '--session-id', 'addon-dev', '--run-id', 'r2',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+      '--supported-phases', 'review',
+    );
+    expect(r.code).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    expect(out).toMatchObject({ ok: true, outcome: 'completed', task: { issueNumber: 77 } });
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 77 });
+    store2.close();
+    expect(task).toMatchObject({ status: 'ready_for_human', phase: 'review' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resolved agent profile metadata
+// ---------------------------------------------------------------------------
+
+describe('review handler — resolved profile metadata', () => {
+  const dir = () => join(artifactRoot, 'runs', 'run-review-1');
+
+  test('review-context.json contains resolvedProfile with phase and agentId', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ phase: 'review', agentId: 'codex', cmd: 'codex' });
+  });
+
+  test('review-context.json resolvedProfile records modelSource as cli-default', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile.modelSource).toBe('cli-default');
+  });
+
+  test('review-context.json resolvedProfile argv excludes --title value (prompt content)', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    const argv = ctx.resolvedProfile.argv;
+    expect(argv).toContain('review');
+    expect(argv).toContain('--base');
+    // --title value (review brief) must not appear in sanitized argv
+    const argvStr = argv.join(' ');
+    expect(argvStr).not.toContain('Issue Requirements');
+    expect(argvStr).not.toContain('Review Instructions');
+  });
+
+  test('review-context.json resolvedProfile is written before agent runs (available on early failures)', async () => {
+    // Fail on gh pr checkout (step 3) — before codex runs — and verify context still has profile
+    const earlyFailRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },  // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 },  // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },  // git pull --ff-only
+      { stdout: '', stderr: 'no such pr', exitCode: 1 }, // gh pr checkout — fails
+    ]);
+    await createReviewHandler(CONTEXT(), earlyFailRunner)(makeTask());
+    expect(existsSync(join(dir(), 'review-context.json'))).toBe(true);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ phase: 'review', agentId: 'codex' });
+  });
+
+  test('resolvedProfile includes reviewStrength and reviewStrengthSource', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile.reviewStrength).toBeDefined();
+    expect(ctx.resolvedProfile.reviewStrengthSource).toBeDefined();
+  });
+
+  test('no relevant labels -> reviewStrength: default, reviewStrengthSource: default', async () => {
+    await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ reviewStrength: 'default', reviewStrengthSource: 'default' });
+  });
+
+  test('complexity:high label -> reviewStrength: high, reviewStrengthSource: complexity', async () => {
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'complexity:high'] } });
+    await createReviewHandler(CONTEXT(), happyRunner())(task);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ reviewStrength: 'high', reviewStrengthSource: 'complexity' });
+  });
+
+  test('review:medium label + complexity:high -> reviewStrength: default, reviewStrengthSource: label (label wins)', async () => {
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'complexity:high', 'review:medium'] } });
+    await createReviewHandler(CONTEXT(), happyRunner())(task);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ reviewStrength: 'default', reviewStrengthSource: 'label' });
+  });
+
+  // Codex has no xhigh reasoning tier, so complexity:xhigh derives the strongest
+  // Codex-supported strength ('high') — the review ceiling, not a silent
+  // downgrade of an explicit review label (issue #243).
+  test('complexity:xhigh label -> reviewStrength: high, reviewStrengthSource: complexity (Codex ceiling)', async () => {
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'complexity:xhigh'] } });
+    await createReviewHandler(CONTEXT(), happyRunner())(task);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ reviewStrength: 'high', reviewStrengthSource: 'complexity' });
+  });
+
+  // review:xhigh is intentionally unsupported (Codex model_reasoning_effort only
+  // accepts low/medium/high). It must NOT be silently mapped to high; on its own
+  // it has no effect and the strength stays default (issue #243 non-goal).
+  test('review:xhigh label alone -> reviewStrength: default (unsupported, not mapped to high)', async () => {
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:xhigh'] } });
+    await createReviewHandler(CONTEXT(), happyRunner())(task);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ reviewStrength: 'default', reviewStrengthSource: 'default' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review strength — Codex CLI argument passthrough
+// ---------------------------------------------------------------------------
+
+describe('review handler — review strength Codex CLI args', () => {
+  // codex call is always at index 6 in the happy-path runner sequence (index 5 is the new git diff for diff classification, issue #506)
+  const CODEX_IDX = 6;
+
+  test('no review or complexity label -> codex args do not include -c model_reasoning_effort', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const codexCall = runner.calls[CODEX_IDX];
+    expect(codexCall.args).not.toContain('-c');
+    expect(codexCall.args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
+  test('complexity:high label -> codex receives -c model_reasoning_effort=high', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'complexity:high'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    const argStr = codexCall.args.join(' ');
+    expect(argStr).toContain('-c');
+    expect(argStr).toContain('model_reasoning_effort=high');
+  });
+
+  test('complexity:low label -> codex receives -c model_reasoning_effort=low', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'complexity:low'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    const argStr = codexCall.args.join(' ');
+    expect(argStr).toContain('-c');
+    expect(argStr).toContain('model_reasoning_effort=low');
+  });
+
+  test('review:high label -> codex receives -c model_reasoning_effort=high', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:high'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    const argStr = codexCall.args.join(' ');
+    expect(argStr).toContain('model_reasoning_effort=high');
+  });
+
+  test('review:low label -> codex receives -c model_reasoning_effort=low', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:low'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    const argStr = codexCall.args.join(' ');
+    expect(argStr).toContain('model_reasoning_effort=low');
+  });
+
+  test('review:medium label -> codex args do not include -c model_reasoning_effort', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:medium'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    expect(codexCall.args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
+  test('review:medium + complexity:high -> no model_reasoning_effort flag (label beats complexity)', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:medium', 'complexity:high'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    expect(codexCall.args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
+  test('review:low + complexity:high -> model_reasoning_effort=low (explicit label overrides complexity)', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:low', 'complexity:high'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=low');
+  });
+
+  test('complexity:xhigh -> codex receives model_reasoning_effort=high (never xhigh)', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'complexity:xhigh'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    const argStr = codexCall.args.join(' ');
+    expect(argStr).toContain('model_reasoning_effort=high');
+    // Codex never receives xhigh — it is not a valid model_reasoning_effort value.
+    expect(argStr).not.toContain('model_reasoning_effort=xhigh');
+  });
+
+  test('review:xhigh alone -> codex args do not include model_reasoning_effort (unsupported, not mapped to high)', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:xhigh'] } });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const codexCall = runner.calls[CODEX_IDX];
+    expect(codexCall.args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Claude review agent
+// ---------------------------------------------------------------------------
+
+describe('review handler — Claude review agent', () => {
+  // Happy-path sequence for Claude review (two extra steps vs Codex: pre-diff + full diff).
+  // Call order: status(0) checkout-main(1) pull(2) gh-pr-checkout(3)
+  //             pre-diff(4) npm-test(5) git-diff(6) claude-review(7)
+  function claudeHappyRunner() {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout 99
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff main...HEAD (pre-verification, issue #506)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff main...HEAD (full diff for prompt)
+      { stdout: 'No blocking issues found. Implementation looks correct.', stderr: '', exitCode: 0 }, // claude -p
+    ]);
+  }
+
+  function makeClaudeTask(overrides = {}) {
+    return makeTask({ reviewAgent: 'claude', ...overrides });
+  }
+
+  function claudeContext(overrides = {}) {
+    return CONTEXT({
+      session: SESSION({ defaults: { implementationAgent: 'claude', reviewAgent: 'claude', researchAgent: 'gemini' } }),
+      ...overrides,
+    });
+  }
+
+  test('Claude pass -> result: success', async () => {
+    const result = await createReviewHandler(claudeContext(), claudeHappyRunner())(makeClaudeTask());
+    expect(result.result).toBe('success');
+  });
+
+  test('Claude review invokes claude command with -p flag, not codex', async () => {
+    const runner = claudeHappyRunner();
+    await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    const claudeCall = runner.calls[7];
+    expect(claudeCall.cmd).toBe('claude');
+    expect(claudeCall.args).toContain('-p');
+    expect(claudeCall.args).not.toContain('review'); // not the Codex review subcommand
+  });
+
+  test('Claude review fetches the PR diff via git diff before invoking claude', async () => {
+    const runner = claudeHappyRunner();
+    await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    const diffCall = runner.calls[6];
+    expect(diffCall.cmd).toBe('git');
+    expect(diffCall.args).toContain('diff');
+    // Three-dot notation: diff from merge-base of reviewBase..HEAD to HEAD
+    expect(diffCall.args.join(' ')).toContain('main...HEAD');
+  });
+
+  test('Claude review passes review brief and diff via stdin', async () => {
+    const runner = claudeHappyRunner();
+    await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    const claudeCall = runner.calls[7];
+    expect(typeof claudeCall.opts.stdin).toBe('string');
+    expect(claudeCall.opts.stdin).toContain('## PR Diff');
+    expect(claudeCall.opts.stdin).toContain('diff --git');
+  });
+
+  test('Claude review stdin includes review instructions from the review brief', async () => {
+    const runner = claudeHappyRunner();
+    await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    const claudeCall = runner.calls[7];
+    expect(claudeCall.opts.stdin).toContain('Review Instructions');
+    expect(claudeCall.opts.stdin).toContain('Requirement fit');
+    expect(claudeCall.opts.stdin).toContain('acceptance criteri');
+  });
+
+  test('Claude review includes issue body in stdin when present', async () => {
+    const runner = claudeHappyRunner();
+    const task = makeClaudeTask({ context: { ...makeTask().context, body: 'Must support token refresh.' } });
+    await createReviewHandler(claudeContext(), runner)(task);
+    const claudeCall = runner.calls[7];
+    expect(claudeCall.opts.stdin).toContain('## Issue Requirements');
+    expect(claudeCall.opts.stdin).toContain('Must support token refresh.');
+  });
+
+  test('[P1] finding in Claude output -> result: needs_fix with reviewFeedback', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: '[P1] Null pointer dereference in handler', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.hasBlockingFindings).toBe(true);
+    expect(result.context?.reviewFeedback).toContain('[P1] Null pointer dereference');
+  });
+
+  test('conflict signal in Claude output -> result: conflict', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    expect(result.result).toBe('conflict');
+    expect(result.context?.hasConflictSignal).toBe(true);
+  });
+
+  test('Claude execution failure -> result: failed', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'claude: api error', exitCode: 1 },
+    ]);
+    const result = await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/claude: api error/);
+    expect(result.error).toMatch(/Review agent/);
+  });
+
+  test('review-context.json resolvedProfile contains claude agent info with model and effort', async () => {
+    const runner = claudeHappyRunner();
+    await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ phase: 'review', agentId: 'claude', cmd: 'claude' });
+    expect(typeof ctx.resolvedProfile.model).toBe('string');
+    expect(typeof ctx.resolvedProfile.effort).toBe('string');
+    expect(ctx.resolvedProfile.effortSource).toBeDefined();
+  });
+
+  test('Claude resolvedProfile argv excludes prompt content (no stdin text in argv)', async () => {
+    const runner = claudeHappyRunner();
+    await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8'));
+    const argvStr = ctx.resolvedProfile.argv.join(' ');
+    expect(argvStr).not.toContain('Issue Requirements');
+    expect(argvStr).not.toContain('Review Instructions');
+    expect(argvStr).not.toContain('PR Diff');
+  });
+
+  test('Claude resolvedProfile records model and effort for auditability', async () => {
+    const savedModel = process.env.CLAUDE_MODEL;
+    const savedEffort = process.env.CLAUDE_EFFORT;
+    delete process.env.CLAUDE_MODEL;
+    delete process.env.CLAUDE_EFFORT;
+    try {
+      const runner = claudeHappyRunner();
+      const task = makeClaudeTask({ context: { ...makeTask().context, labels: ['review:high'] } });
+      await createReviewHandler(claudeContext(), runner)(task);
+      const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8'));
+      expect(ctx.resolvedProfile.model).toBe('opus');
+      expect(ctx.resolvedProfile.effort).toBe('high');
+    } finally {
+      if (savedModel !== undefined) process.env.CLAUDE_MODEL = savedModel;
+      if (savedEffort !== undefined) process.env.CLAUDE_EFFORT = savedEffort;
+    }
+  });
+
+  test('default labels -> Claude uses sonnet model with high effort (no env overrides)', async () => {
+    // Temporarily clear env vars so the test exercises the label-derived defaults.
+    const savedModel = process.env.CLAUDE_MODEL;
+    const savedEffort = process.env.CLAUDE_EFFORT;
+    delete process.env.CLAUDE_MODEL;
+    delete process.env.CLAUDE_EFFORT;
+    try {
+      const runner = claudeHappyRunner();
+      await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+      const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8'));
+      expect(ctx.resolvedProfile.model).toBe('sonnet');
+      expect(ctx.resolvedProfile.effort).toBe('high');
+      expect(ctx.resolvedProfile.modelSource).toBe('default');
+      expect(ctx.resolvedProfile.effortSource).toBe('default');
+    } finally {
+      if (savedModel !== undefined) process.env.CLAUDE_MODEL = savedModel;
+      if (savedEffort !== undefined) process.env.CLAUDE_EFFORT = savedEffort;
+    }
+  });
+
+  test('review:low label -> Claude uses low effort (no env overrides)', async () => {
+    // Temporarily clear CLAUDE_EFFORT so the label-derived effort is used.
+    const savedEffort = process.env.CLAUDE_EFFORT;
+    delete process.env.CLAUDE_EFFORT;
+    try {
+      const runner = claudeHappyRunner();
+      const task = makeClaudeTask({ context: { ...makeTask().context, labels: ['review:low'] } });
+      await createReviewHandler(claudeContext(), runner)(task);
+      const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8'));
+      expect(ctx.resolvedProfile.effort).toBe('low');
+      expect(ctx.resolvedProfile.effortSource).toBe('label');
+    } finally {
+      if (savedEffort !== undefined) process.env.CLAUDE_EFFORT = savedEffort;
+    }
+  });
+
+  test('empty Claude output -> result: blocked', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 }, // empty output
+    ]);
+    const result = await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
+    expect(result.result).toBe('blocked');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Claude review — phase transitions
+// ---------------------------------------------------------------------------
+
+describe('review handler — Claude review phase transitions', () => {
+  let store;
+
+  beforeEach(() => {
+    store = new SqliteTaskStore(join(tmpDir, 'test.db'));
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  function claudeContext(overrides = {}) {
+    return CONTEXT({
+      session: SESSION({ defaults: { implementationAgent: 'claude', reviewAgent: 'claude', researchAgent: 'gemini' } }),
+      ...overrides,
+    });
+  }
+
+  test('Claude pass transitions to ready_for_human', async () => {
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 200, phase: 'review',
+      reviewAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/200', title: 'T' },
+    });
+
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 },
+      { stdout: 'No blocking issues. Looks good.', stderr: '', exitCode: 0 },
+    ]);
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(claudeContext(), runner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'ready_for_human', phase: 'review' });
+    expect(outcome.result.context?.reviewAgentUsed).toBe('claude');
+  });
+
+  test('Claude needs_fix transitions to queued implementation with reviewFeedback', async () => {
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 201, phase: 'review',
+      reviewAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/201', title: 'T' },
+    });
+
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 },
+      { stdout: '[P1] Critical bug in authentication handler', stderr: '', exitCode: 0 },
+    ]);
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(claudeContext(), runner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'queued', phase: 'implementation' });
+    expect(outcome.result.context?.classification).toBe('needs_fix');
+    expect(typeof outcome.task.context?.reviewFeedback).toBe('string');
+    expect(outcome.task.context?.reviewFeedback).toContain('[P1]');
+  });
+
+  test('Claude conflict routes to conflict_resolution phase', async () => {
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 202, phase: 'review',
+      reviewAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/202', title: 'T' },
+    });
+
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 },
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+    ]);
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(claudeContext(), runner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'queued', phase: 'conflict_resolution' });
+    expect(outcome.result.result).toBe('conflict');
+  });
+
+  test('Claude execution failure transitions to failed status', async () => {
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 203, phase: 'review',
+      reviewAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/203', title: 'T' },
+    });
+
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'claude: api error 503', exitCode: 1 },
+    ]);
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(claudeContext(), runner) },
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'failed' });
+    expect(outcome.task.lastError).toMatch(/claude: api error 503/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gemini/Antigravity review agent
+// ---------------------------------------------------------------------------
+
+function geminiHappyRunner() {
+  return sequenceRunner([
+    { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
+    { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+    { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+    { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
+    { stdout: 'diff --git a/src/auth.ts b/src/auth.ts\n-old\n+new', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+    { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // verification
+    { stdout: 'diff --git a/src/auth.ts b/src/auth.ts\n-old\n+new', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+    { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // agy --print
+    { stdout: '', stderr: '', exitCode: 0 },              // post-review git status
+    { stdout: JSON.stringify({ mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }), stderr: '', exitCode: 0 }, // gh pr view
+  ]);
+}
+
+function makeGeminiTask(overrides = {}) {
+  return makeTask({
+    reviewAgent: 'gemini',
+    context: {
+      title: 'Add login rate limiting',
+      url: 'https://github.com/m2dw/test-repo/issues/77',
+      prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+      branch: 'ai/issue-77-run-impl-1',
+      labels: ['agent:gemini', 'status:needs-review'],
+    },
+    ...overrides,
+  });
+}
+
+function geminiContext(overrides = {}) {
+  return CONTEXT({
+    session: SESSION({ defaults: { implementationAgent: 'claude', reviewAgent: 'gemini', researchAgent: 'gemini' } }),
+    ...overrides,
+  });
+}
+
+describe('review handler — Gemini/Antigravity review agent', () => {
+  const AGY_IDX = 7;
+
+  beforeEach(() => { delete process.env.ANTIGRAVITY_BIN; });
+  afterEach(() => { delete process.env.ANTIGRAVITY_BIN; });
+
+  test('Gemini pass -> result: success', async () => {
+    const result = await createReviewHandler(geminiContext(), geminiHappyRunner())(makeGeminiTask());
+    expect(result.result).toBe('success');
+  });
+
+  test('Gemini review invokes agy --print with the prompt as positional arg and stdin', async () => {
+    const runner = geminiHappyRunner();
+    await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    const agyCall = runner.calls[AGY_IDX];
+    expect(agyCall.cmd).toBe('agy');
+    // Antigravity contract: `agy --print "<prompt>"` with the prompt as the
+    // positional argument AND on stdin, matching the research lane. Some `agy`
+    // builds read only the positional arg, so stdin-only would run without the
+    // brief/diff.
+    expect(agyCall.args).toHaveLength(2);
+    expect(agyCall.args[0]).toBe('--print');
+    expect(agyCall.args[1]).toContain('Review Instructions');
+    expect(agyCall.args[1]).toContain('## PR Diff');
+    expect(agyCall.args[1]).toContain('-old');
+    expect(agyCall.opts.stdin).toBe(agyCall.args[1]);
+  });
+
+  test('Gemini uses ANTIGRAVITY_BIN when set', async () => {
+    process.env.ANTIGRAVITY_BIN = '/usr/local/bin/custom-agy';
+    const runner = geminiHappyRunner();
+    await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(runner.calls[AGY_IDX].cmd).toBe('/usr/local/bin/custom-agy');
+  });
+
+  test('Gemini [P1] finding -> needs_fix with reviewFeedback', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 },
+      { stdout: '[P1] Missing input validation', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.reviewFeedback).toContain('[P1] Missing input validation');
+  });
+
+  test('Gemini conflict signal -> conflict', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 },
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(result.result).toBe('conflict');
+  });
+
+  test('Gemini nonzero exit -> failed with agent output', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'agy: auth error', exitCode: 1 },
+      { stdout: '', stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('agy: auth error');
+  });
+
+  test('Gemini success with dirty merge state routes to conflict resolution', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 },
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), stderr: '', exitCode: 0 },
+    ]);
+    const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(result.result).toBe('conflict');
+  });
+
+  // Fail closed: a clean Gemini review only promotes to ready_for_human when
+  // GitHub confirms mergeability. When the check is unavailable, the PR must
+  // block for a human rather than fall through to success.
+  function geminiRunnerWithMergeCheck(mergeCheck) {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // verification
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // agy --print
+      { stdout: '', stderr: '', exitCode: 0 },              // post-review git status
+      mergeCheck,                                           // gh pr view
+    ]);
+  }
+
+  test('Gemini pass blocks when gh pr view exits nonzero', async () => {
+    const runner = geminiRunnerWithMergeCheck({ stdout: '', stderr: 'gh: not found', exitCode: 1 });
+    const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/mergeability could not be confirmed/);
+  });
+
+  test('Gemini pass blocks when mergeability JSON is unparsable', async () => {
+    const runner = geminiRunnerWithMergeCheck({ stdout: 'not json', stderr: '', exitCode: 0 });
+    const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/not valid JSON/);
+  });
+
+  test('Gemini pass blocks when mergeability is UNKNOWN', async () => {
+    const runner = geminiRunnerWithMergeCheck({
+      stdout: JSON.stringify({ mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' }), stderr: '', exitCode: 0,
+    });
+    const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/mergeable=UNKNOWN/);
+  });
+
+  test('Gemini clean pass over a truncated diff blocks for a human (issue #264)', async () => {
+    // A PR diff longer than MAX_REVIEW_DIFF_CHARS is truncated before being shown
+    // to Gemini, so any blocking change after the cutoff is never reviewed. A clean
+    // agent output therefore cannot certify the full PR — fail closed to a human
+    // rather than promoting a partially reviewed PR to ready_for_human. (Unlike the
+    // mergeability guards above, this returns before the gh pr view call.)
+    const hugeDiff = 'diff --git a/src/big.ts b/src/big.ts\n' + '+x\n'.repeat(30_000); // > 50k chars
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
+      { stdout: hugeDiff, stderr: '', exitCode: 0 },        // git diff (pre-verification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // verification
+      { stdout: hugeDiff, stderr: '', exitCode: 0 },        // git diff (oversized, for prompt)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // agy --print (clean)
+      { stdout: '', stderr: '', exitCode: 0 },              // post-review git status
+    ]);
+    const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/truncated before review/);
+    // The agent must have been given the truncation marker, and the merge check
+    // must NOT have run (we block before it).
+    expect(runner.calls[AGY_IDX].args[1]).toContain('…(diff truncated)');
+    expect(runner.calls.some((c) => c.cmd === 'gh' && (c.args || []).includes('view'))).toBe(false);
+  });
+
+  test('Gemini pass transitions to ready_for_human', async () => {
+    const store = new SqliteTaskStore(join(tmpDir, 'gemini-review.db'));
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 200, phase: 'review',
+      reviewAgent: 'gemini', now: '2026-06-07T00:00:00.000Z',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/200', title: 'Gemini test' },
+    });
+
+    const outcome = await runNextPhase({
+      store,
+      request: { sessionId: 'addon-dev', workerId: 'w', runId: 'run-review-1', now: '2026-06-07T00:01:00.000Z' },
+      handlers: { review: createReviewHandler(geminiContext(), geminiHappyRunner()) },
+    });
+
+    store.close();
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'ready_for_human', phase: 'review' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex context-mode (issue #376)
+// ---------------------------------------------------------------------------
+
+describe('review handler — codex context-mode', () => {
+  const REVIEW_IDX = 6; // status(0) checkout(1) pull(2) gh-checkout(3) verify(4) git-diff(5) codex(6)
+
+  function readReviewProfile() {
+    const raw = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8');
+    return JSON.parse(raw).resolvedProfile;
+  }
+
+  test('no codex config: argv unchanged, metadata records context-mode unset', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const { args } = runner.calls[REVIEW_IDX];
+    expect(args).not.toContain('--profile');
+    expect(args).not.toContain('context_mode=on');
+    const profile = readReviewProfile();
+    expect(profile).toMatchObject({
+      agentId: 'codex',
+      provider: 'openai',
+      contextMode: 'unset',
+      contextModeSource: 'default',
+    });
+    expect(profile.contextModeConfig).toBeUndefined();
+  });
+
+  test('enabled with config override: codex review receives -c context_mode=on', async () => {
+    const session = SESSION({ codex: { contextMode: { enabled: true, config: ['context_mode=on'] } } });
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+    const { args } = runner.calls[REVIEW_IDX];
+    const cIdx = args.lastIndexOf('-c');
+    expect(args[cIdx + 1]).toBe('context_mode=on');
+    const profile = readReviewProfile();
+    expect(profile).toMatchObject({
+      contextMode: 'enabled',
+      contextModeSource: 'session',
+      contextModeConfig: ['context_mode=on'],
+    });
+  });
+
+  test('enabled with profile: codex review receives --profile before the review subcommand', async () => {
+    const session = SESSION({ codex: { contextMode: { enabled: true, profile: 'ctx' } } });
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+    const { args } = runner.calls[REVIEW_IDX];
+    const pIdx = args.indexOf('--profile');
+    expect(pIdx).toBeGreaterThanOrEqual(0);
+    expect(args[pIdx + 1]).toBe('ctx');
+    // `--profile` is a GLOBAL Codex option, not a `codex review` option, so it
+    // must precede the `review` subcommand or Codex fails arg parsing before the
+    // review starts (issue #376 review follow-up).
+    const reviewIdx = args.indexOf('review');
+    expect(reviewIdx).toBeGreaterThanOrEqual(0);
+    expect(pIdx).toBeLessThan(reviewIdx);
+    expect(readReviewProfile().contextModeConfig).toContain('profile=ctx');
+  });
+
+  test('enabled with profile and config: --profile precedes review, -c overrides follow it', async () => {
+    const session = SESSION({ codex: { contextMode: { enabled: true, profile: 'ctx', config: ['context_mode=on'] } } });
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+    const { args } = runner.calls[REVIEW_IDX];
+    const pIdx = args.indexOf('--profile');
+    const reviewIdx = args.indexOf('review');
+    const cIdx = args.lastIndexOf('-c');
+    expect(pIdx).toBeGreaterThanOrEqual(0);
+    expect(pIdx).toBeLessThan(reviewIdx);
+    // The context-mode `-c` override stays after the subcommand.
+    expect(cIdx).toBeGreaterThan(reviewIdx);
+    expect(args[cIdx + 1]).toBe('context_mode=on');
+    expect(readReviewProfile().contextModeConfig).toEqual(['profile=ctx', 'context_mode=on']);
+  });
+
+  test('invalid config fails before running codex review with a clear error', async () => {
+    const session = SESSION({ codex: { contextMode: { enabled: true, config: ['noequalshere'] } } });
+    const runner = happyRunner();
+    const r = await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+    expect(r.result).toBe('failed');
+    expect(r.error).toMatch(/context-mode config override/i);
+    // No git/codex commands ran — the run failed at command resolution.
+    expect(runner.calls.find(c => c.cmd === 'codex')).toBeUndefined();
+  });
+
+  test('enabled but no invocation form fails with a clear error', async () => {
+    const session = SESSION({ codex: { contextMode: { enabled: true } } });
+    const runner = happyRunner();
+    const r = await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+    expect(r.result).toBe('failed');
+    expect(r.error).toMatch(/no invocation form is configured/i);
+  });
+
+  test('CODEX_CONTEXT_MODE=off disables a session-enabled context-mode', async () => {
+    process.env['CODEX_CONTEXT_MODE'] = 'off';
+    const session = SESSION({ codex: { contextMode: { enabled: true, config: ['context_mode=on'] } } });
+    const runner = happyRunner();
+    try {
+      await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+    } finally {
+      delete process.env['CODEX_CONTEXT_MODE'];
+    }
+    const { args } = runner.calls[REVIEW_IDX];
+    expect(args).not.toContain('context_mode=on');
+    expect(readReviewProfile()).toMatchObject({ contextMode: 'unset', contextModeSource: 'env' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-issue worktree review (issue #456)
+// ---------------------------------------------------------------------------
+
+describe('review handler — per-issue worktree review (issue #456)', () => {
+  const worktreePath = () => join(tmpDir, 'worktrees', 'addon-dev', 'issue-77');
+
+  // Records every resolveWorktree() input and returns a fixed worktree path so the
+  // handler's cwd switch is exercised without a real `git worktree`. Defaults model
+  // the common review case: the worktree already exists and is reused on the issue
+  // branch (created: false, branchReused: true).
+  function fakeWorktreeResolver(path, { ok = true, error, created = false, branchReused = true } = {}) {
+    const calls = [];
+    return {
+      calls,
+      resolve(input) {
+        calls.push(input);
+        if (!ok) return { ok: false, error: error ?? 'resolve failed' };
+        return { ok: true, path, worktreeId: `${input.sessionId}/issue-${input.issueNumber}`, branch: input.branch, created, branchReused };
+      },
+    };
+  }
+
+  // Duck-typed IssueWorktreeLock: records acquire/release and returns a configurable
+  // acquire result so a held lock (concurrent execution) can be simulated.
+  function fakeLock(acquireResult = { ok: true, locked: true, contextId: 'run-review-1', sessionId: 'addon-dev' }) {
+    const calls = { acquire: [], release: [] };
+    return {
+      calls,
+      acquire(ownerId, sessionId, issueNumber) { calls.acquire.push({ ownerId, sessionId, issueNumber }); return acquireResult; },
+      release(ownerId, sessionId, issueNumber) { calls.release.push({ ownerId, sessionId, issueNumber }); return { ok: true, released: true }; },
+    };
+  }
+
+  // Worktree-mode codex happy path: validate recorded branch (gh pr view) → fetch base →
+  // local-branch probe (exists, so no PR-head fetch) → resolveWorktree (injected,
+  // branchReused) → pull --ff-only onto the live PR head → preflight → verification →
+  // codex. Steps 2 (checkout main + pull) and 3 (gh pr checkout) are skipped — the `gh`
+  // call here is only the branch-validation read (issue #447 P2), not a checkout.
+  function worktreeHappyRunner() {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch, issue #447 P2)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },       // git rev-parse refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin ai/issue-77 --ff-only (reconcile reused branch with PR head)
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD (on the live PR head)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (Step 1 preflight) — clean
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (Step 5.5 post-review) — clean
+    ]);
+  }
+
+  const wtTask = () => makeTask({
+    context: {
+      title: 'Add login rate limiting',
+      url: 'https://github.com/m2dw/test-repo/issues/77',
+      prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+      branch: 'ai/issue-77',
+      labels: ['agent:codex', 'status:needs-review'],
+    },
+  });
+
+  // The headline acceptance case: implementation left `ai/issue-77` checked out in
+  // the per-issue worktree, so the review must run there instead of checking the
+  // held branch out in the canonical checkout (Git would reject that).
+  test('runs review inside the per-issue worktree and never checks the held branch out in the canonical checkout', async () => {
+    const wt = worktreePath();
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(wt);
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+
+    // The worktree was resolved for the issue's own branch, tolerant of a
+    // behind-origin (fast-forwardable) PR head.
+    expect(resolver.calls).toHaveLength(1);
+    expect(resolver.calls[0]).toMatchObject({
+      repoRoot,
+      issueNumber: 77,
+      branch: 'ai/issue-77',
+      allowFastForward: true,
+    });
+
+    // The regression guard: NO canonical `git checkout` (Step 2) and NO `gh pr
+    // checkout` (Step 3) — Git refuses a branch already held by another worktree.
+    // A `gh pr view` IS called to validate the recorded branch (issue #447 P2), but
+    // not `gh pr checkout`.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'checkout')).toBe(false);
+
+    // The diff base is the freshly-fetched origin/<base> (local main is never
+    // advanced in a worktree-only session), and codex diffs against it.
+    const fetch = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetch.args).toEqual(['fetch', 'origin', '+main:refs/remotes/origin/main']);
+    expect(fetch.opts.cwd).toBe(repoRoot);
+    const codex = runner.calls.find((c) => c.cmd === 'codex');
+    expect(codex.args).toContain('origin/main');
+
+    // Verification, the agent, and the pre/post-review status checks all run INSIDE
+    // the worktree, never the canonical checkout.
+    expect(codex.opts.cwd).toBe(wt);
+    expect(runner.calls.find((c) => c.cmd === 'npm').opts.cwd).toBe(wt);
+    for (const c of runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'status')) {
+      expect(c.opts.cwd).toBe(wt);
+    }
+
+    // The issue-scoped worktree lock was held across the review and released once.
+    expect(lock.calls.acquire).toEqual([{ ownerId: 'run-review-1', sessionId: 'addon-dev', issueNumber: 77 }]);
+    expect(lock.calls.release).toEqual([{ ownerId: 'run-review-1', sessionId: 'addon-dev', issueNumber: 77 }]);
+  });
+
+  // Concurrent review lock behavior: a different execution already holds this issue's
+  // worktree lock, so the review fails closed to a human without touching anything.
+  test('blocks when the issue worktree lock is already held by another execution', async () => {
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock({
+      ok: true, locked: false, reason: 'lock_held',
+      ownerContextId: 'other-run', ownerStartedAt: '2026-06-30T00:00:00.000Z',
+    });
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('blocked');
+    // The held lock scope + owner are surfaced for the task event / lock diagnostics.
+    expect(result.context?.reviewLockScope).toBe('addon-dev::issue-77');
+    expect(result.context?.reviewLockHeldBy).toBe('other-run');
+    expect(result.message).toContain('addon-dev::issue-77');
+
+    // Nothing was mutated: the worktree was never resolved, no git/agent ran, and the
+    // lock we never acquired is not released.
+    expect(resolver.calls).toHaveLength(0);
+    expect(runner.calls).toHaveLength(0);
+    expect(lock.calls.release).toHaveLength(0);
+  });
+
+  // A failed worktree resolution still releases the lock so the issue is not wedged.
+  test('releases the lock when worktree resolution fails', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },             // git fetch origin main
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },  // git rev-parse (branch exists)
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath(), { ok: false, error: 'diverged from origin' });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('diverged from origin');
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // On a fresh/single-branch clone the local issue branch is absent; the PR head is
+  // recovered into its remote-tracking ref so resolveWorktree materializes from it.
+  test('fetches the PR head when the local issue branch is absent', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/issue-77 (ABSENT)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin ai/issue-77:refs/remotes/origin/ai/issue-77
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+    const prHeadFetch = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    // Two fetches: the base refresh and the PR-head recovery.
+    expect(prHeadFetch.map((c) => c.args)).toEqual([
+      ['fetch', 'origin', '+main:refs/remotes/origin/main'],
+      ['fetch', 'origin', 'ai/issue-77:refs/remotes/origin/ai/issue-77'],
+    ]);
+  });
+
+  // P1: a reused local PR branch may be BEHIND origin/<branch> (another worker/operator
+  // pushed a follow-up). resolveWorktree's allowFastForward accepts it but leaves the
+  // worktree on the stale local commit, so the handler must fast-forward it onto the
+  // live PR head before verifying/reviewing or it could approve a PR against old
+  // contents.
+  test('fast-forwards the reused worktree branch onto the live PR head before reviewing', async () => {
+    const wt = worktreePath();
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+
+    // The reconciliation runs INSIDE the worktree, fetching the live PR head.
+    const pull = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'pull' && c.args[1] === 'origin');
+    expect(pull).toBeDefined();
+    expect(pull.args).toEqual(['pull', 'origin', 'ai/issue-77', '--ff-only']);
+    expect(pull.opts.cwd).toBe(wt);
+
+    // It happens before the verification + review agent, so they run on the fresh head.
+    const pullIdx = runner.calls.indexOf(pull);
+    const verifyIdx = runner.calls.findIndex((c) => c.cmd === 'npm');
+    const codexIdx = runner.calls.findIndex((c) => c.cmd === 'codex');
+    expect(pullIdx).toBeLessThan(verifyIdx);
+    expect(pullIdx).toBeLessThan(codexIdx);
+  });
+
+  // P1: a genuinely diverged (non-fast-forwardable) head makes the reconciliation pull
+  // fail; the review must fail closed (not review stale/diverged contents) and still
+  // release the lock so the issue is not wedged.
+  test('fails closed and releases the lock when the worktree branch cannot fast-forward onto the PR head', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },       // git rev-parse (branch exists)
+      { stdout: '', stderr: 'not possible to fast-forward', exitCode: 1 }, // git pull --ff-only — diverged
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('--ff-only');
+    expect(result.context?.reviewLockScope).toBe('addon-dev::issue-77');
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+    // The review agent never ran — no review happened against the diverged head.
+    expect(runner.calls.some((c) => c.cmd === 'codex')).toBe(false);
+  });
+
+  // P2: `git pull --ff-only` is a successful NO-OP when the reused branch is AHEAD of
+  // origin/<branch> (local-only commits after a failed/manual local commit or a remote
+  // reset). That leaves HEAD past the live PR head, so the review must fail closed
+  // rather than approve commits that were never pushed — and still release the lock.
+  test('refuses the review and releases the lock when the worktree branch is ahead of the live PR head', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },       // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull --ff-only — no-op (local is ahead)
+      { stdout: '2', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD — 2 local-only commits
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('ahead of the live PR head');
+    expect(result.error).toContain('2 commit');
+    expect(result.context?.reviewLockScope).toBe('addon-dev::issue-77');
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+    // The review agent never ran — no review happened against the local-ahead head.
+    expect(runner.calls.some((c) => c.cmd === 'codex')).toBe(false);
+    // The local-ahead guard compared against the freshly-fetched remote head.
+    const revList = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'rev-list');
+    expect(revList.args).toEqual(['rev-list', '--count', 'FETCH_HEAD..HEAD']);
+    expect(revList.opts.cwd).toBe(worktreePath());
+  });
+
+  // P2: if the local-ahead probe itself fails (e.g. FETCH_HEAD missing), fail closed
+  // rather than assume the worktree is on the live PR head.
+  test('fails closed and releases the lock when the local-ahead probe cannot run', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },       // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull --ff-only
+      { stdout: '', stderr: 'bad revision FETCH_HEAD', exitCode: 128 }, // git rev-list — fails
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('FETCH_HEAD..HEAD');
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+    expect(runner.calls.some((c) => c.cmd === 'codex')).toBe(false);
+  });
+
+  // P1: a branch the resolver CREATED fresh from origin/<branch> already sits at the PR
+  // head, so the reconciliation pull is skipped (only reused branches need it).
+  test('does not fast-forward when the worktree branch was created fresh from the PR head', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse (ABSENT)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin ai/issue-77 (recover PR head)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath(), { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'pull' && c.args[1] === 'origin')).toBe(false);
+  });
+
+  // P2: a supported PR-url-only review task whose PR head is NON-conventional. The
+  // worktree path must materialize the PR's ACTUAL head (resolved from the PR metadata),
+  // not the assumed `ai/issue-<n>` convention — otherwise it fetches a nonexistent
+  // branch or reviews the wrong one (the canonical path supports this by checking out
+  // the PR number).
+  test('resolves the PR head from prUrl when no branch is recorded (non-conventional head)', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic per-PR name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD (on the live PR head)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt> (synthetic ready-for-human handoff cleanup, issue #459 P2)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        // no `branch` recorded — the PR head is non-conventional
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('success');
+    // The PR head was resolved from the PR number (backend-neutral selector).
+    const view = runner.calls.find((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
+    expect(view).toBeDefined();
+    expect(view.args).toContain('99');
+    // The worktree targets a SYNTHETIC per-PR branch (`ai/pr-<n>`), not the PR's raw
+    // `headRefName` (which for a forked PR is the contributor's branch and can collide
+    // with a local branch) and not the `ai/issue-77` convention (issue #459 review, P1).
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // The reconciliation pulls the PR head by its PR ref (`pull/<n>/head`), not by an
+    // assumed origin branch — a PR-url-only head may be a forked PR with no `origin`
+    // branch (issue #456 review, P2).
+    const pull = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'pull' && c.args[1] === 'origin');
+    expect(pull.args).toEqual(['pull', 'origin', 'pull/99/head', '--ff-only']);
+    // The resolved synthetic head is persisted into the returned context so a later
+    // fix run's Tool Request handoff does not fall back to `ai/issue-77`.
+    expect(result.context.branch).toBe('ai/pr-99');
+  });
+
+  // P1 (issue #472 review): a SYNTHETIC `ai/pr-<n>` review worktree that is already
+  // dirty at the Step 1 preflight must NOT be force-removed on the dirty-tree human
+  // handoff. The dirty contents (e.g. leftover output from an interrupted review) are
+  // the very reason for the escalation; `git worktree remove --force --force` would
+  // delete them before anyone can inspect or recover them. The worktree is preserved
+  // in place and its path surfaced for manual cleanup.
+  test('preserves a dirty synthetic ai/pr-<n> review worktree on the preflight dirty-tree block', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic per-PR name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD (on the live PR head)
+      { stdout: ' M src/foo.ts\n?? leftover.txt\n', stderr: '', exitCode: 0 }, // git status (preflight) — DIRTY
+      // No further calls: the handler blocks here and must NOT remove the worktree.
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        // no `branch` recorded — the PR head is non-conventional, so review runs on
+        // the SYNTHETIC `ai/pr-99` worktree.
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    // The dirty tree escalates to a human.
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/dirty/);
+    expect(result.context?.reviewFeedback).toMatch(/dirty/i);
+    // The synthetic review worktree ran on `ai/pr-99` (confirms the synthetic path).
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // Critically: the dirty synthetic worktree is NOT force-removed — the uncommitted
+    // changes are preserved for manual inspection/recovery.
+    const removed = runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(removed).toBe(false);
+    // The preserved worktree's path is surfaced so the leftover work can be found.
+    expect(result.message).toContain(wt);
+    expect(result.message).toMatch(/left in place/);
+    // The advisory lock is still released in the `finally`.
+    expect(lock.calls.release.length).toBeGreaterThan(0);
+  });
+
+  // P1 (issue #459): a forked PR head (`isCrossRepository: true`) whose
+  // `headRefName` collides with a local branch is materialized through a synthetic
+  // `ai/pr-<n>` branch fetched from the PR ref, never through the raw fork head name.
+  test('materializes a forked PR head through the synthetic ai/pr-<n> path', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'main', state: 'OPEN', baseRefName: 'main', isCrossRepository: true }), stderr: '', exitCode: 0 }, // gh pr view 99 — forked head
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/pr-99 (ABSENT — synthetic name)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin pull/99/head:refs/remotes/origin/ai/pr-99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt>
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        // no `branch` recorded — the PR head lives on a fork
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('success');
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    const fetches = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetches.map((c) => c.args)).toEqual([
+      ['fetch', 'origin', '+main:refs/remotes/origin/main'],
+      ['fetch', 'origin', 'pull/99/head:refs/remotes/origin/ai/pr-99'],
+    ]);
+    // The colliding fork branch name was never used as the local worktree branch.
+    expect(resolver.calls.some((c) => c.branch === 'main')).toBe(false);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #459): a forked PR (`isCrossRepository: true`) reviewed on the synthetic
+  // `ai/pr-<n>` path whose review yields blocking findings must NOT auto-queue the
+  // implementation-fix phase — that handler refuses forked heads (it cannot push a fix
+  // back to the contributor's fork), so a `needs_fix` result would deterministically
+  // fail the next phase. The review hands off to a human (`blocked`) instead, carrying
+  // the review feedback, and still frees the synthetic worktree.
+  test('forked PR with blocking review findings hands off to a human instead of auto-queuing a fix', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'main', state: 'OPEN', baseRefName: 'main', isCrossRepository: true }), stderr: '', exitCode: 0 }, // gh pr view 99 — forked head
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/pr-99 (ABSENT — synthetic name)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin pull/99/head:refs/remotes/origin/ai/pr-99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Null pointer in auth handler', stderr: '', exitCode: 0 }, // codex review — blocking finding
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt> (synthetic fix handoff cleanup)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        // no `branch` recorded — the PR head lives on a fork
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    // Human handoff, NOT an auto-queued needs_fix (the fix phase would refuse the fork).
+    expect(result.result).toBe('blocked');
+    expect(result.message).toContain('forked PR');
+    expect(result.message).toContain('#99');
+    // The blocking review feedback is preserved for the human handoff.
+    expect(result.context?.reviewFeedback).toContain('[P1] Null pointer in auth handler');
+    // The synthetic review worktree was still freed, and the lock released.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(true);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #459): a forked PR whose review finds a merge conflict must NOT auto-queue
+  // conflict_resolution — that handler also refuses forked heads (it cannot push the
+  // resolution back to the fork). The review hands off to a human (`blocked`) instead.
+  test('forked PR with a review-detected conflict hands off to a human instead of auto-queuing conflict resolution', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'main', state: 'OPEN', baseRefName: 'main', isCrossRepository: true }), stderr: '', exitCode: 0 }, // gh pr view 99 — forked head
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/pr-99 (ABSENT)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin pull/99/head:refs/remotes/origin/ai/pr-99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // codex review — conflict
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt> (conflict handoff cleanup)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    // Human handoff, NOT an auto-queued conflict (conflict_resolution refuses the fork).
+    expect(result.result).toBe('blocked');
+    expect(result.context?.classification).not.toBe('conflict');
+    expect(result.message).toContain('forked PR');
+    // The synthetic review worktree was still freed, and the lock released.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(true);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // Regression: a SAME-repository PR reviewed in worktree mode keeps its auto-queue
+  // lanes. The recorded conventional `ai/issue-<n>` branch is validated against the
+  // live PR and confirmed as a same-repository head, so `needs_fix` must still route
+  // to the implementation-fix phase — the forked-PR handoff must not swallow same-repo
+  // blocking outcomes.
+  test('same-repo worktree PR with blocking findings still returns needs_fix (auto-queue unchanged)', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },       // git rev-parse refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin ai/issue-77 --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Null pointer in auth handler', stderr: '', exitCode: 0 }, // codex review — blocking finding
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    // Same-repo head → auto-requeue the implementation-fix phase, not a human handoff.
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.classification).toBe('needs_fix');
+    expect(result.context?.reviewFeedback).toContain('[P1] Null pointer in auth handler');
+    // A same-repo review reuses its worktree for the fix phase, so it is NOT removed.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2: when the PR head cannot be resolved from prUrl (PR read fails), fail closed
+  // rather than fall back to the convention and review a possibly-wrong branch.
+  test('fails closed and releases the lock when the PR head cannot be resolved from prUrl', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: 'gh: could not resolve PR', exitCode: 1 }, // gh pr view 99 — lookup fails
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('resolve PR head');
+    // No worktree was materialized against a guessed branch, and the lock is released.
+    expect(resolver.calls).toHaveLength(0);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2: a PR-url-only review whose non-conventional head is not (or no longer) a branch
+  // on `origin` under its name (`isCrossRepository` unset → same-repo, so it is NOT a
+  // fork blocked above). The worktree path must recover the head by its PR ref
+  // (`pull/<n>/head`) — the ref `gh pr checkout <n>` used on the canonical path — not by
+  // `git fetch origin <head>`, which fails when the head branch is absent on `origin`.
+  test('fetches a non-origin PR head by its PR ref when the local branch is absent', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/pr-99 (ABSENT — synthetic per-PR name, forked head)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin pull/99/head:refs/remotes/origin/ai/pr-99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt> (synthetic ready-for-human handoff cleanup, issue #459 P2)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        // no `branch` recorded — same-repo head not present on `origin` by name
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('success');
+    // The head was recovered by PR ref into the SYNTHETIC per-PR tracking ref
+    // (`origin/ai/pr-<n>`), so a forked PR (no `origin` branch) still materializes the
+    // review worktree without reusing the fork's head ref name locally (issue #459, P1).
+    const fetches = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetches.map((c) => c.args)).toEqual([
+      ['fetch', 'origin', '+main:refs/remotes/origin/main'],
+      ['fetch', 'origin', 'pull/99/head:refs/remotes/origin/ai/pr-99'],
+    ]);
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+  });
+
+  // P1 (issue #459): a forked PR whose `headRefName` COLLIDES with a branch that already
+  // exists locally — commonly `main`. Reusing that raw head ref name as the local
+  // worktree branch would make the resolver reuse/detach the base repo's local `main`
+  // and fast-forward it to the PR head, leaving the base branch checked out in the issue
+  // worktree (and contaminating later phases). The synthetic `ai/pr-<n>` name must be
+  // used for the local branch, the rev-parse probe, and the `origin/<branch>` ref so no
+  // real local/base ref is ever touched.
+  test('never reuses a colliding fork head name (e.g. main) as the local worktree branch', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'main', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99 (forked head named `main`)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/pr-99 (ABSENT — synthetic name, not local `main`)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin pull/99/head:refs/remotes/origin/ai/pr-99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt> (synthetic ready-for-human handoff cleanup, issue #459 P2)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        // no `branch` recorded — the PR head lives on a fork and is literally named `main`
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('success');
+    // The local branch is the synthetic per-PR name, NEVER the colliding `main`.
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // The rev-parse probe and the PR-ref recovery fetch both target the synthetic ref,
+    // so the base repo's local `main` and `origin/main` are never reused or rewritten.
+    const revParse = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'rev-parse');
+    expect(revParse.args).toContain('refs/heads/ai/pr-99');
+    const fetches = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetches.map((c) => c.args)).toEqual([
+      ['fetch', 'origin', '+main:refs/remotes/origin/main'],
+      ['fetch', 'origin', 'pull/99/head:refs/remotes/origin/ai/pr-99'],
+    ]);
+    // No fetch ever writes the PR head into `origin/main` (the base-refresh fetch above
+    // legitimately updates `origin/main` from the base branch).
+    expect(fetches.some((c) => c.args.includes('pull/99/head:refs/remotes/origin/main'))).toBe(false);
+  });
+
+  // P1 (issue #459): a forked PR can arrive with BOTH a `prUrl` and a non-conventional
+  // recorded `branch` whose name is the contributor's fork head — commonly `main`.
+  // Trusting that `branch` would `rev-parse`/`fetch` the local/origin base branch instead
+  // of `refs/pull/<n>/head`, reviewing (and promoting) the base branch. The handler reads
+  // the PR, sees a confirmed cross-repository head, and reroutes to the synthetic
+  // `ai/pr-<n>` path + PR-ref fetch despite the recorded `branch`.
+  test('reroutes a forked PR to the synthetic ai/pr-<n> path even when a non-conventional branch is recorded', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'main', state: 'OPEN', baseRefName: 'main', isCrossRepository: true }), stderr: '', exitCode: 0 }, // gh pr view 99 (forked head named `main`)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/pr-99 (ABSENT — synthetic name)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin pull/99/head:refs/remotes/origin/ai/pr-99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt> (synthetic ready-for-human handoff cleanup, issue #459 P2)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        branch: 'main', // a forked PR head recorded as the contributor's branch name
+        labels: ['agent:codex', 'status:needs-review'],
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('success');
+    // The recorded `branch: 'main'` is NOT trusted: the worktree uses the synthetic
+    // per-PR name and the head is recovered by its PR ref, never by `origin/main`.
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    const fetches = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetches.map((c) => c.args)).toEqual([
+      ['fetch', 'origin', '+main:refs/remotes/origin/main'],
+      ['fetch', 'origin', 'pull/99/head:refs/remotes/origin/ai/pr-99'],
+    ]);
+    // No fetch ever writes the PR head into `origin/main` (the base-refresh fetch above
+    // legitimately updates `origin/main` from the base branch).
+    expect(fetches.some((c) => c.args.includes('pull/99/head:refs/remotes/origin/main'))).toBe(false);
+  });
+
+  // P1 guard (issue #459): the cross-repository reroute must NOT over-fire. A
+  // non-conventional recorded `branch` that the PR confirms is a SAME-repository origin
+  // head (a non-conventional head pushed to `origin`) stays authoritative — the review
+  // fetches and materializes it by branch name, never via the synthetic PR-ref path.
+  test('trusts a recorded non-conventional same-repository branch (no synthetic reroute)', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (same-repo head)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/feature/custom (ABSENT)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin feature/custom:refs/remotes/origin/feature/custom
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        branch: 'feature/custom', // a same-repo non-conventional head pushed to origin
+        labels: ['agent:codex', 'status:needs-review'],
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('success');
+    // The same-repo branch is trusted: the worktree uses it directly and the head is
+    // fetched by branch name, NOT the synthetic `ai/pr-99` / `pull/99/head` path.
+    expect(resolver.calls[0].branch).toBe('feature/custom');
+    const fetches = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetches.map((c) => c.args)).toEqual([
+      ['fetch', 'origin', '+main:refs/remotes/origin/main'],
+      ['fetch', 'origin', 'feature/custom:refs/remotes/origin/feature/custom'],
+    ]);
+    expect(runner.calls.some((c) => c.args.some((a) => typeof a === 'string' && a.includes('ai/pr-99')))).toBe(false);
+  });
+
+  // Even a CONVENTIONAL `ai/issue-<n>` recorded branch is validated against the live PR
+  // when `prUrl` is present (issue #447 review, P2): a fork's head branch could
+  // coincidentally use the same naming, making it unsafe to bypass the live read. When
+  // the PR confirms the conventional branch as the same-repo head the worktree still
+  // materializes on `ai/issue-<n>` — the conventional branch is not replaced.
+  test('validates the recorded branch against the live PR even for a conventional ai/issue-<n> branch', async () => {
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+    // A `gh pr view` IS called to validate the recorded branch (issue #447 P2).
+    const view = runner.calls.find((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
+    expect(view).toBeDefined();
+    // The PR confirmed the conventional branch → worktree materializes on it as before.
+    expect(resolver.calls[0].branch).toBe('ai/issue-77');
+  });
+
+  // A GitHub review whose task context carries a `branch` but NO `prUrl` (issue #447
+  // review, P2). The canonical path runs `gh pr checkout <branch>`, which fails when the
+  // branch is stale or has no open PR; the worktree path has no PR number to resolve, so
+  // without this gate it would fetch `origin/<branch>` and review it, promoting a task to
+  // human handoff with no PR. So the recorded branch is first validated against the live PR.
+  const wtBranchOnlyTask = () => makeTask({
+    context: {
+      title: 'Add login rate limiting',
+      url: 'https://github.com/m2dw/test-repo/issues/77',
+      branch: 'ai/issue-77',
+      labels: ['agent:codex', 'status:needs-review'],
+      // no `prUrl` recorded — a branch-only GitHub selector
+    },
+  });
+
+  test('validates a branch-only GitHub selector has an open PR before materializing the worktree', async () => {
+    // worktreeHappyRunner's first entry is an OPEN PR, consumed here by the branch validation.
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtBranchOnlyTask());
+
+    expect(result.result).toBe('success');
+    // The BRANCH — not a PR number — is the selector handed to `gh pr view` for validation.
+    const view = runner.calls.find((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
+    expect(view).toBeDefined();
+    expect(view.args).toContain('ai/issue-77');
+    // The open PR is confirmed → the worktree materializes on the recorded branch, and the
+    // canonical `gh pr checkout` is still never used.
+    expect(resolver.calls[0].branch).toBe('ai/issue-77');
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args[1] === 'checkout')).toBe(false);
+  });
+
+  test('fails closed and releases the lock when a branch-only selector has no open PR on GitHub', async () => {
+    const runner = sequenceRunner([
+      { stdout: '', stderr: 'no pull requests found for branch "ai/issue-77"', exitCode: 1 }, // gh pr view ai/issue-77 (no PR)
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtBranchOnlyTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/No open PR found for branch 'ai\/issue-77'/);
+    // The stale branch is never materialized and nothing beyond the validation read runs —
+    // no base fetch, no worktree, no canonical checkout — and the lock is released.
+    expect(resolver.calls).toHaveLength(0);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'fetch')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args[1] === 'checkout')).toBe(false);
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  test('fails closed and releases the lock when a branch-only selector points at a merged (not open) PR', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'MERGED', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view ai/issue-77 (already MERGED)
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtBranchOnlyTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/has a merged PR, not an open one/);
+    // A merged/closed PR is treated like a stale branch: nothing is materialized and the
+    // lock is released.
+    expect(resolver.calls).toHaveLength(0);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'fetch')).toBe(false);
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #447): a branch-only GitHub selector whose PR is FORKED (cross-repository).
+  // The branch validation read above already reveals `isCrossRepository` and the PR number,
+  // but if those were discarded the path would fetch `origin/<branch>` — and a fork's head
+  // ref name is the contributor's branch, commonly `main` — so the review would run against
+  // (and approve) the BASE repository's branch instead of the fork's PR head. The handler
+  // routes the confirmed fork through the same synthetic `ai/pr-<n>` + `pull/<n>/head` path a
+  // `prUrl`-only forked PR uses, so the review materializes on the real PR head.
+  test('reroutes a branch-only forked PR through the synthetic ai/pr-<n> path', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'main', state: 'OPEN', baseRefName: 'main', isCrossRepository: true }), stderr: '', exitCode: 0 }, // gh pr view main (branch-only selector; forked head named `main`)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/pr-99 (ABSENT — synthetic name, not local `main`)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin pull/99/head:refs/remotes/origin/ai/pr-99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt> (synthetic ready-for-human handoff cleanup)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        branch: 'main', // the fork's head ref name, recorded with NO prUrl
+        labels: ['agent:codex', 'status:needs-review'],
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('success');
+    // The branch — `main` — is the selector handed to the validation read (there is no PR
+    // number to resolve without a prUrl); the read is what reveals the cross-repository head.
+    const view = runner.calls.find((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
+    expect(view.args).toContain('main');
+    // The confirmed fork reroutes to the synthetic per-PR name: the recorded `branch: 'main'`
+    // is NOT trusted, so the worktree is materialized on `ai/pr-99` and the head is recovered
+    // by its PR ref — the base repo's `origin/main` is never used for the head.
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    const fetches = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetches.map((c) => c.args)).toEqual([
+      ['fetch', 'origin', '+main:refs/remotes/origin/main'],
+      ['fetch', 'origin', 'pull/99/head:refs/remotes/origin/ai/pr-99'],
+    ]);
+    // The PR head is recovered into the synthetic tracking ref, never `origin/main`.
+    expect(fetches.some((c) => c.args.some((a) => a.startsWith('pull/') && a.endsWith(':refs/remotes/origin/main')))).toBe(false);
+    // The synthetic `ai/pr-99` head is persisted as the branch, but on its own that name is
+    // not a real PR selector. The resolved PR URL must ALSO be persisted so a successful
+    // review's outbox timeline comment and any later `human-review-return` target the actual
+    // fork PR (#99) instead of a synthetic branch with no open PR (issue #447 review, P2).
+    expect(result.context?.branch).toBe('ai/pr-99');
+    expect(result.context?.prUrl).toBe('https://github.com/m2dw/test-repo/pull/99');
+  });
+
+  // P2: a GitHub worktree review with NEITHER prUrl NOR branch must fail closed with the
+  // same `No PR URL or branch` error the canonical `gh` path raises — not fall back to
+  // materializing `ai/issue-<n>` by convention (which would promote a task to
+  // `ready_for_human` with no PR to hand off). The lock is still released.
+  test('fails closed (no PR selector) without materializing the convention branch on GitHub', async () => {
+    const runner = sequenceRunner([]);
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        labels: ['agent:codex', 'status:needs-review'],
+        // neither `prUrl` nor `branch` recorded
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/No PR URL or branch/);
+    // No branch was materialized and no git/agent ran; the lock acquired by the worktree
+    // path is still released.
+    expect(resolver.calls).toHaveLength(0);
+    expect(runner.calls).toHaveLength(0);
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #447): a NON-GitHub (e.g. Gitea) worktree review of a FORKED
+  // (cross-repository) PR must fail closed instead of reviewing the wrong ref. GitHub
+  // forked PRs route to the synthetic `ai/pr-<n>` + `pull/<n>/head` path above, but a
+  // non-`gh` host has no PR-ref fetch: it resolves a `prUrl`-only head as an ordinary
+  // `origin` branch via the head-branch convention, adopting the PR's `headRefName`. A
+  // fork's head ref name is the contributor's branch — commonly `main` — so that would
+  // fetch/review the BASE repository's branch and mark unrelated code ready. The provider
+  // populates `isCrossRepository`, so the handler refuses the review. (The real Gitea
+  // provider reads PRs over a synchronous HTTP client that a same-process test server
+  // would deadlock, so the repo-host resolver is injected with a fake here.)
+  test('fails closed on a non-GitHub (Gitea) forked PR instead of reviewing the base branch', async () => {
+    const runner = sequenceRunner([]); // no git/agent call should run — the guard fires first
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+    const session = SESSION({
+      worktrees: { enabled: true },
+      // A Gitea repo host: no `gh` runner is resolved, so the synthetic PR-ref path never
+      // applies and the head-branch convention would otherwise adopt the fork `headRefName`.
+      repoHostProvider: {
+        provider: 'gitea',
+        gitea: { baseUrl: 'https://gitea.example.com', owner: 'acme', repo: 'code' },
+        auth: { mode: 'api-token', tokenEnv: 'GITEA_TOKEN' },
+      },
+    });
+    // Stand in for the Gitea provider: a cross-repository PR whose head ref name is the
+    // contributor's fork branch (`main`), with NO `gh` runner (the non-GitHub host).
+    const resolveRepoHost = async () => ({
+      kind: 'gitea',
+      provider: {
+        getPullRequest: () => ({
+          ok: true,
+          value: { number: 99, url: 'https://gitea.example.com/acme/code/pulls/99', headRefName: 'main', state: 'OPEN', baseRefName: 'main', isCrossRepository: true },
+        }),
+      },
+    });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://gitea.example.com/acme/code/issues/77',
+        prUrl: 'https://gitea.example.com/acme/code/pulls/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        // no `branch` recorded — the PR head is resolved from prUrl and lives on a fork
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock, resolveRepoHost,
+    )(task);
+
+    expect(result.result).toBe('failed');
+    // The refusal names the fork, the PR, and the branch it would otherwise have reviewed.
+    expect(result.error).toMatch(/fork|cross-repository/i);
+    expect(result.error).toMatch(/PR #99/);
+    expect(result.error).toContain("'main'");
+    // Nothing was materialized or fetched — the guard fires before touching any branch —
+    // and the issue-scoped lock the worktree path acquired is released.
+    expect(resolver.calls).toHaveLength(0);
+    expect(runner.calls).toHaveLength(0);
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // Conflict handoff (issue #456 review follow-up): a worktree-mode review that
+  // detects a merge conflict must FREE the per-issue worktree before returning
+  // `conflict`. The downstream conflict_resolution phase runs in the canonical
+  // checkout and does `git checkout -B <prBranch>`, which Git refuses while the
+  // branch is still held by the review worktree — so a conflicted PR would be
+  // queued into a phase that immediately fails unless the worktree is removed.
+  function worktreeConflictRunner(removeResult = { stdout: '', stderr: '', exitCode: 0 }) {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },       // git rev-parse refs/heads/ai/issue-77 (exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin ai/issue-77 --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD (on PR head)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (preflight) — clean
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (post-review) — clean
+      removeResult,                                             // git worktree remove --force --force <wt>
+    ]);
+  }
+
+  test('frees the per-issue worktree before returning conflict so conflict_resolution can check out the branch', async () => {
+    const wt = worktreePath();
+    const runner = worktreeConflictRunner();
+    const resolver = fakeWorktreeResolver(wt);
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('conflict');
+
+    // The held branch was released by removing the review worktree, run in the
+    // canonical checkout (where conflict_resolution will check the branch out).
+    const remove = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(remove).toBeDefined();
+    expect(remove.args).toEqual(['worktree', 'remove', '--force', '--force', wt]);
+    expect(remove.opts.cwd).toBe(repoRoot);
+
+    // Removal happened before the handler returned (i.e. it was the last git call),
+    // and the review agent had already run against the worktree.
+    const removeIdx = runner.calls.indexOf(remove);
+    const codexIdx = runner.calls.findIndex((c) => c.cmd === 'codex');
+    expect(codexIdx).toBeLessThan(removeIdx);
+
+    // The advisory lock is still released independently.
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  test('escalates to a human (not conflict) when freeing the worktree before the conflict handoff fails', async () => {
+    const wt = worktreePath();
+    const runner = worktreeConflictRunner({ stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 });
+    const resolver = fakeWorktreeResolver(wt);
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    // A failed removal must NOT queue conflict_resolution against a still-held
+    // branch — it blocks for a human and surfaces the worktree path to recover.
+    expect(result.result).toBe('blocked');
+    expect(result.message).toContain(wt);
+    expect(result.message).toContain('conflict_resolution');
+    // The removal was still attempted, and the lock is released regardless.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(true);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // needs_fix handoff for a SYNTHETIC `ai/pr-<n>` review (issue #459 review, P2): a
+  // PR-url-only GitHub review materializes the worktree on the synthetic `ai/pr-<n>`
+  // branch, but the implementation fix phase resolves the worktree on the PR's real
+  // `headRefName` (e.g. `feature/custom`). `resolveIssueWorktree` refuses to reuse the
+  // path while it is still on `ai/pr-<n>`, wedging the PR-url-only review/fix cycle —
+  // so the review must remove the synthetic worktree before returning `needs_fix`.
+  function syntheticNeedsFixRunner(removeResult = { stdout: '', stderr: '', exitCode: 0 }) {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD (on PR head)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (preflight) — clean
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Null pointer in auth handler', stderr: '', exitCode: 0 }, // codex review — blocking finding
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (post-review) — clean
+      removeResult,                                             // git worktree remove --force --force <wt>
+    ]);
+  }
+
+  const prUrlOnlyTask = () => makeTask({
+    context: {
+      title: 'Add login rate limiting',
+      url: 'https://github.com/m2dw/test-repo/issues/77',
+      prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+      labels: ['agent:codex', 'status:needs-review'],
+      // no `branch` recorded — the PR head is non-conventional, so the worktree
+      // materializes on the synthetic `ai/pr-99` branch.
+    },
+  });
+
+  test('frees the synthetic ai/pr-<n> worktree before returning needs_fix so the fix phase can re-materialize on the real head', async () => {
+    const wt = worktreePath();
+    const runner = syntheticNeedsFixRunner();
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(prUrlOnlyTask());
+
+    expect(result.result).toBe('needs_fix');
+    // The worktree was materialized on the synthetic per-PR branch (not the real head).
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+
+    // The synthetic worktree was removed before the handoff so the fix phase can
+    // resolve the worktree on the PR's real `headRefName`.
+    const remove = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(remove).toBeDefined();
+    expect(remove.args).toEqual(['worktree', 'remove', '--force', '--force', wt]);
+    expect(remove.opts.cwd).toBe(repoRoot);
+    // Removal happened after the review agent ran (i.e. as the final git call).
+    const removeIdx = runner.calls.indexOf(remove);
+    const codexIdx = runner.calls.findIndex((c) => c.cmd === 'codex');
+    expect(codexIdx).toBeLessThan(removeIdx);
+
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  test('escalates to a human (not needs_fix) when freeing the synthetic worktree before the fix handoff fails', async () => {
+    const runner = syntheticNeedsFixRunner({ stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 });
+    const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(prUrlOnlyTask());
+
+    // A failed removal must NOT queue a fix phase against a still-held synthetic
+    // branch — it blocks for a human and surfaces the worktree path to recover.
+    expect(result.result).toBe('blocked');
+    expect(result.message).toContain('ai/pr-99');
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(true);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #459): the synthetic-worktree release must ALSO run on the review-loop cap
+  // handoff, not only on a plain `needs_fix`. The cap returns `blocked` for a human who
+  // later requeues implementation, which resolves the worktree on the PR's real head —
+  // `resolveIssueWorktree` would refuse the path while it is still on `ai/pr-<n>`. So the
+  // cap path frees the synthetic worktree before escalating.
+  test('frees the synthetic ai/pr-<n> worktree before the review-loop cap handoff', async () => {
+    const wt = worktreePath();
+    const runner = syntheticNeedsFixRunner();
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    // reviewCycles: 4 → this cycle is the 5th, hitting the default maxCycles=5 cap.
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        reviewCycles: 4,
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    // The cap escalates to a human...
+    expect(result.result).toBe('blocked');
+    expect(result.context?.reviewLoopCapReached).toBe(true);
+    expect(result.context?.reviewCycles).toBe(5);
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // ...but the synthetic worktree is removed first so a later requeue to implementation
+    // can re-materialize the worktree on the PR's real head.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(true);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // Regression: a NON-synthetic worktree review (a recorded `ai/issue-<n>` branch) keeps
+  // its worktree on a `needs_fix` — the fix phase resolves the same branch and reuses it,
+  // so removing it would force a wasteful re-materialization (issue #459 review, P2).
+  test('keeps the worktree on needs_fix when the review ran on the recorded issue branch (non-synthetic)', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },       // git rev-parse refs/heads/ai/issue-77 (exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin ai/issue-77 --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: '[P1] Null pointer in auth handler', stderr: '', exitCode: 0 }, // codex review — blocking finding
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (post-review)
+    ]);
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('needs_fix');
+    // The worktree is left in place for the fix phase to reuse on the same branch.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #459): a SYNTHETIC `ai/pr-<n>` review that PASSES (or otherwise hands off to
+  // a human via `success`/`blocked`) must ALSO free the synthetic worktree, not only the
+  // `needs_fix`/cap paths. If a human later returns the ready-for-human task to
+  // implementation fixes, that phase resolves the worktree on the PR's real `headRefName`
+  // and `resolveIssueWorktree` refuses the path while it is still on `ai/pr-<n>`. So the
+  // terminal human-handoff return frees the synthetic worktree first.
+  function syntheticSuccessRunner(removeResult = { stdout: '', stderr: '', exitCode: 0 }) {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD (on PR head)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (preflight) — clean
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review — clean pass
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (post-review) — clean
+      removeResult,                                             // git worktree remove --force --force <wt>
+    ]);
+  }
+
+  test('frees the synthetic ai/pr-<n> worktree before the ready-for-human handoff on a passing review', async () => {
+    const wt = worktreePath();
+    const runner = syntheticSuccessRunner();
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(prUrlOnlyTask());
+
+    expect(result.result).toBe('success');
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // The synthetic worktree is removed before the handoff so a later human-requested
+    // implementation fix can re-materialize the worktree on the PR's real `headRefName`.
+    const remove = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(remove).toBeDefined();
+    expect(remove.args).toEqual(['worktree', 'remove', '--force', '--force', wt]);
+    expect(remove.opts.cwd).toBe(repoRoot);
+    // Removal happened after the review agent ran (the final git call).
+    const codexIdx = runner.calls.findIndex((c) => c.cmd === 'codex');
+    expect(codexIdx).toBeLessThan(runner.calls.indexOf(remove));
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  test('escalates to a human when freeing the synthetic worktree before the ready-for-human handoff fails', async () => {
+    const runner = syntheticSuccessRunner({ stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 });
+    const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(prUrlOnlyTask());
+
+    // A failed removal must not promote a task whose synthetic worktree still blocks a
+    // later fix phase — it blocks for a human and surfaces the worktree to recover.
+    expect(result.result).toBe('blocked');
+    expect(result.message).toContain('ai/pr-99');
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(true);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // Regression (issue #459): a NON-synthetic worktree review that PASSES keeps its worktree
+  // — a later fix phase resolves the SAME `ai/issue-<n>` branch and reuses the path, so the
+  // terminal handoff must not remove it.
+  test('keeps the worktree on a passing review that ran on the recorded issue branch (non-synthetic)', async () => {
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+    expect(resolver.calls[0].branch).toBe('ai/issue-77');
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #472): an EARLY `blocked` exit — the Step 0 dependency-base check — can return
+  // after the synthetic `ai/pr-<n>` worktree is already materialized but before the
+  // post-classification synthetic cleanup. If that early exit leaves the issue path checked
+  // out on `ai/pr-<n>`, a later human-requested implementation fix resolves the worktree on
+  // the PR's real `headRefName` and `resolveIssueWorktree` refuses the path — wedging the
+  // PR-url-only review/fix cycle. So the early blocked exit must free the synthetic worktree
+  // first, exactly like the terminal handoffs below.
+  const depSyntheticTask = () => makeTask({
+    context: {
+      title: 'Add login rate limiting',
+      url: 'https://github.com/m2dw/test-repo/issues/77',
+      prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+      labels: ['agent:codex', 'status:needs-review'],
+      // no `branch` recorded → the PR head is non-conventional, so the worktree
+      // materializes on the synthetic `ai/pr-99` branch.
+      dependencyBase: {
+        baseIssueNumber: 50,
+        basePrNumber: 88,
+        baseHeadRefName: 'ai/issue-50',
+        basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+      },
+    },
+  });
+
+  // Step 0 (dependency-base) runs after the worktree is materialized but before the preflight
+  // status check, so a blocked exit here is the earliest one that can strand the synthetic
+  // worktree.
+  function depSyntheticBlockedRunner(liveBase = 'ai/issue-50', removeResult = { stdout: '', stderr: '', exitCode: 0 }) {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99 (head resolution)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD (on PR head)
+      { stdout: JSON.stringify({ baseRefName: liveBase }), stderr: '', exitCode: 0 }, // gh pr view 99 --json baseRefName (Step 0 live-base check)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (dirty check inside the early synthetic release — CLEAN, so the worktree is freed)
+      removeResult,                                             // git worktree remove --force --force <wt> (early blocked-exit synthetic cleanup, issue #472 P2)
+    ]);
+  }
+
+  test('frees the synthetic ai/pr-<n> worktree before the early Step 0 dependency-base blocked exit', async () => {
+    const wt = worktreePath();
+    const runner = depSyntheticBlockedRunner('ai/issue-50');
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(depSyntheticTask());
+
+    // The dependency-base check blocks because the live base still targets the blocker branch.
+    expect(result.result).toBe('blocked');
+    expect(result.context?.livePrBase).toBe('ai/issue-50');
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // The review never proceeds to the agent on a wrong live base.
+    expect(runner.calls.some((c) => c.cmd === 'codex')).toBe(false);
+    // The synthetic worktree is removed before the human handoff so a later requeue to
+    // implementation can re-materialize the worktree on the PR's real `headRefName`.
+    const remove = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(remove).toBeDefined();
+    expect(remove.args).toEqual(['worktree', 'remove', '--force', '--force', wt]);
+    expect(remove.opts.cwd).toBe(repoRoot);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  test('surfaces the leftover synthetic worktree when its removal fails on the early Step 0 blocked exit', async () => {
+    const runner = depSyntheticBlockedRunner('ai/issue-50', { stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 });
+    const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(depSyntheticTask());
+
+    // Still a human handoff, but the message now names the still-held synthetic worktree so a
+    // human can remove it before the task is returned to implementation.
+    expect(result.result).toBe('blocked');
+    expect(result.context?.livePrBase).toBe('ai/issue-50');
+    expect(result.message).toContain('ai/issue-50'); // original dependency-base reason preserved
+    expect(result.message).toContain('ai/pr-99');     // appended leftover-worktree note
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(true);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #472 review): the Step 0 dependency-base block runs BEFORE the Step 1 dirty
+  // preflight, so a REUSED synthetic `ai/pr-<n>` worktree that is already dirty (staged/
+  // untracked leftovers from an interrupted review) must NOT be force-removed on this early
+  // blocked exit. `git worktree remove --force --force` would delete those changes before a
+  // human can inspect or recover them. The worktree is preserved and its path surfaced,
+  // mirroring the Step 1 dirty-preflight handoff — the dependency-base reason is still kept.
+  function depSyntheticDirtyBlockedRunner(liveBase = 'ai/issue-50', dirtyStatus = ' M src/foo.ts\n?? leftover.txt\n') {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99 (head resolution)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD (on PR head)
+      { stdout: JSON.stringify({ baseRefName: liveBase }), stderr: '', exitCode: 0 }, // gh pr view 99 --json baseRefName (Step 0 live-base check → blocks)
+      { stdout: dirtyStatus, stderr: '', exitCode: 0 },         // git status --porcelain (dirty check inside the early synthetic release — DIRTY, so worktree is preserved)
+      // No `git worktree remove`: the dirty synthetic worktree is left in place.
+    ]);
+  }
+
+  test('preserves a dirty synthetic ai/pr-<n> worktree on the early Step 0 dependency-base blocked exit', async () => {
+    const wt = worktreePath();
+    const runner = depSyntheticDirtyBlockedRunner('ai/issue-50');
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(depSyntheticTask());
+
+    // Still a human handoff for the wrong live base.
+    expect(result.result).toBe('blocked');
+    expect(result.context?.livePrBase).toBe('ai/issue-50');
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // The review never proceeds to the agent on a wrong live base.
+    expect(runner.calls.some((c) => c.cmd === 'codex')).toBe(false);
+    // Critically: the DIRTY synthetic worktree is NOT force-removed — the uncommitted
+    // changes are preserved for manual inspection/recovery instead of being deleted.
+    const removed = runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(removed).toBe(false);
+    // The original dependency-base reason is preserved AND the leftover worktree path is
+    // surfaced so the dirty work can be found and recovered.
+    expect(result.message).toContain('ai/issue-50');
+    expect(result.message).toContain(wt);
+    expect(result.message).toMatch(/holds uncommitted changes and is left in place/);
+    // The advisory lock is still released in the `finally`.
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #459): a recorded SAME-repository `branch` that the live PR confirms does NOT
+  // match the PR's `headRefName` (stale or mistyped) must NOT be trusted — fetching/reviewing
+  // that origin branch would promote code that is not in the PR. The handler reroutes to the
+  // synthetic `ai/pr-<n>` path and materializes the live PR head by its ref instead.
+  test('reroutes to the synthetic ai/pr-<n> path when the recorded same-repo branch does not match the live PR head', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/actual', state: 'OPEN', baseRefName: 'main', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (same-repo head differs from recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main (refresh review base)
+      { stdout: '', stderr: '', exitCode: 1 },                  // git rev-parse refs/heads/ai/pr-99 (ABSENT — synthetic name)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin pull/99/head:refs/remotes/origin/ai/pr-99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (preflight)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review — clean pass
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt> (synthetic handoff cleanup)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        branch: 'feature/stale', // recorded same-repo branch that no longer matches the PR head
+        labels: ['agent:codex', 'status:needs-review'],
+      },
+    });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(task);
+
+    expect(result.result).toBe('success');
+    // The mismatched recorded `branch` is NOT trusted: the worktree uses the synthetic
+    // per-PR name and the head is materialized by its PR ref, never `origin/feature/stale`.
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    const fetches = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetches.map((c) => c.args)).toEqual([
+      ['fetch', 'origin', '+main:refs/remotes/origin/main'],
+      ['fetch', 'origin', 'pull/99/head:refs/remotes/origin/ai/pr-99'],
+    ]);
+    expect(runner.calls.some((c) => c.args.some((a) => typeof a === 'string' && a.includes('feature/stale')))).toBe(false);
+    // The PR was read once to validate the recorded branch against the live head.
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view')).toBe(true);
+  });
+
+  // Issue #477: rebuild-of-#443 guard. The review phase must execute on the SAME
+  // per-issue worktree contract the current stack (#454–#470) established, NOT the
+  // superseded #441/#442/#443 path. This consolidates that contract into one named
+  // anti-regression test on the post-#470 stack: the resolver is invoked with the
+  // new-stack contract (the issue's own `ai/issue-<n>` branch, diffed against the
+  // freshly-fetched `origin/<base>`, fast-forward-tolerant), the review serializes on
+  // the shared issue-scoped lock scope `<sessionId>::issue-<n>` (the same scope
+  // `admin doctor` / `worktree release-lock` report), and a passing NON-synthetic
+  // review preserves the worktree directory — matching #470's cleanup-preservation
+  // contract so the downstream implementation phase reuses the same worktree.
+  test('review executes on the current-stack per-issue worktree contract, not the superseded #443 path (issue #477)', async () => {
+    const wt = worktreePath();
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(wt);
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+
+    // New-stack worktree contract: the resolver owns worktree materialization (the
+    // #443 path predated this seam) and is asked for the issue's own branch, based on
+    // the fetched `origin/<base>`, tolerant of a fast-forwardable behind-origin head.
+    expect(resolver.calls).toHaveLength(1);
+    expect(resolver.calls[0]).toMatchObject({
+      repoRoot,
+      sessionId: 'addon-dev',
+      issueNumber: 77,
+      branch: 'ai/issue-77',
+      baseRef: 'origin/main',
+      allowFastForward: true,
+    });
+
+    // The review serializes on the shared issue-scoped lock scope — the same scope the
+    // rest of the stack (implementation, `admin doctor`, `worktree release-lock`) uses,
+    // acquired once for this run and released on the success handoff.
+    expect(lock.calls.acquire).toEqual([{ ownerId: 'run-review-1', sessionId: 'addon-dev', issueNumber: 77 }]);
+    expect(lock.calls.release).toEqual([{ ownerId: 'run-review-1', sessionId: 'addon-dev', issueNumber: 77 }]);
+
+    // #470 cleanup-preservation contract: a passing non-synthetic review leaves the
+    // per-issue worktree directory in place (no `git worktree remove`) so the fix phase
+    // reuses it on the same branch.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
+  });
+
+  // When the canonical repo has node_modules but the worktree doesn't, a symlink is
+  // created so npm lifecycle scripts (tsc, jest) resolve without a separate install.
+  test('symlinks canonical node_modules into the worktree when absent', async () => {
+    const wt = worktreePath();
+    mkdirSync(wt, { recursive: true });
+    mkdirSync(join(repoRoot, 'node_modules'), { recursive: true });
+
+    // worktreeHappyRunner() doesn't include the git check-ignore entry; use an
+    // inline runner so the node_modules gitignore probe doesn't shift subsequent
+    // git pull / rev-list slots and cause the ahead-of-remote guard to fire.
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77', state: 'OPEN', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },       // git rev-parse refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git check-ignore -q node_modules (gitignored → create symlink)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin ai/issue-77 --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (preflight) — clean
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (codex diff classification)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },// codex review
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (post-review) — clean
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+    const wtNodeModules = join(wt, 'node_modules');
+    expect(existsSync(wtNodeModules)).toBe(true);
+    expect(lstatSync(wtNodeModules).isSymbolicLink()).toBe(true);
+  });
+
+  // When canonical node_modules is also absent, no symlink is created and the review
+  // still runs (the try/catch is non-fatal).
+  test('does not create a node_modules symlink when canonical root has none', async () => {
+    const wt = worktreePath();
+    mkdirSync(wt, { recursive: true });
+    // No canonical node_modules created
+
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+    expect(existsSync(join(wt, 'node_modules'))).toBe(false);
+  });
+
+  // Regression for issue #515: run-one-phase acquires the issue-scoped worktree lock
+  // via acquirePhaseLock BEFORE invoking the handler. Without phaseLockOwnerId the
+  // review handler would try to acquire the same lock, see it held, and return
+  // `blocked` — a self-contention that prevented all worktree-enabled reviews.
+  // When phaseLockOwnerId is set the handler must proceed without touching the lock.
+  test('proceeds without re-acquiring the lock when the phase runner already holds it (phaseLockOwnerId set) — regression for issue #515', async () => {
+    const wt = worktreePath();
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(wt);
+    // fakeLock defaults to locked:true — if the handler were to call acquire() it
+    // would succeed here. But passing phaseLockOwnerId must skip acquire entirely.
+    const lock = fakeLock();
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock, undefined, 'ctx-exec-id',
+    )(wtTask());
+
+    expect(result.result).toBe('success');
+    // The handler must not have touched the lock at all — the phase runner owns it.
+    expect(lock.calls.acquire).toHaveLength(0);
+    expect(lock.calls.release).toHaveLength(0);
+  });
+
+  // Confirm that without phaseLockOwnerId a lock held by a DIFFERENT execution still
+  // blocks the review — cross-execution isolation is not weakened by issue #515.
+  test('still blocks when a different execution holds the lock and phaseLockOwnerId is absent', async () => {
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock({
+      ok: true, locked: false, reason: 'lock_held',
+      ownerContextId: 'other-run', ownerStartedAt: '2026-07-04T00:00:00.000Z',
+    });
+    const session = SESSION({ worktrees: { enabled: true } });
+
+    // No phaseLockOwnerId → handler acquires the lock itself and must detect contention.
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.context?.reviewLockHeldBy).toBe('other-run');
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(0);
+  });
+
+  // Worktrees disabled keeps the canonical checkout: no worktree is resolved, no lock
+  // is acquired, and the canonical Step 2 `git checkout main` still runs.
+  test('worktrees disabled keeps the canonical checkout and never resolves a worktree or acquires a lock', async () => {
+    const runner = happyRunner();
+    const resolver = fakeWorktreeResolver(worktreePath());
+    const lock = fakeLock();
+
+    const result = await createReviewHandler(
+      CONTEXT(), runner, resolver.resolve, lock,
+    )(makeTask());
+
+    expect(result.result).toBe('success');
+    expect(resolver.calls).toHaveLength(0);
+    expect(lock.calls.acquire).toHaveLength(0);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args[1] === 'main')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Diff classification and guardrail context in Claude/Gemini review prompts
+// (issue #505)
+//
+// Claude and Gemini receive the full diff via stdin. The review prompt also
+// includes a structured "Diff Classification" section (added/modified/deleted
+// files) and a "Guardrail and Tooling Changes" section so the reviewer can
+// identify deleted CI workflows, test files, or agent instruction files
+// without inferring them from a large patch.
+//
+// Runner sequence for a Claude review (canonical, single-verification):
+//   0: git status --porcelain  (preflight)
+//   1: git checkout main       (Step 2)
+//   2: git pull --ff-only      (Step 2)
+//   3: gh pr checkout          (Step 3, via ghRunner → sequenceRunner)
+//   4: git diff main...HEAD    (pre-verification diff classification, issue #506)
+//   5: npm test                (Step 4 verification)
+//   6: git diff main...HEAD    (Step 5 full diff for prompt)
+//   7: claude -p               (Step 5 review agent)
+//   8: git status --porcelain  (Step 5.5 post-review cleanup check)
+// ---------------------------------------------------------------------------
+
+describe('review handler — diff classification in Claude prompt (issue #505)', () => {
+  const CLAUDE_SESSION = (overrides = {}) => SESSION({
+    defaults: { implementationAgent: 'claude', reviewAgent: 'claude', researchAgent: 'gemini' },
+    ...overrides,
+  });
+  const CLAUDE_CONTEXT = (overrides = {}) => CONTEXT({ session: CLAUDE_SESSION(), ...overrides });
+
+  function claudeRunner({ diffOutput = '', reviewOutput = 'No issues found.' } = {}) {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                                        // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 },                                        // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },                                        // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },                                        // gh pr checkout 99
+      { stdout: diffOutput, stderr: '', exitCode: 0 },                               // git diff main...HEAD (pre-verification, issue #506)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },                       // npm test
+      { stdout: diffOutput, stderr: '', exitCode: 0 },                               // git diff main...HEAD (full diff for prompt)
+      { stdout: reviewOutput, stderr: '', exitCode: 0 },                             // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },                                        // git status (post-review)
+    ]);
+  }
+
+  const DELETED_WORKFLOW_DIFF = [
+    'diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml',
+    'deleted file mode 100644',
+    'index abc1234..0000000',
+    '--- a/.github/workflows/ci.yml',
+    '+++ /dev/null',
+    '@@ -1,5 +0,0 @@',
+    '-name: CI',
+    '-on: [push, pull_request]',
+    '-jobs:',
+    '-  test:',
+    '-    runs-on: ubuntu-latest',
+  ].join('\n');
+
+  const SOURCE_ONLY_DIFF = [
+    'diff --git a/src/auth.ts b/src/auth.ts',
+    'index abc1234..def5678 100644',
+    '--- a/src/auth.ts',
+    '+++ b/src/auth.ts',
+    '@@ -1,3 +1,3 @@',
+    ' const login = () => {};',
+    '-const old = 1;',
+    '+const updated = 1;',
+  ].join('\n');
+
+  test('deleted CI workflow appears in Diff Classification section of review-prompt.md', async () => {
+    const runner = claudeRunner({ diffOutput: DELETED_WORKFLOW_DIFF });
+    await createReviewHandler(CLAUDE_CONTEXT(), runner)(makeTask({ reviewAgent: 'claude' }));
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).toContain('## Diff Classification');
+    expect(prompt).toContain('.github/workflows/ci.yml');
+    expect(prompt).toContain('Deleted');
+  });
+
+  test('deleted CI workflow appears in Guardrail and Tooling Changes section', async () => {
+    const runner = claudeRunner({ diffOutput: DELETED_WORKFLOW_DIFF });
+    await createReviewHandler(CLAUDE_CONTEXT(), runner)(makeTask({ reviewAgent: 'claude' }));
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).toContain('## Guardrail and Tooling Changes');
+    expect(prompt).toContain('**DELETED (1) [requires justification]:** .github/workflows/ci.yml');
+    expect(prompt).toContain('[requires justification]');
+  });
+
+  test('deleted guardrail includes a note about justification in prompt', async () => {
+    const runner = claudeRunner({ diffOutput: DELETED_WORKFLOW_DIFF });
+    await createReviewHandler(CLAUDE_CONTEXT(), runner)(makeTask({ reviewAgent: 'claude' }));
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).toMatch(/unexplained deletion/i);
+  });
+
+  test('source-only diff does not include Guardrail and Tooling Changes section', async () => {
+    const runner = claudeRunner({ diffOutput: SOURCE_ONLY_DIFF });
+    await createReviewHandler(CLAUDE_CONTEXT(), runner)(makeTask({ reviewAgent: 'claude' }));
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).not.toContain('## Guardrail and Tooling Changes');
+  });
+
+  test('source-only diff includes Diff Classification section with modified file', async () => {
+    const runner = claudeRunner({ diffOutput: SOURCE_ONLY_DIFF });
+    await createReviewHandler(CLAUDE_CONTEXT(), runner)(makeTask({ reviewAgent: 'claude' }));
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).toContain('## Diff Classification');
+    expect(prompt).toContain('src/auth.ts');
+    expect(prompt).toContain('Modified');
+  });
+
+  test('review prompt still includes PR Diff section after classification sections', async () => {
+    const runner = claudeRunner({ diffOutput: DELETED_WORKFLOW_DIFF });
+    await createReviewHandler(CLAUDE_CONTEXT(), runner)(makeTask({ reviewAgent: 'claude' }));
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).toContain('## PR Diff');
+    // Classification sections come before the raw diff
+    expect(prompt.indexOf('## Diff Classification')).toBeLessThan(prompt.indexOf('## PR Diff'));
+  });
+
+  test('review instructions include guardrail and scope-fit dimensions', async () => {
+    const runner = claudeRunner({ diffOutput: SOURCE_ONLY_DIFF });
+    await createReviewHandler(CLAUDE_CONTEXT(), runner)(makeTask({ reviewAgent: 'claude' }));
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).toMatch(/Guardrail and tooling changes/i);
+    expect(prompt).toMatch(/Scope fit/i);
+  });
+
+  test('Diff Classification file list is capped at 30 per category with (+N more) suffix, but PR Diff includes all files', async () => {
+    // Build a diff with 35 modified source files to exceed MAX_CLASSIFICATION_FILES_PER_CATEGORY (30).
+    const fileDiff = (i) => [
+      `diff --git a/src/file${String(i).padStart(2, '0')}.ts b/src/file${String(i).padStart(2, '0')}.ts`,
+      'index abc1234..def5678 100644',
+      `--- a/src/file${String(i).padStart(2, '0')}.ts`,
+      `+++ b/src/file${String(i).padStart(2, '0')}.ts`,
+      '@@ -1,1 +1,1 @@',
+      '-const old = 1;',
+      '+const updated = 1;',
+    ].join('\n');
+    const largeDiff = Array.from({ length: 35 }, (_, i) => fileDiff(i + 1)).join('\n');
+
+    const runner = claudeRunner({ diffOutput: largeDiff });
+    await createReviewHandler(CLAUDE_CONTEXT(), runner)(makeTask({ reviewAgent: 'claude' }));
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    // The classification section shows 35 total but only 30 names; excess is "(+5 more)".
+    expect(prompt).toContain('Modified (35)');
+    expect(prompt).toContain('(+5 more)');
+    // First file present in both classification and diff sections.
+    expect(prompt).toContain('src/file01.ts');
+    // The 31st file is absent from the classification list but present in the full PR Diff.
+    expect(prompt).toContain('src/file31.ts');
+  });
+});
+
+describe('review handler — predecessor context in review brief (issue #505)', () => {
+  test('blockedBy in task context surfaces a Predecessor Issues section in all agents', async () => {
+    const runner = happyRunner();
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        blockedBy: [{ issueNumber: 42, state: 'closed' }],
+      },
+    });
+    await createReviewHandler(CONTEXT(), runner)(task);
+    // For Codex the brief is written to review-prompt.md as the --title artifact.
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).toContain('## Predecessor Issues');
+    expect(prompt).toContain('Issue #42');
+    expect(prompt).toMatch(/pre-existing baseline/i);
+  });
+
+  test('no Predecessor Issues section when blockedBy is absent', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).not.toContain('## Predecessor Issues');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Conflict-specific review after semantic conflict escalation (issue #540)
+// ---------------------------------------------------------------------------
+
+describe('review handler — conflict-specific review (issue #540)', () => {
+  // Runner that returns a given review output on the Codex (default) path.
+  function codexReviewRunner(reviewOutput) {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 },                                 // gh pr checkout 99
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },                // npm test (verification)
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git diff main...HEAD (diff classification)
+      { stdout: reviewOutput, stderr: '', exitCode: 0 },                      // codex review
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git status (post-review)
+    ]);
+  }
+
+  test('post-conflict review prompt includes the Post-Conflict-Resolution Review section', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        postConflictReview: true,
+      },
+    });
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).toContain('## Post-Conflict-Resolution Review');
+    expect(prompt).toMatch(/one-sided resolution/i);
+    expect(prompt).toMatch(/discarded behavior/i);
+  });
+
+  test('post-conflict review prompt is absent when task did not come from conflict_resolution', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+    expect(prompt).not.toContain('## Post-Conflict-Resolution Review');
+  });
+
+  test('one-sided semantic resolution detected by reviewer routes to needs_fix (implementation), not conflict_resolution', async () => {
+    // A post-conflict review where the reviewer flags a one-sided resolution with [P1].
+    // The [P1] marker makes this needs_fix — it must NOT re-enter conflict_resolution.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        postConflictReview: true,
+      },
+    });
+    const reviewOutput = '[P1] The resolution discards the PR\'s rate-limiting feature and only preserves the main-side behavior. Both sides must be preserved.';
+    const runner = codexReviewRunner(reviewOutput);
+    const result = await createReviewHandler(CONTEXT(), runner)(task);
+    expect(result.result).toBe('needs_fix');
+    // conflict_resolution is only triggered by the `conflict` result, never `needs_fix`
+    expect(result.context?.classification).toBe('needs_fix');
+    // Conflict-review tracking is reset so a subsequent implementation→review cycle starts fresh
+    expect(result.context?.postConflictReview).toBeNull();
+    expect(result.context?.conflictReviewCycles).toBeNull();
+  });
+
+  test('ordinary code-review failure routes to needs_fix (implementation) and must not route to conflict_resolution', async () => {
+    // An ordinary P1 bug finding — no relationship to conflict resolution.
+    const reviewOutput = '[P1] Missing input validation: the login handler does not check for empty username.';
+    const runner = codexReviewRunner(reviewOutput);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.classification).toBe('needs_fix');
+  });
+
+  test('conflict-review loop cap escalates to blocked after repeated conflict signals post-resolution', async () => {
+    // Simulate: conflictReviewCycles = 1 (already used one cycle), DEFAULT cap is 2.
+    // On this review, completedCycles = 2 >= 2, so capReached = true.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        postConflictReview: true,
+        conflictReviewCycles: 1,
+      },
+    });
+    // Review output contains structural git conflict markers — would normally route to conflict_resolution.
+    const reviewOutput = '<<<<<<< HEAD\nold implementation\n=======\nnew implementation\n>>>>>>> feature-branch';
+    const runner = codexReviewRunner(reviewOutput);
+    const result = await createReviewHandler(CONTEXT(), runner)(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.conflictReviewLoopCapReached).toBe(true);
+    expect(result.context?.conflictReviewCycles).toBe(2);
+    expect(result.context?.conflictReviewLoopMaxCycles).toBe(2);
+    expect(result.message).toMatch(/conflict-review loop cap/i);
+  });
+
+  test('first post-conflict conflict signal does not cap — returns conflict with updated cycle count', async () => {
+    // conflictReviewCycles not set yet (first cycle). completedCycles = 1 < 2, so not capped.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        postConflictReview: true,
+      },
+    });
+    const reviewOutput = '<<<<<<< HEAD\nold code\n=======\nnew code\n>>>>>>> main';
+    const runner = codexReviewRunner(reviewOutput);
+    const result = await createReviewHandler(CONTEXT(), runner)(task);
+    expect(result.result).toBe('conflict');
+    expect(result.context?.conflictReviewCycles).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue-required verification (issue #542)
+// ---------------------------------------------------------------------------
+
+describe('review handler — issue-required verification', () => {
+  // Runner for the setup + verification steps without a review agent call.
+  // Used when Step 4.5 is expected to block before the review agent runs.
+  // Actual order: git status → checkout → pull → gh pr checkout →
+  //               git diff (pre-classification) → npm test (verification)
+  //               [Step 4.5 blocks — no review agent call]
+  function preReviewRunner() {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 }, // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 }, // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 }, // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 }, // gh pr checkout 99
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-classification, issue #506)
+      { stdout: '', stderr: '', exitCode: 0 }, // npm test (verification passes)
+      // Step 4.5 returns blocked — no review agent call follows
+    ]);
+  }
+
+  test('all required commands passed — succeeds and includes issueRequiredVerifications in context', async () => {
+    // Issue body declares `npm test` as required; session.verification has { test: 'npm test' } — matched.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm test`\n',
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(task);
+    expect(result.result).toBe('success');
+    expect(Array.isArray(result.context?.issueRequiredVerifications)).toBe(true);
+    const verifications = result.context?.issueRequiredVerifications;
+    expect(verifications).toHaveLength(1);
+    expect(verifications[0]).toMatchObject({ command: 'npm test', status: 'passed' });
+  });
+
+  test('required command not run — returns blocked with missing command listed', async () => {
+    // Issue body requires `npm run test:e2e` but session.verification only has `npm test`.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n```\nnpm run test:e2e\n```\n',
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/npm run test:e2e/);
+    expect(result.message).toMatch(/not run/i);
+  });
+
+  test('required command not run — context carries issueRequiredVerifications with not_run status', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n```\nnpm run test:e2e\n```\n',
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    const verifications = result.context?.issueRequiredVerifications;
+    expect(Array.isArray(verifications)).toBe(true);
+    expect(verifications).toHaveLength(1);
+    expect(verifications[0]).toMatchObject({ command: 'npm run test:e2e', status: 'not_run' });
+  });
+
+  test('required command not run — context carries missingVerificationCommands', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(Array.isArray(result.context?.missingVerificationCommands)).toBe(true);
+    expect(result.context?.missingVerificationCommands).toContain('npm run test:e2e');
+  });
+
+  test('required command failed — existing Step 4 catches it and returns needs_fix', async () => {
+    // Issue body requires `npm test` AND session.verification has it, but the command fails.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm test`\n',
+      },
+    });
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 }, // git status — clean
+      { stdout: '', stderr: '', exitCode: 0 }, // git checkout main
+      { stdout: '', stderr: '', exitCode: 0 }, // git pull --ff-only
+      { stdout: '', stderr: '', exitCode: 0 }, // gh pr checkout 99
+      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-classification, issue #506)
+      { stdout: '', stderr: 'FAIL src/foo.test.js', exitCode: 1 }, // npm test fails
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(task);
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.verificationFailedStep).toBe('test');
+  });
+
+  test('command requires tool approval / human action — returns blocked (not run scenario)', async () => {
+    // A command that requires human/tool setup is indistinguishable from "not run"
+    // at review time. It must route to blocked so a human can investigate.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: [
+          '## Test Plan',
+          '',
+          '```bash',
+          'npm run build:demo',
+          'npm run test:e2e',
+          '```',
+        ].join('\n'),
+      },
+    });
+    // session.verification only runs `npm test`; the two issue-required commands are not covered.
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    const missing = result.context?.missingVerificationCommands;
+    expect(missing).toContain('npm run build:demo');
+    expect(missing).toContain('npm run test:e2e');
+  });
+
+  test('no verification section in issue body — no issue-required check, review proceeds normally', async () => {
+    // Issue body with no Verification/Test Plan section should not trigger Step 4.5.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Background\nThis is a login rate limiting feature.\n\n## Implementation\nAdd rate limiting.',
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(task);
+    expect(result.result).toBe('success');
+    expect(result.context?.issueRequiredVerifications).toBeUndefined();
+  });
+
+  test('no body in task context — no issue-required check, review proceeds normally', async () => {
+    // Task has no body (ctx.body absent) — Step 4.5 is a no-op.
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    expect(result.result).toBe('success');
+    expect(result.context?.issueRequiredVerifications).toBeUndefined();
+  });
+});

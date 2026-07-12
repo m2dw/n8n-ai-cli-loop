@@ -1,0 +1,31 @@
+{
+  "name": "n8n-ai-cli-loop",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "Apache-2.0",
+  "private": true,
+  "workspaces": ["n8n-node"],
+  "scripts": {
+    "build": "npm run build:lib && npm run build:parent-child-workflow && npm run build:n8n-node",
+    "build:lib": "tsc -p tsconfig.json",
+    "build:n8n-node": "npm -w n8n-nodes-ai-cli-loop run build",
+    "pretest": "npm run build",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "package": "npm run build",
+    "build:parent-child-workflow": "node scripts/build-parent-child-workflow.mjs",
+    "metrics": "npm run build && node scripts/metrics.mjs"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "jest": "^29.7.0",
+    "typescript": "^6.0.3"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "transform": {}
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.6.0",
+    "better-sqlite3": "^12.10.0"
+  }
+}
