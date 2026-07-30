@@ -1,26 +1,23 @@
 {
-  "generated": "2026-07-12T09:25:43.968Z",
+  "generated": "2026-07-30T16:18:13.956Z",
   "src": {
-    "files": 74,
-    "lines": 45235,
-    "nonBlankLines": 42177
+    "files": 94,
+    "lines": 62258,
+    "nonBlankLines": 58166
   },
   "tests": {
-    "files": 87,
-    "suites": 661,
-    "cases": 3547
+    "files": 120,
+    "suites": 920,
+    "cases": 4921
   },
   "coverage": {
-    "lines": 73.62,
-    "statements": 73.62,
-    "functions": 77.21,
-    "branches": 84
+    "lines": 75.42,
+    "statements": 75.42,
+    "functions": 79.5,
+    "branches": 84.19
   },
   "dependencies": {
-    "circularCycles": 1,
-    "filesInCycles": [
-      "core/outbox-effects",
-      "core/outbox-visibility"
-    ]
+    "circularCycles": 0,
+    "filesInCycles": []
   }
 }

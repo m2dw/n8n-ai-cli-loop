@@ -1,39 +1,34 @@
 # Project Metrics
 
-Generated: 2026-07-12T09:25:43.968Z
+Generated: 2026-07-30T16:18:13.956Z
 
 ## Source
 
 | Metric | Value |
 |--------|-------|
-| TypeScript files | 74 |
-| Total lines | 45235 |
-| Non-blank lines | 42177 |
+| TypeScript files | 94 |
+| Total lines | 62258 |
+| Non-blank lines | 58166 |
 
 ## Tests
 
 | Metric | Value |
 |--------|-------|
-| Test files | 87 |
-| Suites (describe blocks) | 661 |
-| Cases (test/it calls) | 3547 |
+| Test files | 120 |
+| Suites (describe blocks) | 920 |
+| Cases (test/it calls) | 4921 |
 
 ## Coverage
 
 | Metric | Value |
 |--------|-------|
-| Lines | 73.62% |
-| Statements | 73.62% |
-| Functions | 77.21% |
-| Branches | 84% |
+| Lines | 75.42% |
+| Statements | 75.42% |
+| Functions | 79.5% |
+| Branches | 84.19% |
 
 ## Dependencies
 
 | Metric | Value |
 |--------|-------|
-| Circular dependency cycles | 1 |
-
-### Files in Cycles
-
-- `core/outbox-effects`
-- `core/outbox-visibility`
+| Circular dependency cycles | 0 |
