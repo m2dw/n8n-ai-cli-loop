@@ -172,6 +172,42 @@ export interface OutboxEntry {
   payload: OutboxPayload;
   createdAt: string;
   sentAt?: string;
+  /** Number of failed dispatch attempts recorded so far (issue #606). */
+  attemptCount: number;
+  /** Sanitized message from the most recent failed attempt, if any. */
+  lastError?: string;
+  /**
+   * Earliest time this row is eligible for another dispatch attempt. `undefined`
+   * means eligible now (never failed, or a fresh row). Dispatch selection must
+   * skip a row while this is in the future so a delayed row cannot occupy the
+   * fetch/limit window ahead of a newer due row (issue #606).
+   */
+  nextAttemptAt?: string;
+  /**
+   * Set once this row has exhausted its retry budget ({@link OUTBOX_MAX_ATTEMPTS}
+   * failed attempts). A dead-lettered row is permanently excluded from dispatch
+   * selection — it no longer competes with pending rows for the run cap.
+   */
+  deadLetterAt?: string;
+  /**
+   * Set when an operator explicitly cancels this row via `admin outbox cancel`
+   * (issue #607). A cancelled row is always dead-lettered too (excluded from
+   * dispatch selection), but `cancelledAt` distinguishes an operator decision
+   * from an automatic dead-letter caused by exhausting {@link OUTBOX_MAX_ATTEMPTS}.
+   */
+  cancelledAt?: string;
+  /**
+   * Set for the duration of a single dispatch attempt (issue #607 review
+   * follow-up): `dispatchOutbox` claims a row atomically immediately before
+   * performing its external side effect and clears this when the attempt
+   * resolves (success or failure). Lets `cancelEntry` detect an in-flight
+   * dispatch and refuse to report `cancelled: true` for a row that may
+   * already have been delivered. A claim older than
+   * {@link OUTBOX_CLAIM_STALE_MS} is treated as abandoned (e.g. the
+   * dispatching process crashed) and ignored by both dispatch and cancel —
+   * see {@link isOutboxClaimActive}.
+   */
+  claimedAt?: string;
 }
 
 export interface OutboxEnqueueInput {
@@ -208,14 +244,227 @@ export interface OutboxStore {
   ): Promise<{ enqueued: boolean }>;
 
   /**
-   * Return entries that have not been sent yet, oldest-first.
-   * When `limit` is omitted, every pending entry is returned so a caller that
+   * Return entries that have not been sent and have not been dead-lettered yet,
+   * oldest-first. Delayed rows (a future {@link OutboxEntry.nextAttemptAt}) are
+   * still included — due-time eligibility is a dispatch-selection concern (see
+   * `dispatchOutbox` in handlers/gh-dispatcher.ts), not a store-read concern, so
+   * a caller that only wants "is this row still retryable" (e.g. tests) does not
+   * need to reason about the clock.
+   * When `limit` is omitted, every such entry is returned so a caller that
    * filters in memory can apply its own cap after filtering.
    */
   listPending(limit?: number): Promise<OutboxEntry[]>;
 
-  /** Mark a single entry as sent. */
-  markSent(id: number, sentAt?: string): Promise<void>;
+  /**
+   * Return up to `limit` entries that are pending and not dead-lettered,
+   * oldest-first, starting after `afterId` (issue #606 review follow-up).
+   * Unlike an earlier version of this method, due-time is *not* filtered here:
+   * a delayed row (a future {@link OutboxEntry.nextAttemptAt}) is still
+   * returned, because the dispatcher's persisted scan cursor (`scanCursorKey`)
+   * must be able to see a delayed row that belongs to it (matches its
+   * `filter`) in order to avoid advancing the cursor past it — filtering
+   * due-time in SQL would make such a row invisible to the scan entirely,
+   * letting the cursor skip past its id and permanently strand it once it
+   * becomes due (issue #606 review follow-up). The dispatcher applies
+   * due-time filtering itself, after the ownership filter, when deciding which
+   * scanned rows are actually dispatch-eligible this run. Pagination via
+   * `afterId` still keeps this bounded — the dispatcher pages through this
+   * instead of pulling every pending row via {@link listPending} to stay
+   * bounded by the configured run limit even when the table has accumulated a
+   * large backlog (e.g. during a prolonged provider outage).
+   */
+  listPendingEntries(opts: { limit: number; afterId?: number }): Promise<OutboxEntry[]>;
+
+  /**
+   * Mark a single entry as sent. When `claimToken` is supplied (issue #607
+   * review follow-up), the update is fenced to it: it only commits while the
+   * row's `claimedAt` still equals `claimToken`, so a completion from a
+   * dispatch attempt whose claim already expired and was reclaimed by another
+   * dispatcher becomes a safe no-op instead of clearing the newer claim.
+   * Omitted (direct callers that never claimed the row) keeps the update
+   * unconditional.
+   *
+   * Returns `{ updated: boolean }` (P2 review follow-up) reporting whether
+   * `sentAt` was actually persisted by this call — `false` for a fenced no-op
+   * (stale claim) or an unknown id. A fenced caller (the dispatcher) uses this
+   * to avoid treating a rejected completion as dispatched: counting it anyway
+   * would advance the scan cursor past a row whose new owner may later fail
+   * and schedule a retry, stranding it.
+   */
+  markSent(id: number, sentAt?: string, claimToken?: string): Promise<{ updated: boolean }>;
+
+  /**
+   * Record a failed dispatch attempt (issue #606). Increments the row's
+   * attempt count and either schedules the next eligible attempt with bounded
+   * backoff ({@link computeOutboxBackoffMs}) or, once {@link OUTBOX_MAX_ATTEMPTS}
+   * is reached, marks the row dead-lettered (excluded from {@link listPending}
+   * from then on). `error` is sanitized (paths/tokens stripped, length bounded)
+   * before being persisted as `lastError`. A no-op (returns `{ deadLettered:
+   * false }`) when `id` does not match a row — mirrors {@link markSent}'s
+   * tolerance of an unknown id. `claimToken`, when supplied, fences this
+   * update the same way it fences {@link markSent} — a no-op once the row's
+   * claim no longer matches (issue #607 review follow-up).
+   */
+  markFailed(id: number, error: string, now?: string, claimToken?: string): Promise<{ deadLettered: boolean }>;
+
+  /**
+   * Return the persisted scan cursor for `key` (issue #606 review follow-up),
+   * or `undefined` if none has been recorded yet. `key` scopes the cursor to a
+   * single dispatch identity (e.g. a session id) — see {@link setScanCursor}.
+   */
+  getScanCursor(key: string): Promise<number | undefined>;
+
+  /**
+   * Persist the scan cursor for `key`: the id of the last outbox row a bounded
+   * `listPendingEntries` scan confirmed does *not* belong to `key` (issue #606
+   * review follow-up). A session-scoped dispatch whose filter matches few or
+   * none of a large shared pending backlog would otherwise re-scan the same
+   * non-matching prefix from row 1 on every invocation — each run bounded by
+   * `scanLimit` in `dispatchOutbox`, but never making progress past that
+   * prefix since the in-memory `afterId` pagination cursor does not survive
+   * between process invocations. Persisting it here lets the next run resume
+   * scanning after the confirmed-foreign prefix instead of re-scanning it,
+   * so a capped scan still eventually reaches newer due rows that belong to
+   * `key`. The caller only advances this up to the last row confirmed to
+   * *not* match its filter — never past a row that matched (dispatched, or
+   * still delayed/capped-by-`limit` and left pending) — so a row this key
+   * owns, due or delayed, can never be skipped (issue #606 review follow-up).
+   */
+  setScanCursor(key: string, id: number): Promise<void>;
+
+  /**
+   * Return a single entry by id, in any delivery state (pending, delayed, sent,
+   * dead-lettered, or cancelled), or `undefined` if no row has that id. This is
+   * the operator-lookup path (issue #607) `admin outbox retry`/`cancel` use to
+   * validate a row before mutating it.
+   */
+  getById(id: number): Promise<OutboxEntry | undefined>;
+
+  /**
+   * Return every entry that has not been sent, oldest-first, regardless of
+   * delayed or dead-lettered state (issue #607). Unlike {@link listPending} /
+   * {@link listPendingEntries} — which exclude a dead-lettered row because it is
+   * no longer dispatch-eligible — `admin outbox list` needs to show dead-lettered
+   * (including cancelled) rows too, so an operator can diagnose and recover a
+   * poison row. Callers apply their own session-ownership filtering and
+   * pending/delayed/dead categorization (see {@link categorizeOutboxEntry}).
+   */
+  listUnsent(): Promise<OutboxEntry[]>;
+
+  /**
+   * Recover a delayed, dead-lettered, or cancelled row for another dispatch
+   * attempt (issue #607): clears `nextAttemptAt`, `deadLetterAt`, and
+   * `cancelledAt`, and resets `attemptCount` to 0 so the row gets a full fresh
+   * retry budget. Returns `{ retried: false, reason }` without mutating
+   * anything when `id` is unknown (`"not_found"`), the row was already
+   * dispatched (`"already_sent"`), the row is already immediately
+   * dispatch-eligible with nothing to recover (`"already_pending"`), a
+   * concurrent {@link cancelEntry} won the race and cancelled the row first
+   * (`"already_cancelled"`, issue #607 review follow-up), or some other
+   * concurrent write changed the row between the eligibility check and the
+   * commit (`"concurrent_update"` — safe to retry the call).
+   *
+   * Implemented as a compare-and-swap, not a blind read-then-write: the
+   * `UPDATE` pins `nextAttemptAt`/`deadLetterAt`/`cancelledAt` to the exact
+   * values just read, so it only commits if nothing raced it. This preserves
+   * deliberate, sequential recovery of an already-cancelled row (its
+   * `cancelledAt` is read and pinned as-is) while preventing a `retryEntry`
+   * that read the row as retryable from clobbering a `cancelEntry` that
+   * commits concurrently — otherwise the cancel would have already been
+   * reported to the operator as successful while the row silently became
+   * dispatchable again.
+   */
+  retryEntry(id: number, now?: string): Promise<{ retried: boolean; reason?: string }>;
+
+  /**
+   * Permanently exclude a row from dispatch selection by operator decision
+   * (issue #607): sets `cancelledAt` and, if not already set, `deadLetterAt`.
+   * Returns `{ cancelled: false, reason }` without mutating anything when `id`
+   * is unknown (`"not_found"`), the row was already dispatched
+   * (`"already_sent"`), the row was already cancelled (`"already_cancelled"`),
+   * or a dispatch attempt currently holds the row's claim (`"dispatch_in_progress"`,
+   * issue #607 review follow-up — see {@link claimForDispatch}): that attempt
+   * may already have performed the external side effect, so cancellation
+   * cannot be reported as successful while it is in flight.
+   *
+   * Implemented as a single atomic `UPDATE ... WHERE` (not a read-then-write)
+   * so a concurrent {@link claimForDispatch} and `cancelEntry` call can never
+   * both believe they won: whichever's `UPDATE` commits first is authoritative
+   * and the loser's `WHERE` no longer matches.
+   */
+  cancelEntry(id: number, now?: string): Promise<{ cancelled: boolean; reason?: string }>;
+
+  /**
+   * Atomically claim a row for a single dispatch attempt (issue #607 review
+   * follow-up): sets `claimedAt` and returns `true`, but only when the row is
+   * still unsent, uncancelled, not dead-lettered, not delayed by a still-future
+   * `nextAttemptAt`, and not already claimed by another (non-stale) attempt —
+   * the same atomic `UPDATE ... WHERE` mechanism {@link cancelEntry} uses, so
+   * the two can never race each other into an inconsistent outcome. The
+   * `nextAttemptAt` check (P2 review follow-up) closes a gap where two
+   * dispatchers scan the same due row and one of them fails and schedules a
+   * retry backoff (via `markFailed`) before the other reaches this claim:
+   * without it, the second dispatcher would still claim and dispatch the row
+   * immediately, bypassing the backoff that was just set. Returns `false`
+   * without mutating anything when the row is no longer claimable (most
+   * notably: an operator cancelled it, or a concurrent attempt's failure just
+   * delayed it, between the dispatcher's scan and this claim attempt) — the
+   * caller must skip dispatching that row rather than performing its external
+   * side effect.
+   *
+   * The caller is responsible for clearing `claimedAt` once the attempt
+   * resolves (folded into `markSent`/`markFailed`), so a claim never outlives
+   * its dispatch attempt under normal operation. A claim older than
+   * {@link OUTBOX_CLAIM_STALE_MS} is ignored by this check (and by
+   * `cancelEntry`) so a crashed dispatch process cannot permanently strand a
+   * row.
+   */
+  claimForDispatch(id: number, now?: string): Promise<boolean>;
+
+  /**
+   * Extend a claim this caller currently holds (issue #607 review follow-up):
+   * a compare-and-swap on the exact `claimedAt` value returned by the caller's
+   * own {@link claimForDispatch} (or a prior `renewClaim`) that, on success,
+   * advances `claimedAt` to `now` and returns it. A dispatch attempt with no
+   * per-call timeout (e.g. `gh`) can run past {@link OUTBOX_CLAIM_STALE_MS}
+   * while still legitimately in flight; renewing periodically during that
+   * attempt keeps the claim looking active so a concurrent dispatcher's
+   * staleness check in `claimForDispatch`/`cancelEntry` never mistakes a slow
+   * but live claim for an abandoned one and reclaims/duplicates the same
+   * external side effect. Returns `undefined` without mutating anything when
+   * `claimedAt` no longer matches the row's current value — the claim was
+   * already released (sent/failed) or reclaimed by someone else, so this
+   * caller no longer owns it and must stop renewing.
+   */
+  renewClaim(id: number, claimedAt: string, now?: string): Promise<string | undefined>;
+}
+
+// ---------------------------------------------------------------------------
+// Delivery-status categorization (issue #607)
+// ---------------------------------------------------------------------------
+
+/** Operator-facing delivery status derived from an entry's retry/dead-letter/claim state. */
+export type OutboxDeliveryStatus = "pending" | "delayed" | "in_flight" | "dead";
+
+/**
+ * Categorize an unsent entry's delivery status for `admin outbox list` (issue
+ * #607): `"dead"` once dead-lettered (by exhausted retries or an operator
+ * cancel), `"delayed"` while its next attempt is still in the future,
+ * `"in_flight"` while a non-stale {@link OutboxStore.claimForDispatch} claim
+ * holds the row for an active dispatch attempt (issue #607 review follow-up —
+ * such a row is not eligible for dispatch or cancellation right now, so it
+ * must not be reported as `"pending"`), else `"pending"` (eligible for
+ * dispatch right now). Callers exclude sent entries before categorizing — a
+ * sent row has no meaningful delivery status.
+ */
+export function categorizeOutboxEntry(
+  entry: Pick<OutboxEntry, "nextAttemptAt" | "deadLetterAt" | "claimedAt">,
+  nowIso: string,
+): OutboxDeliveryStatus {
+  if (entry.deadLetterAt) return "dead";
+  if (entry.nextAttemptAt && entry.nextAttemptAt > nowIso) return "delayed";
+  if (isOutboxClaimActive(entry.claimedAt, nowIso)) return "in_flight";
+  return "pending";
 }
 
 // ---------------------------------------------------------------------------
@@ -232,4 +481,61 @@ export interface OutboxStore {
  */
 export function makeOutboxKey(...parts: (string | number)[]): string {
   return parts.map(String).join(":");
+}
+
+// ---------------------------------------------------------------------------
+// Retry backoff / dead-letter policy (issue #606)
+// ---------------------------------------------------------------------------
+
+/**
+ * Failed attempts a row may accumulate before it is dead-lettered. The Nth
+ * failure (attemptCount reaching this value) dead-letters the row instead of
+ * scheduling another retry.
+ */
+export const OUTBOX_MAX_ATTEMPTS = 8;
+
+/** Backoff delay after the first failed attempt. */
+export const OUTBOX_BASE_RETRY_DELAY_MS = 60 * 1000;
+
+/** Upper bound on the backoff delay, reached well before {@link OUTBOX_MAX_ATTEMPTS}. */
+export const OUTBOX_MAX_RETRY_DELAY_MS = 60 * 60 * 1000;
+
+/**
+ * Bounded exponential backoff for the Nth failed attempt: doubles per attempt
+ * from {@link OUTBOX_BASE_RETRY_DELAY_MS}, capped at {@link OUTBOX_MAX_RETRY_DELAY_MS}.
+ * `attemptCount` is the total failures recorded so far (1 after the first
+ * failure), matching the value persisted as `OutboxEntry.attemptCount`.
+ */
+export function computeOutboxBackoffMs(attemptCount: number): number {
+  const exponent = Math.max(0, attemptCount - 1);
+  return Math.min(OUTBOX_BASE_RETRY_DELAY_MS * 2 ** exponent, OUTBOX_MAX_RETRY_DELAY_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch claim policy (issue #607 review follow-up)
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a dispatch claim ({@link OutboxEntry.claimedAt}) remains active
+ * before both {@link OutboxStore.claimForDispatch} and
+ * {@link OutboxStore.cancelEntry} treat it as abandoned. A single dispatch
+ * attempt (one network call) normally holds a claim for well under a minute;
+ * this bound only matters if the dispatching process crashes mid-attempt —
+ * without it, a crashed claim would permanently block both re-dispatch and
+ * operator cancellation of that row.
+ */
+export const OUTBOX_CLAIM_STALE_MS = 10 * 60 * 1000;
+
+/**
+ * Whether `claimedAt` currently represents an active (non-stale) dispatch
+ * claim as of `nowIso`. Shared by the admin `outbox cancel` preview
+ * ({@link OutboxStore.cancelEntry}'s read-only mirror) and, in spirit, by the
+ * SQL `WHERE` conditions `claimForDispatch`/`cancelEntry` evaluate atomically
+ * in the store — kept here as plain JS so the preview path needs no database
+ * round trip.
+ */
+export function isOutboxClaimActive(claimedAt: string | undefined, nowIso: string): boolean {
+  if (!claimedAt) return false;
+  const staleBefore = new Date(new Date(nowIso).getTime() - OUTBOX_CLAIM_STALE_MS).toISOString();
+  return claimedAt > staleBefore;
 }

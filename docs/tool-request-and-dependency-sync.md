@@ -322,11 +322,36 @@ so the requeued run branches cleanly from the base). When the command **produced
 changes** on the issue branch — a dirty worktree or a new commit on the branch —
 the task is left a human handoff and is **not** re-queued: the operator commits /
 pushes those changes on the issue branch (never the base branch) and then resolves
-`manual-done`. On a **non-zero exit** the task is left a human handoff and is
-**not** re-queued, so a failing granted command surfaces a clear failed/handoff
-state instead of looping silently; the consumed grant is recorded so the same
-exact command cannot be re-granted (the operator must grant a corrected command or
-reject).
+`manual-done`.
+
+On a **non-zero exit** (issue #678), a failing exit code is diagnostic
+information for the implementation agent, not by itself a reason to stop at a
+human handoff. If the failing command left the tree clean — the common case: a
+verification command such as `npm test` failing without touching any files —
+the request is resolved with `resolution.disposition: "failed"` and the captured
+exit code/stdout/stderr, and the task is **re-queued** exactly like a clean
+no-op, so the agent receives the failure and can diagnose it directly instead of
+waiting on an operator. If the failing command left changes behind, re-queueing
+immediately would fail the implementation preflight's dirty-tree check —
+repository state cannot be preserved safely — so that case is unchanged: the
+task is left a human handoff and is **not** re-queued, so a failing granted
+command that leaves a dirty tree surfaces a clear failed/handoff state instead
+of looping silently. A failing command can also leave the issue-branch tree
+clean while having mutated the **base** branch directly (e.g. `git checkout
+main && git commit ... && git push`) before returning; the base branch's SHA is
+snapshotted before the command runs and compared afterward regardless of
+whether `origin/<base>` is in sync, so that mutation is caught even when the
+command pushed it — a bare `origin/<base>..<base>` ahead-count check would read
+as safe once origin absorbs the push (issue #678 review). A failing command can
+also mutate the **remote** base directly via a refspec push (e.g. `git push
+origin <sha>:main`) without ever checking out or moving the local base branch
+at all, which the local-base-SHA snapshot above does not see either — so the
+`origin/<base>` tracking ref itself is also snapshotted before the command runs
+and compared afterward, catching the case where Git updates that local ref to
+the new remote tip as a side effect of the push (issue #678 review). Any of
+these base-mutation cases, too, stays a human handoff and is **not** re-queued.
+Either way the consumed grant is recorded so the same exact command cannot be
+re-granted (the operator must grant a corrected command or reject).
 
 ### 2.7 Preserving partial work and a recoverable continuation point (issue #379)
 

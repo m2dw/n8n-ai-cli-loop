@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteTaskStore, SqliteOutboxStore } from '../dist/index.js';
@@ -14,6 +14,21 @@ let repoRoot;
 function run(...args) {
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
+    return { code: 0, stdout };
+  } catch (err) {
+    return { code: err.status ?? 1, stdout: err.stdout ?? '' };
+  }
+}
+
+// Runs with a fake `gh` binary prepended to PATH so the live repo-host PR lookup
+// (issue #674 review, P1) resolves against a canned response instead of the real
+// GitHub CLI/network.
+function runWithFakeGh(fakeGhDir, ...args) {
+  try {
+    const stdout = execFileSync(process.execPath, [CLI, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${fakeGhDir}:${process.env.PATH}` },
+    });
     return { code: 0, stdout };
   } catch (err) {
     return { code: err.status ?? 1, stdout: err.stdout ?? '' };
@@ -226,10 +241,24 @@ describe('admin CLI — human-review-return: requeue behavior', () => {
     expect(task.context.branch).toBe('ai/issue-21');
   });
 
-  test('derives the conventional branch when no PR/branch context is present', async () => {
+  // Issue #674: a task with no recorded PR must never be forced into fix mode —
+  // fix mode requires an open PR to edit, and the implementation handler fails
+  // hard ("No open PR found") when none exists. This is the exact shape a Tool
+  // Request raised during INITIAL implementation (before PR creation) leaves
+  // behind: ready_for_human, phase implementation/review, no prUrl in context.
+  // Issue #674 review (P1 follow-up): missing context alone is not proof no PR
+  // exists — the conventional `ai/issue-<n>` branch is still live-checked, so
+  // this test stubs `gh` to confirm no open PR rather than relying on a
+  // short-circuit.
+  test('refuses to return a task with no recorded PR to fix mode', async () => {
     writeSession();
+    mkdirSync(repoRoot, { recursive: true });
+    const fakeGh = join(tmpDir, 'gh');
+    writeFileSync(fakeGh, '#!/bin/sh\nexit 1\n', 'utf8');
+    chmodSync(fakeGh, 0o755);
+
     const store = new SqliteTaskStore(dbPath);
-    await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 22, phase: 'review' });
+    await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 22, phase: 'implementation' });
     await store.transitionTask(
       { sessionId: 'addon-dev', issueNumber: 22 },
       { status: 'queued' },
@@ -237,7 +266,8 @@ describe('admin CLI — human-review-return: requeue behavior', () => {
     );
     store.close();
 
-    const r = run(
+    const r = runWithFakeGh(
+      tmpDir,
       'human-review-return',
       '--session-id', 'addon-dev',
       '--issue-number', '22',
@@ -245,10 +275,147 @@ describe('admin CLI — human-review-return: requeue behavior', () => {
       '--sessions-path', sessionsPath,
       '--feedback', 'tidy up',
     );
-    expect(r.code).toBe(0);
+    expect(r.code).not.toBe(0);
+    const out = parse(r);
+    expect(out).toMatchObject({ ok: false });
+    expect(out.error).toContain('could not confirm');
+    expect(out.error).toContain('tool-request resolve --action manual-done');
 
     const task = await getTask(22);
-    expect(task.context.branch).toBe('ai/issue-22');
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.implementationMode).toBeUndefined();
+    expect(await getOutbox()).toHaveLength(0);
+  });
+
+  // Issue #674 review (P1): a task with NEITHER `prUrl` NOR `branch` recorded is
+  // still not proof no PR exists — a legacy task or an externally created
+  // conventional `ai/issue-<n>` PR can be genuinely open. Live-check the
+  // conventional branch name before refusing: a fake `gh` reports an open PR for
+  // it, so the return must succeed and record the discovered PR URL.
+  //
+  // The conventional branch is resolved via `gh pr list --head ... --state open`
+  // (findPullRequestForWorkItem), NOT `gh pr view <branch>` (issue #674 review,
+  // P1 follow-up: `getPullRequest` is not a safe branch selector on every
+  // backend, so the conventional-branch case now goes through the backend-neutral
+  // work-item lookup instead) — the fake script must answer `pr list`.
+  test('resumes a no-context task when the conventional branch has a live open PR', async () => {
+    writeSession();
+    mkdirSync(repoRoot, { recursive: true });
+    const fakeGh = join(tmpDir, 'gh');
+    writeFileSync(
+      fakeGh,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n' +
+        '  echo \'[{"number":88,"url":"https://github.com/m2dw/some-repo/pull/88","headRefName":"ai/issue-25","state":"OPEN"}]\'\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 1\n',
+      'utf8',
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 25, phase: 'implementation' });
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 25 },
+      { status: 'queued' },
+      { status: 'ready_for_human', context: {} },
+    );
+    store.close();
+
+    const r = runWithFakeGh(
+      tmpDir,
+      'human-review-return',
+      '--session-id', 'addon-dev',
+      '--issue-number', '25',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--feedback', 'tidy up',
+    );
+    expect(r.code).toBe(0);
+
+    const task = await getTask(25);
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('implementation');
+    expect(task.context.implementationMode).toBe('fix');
+    expect(task.context.branch).toBe('ai/issue-25');
+    expect(task.context.prUrl).toBe('https://github.com/m2dw/some-repo/pull/88');
+  });
+
+  // Issue #674 review (P1): a task recording only `context.branch` (no `prUrl`)
+  // is a supported state — review.ts's branch-selected / non-conventional PR
+  // handoff records exactly this shape — and the branch may still carry a
+  // genuinely open PR. Treating the missing `prUrl` as proof no PR exists would
+  // wrongly refuse a valid resume. Live-validate the branch against the repo host
+  // instead: a fake `gh` reports an open PR for the recorded (non-conventional)
+  // branch, so the return must succeed and record the discovered PR URL.
+  test('resumes a branch-only PR context when the recorded branch has a live open PR', async () => {
+    writeSession();
+    mkdirSync(repoRoot, { recursive: true });
+    const fakeGh = join(tmpDir, 'gh');
+    writeFileSync(
+      fakeGh,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "pr" ] && [ "$2" = "view" ]; then\n' +
+        '  echo \'{"number":77,"url":"https://github.com/m2dw/some-repo/pull/77","headRefName":"feature/custom","state":"OPEN"}\'\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 1\n',
+      'utf8',
+    );
+    chmodSync(fakeGh, 0o755);
+
+    await seedReadyForHumanTask(30, { prUrl: undefined, branch: 'feature/custom' });
+
+    const r = runWithFakeGh(
+      tmpDir,
+      'human-review-return',
+      '--session-id', 'addon-dev',
+      '--issue-number', '30',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--feedback', 'tidy up',
+    );
+    expect(r.code).toBe(0);
+
+    const task = await getTask(30);
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('implementation');
+    expect(task.context.implementationMode).toBe('fix');
+    expect(task.context.branch).toBe('feature/custom');
+    expect(task.context.prUrl).toBe('https://github.com/m2dw/some-repo/pull/77');
+  });
+
+  // Issue #674 review (P1): the live-validate path must fail closed — not
+  // silently proceed — when the recorded branch's PR cannot be confirmed open.
+  // Distinguishes this from the "no branch/PR recorded at all" refusal above: it
+  // proves an actual lookup was attempted rather than short-circuiting.
+  test('refuses to return a branch-only PR context when the live lookup finds no open PR', async () => {
+    writeSession();
+    mkdirSync(repoRoot, { recursive: true });
+    const fakeGh = join(tmpDir, 'gh');
+    writeFileSync(fakeGh, '#!/bin/sh\nexit 1\n', 'utf8');
+    chmodSync(fakeGh, 0o755);
+
+    await seedReadyForHumanTask(31, { prUrl: undefined, branch: 'feature/custom' });
+
+    const r = runWithFakeGh(
+      tmpDir,
+      'human-review-return',
+      '--session-id', 'addon-dev',
+      '--issue-number', '31',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--feedback', 'tidy up',
+    );
+    expect(r.code).not.toBe(0);
+    const out = parse(r);
+    expect(out).toMatchObject({ ok: false });
+    expect(out.error).toContain('could not confirm');
+
+    const task = await getTask(31);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.implementationMode).toBeUndefined();
   });
 
   test('refuses to return an active (claimed) task', async () => {

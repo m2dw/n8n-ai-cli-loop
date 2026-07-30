@@ -3,7 +3,7 @@
  * `admin` subcommands (issue #307).
  *
  * The UI is a thin presentation layer. It NEVER mutates the database directly:
- * read-only views query SqliteTaskStore, and every state-changing action is
+ * read-only views query the TaskStore port, and every state-changing action is
  * executed by spawning the exact same non-interactive `admin` subcommand the
  * operator could copy/paste (e.g. `admin recover ...`). This guarantees the
  * dirty-worktree, lease, lock and cap safeguards in those commands are never
@@ -29,6 +29,7 @@ import {
 } from "@clack/prompts";
 import { emit, die } from "./cli-io.js";
 import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
+import type { TaskStore } from "../core/task-store.js";
 import { isClaimExpired } from "../core/transitions.js";
 import type { AiTask, TaskStatus } from "../core/task.js";
 import {
@@ -41,6 +42,7 @@ import { defaultGhRunner } from "../providers/github/gh-runner.js";
 import type { GhRunner } from "../providers/github/gh-runner.js";
 import { tokenizeArgs } from "./admin-command.js";
 import { IssueWorktreeLock } from "../handlers/worktree.js";
+import { hasUnresolvedToolRequest } from "../core/tool-request.js";
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-testable without a TTY)
@@ -159,10 +161,7 @@ export function isCapRecoverable(task: AiTask): boolean {
  * not treated as Tool Request handoffs here.
  */
 export function isToolRequestHandoff(task: AiTask): boolean {
-  if (task.status !== "ready_for_human") return false;
-  const tr = task.context["toolRequest"];
-  if (!tr || typeof tr !== "object" || Array.isArray(tr)) return false;
-  return (tr as { resolved?: unknown }).resolved !== true;
+  return task.status === "ready_for_human" && hasUnresolvedToolRequest(task.context);
 }
 
 /**
@@ -188,10 +187,10 @@ export function isHumanReviewHandoff(task: AiTask): boolean {
  * Collect active tasks across the given sessions, most-recently-updated first.
  * Read-only: this only reads from the store and never mutates task state.
  */
-export function collectActiveTasks(store: SqliteTaskStore, sessionIds: string[]): AiTask[] {
+export async function collectActiveTasks(store: TaskStore, sessionIds: string[]): Promise<AiTask[]> {
   const out: AiTask[] = [];
   for (const sid of sessionIds) {
-    for (const task of store.listTasks(sid)) {
+    for (const task of await store.listSessionTasks(sid)) {
       if (isActiveStatus(task.status)) out.push(task);
     }
   }
@@ -1073,6 +1072,9 @@ async function runFilterMenu(current: UiFilter): Promise<UiFilter> {
         "review",
         "conflict_resolution",
         "research",
+        "content_research",
+        "content_draft",
+        "content_review",
         "planner",
       ] as const;
       const phaseOptions = [
@@ -1191,7 +1193,7 @@ async function runStateChange(task: AiTask, argv: string[]): Promise<void> {
   await pause();
 }
 
-async function showEvents(store: SqliteTaskStore, task: AiTask): Promise<void> {
+async function showEvents(store: TaskStore, task: AiTask): Promise<void> {
   const events = await store.listEvents({
     sessionId: task.sessionId,
     issueNumber: task.issueNumber,
@@ -1453,7 +1455,7 @@ async function selectCapResetPhase(): Promise<string> {
 }
 
 async function taskMenu(
-  store: SqliteTaskStore,
+  store: TaskStore,
   task: AiTask,
   now: string,
   dbPath: string | undefined,
@@ -1553,7 +1555,7 @@ async function showInspectCommand(task: AiTask, dbPath?: string): Promise<void> 
 }
 
 async function closedTaskMenu(
-  store: SqliteTaskStore,
+  store: TaskStore,
   task: AiTask,
   now: string,
   dbPath: string | undefined,
@@ -1592,7 +1594,7 @@ async function closedTaskMenu(
  * exit the list (q / escape).
  */
 async function closedTaskList(
-  store: SqliteTaskStore,
+  store: TaskStore,
   tasks: AiTask[],
   now: string,
   dbPath: string | undefined,
@@ -1653,7 +1655,7 @@ async function runSessionSelector(
 }
 
 async function interactiveLoop(
-  store: SqliteTaskStore,
+  store: TaskStore,
   sessionIds: string[],
   dbPath: string | undefined,
   sessionsPath: string | undefined,
@@ -1689,7 +1691,7 @@ async function interactiveLoop(
   for (;;) {
     const scopedIds = sessionIdsForScope(scope, sessionIds);
     const now = new Date().toISOString();
-    const allActiveTasks = collectActiveTasks(store, scopedIds);
+    const allActiveTasks = await collectActiveTasks(store, scopedIds);
     const { active: allActive, closedResidual, warning } = partitionByGitHubState(
       allActiveTasks,
       cachedReader,

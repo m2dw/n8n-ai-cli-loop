@@ -79,13 +79,9 @@ describe('docs/environment-prepare-contract.md — environmentPrepare contract',
     expect(doc).toMatch(/dependencySync|tool-request-and-dependency-sync/i);
   });
 
-  test('documents that it runs in the issue worktree when worktrees are enabled', () => {
+  test('documents that it always runs in the issue worktree', () => {
     expect(doc).toMatch(/issue worktree/i);
-    expect(doc).toMatch(/worktrees.*enabled|worktree.*mode/i);
-  });
-
-  test('documents that it runs in the shared checkout when worktrees are disabled', () => {
-    expect(doc).toMatch(/shared checkout|session checkout|repoRoot/);
+    expect(doc).toMatch(/unconditionally/i);
   });
 
   test('defines the prepare stamp concept', () => {

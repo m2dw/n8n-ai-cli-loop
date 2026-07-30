@@ -34,7 +34,7 @@ import type {
 } from "./outbox.js";
 import type { WorkItemProviderKind, RepoHostProviderKind } from "./session.js";
 import type { WorkItemTransition } from "../providers/types.js";
-import { boundedExcerpt, sanitizeBody } from "./outbox-effects.js";
+import { boundedExcerpt, sanitizeBody } from "./text-sanitize.js";
 
 // ---------------------------------------------------------------------------
 // Surfaces and tiers

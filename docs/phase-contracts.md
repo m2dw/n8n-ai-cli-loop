@@ -349,6 +349,142 @@ not attempt to resolve them by inventing a merge order.
 - A phase that cannot satisfy its contract should fail clearly instead of
   silently moving work forward.
 
+## Agent Diagnostic Provenance and Retry Classification
+
+Issue #661 attempted to prevent quota-delay false positives — an agent's raw
+output falsely triggering a multi-hour "quota exhausted" delay — while still
+catching every legitimate provider quota/rate-limit message that arrives as
+plain stdout text. After ten implementation/review cycles the work repeatedly
+alternated between two failures: trusting stdout text reintroduced false
+delays whenever an agent transcript or reviewed diff quoted a provider error,
+and rejecting unproven stdout text stopped recognizing legitimate provider
+messages that some CLIs print to stdout. **#661 and its PR #669 are superseded
+exploratory implementations.** This section is the authoritative contract;
+a future runtime issue may replace #661/PR #669's heuristics entirely and is
+not required to preserve any of that branch's signal lists, regexes, or
+stdout+stderr concatenation behavior.
+
+### The provenance problem
+
+A provider's own CLI process and the agent it is running can both write to the
+same stdout stream. Raw agent stdout routinely contains source code, reviewed
+diffs, test output, and verbatim quotes of provider error messages (e.g. an
+agent explaining "the previous run failed with `rate limit exceeded`" while
+reviewing a log, or a diff that adds a string literal containing that phrase).
+**Text-only analysis cannot distinguish a genuine provider diagnostic from an
+identical string quoted inside a transcript, diff, or test fixture** — the
+bytes are the same either way. No amount of additional phrase-matching,
+regex tightening, or signal-list curation closes this gap, because the
+ambiguity is structural (shared stream, arbitrary untrusted content), not a
+matter of insufficiently precise wording.
+
+### Stdout is untrusted for automatic retry classification
+
+Raw agent stdout must not, by itself, trigger an automatic quota/capacity
+delay. It only counts as a provider diagnostic when a provider-specific
+adapter establishes **provenance** — i.e. the adapter can show the text
+originated from the provider/CLI process's own diagnostic output for this
+invocation, not from agent-authored or agent-quoted content. Marker prefixes
+such as `ERROR:` do **not**, by themselves, establish provenance: an agent can
+write or quote a line beginning `ERROR:` in a diff, log excerpt, or
+explanation just as easily as a CLI can emit one. A prefix is a formatting
+convention, not proof of origin.
+
+### Stderr: a bounded, provider-owned diagnostic channel
+
+Raw stderr may be used for classification, but only through a bounded,
+provider-owned channel — it is not automatically more trustworthy than stdout
+just because it is a different stream:
+
+- **Boundary.** A provider adapter must explicitly declare stderr as its
+  diagnostic channel for a given agent CLI; this is not a default trust
+  extended to every agent. Even then, only output attributable to the
+  provider CLI's own process counts — a verbose/debug mode that echoes the
+  agent transcript to stderr does not make that echoed content eligible, for
+  the same reason stdout is untrusted above.
+- **Retention limit.** Classification may inspect only a bounded tail of
+  captured stderr for a given invocation (a fixed-size window, e.g. the final
+  few KB), not the full unbounded capture — this keeps a long transcript that
+  happens to scroll through stderr from being scanned wholesale for
+  quota-shaped phrases. Only the specific matched diagnostic line(s), not the
+  full stderr blob, may be carried into task context, event payloads, or
+  GitHub-facing artifacts; full stderr capture is retained under the same
+  run-log retention as any other phase output, not extended or special-cased
+  because it fed a classification decision.
+
+### Machine-readable output takes precedence over text matching
+
+When a provider adapter exposes a machine-readable result (a structured error
+code, a typed field, a documented exit-code convention — whatever the
+provider's own interface guarantees), that result is preferred over any text
+match on stdout or stderr. Provenance is established by construction in this
+case: the adapter is reading a channel the provider contractually controls,
+not inferring meaning from prose. Text matching against the bounded stderr
+channel above is a fallback for providers/CLIs that expose no machine-readable
+signal, not a substitute for one that already exists.
+
+### Failure categories
+
+Every agent CLI failure is classified into exactly one of four categories:
+
+| Category | Meaning |
+|---|---|
+| `usage_quota` | A fixed-rate or subscription usage window is exhausted (e.g. "usage limit reached", "5-hour limit"). Recoverable only once the window resets. |
+| `rate_limit` | A short-term request-rate limit was hit (e.g. HTTP 429, "too many requests"). Recoverable quickly, independent of any usage window. |
+| `provider_capacity` | The upstream provider is transiently overloaded (e.g. "overloaded_error", "resource exhausted" for capacity reasons). Recoverable once load subsides, independent of the caller's own usage/rate. |
+| `ordinary_failure` | Any failure whose provenance is not established as a provider diagnostic, or that is a genuine task/tooling failure. The default category. |
+
+**Category precedence.** When a trusted diagnostic source (a machine-readable
+result, or the bounded provider-owned stderr channel) contains signals for
+more than one category, explicit usage-exhaustion wording takes precedence
+over generic retry wording: `usage_quota` > `rate_limit` > `provider_capacity`
+> `ordinary_failure`. Generic transient phrasing such as "try again later" on
+its own — with no explicit usage/rate-limit/capacity signal alongside it —
+must not be upgraded to `usage_quota`; it is only decisive when it is the
+only trusted signal available and an adapter maps it to `rate_limit` or
+`provider_capacity`, never to `usage_quota` by itself.
+
+**Ambiguous markerless stdout is deterministic, not a hidden delay.** When
+stdout contains quota/rate-limit-shaped text but no adapter can establish
+provenance, the outcome must be deterministic and fail-visible: the failure is
+classified `ordinary_failure` and surfaces through the phase's normal failure
+handling (e.g. `needs_fix` escalation, `ready_for_human`, or a scoped retry
+per that phase's contract elsewhere in this document) exactly as any other
+task failure would. It must never silently fall back to a long, unexplained
+quota-style delay.
+
+### Retry policy by category
+
+| Category | Retry behavior |
+|---|---|
+| `usage_quota` | May use the long, reset-oriented delay (task requeued with a `notBefore` timestamp scaled to the usage window, e.g. the existing `QUOTA_RETRY_DELAY_MS`/`QUOTA_RETRY_DELAY_HOURS` default). |
+| `rate_limit` | Short transient retry policy — a brief backoff, not the multi-hour quota delay. |
+| `provider_capacity` | Short transient retry policy — a brief backoff, not the multi-hour quota delay. |
+| `ordinary_failure` | Not delayed as quota at all. Follows the ordinary failure path for the phase (fix/escalation/human handoff), with no automatic re-queue delay attributable to this policy. |
+
+### Decision table
+
+| Trusted source | Category | Retry behavior |
+|---|---|---|
+| Machine-readable provider result: usage exhaustion | `usage_quota` | Long reset-oriented delay |
+| Machine-readable provider result: rate limiting | `rate_limit` | Short transient retry |
+| Machine-readable provider result: capacity/overload | `provider_capacity` | Short transient retry |
+| Bounded provider-owned stderr channel: explicit usage-exhaustion wording | `usage_quota` | Long reset-oriented delay |
+| Bounded provider-owned stderr channel: rate-limit/capacity wording only | `rate_limit` / `provider_capacity` | Short transient retry |
+| Markerless stdout, quota-shaped text, no adapter provenance | `ordinary_failure` | Ordinary failure handling — no automatic delay |
+| Any stream, marker-prefixed text alone (e.g. `ERROR:`) with no adapter provenance | `ordinary_failure` | Ordinary failure handling — no automatic delay |
+
+### Known implementation divergence
+
+`src/core/quota-classifier.ts` currently classifies by text-matching the
+**concatenation of raw stdout and stderr**, with no provenance/adapter seam —
+exactly the untrusted-stdout pattern this contract prohibits for automatic
+delay. This is the #661/PR #669 heuristic referenced above. Bringing the
+runtime in line with this contract (introducing a provider-adapter provenance
+seam, bounding the stderr channel, and splitting `isQuotaExhaustion` into the
+four categories above) is out of scope for this specification issue and must
+be done in a dedicated follow-up implementation issue.
+
 ## Complexity Labels
 
 Optional complexity labels control the Claude model, effort, and budget used for
@@ -359,19 +495,35 @@ implementation.  They are evaluated at the start of each implementation run.
 | `complexity:low`  | sonnet | low    | $2     |
 | *(no label)*      | sonnet | high   | $5     |
 | `complexity:high` | opus   | high   | $10    |
-| `complexity:xhigh`| opus   | xhigh  | $20    |
+| `complexity:xhigh`| fable  | high   | $20    |
 
 When multiple complexity labels are present the strongest wins:
 `xhigh > high > low`.
 
+`complexity:xhigh` selects Claude Fable 5 (`fable`) at `high` effort (issue
+#748) — the strongest available implementation profile, not the literal
+`xhigh` effort tier applied to Opus 5. Opus 5 is a distilled model; effort
+above `high` degrades its implementation quality rather than improving it,
+so "strongest profile" means promoting the *model* to Fable 5 while keeping
+effort at `high`. The `xhigh` effort tier remains valid input elsewhere (an
+explicit `CLAUDE_EFFORT=xhigh` override, or a session `claude.
+complexityProfiles` override) — it is simply not what `complexity:xhigh`
+implies by default. See `docs/assignment-profiles.md` ("Where Cost Settings
+Fit") for the session-config override shape and a preflight command to
+confirm Fable 5 availability.
+
 Environment variables (`CLAUDE_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_MAX_BUDGET_USD`)
-override complexity-label defaults when set.
+override complexity-label defaults when set; a session's
+`claude.complexityProfiles` override sits between the built-in default and
+the env vars in precedence.
 
 Review-loop effort escalation (`escalatedEffort`) promotes effort to `high` on
 the penultimate fix cycle only when it would actually raise the label-derived
 effort.  Labels whose effort already meets or exceeds the escalation target
-(the default and `high`, plus `complexity:xhigh`) skip escalation — in
-particular `xhigh` is never downgraded to `high`.
+(the default and `high`, plus `complexity:xhigh`, which now also resolves to
+`high`) skip escalation — the escalation rank guard exists so a stronger
+label-derived effort (e.g. a session override that raises a tier back to
+`xhigh`) is never silently downgraded.
 
 `complexity:xhigh` is a Claude implementation tier only. The Codex review path
 has no `xhigh` reasoning effort (`model_reasoning_effort` accepts low/medium/high
@@ -385,21 +537,69 @@ Optional review labels control the Codex `model_reasoning_effort` config used fo
 the review phase. Explicit review labels win over complexity-derived strength;
 when several conflict, the strongest wins.
 
-| Label           | Codex reasoning effort      |
-|-----------------|-----------------------------|
-| `review:low`    | `low`                       |
-| `review:medium` | *(default — no flag)*       |
-| `review:high`   | `high`                      |
+| Label            | Codex reasoning effort |
+|------------------|-------------------------|
+| `review:low`     | `low`                   |
+| `review:medium`  | `medium`                |
+| `review:high`    | `high`                  |
+| *(no label)*     | `high`                  |
 
 Precedence when present: `review:high > review:medium > review:low`.
+
+**Issue #609: `review:medium` now always passes an explicit
+`-c model_reasoning_effort=medium` flag.** Before #609, the "default" tier
+(covering both a genuine `review:medium` label and the no-label case) passed no
+`model_reasoning_effort` flag at all, so the effective effort silently tracked
+whatever the operator's global `~/.codex/config.toml` happened to default to —
+a `review:medium` review could run at `high` on one machine and `low` on
+another. Every review now resolves to an explicit level, independent of
+unrelated global Codex config: an explicit `review:medium` label maps to
+`medium`; the no-label case maps to `high`, mirroring how Claude's own review
+default already resolves to `high` effort when no review label is present
+(`resolveClaudeReviewProfile`, `src/handlers/review.ts`). `CODEX_EFFORT`
+overrides both when set (see `resolveCodexReviewEffort`, `src/handlers/review.ts`),
+mirroring the implementation lane's `CODEX_EFFORT` precedence.
 
 **There is no `review:xhigh`.** The installed Codex CLI's
 `model_reasoning_effort` only accepts low/medium/high — `xhigh` is a Claude-only
 effort tier. Per issue #243 it is *not* silently downgraded to `high`: a
-`review:xhigh` label is simply not a recognized review label and has no effect.
-Only Claude implementation supports `xhigh` (via `complexity:xhigh`). When no
-explicit `review:*` label is set, `complexity:xhigh` and `complexity:high` both
-derive the strongest Codex-supported review strength (`high`).
+`review:xhigh` label is simply not a recognized review label and has no effect
+(it falls through to the no-label case above, `high`). `xhigh` remains a valid
+Claude implementation effort value (via an explicit `CLAUDE_EFFORT=xhigh` or
+session override — `complexity:xhigh` itself now resolves to `high` effort on
+Fable 5, per issue #748). When no explicit `review:*` label is set,
+`complexity:xhigh` and `complexity:high` both derive the strongest
+Codex-supported review strength (`high`).
+
+## Codex Model Selection (issue #609)
+
+Codex model selection is optional and separate from effort. Precedence:
+
+1. `CODEX_MODEL` env var (operator override) — highest.
+2. `session.codex.model` (session-level setting; validated/cloned in
+   `src/registries/json-session-registry.ts`).
+3. **Compatibility mode** — neither is set. No `--model` flag is passed;
+   the Codex CLI's own config/authenticated default selects the model,
+   exactly as it did before this option existed. Resolved profile metadata
+   records this as `model: "cli-default"`, distinguishable from an explicit
+   selection (`modelSource: "default"` for implementation, `"cli-default"`
+   for review — see `ResolvedImplementationProfile`/`ResolvedReviewProfile`).
+
+When resolved to an explicit model, it is passed as `--model <model>`, a
+**global** Codex CLI option spliced before the `exec`/`review` subcommand
+(same positioning rule as `--profile` for context-mode — see
+`resolveCodexModel()`, `src/handlers/codex-context-mode.ts`). This precedence
+is shared by both the implementation (`codex exec`) and review (`codex review`)
+lanes — a single `session.codex.model` setting (or `CODEX_MODEL` override)
+governs both, so the same session/task inputs resolve to the same model
+independent of unrelated global Codex config.
+
+There is no label- or escalation-driven model selection for Codex: models are
+a trusted-config/operator-env concern only, mirroring how assignment profiles
+select the *agent* but never its model/effort (`docs/assignment-profiles.md`,
+"Where Cost Settings Fit", issue #694 decision 5). Escalation
+(`escalatedEffort`) only ever raises *effort*, never model — the same rule
+Claude's `CLAUDE_MODEL` already follows.
 
 ## Implementation
 
@@ -576,6 +776,115 @@ Required artifacts:
 - `research-prompt.md`
 - `research-output.md`
 - `research-result.json`
+- `research-permission-denial.json` — only when the run is classified as a
+  permission denial (see below).
+- `research-denial-diagnostic-<channel>.txt` — only alongside that artifact: a
+  verbatim copy of each populated trusted diagnostic channel, which is what the
+  recorded evidence line numbers index into (see below).
+- `research-evidence-manifest.json`, `research-evidence-turn-<n>.json`,
+  `research-prompt-turn-<n>.md`, `research-turn-<n>-output.md`, and
+  `research-issue-body.md` — only on an evidence-enabled run
+  (`session.research.evidence.enabled`, issue #806): the run-level evidence
+  accounting, the per-turn sanitized request records, and the per-invocation
+  verbatim prompt/output captures of the evidence turn loop defined in
+  [docs/research-evidence-contract.md](research-evidence-contract.md) §9. A
+  disabled run writes none of these.
+
+Input bound: the persisted GitHub Issue body interpolated into the research
+prompt is bounded at 32,768 characters (issue #803; raised from the original
+4,000, which was too small for ordinary research Issues). A body beyond the
+bound is truncated deterministically to a prefix of that length with an
+explicit `<!-- body truncated -->` marker appended. `research-brief.json`,
+`research-context.json`, and `research-result.json` all record
+`bodyIncluded`, `bodyTruncated`, `bodyOriginalLength`, and
+`bodyIncludedLength` so complete and truncated input can be distinguished
+after the fact. The runner-owned full-body artifact and the bounded query path
+for bodies beyond this bound are specified in
+[docs/research-evidence-contract.md](research-evidence-contract.md) (issue #805,
+`issue-body` evidence source) and implemented in its follow-up issue; the bound
+and its reporting above are unchanged by that design.
+
+### Research outcome classification
+
+`research-result.json` records exactly one `outcome`:
+
+| Outcome | Meaning |
+|---|---|
+| `valid` | Exit 0 with non-empty stdout. |
+| `quota/rate-limit` | The trusted diagnostic classifies as `usage_quota` / `rate_limit` / `provider_capacity`; the task is delayed, not failed. |
+| `command-failure` | Non-zero exit that is not a quota condition. |
+| `permission-denied/read` | Exit 0, empty stdout, and the trusted diagnostic states that a repository read/search operation was refused. |
+| `permission-denied/command` | Same, for a refused command/process operation. |
+| `permission-denied/unspecified` | Same, but the diagnostic does not support the read-vs-command distinction (no operation token, or both classes refused). |
+| `empty-output` | Exit 0, empty/whitespace-only stdout, with no denial evidence (issue #795). |
+| `evidence/unavailable` | Evidence-enabled runs only (issue #806): the tracked-file snapshot could not be captured, exceeded its bounds, or the evidence root's identity changed mid-turn. A partial snapshot is never served. |
+| `evidence/protocol-error` | Evidence-enabled runs only: two consecutive invocations produced a malformed evidence request block and no findings. |
+| `evidence/budget-exhausted` | Evidence-enabled runs only: a turn, query, byte, or cumulative-prompt budget was spent and the final invocation produced a request block with no findings text. |
+
+**Headless permission denials (issue #804, first slice of #802).** A headless
+Gemini/Antigravity run can be *soft-denied*: the CLI cannot obtain a tool
+permission non-interactively, abandons the tool call, and still exits 0 with
+empty stdout — process-identical to an unproductive run, with the actionable
+cause left in the CLI's own diagnostics. The research handler therefore
+re-examines exactly that case (exit 0 + empty stdout, no quota classification)
+against the same provider-adapter provenance seam the quota path uses: raw
+stdout is never scanned, and an invocation whose binary was operator-overridden
+via `ANTIGRAVITY_BIN` yields no trusted diagnostic and stays `empty-output`. A
+run that produced findings is never downgraded, and a non-zero exit stays
+`command-failure`.
+
+Because the denial is reported on stderr by a process that exits 0, the research
+phase must be driven by a command runner that captures both streams on success.
+The `execFileSync`-based default runner discards buffered stderr on a zero exit
+and reports `stderr: ""`, which would make every real denial indistinguishable
+from `empty-output`; the research handler therefore defaults to the
+`spawnSync`-based both-streams runner.
+
+The read-vs-command distinction is resolved per denial from its own evidence
+window, preferring the rejected tool's identifier (`run_shell_command`,
+`read_file`, …) over prose or bare command words, which a diagnostic may be
+quoting from the rejected call's arguments — `run_shell_command "grep …":
+permission denied` is a `command` denial, not an ambiguous one. Only a
+diagnostic that names no tool at all falls back to those generic tokens, and
+two opposing tool identifiers stay `unspecified`.
+
+Diagnosis only: this classification grants no permission, relaxes no policy,
+and adds no execution path. The constrained read-only execution contract that
+gives a headless research run repository evidence without any of those grants
+is specified in [docs/research-evidence-contract.md](research-evidence-contract.md)
+(issue #805); it is an approved design whose implementation lands in a separate
+issue in the #802 decomposition, off by default, and it changes nothing
+described in this section until then.
+
+**Denial artifact and publication bounds.** `research-permission-denial.json`
+records the denial category (`deniedOperation`), the matched signal, the
+diagnostic source and `cmdSource` provenance, an operator hint, the total
+`denialCount`, and bounded evidence records. An evidence record is content-free
+by construction: it carries only the matched denial signal, the matched
+operation tokens — both literals from the classifier's own fixed vocabulary,
+never spans copied out of the diagnostic — and the `channel`/`line` where the
+denial appeared. A denied command body, its arguments, a generated scratch
+path, or an echoed prompt line therefore cannot be retained even when the CLI
+prints one on or beside the denial line; the unbounded detail stays in the raw
+local capture (`research-output.md`) — which is why that file falls back to
+stderr whenever stdout carries no visible content, not only when stdout is
+exactly empty: a soft denial commonly prints whitespace on stdout and its
+diagnostic on stderr. The number of retained records is capped, with
+`evidenceTruncated` marking the cut.
+
+An evidence `line` is 1-based *within the bounded diagnostic the classifier
+consumed*, which is a fixed-size tail of the channel and may begin mid-line — so
+for a verbose run it does not agree with the numbering of the fuller
+`research-output.md` capture. The handler therefore also writes
+`research-denial-diagnostic-<channel>.txt` holding exactly the bytes that were
+numbered, and `diagnosticFiles` in the artifact maps each evidence `channel` to
+its file, so a recorded location always resolves precisely. Those files are
+local-only and no wider than the bound the provider adapter already applied.
+`research-result.json` carries only a compact summary of the same fields and
+points at the artifact. The GitHub/Slack failure text is fixed-form: it names
+the outcome, the operation class, and the exit code, and never the denied
+command, refused path, scratch path, prompt content, matched diagnostic text,
+or any repository path.
 
 ## Conflict Resolution
 

@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteTaskStore, SqliteOutboxStore } from '../dist/index.js';
@@ -14,6 +14,21 @@ let repoRoot;
 function run(...args) {
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
+    return { code: 0, stdout };
+  } catch (err) {
+    return { code: err.status ?? 1, stdout: err.stdout ?? '' };
+  }
+}
+
+// Runs with a fake `gh` binary prepended to PATH so the live repo-host PR lookup
+// (issue #674 review, P1 follow-up) resolves against a canned response instead
+// of the real GitHub CLI/network.
+function runWithFakeGh(fakeGhDir, ...args) {
+  try {
+    const stdout = execFileSync(process.execPath, [CLI, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${fakeGhDir}:${process.env.PATH}` },
+    });
     return { code: 0, stdout };
   } catch (err) {
     return { code: err.status ?? 1, stdout: err.stdout ?? '' };
@@ -320,7 +335,7 @@ describe('admin CLI — tool-request resolve', () => {
     // sanitizeBody's generic absolute-path heuristic, so without the worktree root
     // in the redaction set an operator-supplied path would leak into the public
     // comment.
-    writeSession({ worktrees: { enabled: true, root: '/n8nwt/worktrees' } });
+    writeSession({ worktrees: { root: '/n8nwt/worktrees' } });
     await seedToolRequestTask(123);
     const leakedPath = '/n8nwt/worktrees/addon-dev/issue-123/repo';
     const r = run(
@@ -477,25 +492,113 @@ describe('admin CLI — tool-request resolve', () => {
     expect(added).not.toContain('agent:claude');
   });
 
-  test('reject records the decision, keeps the human handoff, and never requeues', async () => {
+  test('reject records the decision and requeues the same phase automatically (issue #678)', async () => {
+    // The operator's decision not to run the command is itself the continuation
+    // context: toolRequestResolutionPromptSection's "reject" branch delivers it to
+    // the agent as human feedback, so no separate human-review-return step is
+    // needed for the ordinary case.
     writeSession();
     await seedToolRequestTask(123);
     const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'reject', '--message', 'Avoid this dependency change.', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
-    expect(parse(r)).toMatchObject({ ok: true, action: 'reject', status: 'ready_for_human', requeued: false });
+    expect(parse(r)).toMatchObject({ ok: true, action: 'reject', status: 'queued', requeued: true });
 
     const task = await getTask(123);
-    expect(task.status).toBe('ready_for_human');
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('implementation');
     expect(task.context.toolRequest.resolved).toBe(true);
     expect(task.context.toolRequest.resolution).toMatchObject({ action: 'reject', message: 'Avoid this dependency change.' });
 
     const outbox = await getOutbox();
     const comment = outbox.find(e => e.topic === 'gh:comment');
     expect(comment.payload.body).toContain('rejected');
+    expect(comment.payload.body).toContain('returned to the agent');
     expect(comment.payload.body).toContain('Avoid this dependency change.');
-    // No label re-add to the implementation lane on reject.
+    // Label re-add to the implementation lane on reject, same as manual-done.
     const added = outbox.filter(e => e.topic === 'gh:label:add').map(e => e.payload.label);
-    expect(added).not.toContain('status:needs-implementation');
+    expect(added).toContain('status:needs-implementation');
+  });
+
+  test('reject requeue is blocked by a local base branch ahead of origin, but the decision is still recorded', async () => {
+    // The rejection itself never touches the repo, so it is always safely
+    // recorded (issue #678) — but auto-requeueing while the local base is ahead
+    // of origin would leak an unpushed base commit into every later issue branch
+    // via the implementation preflight, exactly like manual-done. Stay a human
+    // handoff instead, matching the pre-#678 behavior for this unsafe case.
+    writeSession();
+    initRepo({ baseAhead: true });
+    await seedToolRequestTask(123);
+    const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'reject', '--message', 'No.', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out).toMatchObject({ ok: true, action: 'reject', status: 'ready_for_human', requeued: false });
+    // issue #678 review: the guard's blocking reason must survive into the
+    // resolve output, not just be discarded — the public comment tells the
+    // operator to look here for it.
+    expect(out.requeueBlockedReason).toMatch(/ahead of origin/);
+    const task = await getTask(123);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.toolRequest.resolved).toBe(true);
+    expect(task.context.toolRequest.resolution).toMatchObject({ action: 'reject', message: 'No.' });
+  });
+
+  test('reject requeue is blocked by a dirty session checkout, but the decision is still recorded', async () => {
+    // A dirty tree would immediately fail the implementation preflight if
+    // requeued automatically (issue #678); the rejection itself is still safely
+    // recorded, but the task stays a human handoff until the tree is clean.
+    writeSession();
+    initRepo({ dirty: true });
+    await seedToolRequestTask(123);
+    const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'reject', '--message', 'No.', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out).toMatchObject({ ok: true, action: 'reject', status: 'ready_for_human', requeued: false });
+    expect(out.requeueBlockedReason).toMatch(/is dirty/);
+    const task = await getTask(123);
+    expect(task.context.toolRequest.resolved).toBe(true);
+    expect(task.context.toolRequest.resolution).toMatchObject({ action: 'reject', message: 'No.' });
+  });
+
+  // Regression coverage for issue #677: implementation -> Tool Request handoff ->
+  // a conflicting review action (an operator mistakenly running `admin recover
+  // --from ready_for_human --phase review`, e.g. after the GitHub issue was
+  // relabeled `status:needs-review`) -> the transition is rejected -> the Tool
+  // Request is untouched and still resolvable through the normal flow.
+  test('a conflicting admin recover into review is rejected and the Tool Request remains resolvable afterward', async () => {
+    writeSession();
+    await seedToolRequestTask(123);
+
+    const recoverAttempt = run(
+      'recover', '--session-id', 'addon-dev', '--issue-number', '123',
+      '--from', 'ready_for_human', '--phase', 'review', '--db-path', dbPath, '--json',
+    );
+    expect(recoverAttempt.code).toBe(0);
+    const recoverOut = parse(recoverAttempt);
+    expect(recoverOut.recovered).toHaveLength(0);
+    expect(recoverOut.skipped[0]).toMatchObject({ issueNumber: 123 });
+    expect(recoverOut.skipped[0].reason).toMatch(/tool_request_unresolved/);
+
+    // The handoff was not disturbed: still ready_for_human/implementation, Tool
+    // Request still unresolved.
+    const afterRecover = await getTask(123);
+    expect(afterRecover.status).toBe('ready_for_human');
+    expect(afterRecover.phase).toBe('implementation');
+    expect(afterRecover.context.toolRequest.resolved).toBe(false);
+
+    // The Tool Request is still resolvable exactly as if the bad recover had
+    // never been attempted.
+    const resolve = run(
+      'tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123',
+      '--action', 'reject', '--message', 'Not needed after all.', '--db-path', dbPath, '--sessions-path', sessionsPath,
+    );
+    expect(resolve.code).toBe(0);
+    expect(parse(resolve)).toMatchObject({ ok: true, action: 'reject', status: 'queued', requeued: true });
+
+    const resolved = await getTask(123);
+    expect(resolved.status).toBe('queued');
+    expect(resolved.phase).toBe('implementation');
+    expect(resolved.context.toolRequest.resolved).toBe(true);
+    expect(resolved.context.toolRequest.resolution).toMatchObject({ action: 'reject' });
   });
 
   test('refuses to resolve an already-resolved request', async () => {
@@ -504,6 +607,273 @@ describe('admin CLI — tool-request resolve', () => {
     const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'reject', '--message', 'x', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
+  });
+
+  test('still refuses manual-done after an earlier manual-done resolution (replay protection preserved)', async () => {
+    writeSession();
+    await seedToolRequestTask(123, { resolved: true, resolution: { action: 'manual-done', resolvedAt: '2026-06-07T01:00:00.000Z' } });
+    const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'manual-done', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).not.toBe(0);
+    expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
+  });
+
+  // Regression (issue #674, updated for #678): reproduces the
+  // m2dw/thunderbird-auth-results-filter-ai #345 sequence — the initial
+  // implementation pushed the issue branch, then hit a Tool Request before the PR
+  // was ever created. Before #678, an operator rejecting that request (because
+  // the command was invalid/unnecessary) left the task parked at
+  // ready_for_human, requiring a separate manual-done to resume. Since #678,
+  // reject alone resumes the task in one step — preserving the pushed branch and
+  // staying out of fix mode so the run reaches normal PR creation — with no
+  // manual `human-review-return` or follow-up `manual-done` required.
+  test('rejecting a pre-PR Tool Request handoff resumes it in one step, preserving the pushed issue branch', async () => {
+    writeSession();
+    initRepo({ withRemote: true });
+    // The initial implementation pushed ai/issue-123 before hitting the Tool
+    // Request — no PR exists yet, mirroring the real-world #345 sequence.
+    execFileSync('git', ['checkout', '-q', '-b', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    writeFileSync(join(repoRoot, 'package.json'), '{"name":"x","dependencies":{"left-pad":"^1.3.0"}}\n', 'utf8');
+    execFileSync('git', ['commit', '-q', '-am', 'initial implementation'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['push', '-q', 'origin', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['checkout', '-q', 'main'], { cwd: repoRoot, encoding: 'utf8' });
+
+    // Seeded with mode: 'new' (no PR yet) and no reviewFeedback — the shape a Tool
+    // Request raised during initial implementation leaves behind.
+    await seedToolRequestTask(123, { mode: 'new' });
+
+    const rejected = run(
+      'tool-request', 'resolve',
+      '--session-id', 'addon-dev', '--issue-number', '123',
+      '--action', 'reject', '--message', 'Command was invalid/unnecessary.',
+      '--db-path', dbPath, '--sessions-path', sessionsPath,
+    );
+    expect(rejected.code).toBe(0);
+    expect(parse(rejected)).toMatchObject({ ok: true, action: 'reject', status: 'queued', requeued: true });
+
+    const task = await getTask(123);
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('implementation');
+    // The pushed issue branch is preserved as the resume point, not recreated.
+    expect(task.context.toolRequestResumeBranch).toBe('ai/issue-123');
+    // Stays out of fix mode: no reviewFeedback, no implementationMode: "fix" — the
+    // resumed run reaches normal PR creation instead of the fix-mode PR lookup.
+    expect(task.context.reviewFeedback).toBeUndefined();
+    expect(task.context.implementationMode).not.toBe('fix');
+
+    // Regression (issue #674 review, P2): the command was never run — only the
+    // rejection was delivered — so the stored resolution must still say `reject`
+    // (with its original message), not be overwritten with `manual-done`. The
+    // resumed implementation prompt reads this to decide whether to trust "the
+    // command has been run" vs. "the operator declined to run it".
+    expect(task.context.toolRequest.resolution).toMatchObject({
+      action: 'reject',
+      message: 'Command was invalid/unnecessary.',
+    });
+
+    const added = (await getOutbox()).filter(e => e.topic === 'gh:label:add').map(e => e.payload.label);
+    expect(added).toContain('status:needs-implementation');
+    expect(added).not.toContain('status:needs-fix');
+  });
+
+  // Regression (issue #678): delivery must be idempotent — once reject has
+  // resolved and requeued the task in one step, a second resolve against the
+  // same (now-consumed) Tool Request must be refused, not replayed into a
+  // second requeue.
+  test('refuses a second resolve after reject has already requeued the task', async () => {
+    writeSession();
+    initRepo({ withRemote: true });
+    execFileSync('git', ['checkout', '-q', '-b', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    writeFileSync(join(repoRoot, 'package.json'), '{"name":"x","dependencies":{"left-pad":"^1.3.0"}}\n', 'utf8');
+    execFileSync('git', ['commit', '-q', '-am', 'initial implementation'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['push', '-q', 'origin', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['checkout', '-q', 'main'], { cwd: repoRoot, encoding: 'utf8' });
+
+    await seedToolRequestTask(123, { mode: 'new' });
+
+    const rejected = run(
+      'tool-request', 'resolve',
+      '--session-id', 'addon-dev', '--issue-number', '123',
+      '--action', 'reject', '--message', 'Command was invalid/unnecessary.',
+      '--db-path', dbPath, '--sessions-path', sessionsPath,
+    );
+    expect(rejected.code).toBe(0);
+    expect(parse(rejected)).toMatchObject({ ok: true, action: 'reject', status: 'queued', requeued: true });
+
+    const replay = run(
+      'tool-request', 'resolve',
+      '--session-id', 'addon-dev', '--issue-number', '123',
+      '--action', 'manual-done',
+      '--db-path', dbPath, '--sessions-path', sessionsPath,
+    );
+    expect(replay.code).not.toBe(0);
+    expect(parse(replay)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
+
+    // The task's requeue from the reject is left untouched by the refused replay.
+    const task = await getTask(123);
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('implementation');
+  });
+
+  // Regression (issue #674 review, P2): the reject-recovery exemption must be
+  // one-shot. A rejected request can still be left resolved-but-not-requeued when
+  // its requeue was blocked by an unsafe repo state at the time (issue #678 —
+  // see "reject requeue is blocked by..." above), mirroring the pre-#678 stuck
+  // handoff this exemption was built for. Without consuming it, the same stored
+  // `reject` resolution would stay eligible for `manual-done` forever, letting a
+  // stale Tool Request requeue the issue back into implementation again later —
+  // including after the resumed work has already reached `done` — producing
+  // duplicate labels/comments and unnecessary work.
+  test('refuses a second manual-done against the same already-consumed reject recovery', async () => {
+    writeSession();
+    initRepo({ withRemote: true });
+    execFileSync('git', ['checkout', '-q', '-b', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    writeFileSync(join(repoRoot, 'package.json'), '{"name":"x","dependencies":{"left-pad":"^1.3.0"}}\n', 'utf8');
+    execFileSync('git', ['commit', '-q', '-am', 'initial implementation'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['push', '-q', 'origin', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['checkout', '-q', 'main'], { cwd: repoRoot, encoding: 'utf8' });
+
+    // A rejected request left resolved but not requeued (its requeue was blocked
+    // at the time), mirroring a stuck pre-#678-style handoff.
+    await seedToolRequestTask(123, {
+      mode: 'new',
+      resolved: true,
+      resolution: { action: 'reject', message: 'Command was invalid/unnecessary.', resolvedAt: '2026-06-07T01:00:00.000Z' },
+    });
+
+    const recovered = run(
+      'tool-request', 'resolve',
+      '--session-id', 'addon-dev', '--issue-number', '123',
+      '--action', 'manual-done',
+      '--db-path', dbPath, '--sessions-path', sessionsPath,
+    );
+    expect(recovered.code).toBe(0);
+    expect(parse(recovered)).toMatchObject({ ok: true, action: 'manual-done', requeued: true });
+
+    // The stored resolution still reads `reject`, but the recovery is now marked
+    // consumed so a second manual-done cannot replay the same exemption.
+    const afterResume = await getTask(123);
+    expect(afterResume.context.toolRequest.resolution.action).toBe('reject');
+    expect(afterResume.context.toolRequest.rejectRecoveryConsumed).toBe(true);
+
+    const replay = run(
+      'tool-request', 'resolve',
+      '--session-id', 'addon-dev', '--issue-number', '123',
+      '--action', 'manual-done',
+      '--db-path', dbPath, '--sessions-path', sessionsPath,
+    );
+    expect(replay.code).not.toBe(0);
+    expect(parse(replay)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
+
+    // The task's requeue from the legitimate recovery is left untouched by the
+    // refused replay attempt.
+    const task = await getTask(123);
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('implementation');
+  });
+
+  // Regression (issue #674 review, P2; still relevant after #678 for a
+  // guard-blocked reject — see the comment above): the reject-recovery exemption
+  // must only apply while the task is still parked at the original
+  // ready_for_human handoff. If the task has since reached `done` through some
+  // other recovery path — while its context still carries the old rejected,
+  // unconsumed Tool Request — a stale `manual-done` must not be allowed to yank
+  // it back to `queued` and re-run implementation on already-completed work.
+  test('refuses manual-done against a stale rejected request once the task has already reached done', async () => {
+    writeSession();
+    initRepo({ withRemote: true });
+    execFileSync('git', ['checkout', '-q', '-b', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    writeFileSync(join(repoRoot, 'package.json'), '{"name":"x","dependencies":{"left-pad":"^1.3.0"}}\n', 'utf8');
+    execFileSync('git', ['commit', '-q', '-am', 'initial implementation'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['push', '-q', 'origin', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['checkout', '-q', 'main'], { cwd: repoRoot, encoding: 'utf8' });
+
+    // A rejected request left resolved but not requeued (its requeue was blocked
+    // at the time) — the stored toolRequest is exactly as such a blocked reject
+    // would leave it: resolved, action `reject`, no rejectRecoveryConsumed flag.
+    await seedToolRequestTask(123, {
+      mode: 'new',
+      resolved: true,
+      resolution: { action: 'reject', message: 'Command was invalid/unnecessary.', resolvedAt: '2026-06-07T01:00:00.000Z' },
+    });
+
+    // The task then progresses to `done` through an entirely different recovery
+    // path (e.g. an operator manually landed the PR) without ever consuming the
+    // reject-recovery exemption via `manual-done`.
+    const beforeDone = await getTask(123);
+    const store = new SqliteTaskStore(dbPath);
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 123 },
+      { status: 'ready_for_human' },
+      { status: 'done', phase: 'implementation', context: beforeDone.context },
+    );
+    store.close();
+
+    const replay = run(
+      'tool-request', 'resolve',
+      '--session-id', 'addon-dev', '--issue-number', '123',
+      '--action', 'manual-done',
+      '--db-path', dbPath, '--sessions-path', sessionsPath,
+    );
+    expect(replay.code).not.toBe(0);
+    expect(parse(replay)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
+
+    // The completed task is left untouched by the refused replay attempt.
+    const task = await getTask(123);
+    expect(task.status).toBe('done');
+  });
+
+  // Regression (issue #674 review, round 2; still relevant after #678 for a
+  // guard-blocked reject): status alone (`ready_for_human`) is not enough to gate
+  // the reject-recovery exemption — a task can reach `ready_for_human` again in a
+  // *different* phase (e.g. a review-phase human handoff) while the stale
+  // rejected Tool Request from the original implementation handoff is still
+  // sitting untouched in its context. A `manual-done` against that stale request
+  // must not be allowed to yank a review-phase handoff back into
+  // `queued`/`implementation` and duplicate completed implementation work.
+  test('refuses manual-done against a stale rejected request once the task has reached a later ready_for_human in a different phase', async () => {
+    writeSession();
+    initRepo({ withRemote: true });
+    execFileSync('git', ['checkout', '-q', '-b', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    writeFileSync(join(repoRoot, 'package.json'), '{"name":"x","dependencies":{"left-pad":"^1.3.0"}}\n', 'utf8');
+    execFileSync('git', ['commit', '-q', '-am', 'initial implementation'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['push', '-q', 'origin', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
+    execFileSync('git', ['checkout', '-q', 'main'], { cwd: repoRoot, encoding: 'utf8' });
+
+    // A rejected request left resolved but not requeued (its requeue was blocked
+    // at the time) — the stored toolRequest is exactly as such a blocked reject
+    // would leave it: resolved, action `reject`, no rejectRecoveryConsumed flag.
+    await seedToolRequestTask(123, {
+      mode: 'new',
+      resolved: true,
+      resolution: { action: 'reject', message: 'Command was invalid/unnecessary.', resolvedAt: '2026-06-07T01:00:00.000Z' },
+    });
+
+    // The task then progresses through implementation and review via some
+    // other recovery path, without ever consuming the reject-recovery
+    // exemption, and later lands back at `ready_for_human` — this time in the
+    // review phase (e.g. a review-loop cap or a review-side human decision).
+    const beforeReview = await getTask(123);
+    const store = new SqliteTaskStore(dbPath);
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 123 },
+      { status: 'ready_for_human' },
+      { status: 'ready_for_human', phase: 'review', context: beforeReview.context },
+    );
+    store.close();
+
+    const replay = run(
+      'tool-request', 'resolve',
+      '--session-id', 'addon-dev', '--issue-number', '123',
+      '--action', 'manual-done',
+      '--db-path', dbPath, '--sessions-path', sessionsPath,
+    );
+    expect(replay.code).not.toBe(0);
+    expect(parse(replay)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
+
+    // The review-phase handoff is left untouched by the refused replay attempt.
+    const task = await getTask(123);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.phase).toBe('review');
   });
 
   test('manual-done refuses to requeue when the session checkout is dirty', async () => {
@@ -846,27 +1216,6 @@ describe('admin CLI — tool-request resolve', () => {
     expect(task.context.toolRequestResumeBranch).toBe('ai/issue-123');
   });
 
-  test('reject is not blocked by a local base branch ahead of origin', async () => {
-    // reject never requeues, so the base-contamination concern does not apply.
-    writeSession();
-    initRepo({ baseAhead: true });
-    await seedToolRequestTask(123);
-    const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'reject', '--message', 'No.', '--db-path', dbPath, '--sessions-path', sessionsPath);
-    expect(r.code).toBe(0);
-    expect(parse(r)).toMatchObject({ ok: true, action: 'reject', requeued: false });
-  });
-
-  test('reject is not blocked by a dirty session checkout', async () => {
-    // reject never requeues, so the implementation dirty-preflight concern does
-    // not apply — a dirty tree must not stop the operator recording the decision.
-    writeSession();
-    initRepo({ dirty: true });
-    await seedToolRequestTask(123);
-    const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'reject', '--message', 'No.', '--db-path', dbPath, '--sessions-path', sessionsPath);
-    expect(r.code).toBe(0);
-    expect(parse(r)).toMatchObject({ ok: true, action: 'reject', requeued: false });
-  });
-
   test('--dry-run does not mutate the task', async () => {
     writeSession();
     await seedToolRequestTask(123);
@@ -881,20 +1230,20 @@ describe('admin CLI — tool-request resolve', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Worktree-enabled sessions (issue #454)
+// Per-issue worktree sessions (issue #454)
 //
-// When `session.worktrees.enabled` is true the implementation phase ran in the
-// per-issue worktree and left `ai/issue-<n>` checked out THERE, and a Tool
-// Request handoff (grant or manual run) left the command's side effects in that
-// worktree — never in the canonical checkout. The requeued implementation run's
-// dirty preflight runs in that same worktree, so `manual-done` must validate
-// cleanliness against the issue worktree, not the canonical checkout: probing
-// only `session.repoRoot` would pass a dirty issue worktree and requeue straight
+// The implementation phase runs in the per-issue worktree and leaves
+// `ai/issue-<n>` checked out THERE, and a Tool Request handoff (grant or
+// manual run) left the command's side effects in that worktree — never in the
+// canonical checkout. The requeued implementation run's dirty preflight runs
+// in that same worktree, so `manual-done` must validate cleanliness against
+// the issue worktree, not the canonical checkout: probing only
+// `session.repoRoot` would pass a dirty issue worktree and requeue straight
 // into a worktree-dirty preflight failure (resolved request, stuck task), and
 // would also wrongly refuse when only unrelated canonical dirt exists.
 // ---------------------------------------------------------------------------
 
-describe('admin CLI — tool-request resolve: worktree-enabled sessions', () => {
+describe('admin CLI — tool-request resolve: per-issue worktree sessions', () => {
   // Deterministic per-issue worktree layout: <root>/<session>/issue-<n>/repo.
   function worktreeRoot() {
     return join(tmpDir, 'wt');
@@ -918,7 +1267,7 @@ describe('admin CLI — tool-request resolve: worktree-enabled sessions', () => 
   }
 
   test('manual-done requeues when the issue worktree is clean even if the canonical checkout is dirty', async () => {
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     // Canonical checkout carries unrelated dirt; the issue worktree is clean.
     initRepo({ dirty: true });
     const wtPath = addIssueWorktree(123);
@@ -938,7 +1287,7 @@ describe('admin CLI — tool-request resolve: worktree-enabled sessions', () => 
   });
 
   test('manual-done refuses when the issue worktree is dirty', async () => {
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo({ dirty: false });
     const wtPath = addIssueWorktree(123);
     // Leave the requested command's output uncommitted in the issue worktree.
@@ -969,7 +1318,7 @@ describe('admin CLI — tool-request resolve: worktree-enabled sessions', () => 
     // canonical `main` cannot leak into the issue branch, and the base-ahead guard
     // (which compares the shared `origin/main..main`) must be skipped in worktree mode
     // rather than refuse an otherwise-valid requeue.
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo({ withRemote: true });
     const wtPath = addIssueWorktree(123);
     // Push the issue branch so the resume-branch confirmation finds it on origin.
@@ -993,11 +1342,11 @@ describe('admin CLI — tool-request resolve: worktree-enabled sessions', () => 
   });
 
   test('manual-done refuses with no usable continuation when worktrees are enabled but the issue branch is absent everywhere', async () => {
-    // Regression (issue #379) in worktree mode: with no per-issue worktree registered
-    // and no issue branch locally or on origin, requeueing would branch a fresh
-    // implementation run from the base with none of the prior work. The fail-closed
-    // guard must fire even when worktrees are enabled, not only in shared-checkout mode.
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    // Regression (issue #379): with no per-issue worktree registered and no issue
+    // branch locally or on origin, requeueing would branch a fresh implementation
+    // run from the base with none of the prior work. The fail-closed guard must
+    // fire regardless.
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo({ withRemote: true });
     // No addIssueWorktree — no worktree registered, no issue branch created anywhere.
 
@@ -1016,10 +1365,12 @@ describe('admin CLI — tool-request resolve: worktree-enabled sessions', () => 
     expect(await getOutbox()).toHaveLength(0);
   });
 
-  test('reject is not blocked by a dirty issue worktree', async () => {
-    // reject never requeues, so the implementation dirty-preflight concern does not
-    // apply — a dirty issue worktree must not stop the operator recording the decision.
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+  test('reject requeue is blocked by a dirty issue worktree, but the decision is still recorded', async () => {
+    // A dirty issue worktree would immediately fail the implementation preflight
+    // if requeued automatically (issue #678); the rejection itself is still
+    // safely recorded, but the task stays a human handoff until the worktree is
+    // clean.
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo({ dirty: false });
     const wtPath = addIssueWorktree(123);
     // Leave the requested command's output uncommitted in the issue worktree.
@@ -1029,6 +1380,24 @@ describe('admin CLI — tool-request resolve: worktree-enabled sessions', () => 
     await seedToolRequestTask(123);
     const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'reject', '--message', 'No.', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
-    expect(parse(r)).toMatchObject({ ok: true, action: 'reject', requeued: false });
+    expect(parse(r)).toMatchObject({ ok: true, action: 'reject', status: 'ready_for_human', requeued: false });
+    const task = await getTask(123);
+    expect(task.context.toolRequest.resolved).toBe(true);
+    expect(task.context.toolRequest.resolution).toMatchObject({ action: 'reject', message: 'No.' });
+  });
+
+  test('reject requeues automatically in worktree mode when the issue worktree is clean', async () => {
+    writeSession({ worktrees: { root: worktreeRoot() } });
+    initRepo();
+    addIssueWorktree(123);
+
+    await seedToolRequestTask(123);
+    const r = run('tool-request', 'resolve', '--session-id', 'addon-dev', '--issue-number', '123', '--action', 'reject', '--message', 'No.', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    expect(parse(r)).toMatchObject({ ok: true, action: 'reject', status: 'queued', requeued: true });
+    const task = await getTask(123);
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('implementation');
+    expect(task.context.toolRequest.resolved).toBe(true);
   });
 });

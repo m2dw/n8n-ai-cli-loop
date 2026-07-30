@@ -1,11 +1,8 @@
-import { mkdtempSync, rmSync, readFileSync, existsSync, lstatSync, writeFileSync, chmodSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, lstatSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { execFileSync } from 'child_process';
-import { createReviewHandler } from '../dist/handlers/review.js';
+import { createReviewHandler as _createReviewHandler } from '../dist/handlers/review.js';
 import { SqliteTaskStore, runNextPhase } from '../dist/index.js';
-
-const CLI = new URL('../dist/cli/run-one-phase.js', import.meta.url).pathname;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -14,6 +11,69 @@ const CLI = new URL('../dist/cli/run-one-phase.js', import.meta.url).pathname;
 let tmpDir;
 let repoRoot;
 let artifactRoot;
+
+// ---------------------------------------------------------------------------
+// Worktree + lock fixtures (issue #456/#699: review always resolves a per-issue
+// worktree and an issue-scoped advisory lock — there is no more canonical-
+// checkout path). Shared, module-scope versions so every describe block below
+// can get safe defaults without redefining them; the dedicated "per-issue
+// worktree review (issue #456)" describe block further down defines its OWN
+// local copies (same shape) which shadow these within that block — left
+// untouched since that block already correctly targets worktree mode.
+// ---------------------------------------------------------------------------
+
+// Deterministic fake worktree path used by every test that does not supply its
+// own `resolveWorktree` override.
+const worktreePath = () => join(tmpDir, 'worktrees', 'addon-dev', 'issue-77');
+
+// Records every resolveWorktree() input and returns a fixed worktree path so the
+// handler's cwd switch is exercised without a real `git worktree`. Defaults model
+// the common review case: the worktree already exists and is reused on the issue
+// branch (created: false, branchReused: true).
+function fakeWorktreeResolver(path, { ok = true, error, created = false, branchReused = true } = {}) {
+  const calls = [];
+  return {
+    calls,
+    resolve(input) {
+      calls.push(input);
+      if (!ok) return { ok: false, error: error ?? 'resolve failed' };
+      return { ok: true, path, worktreeId: `${input.sessionId}/issue-${input.issueNumber}`, branch: input.branch, created, branchReused };
+    },
+  };
+}
+
+// Duck-typed IssueWorktreeLock: records acquire/release and returns a configurable
+// acquire result so a held lock (concurrent execution) can be simulated.
+function fakeLock(acquireResult = { ok: true, locked: true, contextId: 'run-review-1', sessionId: 'addon-dev' }) {
+  const calls = { acquire: [], release: [] };
+  return {
+    calls,
+    acquire(ownerId, sessionId, issueNumber) { calls.acquire.push({ ownerId, sessionId, issueNumber }); return acquireResult; },
+    release(ownerId, sessionId, issueNumber) { calls.release.push({ ownerId, sessionId, issueNumber }); return { ok: true, released: true }; },
+  };
+}
+
+// Every call site historically invoked `createReviewHandler(context, runner)`
+// (occasionally with a 3rd/4th arg for a resolveRepoHost or worktree-specific
+// test) and relied on the canonical-checkout path. Since #456/#699 removed
+// that path, review always resolves a per-issue worktree and a real
+// IssueWorktreeLock; tests that don't care about worktree/lock mechanics get
+// deterministic fakes so `runner` only ever sees the git calls review.ts
+// itself issues, not `resolveIssueWorktree`'s or `IssueWorktreeLock`'s
+// internals. Tests that DO care about worktree resolution or lock behavior
+// pass their own fakes as the 3rd/4th args, which this wrapper leaves
+// untouched. `resolveRepoHost` (5th) and `phaseLockOwnerId` (6th) are plain
+// pass-through — the real defaults from review.ts apply when omitted.
+function createReviewHandler(context, runner, resolveWorktree, issueLock, resolveRepoHost, phaseLockOwnerId) {
+  return _createReviewHandler(
+    context,
+    runner,
+    resolveWorktree ?? fakeWorktreeResolver(worktreePath()).resolve,
+    issueLock ?? fakeLock(),
+    resolveRepoHost,
+    phaseLockOwnerId,
+  );
+}
 
 const SESSION = (overrides = {}) => ({
   sessionId: 'addon-dev',
@@ -60,8 +120,13 @@ function makeTask(overrides = {}) {
 }
 
 // Multi-step runner: each call consumes one result.
-// Happy-path order: status(0) checkout-main(1) pull(2) gh-pr-checkout(3)
-//                   npm-test(4) codex-review(5)
+// Happy-path order (worktree-only, issue #456/#699), for the common case — a
+// task with BOTH branch and prUrl recorded, GitHub host, non-cross-repo PR,
+// default fake worktree resolver (created: false, branchReused: true),
+// session.environmentPrepare NOT configured:
+//   gh-pr-view(0) fetch-base(1) rev-parse-branch-exists(2) pull-ff-only(3)
+//   rev-list-count(4) status-preflight(5) diff-classification(6) npm-test(7)
+//   codex-review(8) status-post-review(9)
 function sequenceRunner(steps) {
   const calls = [];
   let i = 0;
@@ -76,15 +141,20 @@ function sequenceRunner(steps) {
   };
 }
 
+// Default happy-path runner for the default `makeTask()` (branch:
+// 'ai/issue-77-run-impl-1', prUrl: pull/99, GitHub host, codex agent).
 function happyRunner() {
   return sequenceRunner([
-    { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-    { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-    { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-    { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout 99
+    { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch, issue #447 P2)
+    { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main (refresh review base)
+    { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse --verify --quiet refs/heads/<branch> (LOCAL BRANCH EXISTS)
+    { stdout: '', stderr: '', exitCode: 0 },              // git pull origin <branch> --ff-only (reconcile reused worktree branch with PR head)
+    { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD (on the live PR head)
+    { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+    { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification diff classification, issue #506)
     { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
-    { stdout: '', stderr: '', exitCode: 0 },              // git diff main...HEAD (codex diff classification, issue #506)
     { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+    { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 5.5 post-review) — clean
   ]);
 }
 
@@ -137,13 +207,15 @@ describe('review handler — artifacts', () => {
 
   test('artifacts written even when codex fails', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },   // verification passes
-      { stdout: '', stderr: '', exitCode: 0 },   // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: '', stderr: 'codex error', exitCode: 1 }, // codex fails
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only (reconcile reused branch)
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test (verification passes)
+      { stdout: '', stderr: 'codex error', exitCode: 1 },   // codex fails
     ]);
     await createReviewHandler(CONTEXT(), runner)(makeTask());
     expect(existsSync(join(artifactRoot, 'runs', 'run-review-1', 'review-result.json'))).toBe(true);
@@ -157,12 +229,14 @@ describe('review handler — artifacts', () => {
 describe('review handler — post-review worktree cleanup', () => {
   function dirtyAfterReviewRunner({ diffOutput = '--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-old\n+new', cleanupExitCode = 0 } = {}) {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },           // git status — clean (preflight)
-      { stdout: '', stderr: '', exitCode: 0 },           // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },           // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },           // gh pr checkout 99
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only (reconcile reused branch)
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
-      { stdout: '', stderr: '', exitCode: 0 },           // git diff main...HEAD (codex diff classification, issue #506)
       { stdout: '[P1] Missing null check', stderr: '', exitCode: 0 }, // codex review
       { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status — dirty after review
       { stdout: diffOutput, stderr: '', exitCode: 0 },   // git diff HEAD
@@ -261,15 +335,21 @@ describe('review handler — post-review worktree cleanup', () => {
   // (no git clean runs), the sentinel must be preserved so the next phase can skip.
 
   test('clears prepare sentinel after git clean during dirty review when environmentPrepare is enabled', async () => {
-    // Create the .git dir so the sentinel can be written by ensureEnvironmentPrepared.
-    mkdirSync(join(repoRoot, '.git'), { recursive: true });
+    // Create the WORKTREE's .git dir so the sentinel can be written by
+    // ensureEnvironmentPrepared, which runs with cwd = the worktree path in
+    // worktree-only mode (issue #699), not session.repoRoot.
+    const wt = worktreePath();
+    mkdirSync(join(wt, '.git'), { recursive: true });
 
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status (preflight)
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout 99
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only (reconcile reused branch)
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (preflight) — clean
       { stdout: '', stderr: '', exitCode: 0 },              // echo ok (environmentPrepare — writes sentinel)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
       { stdout: '[P1] Missing null check', stderr: '', exitCode: 0 }, // codex review
       { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status (dirty after review)
@@ -284,19 +364,24 @@ describe('review handler — post-review worktree cleanup', () => {
 
     // Sentinel must be gone: clearPrepareSentinel was called after git clean so the
     // next phase re-runs prepare instead of skipping on a now-invalid stamp.
-    expect(existsSync(join(repoRoot, '.git', 'ai-env-prepared'))).toBe(false);
+    expect(existsSync(join(wt, '.git', 'ai-env-prepared'))).toBe(false);
   });
 
   test('preserves prepare sentinel when review tree is clean after review', async () => {
-    // Create the .git dir so the sentinel can be written by ensureEnvironmentPrepared.
-    mkdirSync(join(repoRoot, '.git'), { recursive: true });
+    // Create the WORKTREE's .git dir so the sentinel can be written (cwd is the
+    // worktree path in worktree-only mode, issue #699).
+    const wt = worktreePath();
+    mkdirSync(join(wt, '.git'), { recursive: true });
 
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status (preflight)
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout 99
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only (reconcile reused branch)
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (preflight) — clean
       { stdout: '', stderr: '', exitCode: 0 },              // echo ok (environmentPrepare — writes sentinel)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
       { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review — no findings
       { stdout: '', stderr: '', exitCode: 0 },              // git status (clean after review)
@@ -307,7 +392,7 @@ describe('review handler — post-review worktree cleanup', () => {
 
     // Sentinel must still exist: no git clean ran, clearPrepareSentinel was not
     // called, so the next phase can skip prepare cheaply.
-    expect(existsSync(join(repoRoot, '.git', 'ai-env-prepared'))).toBe(true);
+    expect(existsSync(join(wt, '.git', 'ai-env-prepared'))).toBe(true);
   });
 });
 
@@ -316,93 +401,120 @@ describe('review handler — post-review worktree cleanup', () => {
 // ---------------------------------------------------------------------------
 
 describe('review handler — command execution', () => {
-  test('uses session.repoRoot as cwd for all commands', async () => {
+  // Replaces the pre-#456/#699 "uses session.repoRoot as cwd for all commands"
+  // test: cwd is NO LONGER uniform across the whole call sequence — the handler
+  // switches cwd from session.repoRoot to the per-issue worktree path partway
+  // through (issue #456). The equivalent worktree-mode cwd-partitioning
+  // assertions already live in the "per-issue worktree review (issue #456)"
+  // describe block below (e.g. "runs review inside the per-issue worktree...").
+
+  test('executes worktree-setup preflight in order: gh pr view -> fetch base -> rev-parse -> pull --ff-only -> rev-list -> git status', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    for (const call of runner.calls) {
-      expect(call.opts.cwd).toBe(repoRoot);
-    }
+    expect(runner.calls[0]).toMatchObject({ cmd: 'gh', args: ['pr', 'view', '99', '--repo', 'm2dw/test-repo', '--json', expect.any(String)] });
+    expect(runner.calls[1]).toMatchObject({ cmd: 'git', args: ['fetch', 'origin', '+main:refs/remotes/origin/main'] });
+    expect(runner.calls[2]).toMatchObject({ cmd: 'git', args: ['rev-parse', '--verify', '--quiet', 'refs/heads/ai/issue-77-run-impl-1'] });
+    expect(runner.calls[3]).toMatchObject({ cmd: 'git', args: ['pull', 'origin', 'ai/issue-77-run-impl-1', '--ff-only'] });
+    expect(runner.calls[4]).toMatchObject({ cmd: 'git', args: ['rev-list', '--count', 'FETCH_HEAD..HEAD'] });
+    expect(runner.calls[5]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
   });
 
-  test('executes preflight in order: status -> checkout main -> pull -> gh pr checkout', async () => {
+  test('uses PR number from prUrl to validate the recorded branch via gh pr view', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    expect(runner.calls[0]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
-    expect(runner.calls[1]).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
-    expect(runner.calls[2]).toMatchObject({ cmd: 'git', args: ['pull', '--ff-only'] });
-    expect(runner.calls[3]).toMatchObject({ cmd: 'gh', args: expect.arrayContaining(['pr', 'checkout']) });
-  });
-
-  test('uses PR number from prUrl for gh pr checkout', async () => {
-    const runner = happyRunner();
-    await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const ghCall = runner.calls[3];
+    const ghCall = runner.calls[0];
     expect(ghCall.cmd).toBe('gh');
     expect(ghCall.args).toContain('99'); // extracted from pull/99
   });
 
-  test('falls back to branch as selector when no prUrl', async () => {
-    const runner = happyRunner();
+  test('falls back to branch as selector when no prUrl (branch-only PR lookup)', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view <branch> (branch-only PR lookup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (diff classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (post-review)
+    ]);
     const task = makeTask({ context: { branch: 'ai/issue-77-run-impl-1', prUrl: undefined, title: 'T' } });
     await createReviewHandler(CONTEXT(), runner)(task);
-    const ghCall = runner.calls[3];
+    const ghCall = runner.calls[0];
     expect(ghCall.cmd).toBe('gh');
-    // Branch is passed as the selector, not via --branch flag
-    expect(ghCall.args).toEqual(['pr', 'checkout', 'ai/issue-77-run-impl-1']);
-    expect(ghCall.args).not.toContain('--branch');
+    // Branch is passed as the selector for the branch-only `gh pr view` lookup.
+    expect(ghCall.args).toEqual(['pr', 'view', 'ai/issue-77-run-impl-1', '--repo', 'm2dw/test-repo', '--json', expect.any(String)]);
   });
 
-  test('runs each session.verification command after checkout', async () => {
+  test('runs each session.verification command after preflight', async () => {
     const session = SESSION({ verification: { test: 'npm test', build: 'npm run build' } });
     const ctx = CONTEXT({ session });
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },  // git status
-      { stdout: '', stderr: '', exitCode: 0 },  // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },  // git pull
-      { stdout: '', stderr: '', exitCode: 0 },  // gh pr checkout
-      { stdout: '', stderr: '', exitCode: 0 },   // git diff main...HEAD (pre-verification, issue #506)
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification diff classification, issue #506)
       { stdout: 'ok', stderr: '', exitCode: 0 }, // npm test
       { stdout: 'ok', stderr: '', exitCode: 0 }, // npm run build
       { stdout: 'lgtm', stderr: '', exitCode: 0 }, // codex
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (post-review)
     ]);
     await createReviewHandler(ctx, runner)(makeTask());
     const cmds = runner.calls.map(c => `${c.cmd} ${c.args.join(' ')}`);
-    expect(cmds[5]).toContain('test');
-    expect(cmds[6]).toContain('build');
+    expect(cmds[7]).toContain('test');
+    expect(cmds[8]).toContain('build');
   });
 
-  test('invokes codex review with --base main and --title', async () => {
+  test('invokes codex review with --base origin/main and --title', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const codexCall = runner.calls[6];
-    expect(codexCall.cmd).toBe('codex');
+    const codexCall = runner.calls.find((c) => c.cmd === 'codex');
+    expect(codexCall).toBeDefined();
     expect(codexCall.args).toContain('review');
     expect(codexCall.args).toContain('--base');
-    expect(codexCall.args).toContain('main');
+    // The worktree review diffs against the freshly-fetched origin/<base>, never
+    // local main (a worktree session never advances local main; issue #456).
+    expect(codexCall.args).toContain('origin/main');
     expect(codexCall.args).toContain('--title');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Dependency-started PR review base (issue #208, #242)
+// Dependency-started PR review base (issue #208, #242, #667)
 //
 // A dependency-started PR's branch was created from a blocker PR head, but a new
 // dependency-started PR targets the session base branch (`main`) like any other
-// PR. The review therefore diffs against `main`. To stay safe for PRs created
+// PR (issue #228/#242) — that PR-merge-target concept is independent from the
+// REVIEW DIFF BASE (issue #667): the branch was built on top of the blocker PR
+// head, which is typically not yet merged into `main`, so diffing against `main`
+// would review the whole cumulative stack (predecessor + current issue) as if it
+// were all this issue's change. The review therefore diffs against the recorded
+// predecessor head (`dependencyBase.baseHeadSha`), not `main`.
+//
+// The PR-merge-target safety check is unchanged: to stay safe for a PR created
 // under the PRIOR stacked-base flow (whose live GitHub base may still be the
 // blocker branch), the handler first queries the live `baseRefName` whenever
-// `dependencyBase` metadata is present. If the PR still targets the blocker
-// branch — or the base cannot be confirmed — the review blocks for a human
-// instead of approving a PR that would merge into the blocker branch and hide
-// the dependent change from `main` (the #216/#217 trap, issue #242).
+// `dependencyBase` metadata is present (Step 0). If the PR still targets the
+// blocker branch — or the base cannot be confirmed — the review blocks for a
+// human instead of approving a PR that would merge into the blocker branch and
+// hide the dependent change from `main` (the #216/#217 trap, issue #242).
 // ---------------------------------------------------------------------------
 
-describe('review handler — dependency-started PR (issue #242)', () => {
+describe('review handler — dependency-started PR (issue #208, #242, #667)', () => {
+  const BLOCKER_HEAD_SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
   const DEP_BASE = {
     baseIssueNumber: 50,
     basePrNumber: 88,
     baseHeadRefName: 'ai/issue-50',
     basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+    // The exact predecessor commit the branch was built on (issue #667) — the
+    // review diff base.
+    baseHeadSha: BLOCKER_HEAD_SHA,
   };
 
   function stackedTask() {
@@ -411,37 +523,70 @@ describe('review handler — dependency-started PR (issue #242)', () => {
     });
   }
 
-  // Happy sequence for a dependency-started PR whose live base is already `main`.
-  // The live-base check (`gh pr view`) runs first, before the normal review steps.
+  // Happy sequence for a dependency-started PR whose live base is already `main`
+  // and whose recorded predecessor head is an ancestor of HEAD. Worktree setup
+  // (gh pr view branch-validation, fetch base, rev-parse, pull --ff-only,
+  // rev-list) runs first (issue #456); the live-base check (`gh pr view --json
+  // baseRefName`, Step 0) runs next, then the Step 1 dirty preflight, then the
+  // dependency-review-base ancestry guard (`git cat-file` + `git merge-base
+  // --is-ancestor`, Step 3.4), then the pre-verification diff classification,
+  // verification, and the review agent.
   function stackedHappyRunner(liveBase = 'main') {
     return sequenceRunner([
-      { stdout: JSON.stringify({ baseRefName: liveBase }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only (reconcile reused branch)
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: JSON.stringify({ baseRefName: liveBase }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName (Step 0, issue #242)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git cat-file -e <sha>^{commit} (Step 3.4, issue #667)
+      { stdout: '', stderr: '', exitCode: 0 },              // git merge-base --is-ancestor <sha> HEAD (Step 3.4, issue #667)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (pre-verification diff classification, issue #506)
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
-      { stdout: '', stderr: '', exitCode: 0 },              // git diff main...HEAD (codex diff classification, issue #506)
       { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
   }
 
-  test('reviews against the session base (main), not the blocker head', async () => {
+  test('reviews against the recorded predecessor head, not the session base (issue #667)', async () => {
     const runner = stackedHappyRunner();
     await createReviewHandler(CONTEXT(), runner)(stackedTask());
     const codexCall = runner.calls.find(c => c.cmd === 'codex');
     expect(codexCall.args).toContain('--base');
-    expect(codexCall.args).toContain('main');
-    expect(codexCall.args).not.toContain('ai/issue-50');
+    expect(codexCall.args).toContain(BLOCKER_HEAD_SHA);
+    expect(codexCall.args).not.toContain('main');
+  });
+
+  test('the diff excludes predecessor commits: diffs <predecessor-head>...HEAD, never <session-base>...HEAD (issue #667)', async () => {
+    const runner = stackedHappyRunner();
+    await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    const diffCall = runner.calls.find(c => c.cmd === 'git' && c.args[0] === 'diff');
+    expect(diffCall.args).toEqual(['diff', `${BLOCKER_HEAD_SHA}...HEAD`]);
+    expect(diffCall.args).not.toContain('main...HEAD');
+  });
+
+  test('the PR still targets the session base even though the review diff base is the predecessor head (issue #667)', async () => {
+    const runner = stackedHappyRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    expect(result.result).toBe('success');
+    // Step 0 confirmed the live PR base is the session base (`main`) — the PR
+    // merge target and the review diff base are independently correct.
+    const viewCall = runner.calls.find(c => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
+    expect(viewCall).toBeDefined();
+    const codexCall = runner.calls.find(c => c.cmd === 'codex');
+    expect(codexCall.args).toContain(BLOCKER_HEAD_SHA);
   });
 
   test('queries the live PR base before reviewing', async () => {
     // A PR created under the prior stacked-base flow may still target the blocker
     // branch on GitHub. The handler confirms the live base is the session base
-    // before reviewing against `main` (issue #242).
+    // before reviewing (issue #242). Filter to the Step 0 baseRefName read
+    // specifically — a SEPARATE `gh pr view` also runs during worktree setup to
+    // validate the recorded branch (issue #456/#447 P2).
     const runner = stackedHappyRunner();
     await createReviewHandler(CONTEXT(), runner)(stackedTask());
-    const viewCalls = runner.calls.filter(c => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
+    const viewCalls = runner.calls.filter(c => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view' && c.args.includes('baseRefName'));
     expect(viewCalls).toHaveLength(1);
     expect(viewCalls[0].args).toContain('baseRefName');
     // The lookup must be scoped to the configured repo so a fork clone or a
@@ -473,7 +618,12 @@ describe('review handler — dependency-started PR (issue #242)', () => {
 
   test('blocks when the live PR base cannot be confirmed', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: 'pr not found', exitCode: 1 }, // gh pr view fails
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: 'pr not found', exitCode: 1 }, // gh pr view --json baseRefName (Step 0) — fails
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
     expect(result.result).toBe('blocked');
@@ -484,28 +634,182 @@ describe('review handler — dependency-started PR (issue #242)', () => {
     // Because the PR targets main, a conflict is a conflict against main, which
     // the conflict_resolution handler resolves by merging main into the PR branch.
     // The review returns `conflict` (routed to the resolver), not `blocked`
-    // (issue #242).
+    // (issue #242). The review worktree is freed before the conflict handoff
+    // (issue #456) so conflict_resolution can check out the branch.
     const runner = sequenceRunner([
-      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull
-      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName (Step 0)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git cat-file -e <sha>^{commit} (Step 3.4, issue #667)
+      { stdout: '', stderr: '', exitCode: 0 },              // git merge-base --is-ancestor <sha> HEAD (Step 3.4, issue #667)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (pre-verification diff classification, issue #506)
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
-      { stdout: '', stderr: '', exitCode: 0 },              // git diff main...HEAD (codex diff classification, issue #506)
       { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove --force --force <path> (free review worktree, issue #456)
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
     expect(result.result).toBe('conflict');
   });
 
-  test('does not fetch a base ref for a non-dependency PR', async () => {
+  test('does not query the live PR base or fetch a predecessor ref for a non-dependency PR', async () => {
+    // Step 0 (dependency-base live-check) and the Step 3.4 ancestry fallback fetch
+    // are dependency-specific; the worktree setup's OWN base-refresh fetch and
+    // branch-validation `gh pr view` (issue #456) still run for every review.
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const baseRefViewCalls = runner.calls.filter(c => c.cmd === 'gh' && c.args.includes('baseRefName'));
+    expect(baseRefViewCalls).toHaveLength(0);
     const fetchCalls = runner.calls.filter(c => c.cmd === 'git' && c.args[0] === 'fetch');
-    expect(fetchCalls).toHaveLength(0);
-    const viewCalls = runner.calls.filter(c => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'view');
-    expect(viewCalls).toHaveLength(0);
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0].args).toEqual(['fetch', 'origin', '+main:refs/remotes/origin/main']);
+  });
+
+  test('missing dependencyBase.baseHeadSha blocks before any git or gh call (issue #667)', async () => {
+    // Pre-#667 (or otherwise incomplete) dependency-start metadata carries no
+    // recorded predecessor SHA. There is no durable start point to reproduce, so
+    // the review must fail closed rather than silently fall back to a cumulative
+    // diff against the session base.
+    const legacyDepBase = {
+      baseIssueNumber: 50, basePrNumber: 88,
+      baseHeadRefName: 'ai/issue-50',
+      basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+    };
+    const task = makeTask({ context: { ...makeTask().context, dependencyBase: legacyDepBase } });
+    const runner = sequenceRunner([]);
+    const result = await createReviewHandler(CONTEXT(), runner)(task);
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/baseHeadSha/);
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  test('a recorded predecessor head that is not an ancestor of HEAD blocks instead of falling back to the session base (issue #667)', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName (Step 0)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git cat-file -e <sha>^{commit}
+      { stdout: '', stderr: '', exitCode: 1 },              // git merge-base --is-ancestor <sha> HEAD — NOT an ancestor
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    expect(result.result).toBe('blocked');
+    expect(result.message).toContain(BLOCKER_HEAD_SHA);
+    expect(runner.calls.find(c => c.cmd === 'codex')).toBeUndefined();
+  });
+
+  test('fetches the recorded predecessor branch as a fallback when the commit is not already present locally (issue #667)', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName (Step 0)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: 'fatal: not a valid object name', exitCode: 1 }, // git cat-file -e <sha>^{commit} — missing locally
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +ai/issue-50:refs/remotes/origin/ai/issue-50 — fallback
+      { stdout: '', stderr: '', exitCode: 0 },              // git merge-base --is-ancestor <sha> HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (pre-verification diff classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(stackedTask());
+    expect(result.result).toBe('success');
+    const fetchCalls = runner.calls.filter(c => c.cmd === 'git' && c.args[0] === 'fetch');
+    const fallbackFetch = fetchCalls.find(c => c.args.includes('+ai/issue-50:refs/remotes/origin/ai/issue-50'));
+    expect(fallbackFetch).toBeDefined();
+    expect(fallbackFetch.args).toEqual(['fetch', 'origin', '+ai/issue-50:refs/remotes/origin/ai/issue-50']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dependency review base — equivalent diff boundary across review agents
+// (issue #667)
+//
+// Codex resolves its diff internally via `--base`; Claude and Gemini instead
+// receive the diff text directly (in the prompt / stdin). All three must diff
+// against the SAME dependency review base, not just Codex.
+// ---------------------------------------------------------------------------
+
+describe('review handler — dependency review base across agents (issue #667)', () => {
+  const BLOCKER_HEAD_SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
+  const DEP_BASE = {
+    baseIssueNumber: 50, basePrNumber: 88,
+    baseHeadRefName: 'ai/issue-50',
+    basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+    baseHeadSha: BLOCKER_HEAD_SHA,
+  };
+  function stackedDepTask(overrides = {}) {
+    return makeTask({
+      context: { ...makeTask().context, dependencyBase: DEP_BASE },
+      ...overrides,
+    });
+  }
+
+  test('claude receives a diff against the recorded predecessor head, not the session base', async () => {
+    const session = SESSION({ defaults: { implementationAgent: 'claude', reviewAgent: 'claude', researchAgent: 'gemini' } });
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName (Step 0)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git cat-file -e <sha>^{commit} (Step 3.4)
+      { stdout: '', stderr: '', exitCode: 0 },              // git merge-base --is-ancestor <sha> HEAD (Step 3.4)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (pre-verification classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (full diff for prompt)
+      { stdout: 'No issues found.', stderr: '', exitCode: 0 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review cleanup)
+    ]);
+    const task = stackedDepTask({ reviewAgent: 'claude' });
+    const result = await createReviewHandler(CONTEXT({ session }), runner)(task);
+    expect(result.result).toBe('success');
+    const diffCalls = runner.calls.filter(c => c.cmd === 'git' && c.args[0] === 'diff');
+    expect(diffCalls.length).toBeGreaterThan(0);
+    for (const call of diffCalls) {
+      expect(call.args).toEqual(['diff', `${BLOCKER_HEAD_SHA}...HEAD`]);
+    }
+  });
+
+  test('gemini receives a diff against the recorded predecessor head, not the session base', async () => {
+    const session = SESSION({ defaults: { implementationAgent: 'claude', reviewAgent: 'gemini', researchAgent: 'gemini' } });
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName (Step 0)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git cat-file -e <sha>^{commit} (Step 3.4)
+      { stdout: '', stderr: '', exitCode: 0 },              // git merge-base --is-ancestor <sha> HEAD (Step 3.4)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (pre-verification classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (full diff for prompt)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // agy --print
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review cleanup)
+      { stdout: JSON.stringify({ mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }), stderr: '', exitCode: 0 }, // gh pr view (live mergeability)
+    ]);
+    const task = stackedDepTask({ reviewAgent: 'gemini' });
+    const result = await createReviewHandler(CONTEXT({ session }), runner)(task);
+    expect(result.result).toBe('success');
+    const diffCalls = runner.calls.filter(c => c.cmd === 'git' && c.args[0] === 'diff');
+    expect(diffCalls.length).toBeGreaterThan(0);
+    for (const call of diffCalls) {
+      expect(call.args).toEqual(['diff', `${BLOCKER_HEAD_SHA}...HEAD`]);
+    }
   });
 });
 
@@ -525,7 +829,7 @@ describe('review handler — requirement context in review input', () => {
       context: { ...makeTask().context, body: 'Acceptance criteria: throttle login to 5 attempts/min per IP.' },
     });
     await createReviewHandler(CONTEXT(), runner)(task);
-    const title = titleArgOf(runner.calls[6]);
+    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
     expect(title).toContain('## Issue Requirements');
     expect(title).toContain('Acceptance criteria: throttle login to 5 attempts/min per IP.');
   });
@@ -533,7 +837,7 @@ describe('review handler — requirement context in review input', () => {
   test('--title carries issue number, title, url, labels and PR url', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const title = titleArgOf(runner.calls[6]);
+    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
     expect(title).toContain('Issue #77: Add login rate limiting');
     expect(title).toContain('https://github.com/m2dw/test-repo/issues/77');
     expect(title).toContain('status:needs-review');
@@ -543,7 +847,7 @@ describe('review handler — requirement context in review input', () => {
   test('--title instructs the reviewer to check requirement fit and code quality', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const title = titleArgOf(runner.calls[6]);
+    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
     expect(title).toMatch(/Requirement fit/i);
     expect(title).toMatch(/acceptance criteri/i);
     expect(title).toMatch(/code quality/i);
@@ -552,7 +856,7 @@ describe('review handler — requirement context in review input', () => {
   test('--title lists passing verification results', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const title = titleArgOf(runner.calls[6]);
+    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
     expect(title).toContain('## Verification Results');
     expect(title).toContain('- test: passed');
   });
@@ -560,7 +864,7 @@ describe('review handler — requirement context in review input', () => {
   test('--title omits Issue Requirements heading when no body present', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const title = titleArgOf(runner.calls[6]);
+    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
     expect(title).not.toContain('## Issue Requirements');
   });
 
@@ -580,20 +884,22 @@ describe('review handler — requirement context in review input', () => {
     const hugeBody = 'B'.repeat(20_000);
     const task = makeTask({ context: { ...makeTask().context, body: hugeBody } });
     await createReviewHandler(CONTEXT(), runner)(task);
-    const title = titleArgOf(runner.calls[6]);
+    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
     expect(title).toContain('…(issue body truncated for review context)');
     expect(title.length).toBeLessThan(hugeBody.length);
   });
 
   test('a review finding that misses an acceptance criterion is treated as needs_fix', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: 'The implementation does not satisfy acceptance criterion: per-IP rate limiting is missing.', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'The implementation does not satisfy acceptance criterion: per-IP rate limiting is missing.', stderr: '', exitCode: 0 }, // codex review
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('needs_fix');
@@ -621,7 +927,12 @@ describe('review handler — failure cases', () => {
 
   test('returns blocked when working tree is dirty, with reviewFeedback in context', async () => {
     const runner = sequenceRunner([
-      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status — dirty
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status — dirty (Step 1 preflight)
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('blocked');
@@ -629,15 +940,12 @@ describe('review handler — failure cases', () => {
     expect(result.message).toMatch(/escalating to human/i);
     expect(result.context?.reviewFeedback).toMatch(/uncommitted/);
     expect(result.context?.reviewFeedback).toContain('src/foo.ts');
-    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls).toHaveLength(6);
   });
 
-  test('returns failed when gh pr checkout fails', async () => {
+  test('returns failed when the PR head cannot be resolved from prUrl (gh pr view fails)', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: 'not found', exitCode: 1 }, // gh pr checkout fails
+      { stdout: '', stderr: 'not found', exitCode: 1 }, // gh pr view (validate recorded branch) fails
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('failed');
@@ -645,20 +953,115 @@ describe('review handler — failure cases', () => {
   });
 
   test('returns failed when no prUrl and no branch in context', async () => {
-    const result = await createReviewHandler(CONTEXT(), happyRunner())(
+    const runner = happyRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(
       makeTask({ context: { title: 'T' } }),
     );
     expect(result.result).toBe('failed');
     expect(result.error).toMatch(/No PR URL or branch/);
+    // The review-admission preflight (issue #681) fires before any git/gh/agent call.
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  // issue #677: an unresolved implementation Tool Request handoff is authoritative
+  // over whatever queued this review run (a mistaken admin recover, a stale
+  // GitHub review label, etc.). This is a backstop — the normal entry points
+  // already refuse to move such a task into review — but the review handler
+  // must still refuse before touching the repo host, worktree, or agent.
+  test('refuses to run review when the task carries an unresolved Tool Request', async () => {
+    const runner = happyRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(
+      makeTask({
+        context: {
+          ...makeTask().context,
+          toolRequest: {
+            command: 'npm install left-pad',
+            displayCommand: 'npm install left-pad',
+            reason: 'needed for the fix',
+            expectedFiles: ['package.json'],
+            necessity: 'required',
+            requestedBy: 'claude',
+            mode: 'new',
+            requestedAt: '2026-06-07T00:00:00.000Z',
+            resolved: false,
+          },
+        },
+      }),
+    );
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/unresolved implementation Tool Request/i);
+    // No git/gh/agent call was made — the guard fires before any side effect.
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  test('an already-resolved Tool Request does not block review', async () => {
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(
+      makeTask({
+        context: {
+          ...makeTask().context,
+          toolRequest: {
+            command: 'npm install left-pad',
+            displayCommand: 'npm install left-pad',
+            reason: 'needed for the fix',
+            expectedFiles: ['package.json'],
+            necessity: 'required',
+            requestedBy: 'claude',
+            mode: 'new',
+            requestedAt: '2026-06-07T00:00:00.000Z',
+            resolved: true,
+            resolution: { action: 'manual-done', resolvedAt: '2026-06-07T00:05:00.000Z' },
+          },
+        },
+      }),
+    );
+    expect(result.result).not.toBe('failed');
+  });
+
+  // Coverage for a dependency-started task (continuation base is another issue's
+  // branch/PR, via context.dependencyBase) that also carries an unresolved Tool
+  // Request: the Tool Request guard must fire before the dependency-base live
+  // check, since neither the repo host nor any dependency metadata should be
+  // consulted while the handoff is still unresolved.
+  test('refuses a dependency-started task with an unresolved Tool Request before the dependency-base check', async () => {
+    const runner = happyRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(
+      makeTask({
+        context: {
+          ...makeTask().context,
+          dependencyBase: {
+            baseIssueNumber: 50, basePrNumber: 88,
+            baseHeadRefName: 'ai/issue-50',
+            basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+            baseHeadSha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+          },
+          toolRequest: {
+            command: 'npm install left-pad',
+            displayCommand: 'npm install left-pad',
+            reason: 'needed for the fix',
+            expectedFiles: ['package.json'],
+            necessity: 'required',
+            requestedBy: 'claude',
+            mode: 'new',
+            requestedAt: '2026-06-07T00:00:00.000Z',
+            resolved: false,
+          },
+        },
+      }),
+    );
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/unresolved implementation Tool Request/i);
+    expect(runner.calls).toHaveLength(0);
   });
 
   test('returns needs_fix when verification fails, with reviewFeedback in context', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification, issue #506)
       { stdout: '', stderr: '3 tests failed', exitCode: 1 }, // npm test fails
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
@@ -673,11 +1076,13 @@ describe('review handler — failure cases', () => {
   test('reviewFeedback from verification failure is bounded to 20000 chars', async () => {
     const largeVerOutput = 'Error: ' + 'y'.repeat(25_000);
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification, issue #506)
       { stdout: largeVerOutput, stderr: '', exitCode: 1 }, // npm test fails with large output
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
@@ -689,12 +1094,14 @@ describe('review handler — failure cases', () => {
 
   test('returns failed when codex review fails', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
       { stdout: '', stderr: 'codex: timeout', exitCode: 1 }, // codex fails
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
@@ -704,10 +1111,130 @@ describe('review handler — failure cases', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Review-admission preflight (issue #681)
+//
+// A single check gates entry into the handler before any side effect — repo-
+// host resolve, worktree lock/materialization, artifact writes, or the review
+// agent invocation. It requires durable evidence, computable from
+// `task.context` alone, that the task is actually ready for review: no
+// unresolved Tool Request (issue #677, covered above), a durable PR reference
+// with a resolvable head, and — for a dependency-started task — the
+// predecessor review-base metadata (issue #667, covered in the
+// "dependency-started PR" describe block below with its own
+// `missing dependencyBase.baseHeadSha` case). This block covers the
+// remaining PR-reference cases plus the "still reaches the handler
+// unchanged" happy path.
+// ---------------------------------------------------------------------------
+
+describe('review handler — review admission (issue #681)', () => {
+  test('fails before any side effect when the recorded PR reference cannot be resolved to a PR number and no branch is recorded', async () => {
+    const runner = happyRunner();
+    const task = makeTask({
+      context: { ...makeTask().context, prUrl: 'https://github.com/m2dw/test-repo/not-a-pr-link', branch: undefined },
+    });
+    const result = await createReviewHandler(CONTEXT(), runner)(task);
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/does not resolve to a PR number/);
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  test('a recorded branch is enough to admit review even when prUrl is absent', async () => {
+    const runner = happyRunner();
+    const task = makeTask({
+      context: { ...makeTask().context, prUrl: undefined, branch: 'ai/issue-77' },
+    });
+    const result = await createReviewHandler(CONTEXT(), runner)(task);
+    // Admission passes; the run proceeds into the handler's normal worktree-setup
+    // logic exactly as it did before issue #681 and completes the full sequence.
+    expect(result.result).toBe('success');
+    expect(runner.calls).toHaveLength(10);
+  });
+
+  test('a valid implementation-complete PR (prUrl + branch, no unresolved Tool Request) reaches the existing review handler unchanged', async () => {
+    const runner = happyRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('success');
+    // The full happy-path sequence (gh pr view, fetch, rev-parse, pull, rev-list,
+    // status, diff classification, verification, review agent, post-review status)
+    // still runs — admission did not short-circuit a valid task.
+    expect(runner.calls).toHaveLength(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Quota/rate-limit delay (issue #672 — applies the shared category/retry
+// policy to the review handler)
+// ---------------------------------------------------------------------------
+
+describe('review handler — quota delay (issue #672)', () => {
+  test('a rate-limit diagnostic from the review agent delays the retry with category metadata', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: '', stderr: 'Error: HTTP 429 too many requests', exitCode: 1 }, // codex — rate-limited
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+
+    expect(result.result).toBe('delayed');
+    expect(result.category).toBe('rate_limit');
+    expect(result.context.category).toBe('rate_limit');
+    expect(result.retryAfterMs).toBeLessThan(60 * 60 * 1000);
+    expect(result.message).toMatch(/rate limit/i);
+    expect(result.message).not.toMatch(/usage quota/i);
+  });
+
+  test('a usage-quota diagnostic gets the long reset-oriented delay and usage-quota wording', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: '', stderr: "You've hit your usage limit. Try again later.", exitCode: 1 }, // codex — usage quota
+    ]);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+
+    expect(result.result).toBe('delayed');
+    expect(result.category).toBe('usage_quota');
+    // usage_quota must NOT set a handler-level retryAfterMs override — doing so
+    // would bypass a caller's configured quotaRetryDelayMs at the runner (issue
+    // #672 review). The long, reset-oriented delay comes from the runner itself.
+    expect(result.retryAfterMs).toBeUndefined();
+    expect(result.message).toMatch(/usage quota/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Result and transition
 // ---------------------------------------------------------------------------
 
 describe('review handler — result classification', () => {
+  // Shared worktree-setup + preflight + pre-verification diff-classification
+  // preamble for tests in this block that only care about the review AGENT's
+  // output/classification, not the specific worktree-resolution mechanics.
+  // Followed by one verification-command result and then the review agent's
+  // canned output.
+  function codexPreamble() {
+    return [
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification diff classification, issue #506)
+    ];
+  }
+
   // happyRunner codex stdout: 'No P1/P2 findings.' -> classifies as success
   test('clean codex output -> result: success', async () => {
     const result = await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
@@ -728,13 +1255,9 @@ describe('review handler — result classification', () => {
 
   test('[P1] finding in codex output -> result: needs_fix with reviewFeedback in context', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: '[P1] Null pointer in auth handler', stderr: '', exitCode: 0 },
+      ...codexPreamble(),
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '[P1] Null pointer in auth handler', stderr: '', exitCode: 0 }, // codex review
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
     // needs_fix now returns result: "needs_fix" and captures review output
@@ -748,13 +1271,9 @@ describe('review handler — result classification', () => {
   test('reviewFeedback is bounded to 20000 chars when review output is very large', async () => {
     const largeOutput = '[P1] ' + 'x'.repeat(25_000);
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: largeOutput, stderr: '', exitCode: 0 },
+      ...codexPreamble(),
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: largeOutput, stderr: '', exitCode: 0 }, // codex review
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('needs_fix');
@@ -766,13 +1285,9 @@ describe('review handler — result classification', () => {
 
   test('needs_fix result includes reviewOutputPath', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: '[P2] Missing input validation', stderr: '', exitCode: 0 },
+      ...codexPreamble(),
+      { stdout: 'ok', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '[P2] Missing input validation', stderr: '', exitCode: 0 }, // codex review
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('needs_fix');
@@ -782,13 +1297,11 @@ describe('review handler — result classification', () => {
 
   test('real Git conflict output -> result: conflict (routes to conflict-resolution lane)', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+      ...codexPreamble(),
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove --force --force <path> (free review worktree, issue #456)
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
     // A real merge conflict routes to the conflict-resolution lane, not a human.
@@ -800,20 +1313,18 @@ describe('review handler — result classification', () => {
   test('conflict with staged/untracked residue resets+cleans before queuing resolver', async () => {
     // The review agent reports a conflict AND leaves staged + untracked residue.
     // The downstream conflict-resolution handler rejects any dirty worktree, so
-    // the cleanup must fully reset and clean before returning `conflict`.
+    // the cleanup must fully reset and clean before returning `conflict`. The
+    // review worktree is then freed before the conflict handoff (issue #456).
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },           // git status — clean (preflight)
-      { stdout: '', stderr: '', exitCode: 0 },           // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },           // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },           // gh pr checkout 99
+      ...codexPreamble(),
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
-      { stdout: '', stderr: '', exitCode: 0 },           // git diff main...HEAD (codex diff classification, issue #506)
       { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // codex review
       { stdout: 'A  staged.ts\n?? untracked.ts\n', stderr: '', exitCode: 0 }, // git status — dirty residue
       { stdout: 'diff --git a/staged.ts', stderr: '', exitCode: 0 }, // git diff HEAD
       { stdout: '', stderr: '', exitCode: 0 },           // git reset --hard HEAD
       { stdout: '', stderr: '', exitCode: 0 },           // git clean -fd
       { stdout: '', stderr: '', exitCode: 0 },           // git status — recheck (clean)
+      { stdout: '', stderr: '', exitCode: 0 },           // git worktree remove --force --force <path> (free review worktree, issue #456)
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('conflict');
@@ -825,12 +1336,8 @@ describe('review handler — result classification', () => {
 
   test('review output that merely discusses merge conflicts is reviewed normally (issue #168)', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      ...codexPreamble(),
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
       {
         stdout: [
           'review handler — result classification › merge conflict in codex output -> result: blocked',
@@ -851,12 +1358,8 @@ describe('review handler — result classification', () => {
 
   test('empty codex output -> result: blocked', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
+      ...codexPreamble(),
+      { stdout: 'ok', stderr: '', exitCode: 0 }, // npm test
       { stdout: '', stderr: '', exitCode: 0 }, // empty codex output
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
@@ -872,13 +1375,9 @@ describe('review handler — result classification', () => {
 
   test('[P2] finding persisted in review-result.json', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: '[P2] missing input validation', stderr: '', exitCode: 0 },
+      ...codexPreamble(),
+      { stdout: 'ok', stderr: '', exitCode: 0 }, // npm test
+      { stdout: '[P2] missing input validation', stderr: '', exitCode: 0 }, // codex review
     ]);
     await createReviewHandler(CONTEXT(), runner)(makeTask());
     const raw = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-result.json'), 'utf8');
@@ -902,7 +1401,10 @@ describe('review handler — phase transition', () => {
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 77, phase: 'review',
       reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T' },
+      // A recorded branch keeps this on the common (non-synthetic) worktree path,
+      // matching happyRunner()'s call sequence — matters only for the fixture, not
+      // for the phase-transition behavior this test actually pins down.
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', branch: 'ai/issue-77-run-impl-1', title: 'T' },
     });
 
     const outcome = await runNextPhase({
@@ -917,19 +1419,22 @@ describe('review handler — phase transition', () => {
 
   test('needs_fix review transitions task to queued implementation (auto-requeue)', async () => {
     const needsFixRunner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: '[P1] Critical security vulnerability in auth', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-78', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-78', stderr: '', exitCode: 0 },   // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: '[P1] Critical security vulnerability in auth', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
 
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 78, phase: 'review',
       reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', branch: 'ai/issue-78', title: 'T' },
     });
 
     const outcome = await runNextPhase({
@@ -949,19 +1454,22 @@ describe('review handler — phase transition', () => {
 
   test('task context preserves reviewFeedback for the next implementation run', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: '[P1] Null pointer dereference in login()', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 100, url: 'https://github.com/m2dw/test-repo/pull/100', headRefName: 'ai/issue-80', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-80', stderr: '', exitCode: 0 },   // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: '[P1] Null pointer dereference in login()', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
 
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 80, phase: 'review',
       reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/100', title: 'Fix login' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/100', branch: 'ai/issue-80', title: 'Fix login' },
     });
 
     await runNextPhase({
@@ -981,19 +1489,23 @@ describe('review handler — phase transition', () => {
 
   test('conflict review queues the conflict-resolution phase (resolver runs next, not a human)', async () => {
     const conflictRunner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-79', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-79', stderr: '', exitCode: 0 },   // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove --force --force <path> (free review worktree, issue #456)
     ]);
 
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 79, phase: 'review',
       reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', branch: 'ai/issue-79', title: 'T' },
     });
 
     const outcome = await runNextPhase({
@@ -1011,18 +1523,20 @@ describe('review handler — phase transition', () => {
 
   test('verification failure transitions task to queued implementation (auto-requeue)', async () => {
     const verFailRunner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: JSON.stringify({ number: 101, url: 'https://github.com/m2dw/test-repo/pull/101', headRefName: 'ai/issue-81', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-81', stderr: '', exitCode: 0 },   // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification, issue #506)
       { stdout: '', stderr: '5 tests failed\nAssertionError: expected true', exitCode: 1 }, // npm test fails
     ]);
 
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 81, phase: 'review',
       reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/101', title: 'Fix auth' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/101', branch: 'ai/issue-81', title: 'Fix auth' },
     });
 
     const outcome = await runNextPhase({
@@ -1044,10 +1558,7 @@ describe('review handler — phase transition', () => {
 
   test('failed review transitions task to failed status', async () => {
     const failRunner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: 'checkout error', exitCode: 1 }, // gh pr checkout fails
+      { stdout: '', stderr: 'checkout error', exitCode: 1 }, // gh pr view (resolve PR head to materialize the worktree) fails
     ]);
 
     await store.enqueueTask({
@@ -1076,23 +1587,29 @@ describe('review handler — phase transition', () => {
       baseIssueNumber: 50, basePrNumber: 88,
       baseHeadRefName: 'ai/issue-50',
       basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+      baseHeadSha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
     };
 
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 91, phase: 'review',
       reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/110', title: 'Dep', dependencyBase: DEP_BASE },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/110', branch: 'ai/issue-91', title: 'Dep', dependencyBase: DEP_BASE },
     });
 
     const runner = sequenceRunner([
-      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view (live-base check)
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 110, url: 'https://github.com/m2dw/test-repo/pull/110', headRefName: 'ai/issue-91', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-91', stderr: '', exitCode: 0 },   // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName (Step 0, live-base check)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git cat-file -e <sha>^{commit} (Step 3.4, issue #667)
+      { stdout: '', stderr: '', exitCode: 0 },              // git merge-base --is-ancestor <sha> HEAD (Step 3.4, issue #667)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (pre-verification diff classification, issue #506)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
 
     const outcome = await runNextPhase({
@@ -1116,23 +1633,29 @@ describe('review handler — phase transition', () => {
       baseIssueNumber: 50, basePrNumber: 88,
       baseHeadRefName: 'ai/issue-50',
       basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+      baseHeadSha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
     };
 
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 92, phase: 'review',
       reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/111', title: 'Dep guard', dependencyBase: DEP_BASE },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/111', branch: 'ai/issue-92', title: 'Dep guard', dependencyBase: DEP_BASE },
     });
 
     const runner = sequenceRunner([
-      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 111, url: 'https://github.com/m2dw/test-repo/pull/111', headRefName: 'ai/issue-92', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch, worktree setup)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-92', stderr: '', exitCode: 0 },   // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: JSON.stringify({ baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view --json baseRefName (Step 0, live-base check)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git cat-file -e <sha>^{commit} (Step 3.4, issue #667)
+      { stdout: '', stderr: '', exitCode: 0 },              // git merge-base --is-ancestor <sha> HEAD (Step 3.4, issue #667)
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff <sha>...HEAD (pre-verification diff classification, issue #506)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
 
     const outcome = await runNextPhase({
@@ -1143,8 +1666,9 @@ describe('review handler — phase transition', () => {
 
     expect(outcome.status).toBe('completed');
     expect(outcome.task.status).toBe('ready_for_human');
-    // Only two gh calls expected: gh pr view (live-base check) + gh pr checkout.
-    // Any extra call for blocker merge/ancestry proof would be caught above (failed review).
+    // Only two gh calls expected: gh pr view (validate recorded branch) + gh pr
+    // view (Step 0 live-base check). Any extra call for blocker merge/ancestry
+    // proof would be caught above (failed review, unconsumed sequence slot).
     const ghCalls = runner.calls.filter(c => c.cmd === 'gh');
     expect(ghCalls).toHaveLength(2);
   });
@@ -1157,13 +1681,16 @@ describe('review handler — phase transition', () => {
 describe('review handler — review loop cap', () => {
   function needsFixRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: '[P1] Critical bug in auth handler', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: '[P1] Critical bug in auth handler', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
   }
 
@@ -1173,28 +1700,28 @@ describe('review handler — review loop cap', () => {
     expect(result.context?.reviewCycles).toBe(1);
   });
 
-  test('fourth needs_fix (reviewCycles=3) sets escalatedEffort: "high" in context (maxCycles=5)', async () => {
-    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 3 } });
+  test('ninth needs_fix (reviewCycles=8) sets escalatedEffort: "high" in context (maxCycles=10)', async () => {
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 8 } });
     const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
     expect(result.result).toBe('needs_fix');
-    expect(result.context?.reviewCycles).toBe(4);
+    expect(result.context?.reviewCycles).toBe(9);
     expect(result.context?.escalatedEffort).toBe('high');
   });
 
-  test('fifth needs_fix (reviewCycles=4) hits cap, returns blocked with cap metadata (maxCycles=5)', async () => {
-    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+  test('tenth needs_fix (reviewCycles=9) hits cap, returns blocked with cap metadata (maxCycles=10)', async () => {
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 9 } });
     const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
     expect(result.result).toBe('blocked');
     expect(result.context?.reviewLoopCapReached).toBe(true);
-    expect(result.context?.reviewCycles).toBe(5);
-    expect(result.context?.reviewLoopMaxCycles).toBe(5);
+    expect(result.context?.reviewCycles).toBe(10);
+    expect(result.context?.reviewLoopMaxCycles).toBe(10);
   });
 
   test('cap-reached result message describes cycle count', async () => {
-    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 9 } });
     const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
     expect(result.result).toBe('blocked');
-    expect(result.message).toMatch(/5\/5/);
+    expect(result.message).toMatch(/10\/10/);
     expect(result.message).toMatch(/escalating to human/i);
   });
 
@@ -1225,7 +1752,7 @@ describe('review handler — review loop cap', () => {
   });
 
   test('cap-reached preserves reviewFeedback in context', async () => {
-    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 9 } });
     const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
     expect(result.result).toBe('blocked');
     expect(typeof result.context?.reviewFeedback).toBe('string');
@@ -1233,7 +1760,7 @@ describe('review handler — review loop cap', () => {
   });
 
   test('cap-reached carries diffClassification in blocked context (issue #506)', async () => {
-    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 9 } });
     const result = await createReviewHandler(CONTEXT(), needsFixRunner())(task);
     expect(result.result).toBe('blocked');
     expect(result.context?.reviewLoopCapReached).toBe(true);
@@ -1247,20 +1774,23 @@ describe('review handler — review loop cap', () => {
 describe('review handler — loop cap on verification failure', () => {
   function verFailRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification, issue #506)
       { stdout: '', stderr: '5 tests failed', exitCode: 1 }, // verification fails
     ]);
   }
 
   test('verification failure at cap returns blocked with cap metadata', async () => {
-    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 4 } });
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 9 } });
     const result = await createReviewHandler(CONTEXT(), verFailRunner())(task);
     expect(result.result).toBe('blocked');
     expect(result.context?.reviewLoopCapReached).toBe(true);
-    expect(result.context?.reviewCycles).toBe(5);
+    expect(result.context?.reviewCycles).toBe(10);
   });
 
   test('verification failure below cap returns needs_fix with incremented reviewCycles', async () => {
@@ -1283,19 +1813,22 @@ describe('review handler — phase transition with loop cap', () => {
 
   test('cap-reached blocked result transitions task to ready_for_human', async () => {
     const capRunner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff main...HEAD (codex diff classification, issue #506)
-      { stdout: '[P1] Still failing after retries', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 102, url: 'https://github.com/m2dw/test-repo/pull/102', headRefName: 'ai/issue-82', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-82', stderr: '', exitCode: 0 },   // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (codex diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: '[P1] Still failing after retries', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
 
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 82, phase: 'review',
       reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/102', title: 'Fix', reviewCycles: 4 },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/102', branch: 'ai/issue-82', title: 'Fix', reviewCycles: 9 },
     });
 
     const outcome = await runNextPhase({
@@ -1307,105 +1840,6 @@ describe('review handler — phase transition with loop cap', () => {
     expect(outcome.status).toBe('completed');
     expect(outcome.task).toMatchObject({ status: 'ready_for_human', phase: 'review' });
     expect(outcome.task.context?.reviewLoopCapReached).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// CLI — supported phase gating
-// ---------------------------------------------------------------------------
-
-describe('run-one-phase CLI — review gating', () => {
-  let sessionsPath;
-  let dbPath;
-
-  const SESSION_OBJ = {
-    sessionId: 'addon-dev',
-    repoKey: 'test-repo',
-    githubRepo: 'm2dw/test-repo',
-    artifactDir: '.n8n-artifacts',
-    defaults: { implementationAgent: 'claude', reviewAgent: 'codex', researchAgent: 'gemini' },
-    verification: { test: 'npm test' },
-    labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-  };
-
-  function runCli(...args) {
-    try {
-      const stdout = execFileSync(process.execPath, [CLI, ...args], {
-        encoding: 'utf8',
-        env: { ...process.env, PATH: `${join(tmpDir, 'bin')}:${process.env.PATH}` },
-      });
-      return { code: 0, stdout };
-    } catch (err) {
-      return { code: err.status ?? 1, stdout: err.stdout ?? '' };
-    }
-  }
-
-  beforeEach(() => {
-    sessionsPath = join(tmpDir, 'sessions.json');
-    dbPath = join(tmpDir, 'cli.db');
-    const binDir = join(tmpDir, 'bin');
-    mkdirSync(binDir, { recursive: true });
-
-    // Fake git: clean status, succeeds on all subcommands
-    writeFileSync(join(binDir, 'git'), '#!/bin/sh\nexit 0\n', 'utf8');
-    chmodSync(join(binDir, 'git'), 0o755);
-
-    // Fake gh: succeeds (pr checkout + any other gh calls)
-    writeFileSync(join(binDir, 'gh'), '#!/bin/sh\nexit 0\n', 'utf8');
-    chmodSync(join(binDir, 'gh'), 0o755);
-
-    // Fake npm: succeeds (verification)
-    writeFileSync(join(binDir, 'npm'), '#!/bin/sh\necho "ok"\nexit 0\n', 'utf8');
-    chmodSync(join(binDir, 'npm'), 0o755);
-
-    // Fake codex: succeeds
-    writeFileSync(join(binDir, 'codex'), '#!/bin/sh\necho "No findings."\nexit 0\n', 'utf8');
-    chmodSync(join(binDir, 'codex'), 0o755);
-
-    const session = { ...SESSION_OBJ, repoRoot, artifactDir: '.n8n-artifacts' };
-    writeFileSync(sessionsPath, JSON.stringify({ sessions: [session] }), 'utf8');
-  });
-
-  test('review task stays queued with default --supported-phases (research only)', async () => {
-    const store = new SqliteTaskStore(dbPath);
-    await store.enqueueTask({
-      sessionId: 'addon-dev', issueNumber: 77, phase: 'review',
-      now: '2026-06-07T00:00:00.000Z',
-    });
-    store.close();
-
-    const r = runCli('--session-id', 'addon-dev', '--run-id', 'r1', '--sessions-path', sessionsPath, '--db-path', dbPath);
-    expect(r.code).toBe(0);
-    expect(JSON.parse(r.stdout.trim())).toMatchObject({ ok: true, outcome: 'idle' });
-
-    const store2 = new SqliteTaskStore(dbPath);
-    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 77 });
-    store2.close();
-    expect(task?.status).toBe('queued');
-  });
-
-  test('review task processed with --supported-phases review, transitions to ready_for_human', async () => {
-    const store = new SqliteTaskStore(dbPath);
-    await store.enqueueTask({
-      sessionId: 'addon-dev', issueNumber: 77, phase: 'review',
-      reviewAgent: 'codex', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/99', title: 'T', labels: [] },
-    });
-    store.close();
-
-    const r = runCli(
-      '--session-id', 'addon-dev', '--run-id', 'r2',
-      '--sessions-path', sessionsPath, '--db-path', dbPath,
-      '--supported-phases', 'review',
-    );
-    expect(r.code).toBe(0);
-    const out = JSON.parse(r.stdout.trim());
-    expect(out).toMatchObject({ ok: true, outcome: 'completed', task: { issueNumber: 77 } });
-
-    const store2 = new SqliteTaskStore(dbPath);
-    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 77 });
-    store2.close();
-    expect(task).toMatchObject({ status: 'ready_for_human', phase: 'review' });
   });
 });
 
@@ -1440,18 +1874,24 @@ describe('review handler — resolved profile metadata', () => {
     expect(argvStr).not.toContain('Review Instructions');
   });
 
-  test('review-context.json resolvedProfile is written before agent runs (available on early failures)', async () => {
-    // Fail on gh pr checkout (step 3) — before codex runs — and verify context still has profile
+  test('resolvedProfile is available on an early worktree-setup failure even though review-context.json is not written yet', async () => {
+    // Fail on the very first worktree-setup call (gh pr view, resolving the PR
+    // head) — before the worktree materializes and before codex runs. The
+    // artifact dir (and review-context.json inside it) is now created AFTER
+    // worktree materialization (issue #729 review, P1 — mirrors the
+    // implementation handler's issue #732 fix), so an early failure like this
+    // one must mark the artifact dir pending rather than pre-create it: doing
+    // so eagerly would leave a non-empty directory at the worktree's future
+    // path and make `git worktree add` refuse to materialize it on retry. The
+    // resolvedProfile is still surfaced via the returned context, not the file.
     const earlyFailRunner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },  // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },  // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },  // git pull --ff-only
-      { stdout: '', stderr: 'no such pr', exitCode: 1 }, // gh pr checkout — fails
+      { stdout: '', stderr: 'no such pr', exitCode: 1 }, // gh pr view — fails
     ]);
-    await createReviewHandler(CONTEXT(), earlyFailRunner)(makeTask());
-    expect(existsSync(join(dir(), 'review-context.json'))).toBe(true);
-    const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
-    expect(ctx.resolvedProfile).toMatchObject({ phase: 'review', agentId: 'codex' });
+    const result = await createReviewHandler(CONTEXT(), earlyFailRunner)(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.context?.artifactDirPending).toBe(true);
+    expect(existsSync(join(dir(), 'review-context.json'))).toBe(false);
+    expect(result.context?.resolvedProfile).toMatchObject({ phase: 'review', agentId: 'codex' });
   });
 
   test('resolvedProfile includes reviewStrength and reviewStrengthSource', async () => {
@@ -1507,15 +1947,20 @@ describe('review handler — resolved profile metadata', () => {
 // ---------------------------------------------------------------------------
 
 describe('review handler — review strength Codex CLI args', () => {
-  // codex call is always at index 6 in the happy-path runner sequence (index 5 is the new git diff for diff classification, issue #506)
-  const CODEX_IDX = 6;
+  // codex call is always at index 8 in the worktree-only happy-path runner
+  // sequence: gh-pr-view(0) fetch(1) rev-parse(2) pull(3) rev-list(4)
+  // status(5) diff-classification(6) npm-test(7) codex(8).
+  const CODEX_IDX = 8;
 
-  test('no review or complexity label -> codex args do not include -c model_reasoning_effort', async () => {
+  // Issue #609: every review now passes an explicit model_reasoning_effort,
+  // independent of the operator's global Codex CLI config. No label -> high,
+  // mirroring Claude's own review default (resolveClaudeReviewProfile).
+  test('no review or complexity label -> codex receives -c model_reasoning_effort=high (deterministic default)', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
     const codexCall = runner.calls[CODEX_IDX];
-    expect(codexCall.args).not.toContain('-c');
-    expect(codexCall.args.join(' ')).not.toContain('model_reasoning_effort');
+    expect(codexCall.args).toContain('-c');
+    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=high');
   });
 
   test('complexity:high label -> codex receives -c model_reasoning_effort=high', async () => {
@@ -1556,20 +2001,22 @@ describe('review handler — review strength Codex CLI args', () => {
     expect(argStr).toContain('model_reasoning_effort=low');
   });
 
-  test('review:medium label -> codex args do not include -c model_reasoning_effort', async () => {
+  // Issue #609: review:medium now always requests an explicit medium effort
+  // instead of silently falling through to the CLI's own global default.
+  test('review:medium label -> codex receives -c model_reasoning_effort=medium', async () => {
     const runner = happyRunner();
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:medium'] } });
     await createReviewHandler(CONTEXT(), runner)(task);
     const codexCall = runner.calls[CODEX_IDX];
-    expect(codexCall.args.join(' ')).not.toContain('model_reasoning_effort');
+    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=medium');
   });
 
-  test('review:medium + complexity:high -> no model_reasoning_effort flag (label beats complexity)', async () => {
+  test('review:medium + complexity:high -> model_reasoning_effort=medium (label beats complexity)', async () => {
     const runner = happyRunner();
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:medium', 'complexity:high'] } });
     await createReviewHandler(CONTEXT(), runner)(task);
     const codexCall = runner.calls[CODEX_IDX];
-    expect(codexCall.args.join(' ')).not.toContain('model_reasoning_effort');
+    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=medium');
   });
 
   test('review:low + complexity:high -> model_reasoning_effort=low (explicit label overrides complexity)', async () => {
@@ -1591,12 +2038,16 @@ describe('review handler — review strength Codex CLI args', () => {
     expect(argStr).not.toContain('model_reasoning_effort=xhigh');
   });
 
-  test('review:xhigh alone -> codex args do not include model_reasoning_effort (unsupported, not mapped to high)', async () => {
+  // review:xhigh alone is still not a recognized review label (unsupported —
+  // Codex has no xhigh tier), so it falls through to the no-label default —
+  // which issue #609 now resolves explicitly to `high` rather than omitting
+  // the flag.
+  test('review:xhigh alone -> falls through to the no-label default: model_reasoning_effort=high', async () => {
     const runner = happyRunner();
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:xhigh'] } });
     await createReviewHandler(CONTEXT(), runner)(task);
     const codexCall = runner.calls[CODEX_IDX];
-    expect(codexCall.args.join(' ')).not.toContain('model_reasoning_effort');
+    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=high');
   });
 });
 
@@ -1605,19 +2056,23 @@ describe('review handler — review strength Codex CLI args', () => {
 // ---------------------------------------------------------------------------
 
 describe('review handler — Claude review agent', () => {
-  // Happy-path sequence for Claude review (two extra steps vs Codex: pre-diff + full diff).
-  // Call order: status(0) checkout-main(1) pull(2) gh-pr-checkout(3)
-  //             pre-diff(4) npm-test(5) git-diff(6) claude-review(7)
+  // Happy-path sequence for worktree-only Claude review (issue #456/#699).
+  // Call order: gh-pr-view(0) fetch(1) rev-parse(2) pull(3) rev-list(4)
+  //             status-preflight(5) diff-classification(6) npm-test(7)
+  //             git-diff-for-prompt(8) claude-review(9) status-post-review(10)
   function claudeHappyRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
       { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout 99
-      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff main...HEAD (pre-verification, issue #506)
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff origin/main...HEAD (pre-verification diff classification, issue #506)
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
-      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff main...HEAD (full diff for prompt)
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff origin/main...HEAD (full diff for prompt)
       { stdout: 'No blocking issues found. Implementation looks correct.', stderr: '', exitCode: 0 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
   }
 
@@ -1640,7 +2095,7 @@ describe('review handler — Claude review agent', () => {
   test('Claude review invokes claude command with -p flag, not codex', async () => {
     const runner = claudeHappyRunner();
     await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
-    const claudeCall = runner.calls[7];
+    const claudeCall = runner.calls.find((c) => c.cmd === 'claude');
     expect(claudeCall.cmd).toBe('claude');
     expect(claudeCall.args).toContain('-p');
     expect(claudeCall.args).not.toContain('review'); // not the Codex review subcommand
@@ -1649,17 +2104,21 @@ describe('review handler — Claude review agent', () => {
   test('Claude review fetches the PR diff via git diff before invoking claude', async () => {
     const runner = claudeHappyRunner();
     await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
-    const diffCall = runner.calls[6];
-    expect(diffCall.cmd).toBe('git');
-    expect(diffCall.args).toContain('diff');
-    // Three-dot notation: diff from merge-base of reviewBase..HEAD to HEAD
-    expect(diffCall.args.join(' ')).toContain('main...HEAD');
+    // Two `git diff` calls run for Claude: the pre-verification diff-classification
+    // read (issue #506) and the full-diff read for the prompt. Both target the
+    // same reviewBase...HEAD range.
+    const diffCalls = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'diff');
+    expect(diffCalls.length).toBeGreaterThan(0);
+    for (const diffCall of diffCalls) {
+      // Three-dot notation: diff from merge-base of reviewBase..HEAD to HEAD
+      expect(diffCall.args.join(' ')).toContain('main...HEAD');
+    }
   });
 
   test('Claude review passes review brief and diff via stdin', async () => {
     const runner = claudeHappyRunner();
     await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
-    const claudeCall = runner.calls[7];
+    const claudeCall = runner.calls.find((c) => c.cmd === 'claude');
     expect(typeof claudeCall.opts.stdin).toBe('string');
     expect(claudeCall.opts.stdin).toContain('## PR Diff');
     expect(claudeCall.opts.stdin).toContain('diff --git');
@@ -1668,7 +2127,7 @@ describe('review handler — Claude review agent', () => {
   test('Claude review stdin includes review instructions from the review brief', async () => {
     const runner = claudeHappyRunner();
     await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
-    const claudeCall = runner.calls[7];
+    const claudeCall = runner.calls.find((c) => c.cmd === 'claude');
     expect(claudeCall.opts.stdin).toContain('Review Instructions');
     expect(claudeCall.opts.stdin).toContain('Requirement fit');
     expect(claudeCall.opts.stdin).toContain('acceptance criteri');
@@ -1678,21 +2137,24 @@ describe('review handler — Claude review agent', () => {
     const runner = claudeHappyRunner();
     const task = makeClaudeTask({ context: { ...makeTask().context, body: 'Must support token refresh.' } });
     await createReviewHandler(claudeContext(), runner)(task);
-    const claudeCall = runner.calls[7];
+    const claudeCall = runner.calls.find((c) => c.cmd === 'claude');
     expect(claudeCall.opts.stdin).toContain('## Issue Requirements');
     expect(claudeCall.opts.stdin).toContain('Must support token refresh.');
   });
 
   test('[P1] finding in Claude output -> result: needs_fix with reviewFeedback', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 },
-      { stdout: '[P1] Null pointer dereference in handler', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: '[P1] Null pointer dereference in handler', stderr: '', exitCode: 0 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
     const result = await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
     expect(result.result).toBe('needs_fix');
@@ -1702,14 +2164,18 @@ describe('review handler — Claude review agent', () => {
 
   test('conflict signal in Claude output -> result: conflict', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 },
-      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove --force --force <path> (free review worktree, issue #456)
     ]);
     const result = await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
     expect(result.result).toBe('conflict');
@@ -1718,14 +2184,16 @@ describe('review handler — Claude review agent', () => {
 
   test('Claude execution failure -> result: failed', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: 'claude: api error', exitCode: 1 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: '', stderr: 'claude: api error', exitCode: 1 }, // claude -p fails
     ]);
     const result = await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
     expect(result.result).toBe('failed');
@@ -1809,14 +2277,17 @@ describe('review handler — Claude review agent', () => {
 
   test('empty Claude output -> result: blocked', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src/foo.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
       { stdout: '', stderr: '', exitCode: 0 }, // empty output
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
     const result = await createReviewHandler(claudeContext(), runner)(makeClaudeTask());
     expect(result.result).toBe('blocked');
@@ -1849,18 +2320,21 @@ describe('review handler — Claude review phase transitions', () => {
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 200, phase: 'review',
       reviewAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/200', title: 'T' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/200', branch: 'ai/issue-200', title: 'T' },
     });
 
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 },
-      { stdout: 'No blocking issues. Looks good.', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 200, url: 'https://github.com/m2dw/test-repo/pull/200', headRefName: 'ai/issue-200', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-200', stderr: '', exitCode: 0 },  // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: 'No blocking issues. Looks good.', stderr: '', exitCode: 0 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
 
     const outcome = await runNextPhase({
@@ -1878,18 +2352,21 @@ describe('review handler — Claude review phase transitions', () => {
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 201, phase: 'review',
       reviewAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/201', title: 'T' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/201', branch: 'ai/issue-201', title: 'T' },
     });
 
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 },
-      { stdout: '[P1] Critical bug in authentication handler', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 201, url: 'https://github.com/m2dw/test-repo/pull/201', headRefName: 'ai/issue-201', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-201', stderr: '', exitCode: 0 },  // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: '[P1] Critical bug in authentication handler', stderr: '', exitCode: 0 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
 
     const outcome = await runNextPhase({
@@ -1909,18 +2386,22 @@ describe('review handler — Claude review phase transitions', () => {
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 202, phase: 'review',
       reviewAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/202', title: 'T' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/202', branch: 'ai/issue-202', title: 'T' },
     });
 
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 },
-      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 202, url: 'https://github.com/m2dw/test-repo/pull/202', headRefName: 'ai/issue-202', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-202', stderr: '', exitCode: 0 },  // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove --force --force <path> (free review worktree, issue #456)
     ]);
 
     const outcome = await runNextPhase({
@@ -1938,18 +2419,20 @@ describe('review handler — Claude review phase transitions', () => {
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 203, phase: 'review',
       reviewAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/203', title: 'T' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/203', branch: 'ai/issue-203', title: 'T' },
     });
 
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: 'claude: api error 503', exitCode: 1 },
+      { stdout: JSON.stringify({ number: 203, url: 'https://github.com/m2dw/test-repo/pull/203', headRefName: 'ai/issue-203', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-203', stderr: '', exitCode: 0 },  // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: '', stderr: 'claude: api error 503', exitCode: 1 }, // claude -p fails
     ]);
 
     const outcome = await runNextPhase({
@@ -1970,16 +2453,18 @@ describe('review handler — Claude review phase transitions', () => {
 
 function geminiHappyRunner() {
   return sequenceRunner([
-    { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-    { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+    { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+    { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+    { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
     { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-    { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
-    { stdout: 'diff --git a/src/auth.ts b/src/auth.ts\n-old\n+new', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+    { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+    { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+    { stdout: 'diff --git a/src/auth.ts b/src/auth.ts\n-old\n+new', stderr: '', exitCode: 0 }, // git diff origin/main...HEAD (pre-verification diff classification, issue #506)
     { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // verification
-    { stdout: 'diff --git a/src/auth.ts b/src/auth.ts\n-old\n+new', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+    { stdout: 'diff --git a/src/auth.ts b/src/auth.ts\n-old\n+new', stderr: '', exitCode: 0 }, // git diff origin/main...HEAD (full diff for prompt)
     { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // agy --print
-    { stdout: '', stderr: '', exitCode: 0 },              // post-review git status
-    { stdout: JSON.stringify({ mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }), stderr: '', exitCode: 0 }, // gh pr view
+    { stdout: '', stderr: '', exitCode: 0 },              // post-review git status --porcelain — clean
+    { stdout: JSON.stringify({ mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }), stderr: '', exitCode: 0 }, // gh pr view (live mergeability)
   ]);
 }
 
@@ -2005,7 +2490,11 @@ function geminiContext(overrides = {}) {
 }
 
 describe('review handler — Gemini/Antigravity review agent', () => {
-  const AGY_IDX = 7;
+  // agy call is at index 9 in the worktree-only happy-path runner sequence:
+  // gh-pr-view(0) fetch(1) rev-parse(2) pull(3) rev-list(4) status(5)
+  // diff-classification(6) npm-test(7) diff-full-for-prompt(8) agy(9)
+  // post-review-status(10) gh-pr-view-mergeability(11).
+  const AGY_IDX = 9;
 
   beforeEach(() => { delete process.env.ANTIGRAVITY_BIN; });
   afterEach(() => { delete process.env.ANTIGRAVITY_BIN; });
@@ -2041,15 +2530,17 @@ describe('review handler — Gemini/Antigravity review agent', () => {
 
   test('Gemini [P1] finding -> needs_fix with reviewFeedback', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 },
-      { stdout: '[P1] Missing input validation', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: '[P1] Missing input validation', stderr: '', exitCode: 0 }, // agy --print
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
     const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
     expect(result.result).toBe('needs_fix');
@@ -2058,15 +2549,18 @@ describe('review handler — Gemini/Antigravity review agent', () => {
 
   test('Gemini conflict signal -> conflict', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 },
-      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: 'CONFLICT (content): Merge conflict in src/auth.ts', stderr: '', exitCode: 0 }, // agy --print
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove --force --force <path> (free review worktree, issue #456)
     ]);
     const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
     expect(result.result).toBe('conflict');
@@ -2074,15 +2568,17 @@ describe('review handler — Gemini/Antigravity review agent', () => {
 
   test('Gemini nonzero exit -> failed with agent output', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: 'agy: auth error', exitCode: 1 },
-      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: '', stderr: 'agy: auth error', exitCode: 1 }, // agy --print fails
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
     const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
     expect(result.result).toBe('failed');
@@ -2091,16 +2587,19 @@ describe('review handler — Gemini/Antigravity review agent', () => {
 
   test('Gemini success with dirty merge state routes to conflict resolution', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
-      { stdout: 'ok', stderr: '', exitCode: 0 },
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 },
-      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: JSON.stringify({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), stderr: '', exitCode: 0 },
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
+      { stdout: 'ok', stderr: '', exitCode: 0 },            // npm test
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // agy --print
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      { stdout: JSON.stringify({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), stderr: '', exitCode: 0 }, // gh pr view (live mergeability)
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove --force --force <path> (free review worktree, issue #456)
     ]);
     const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
     expect(result.result).toBe('conflict');
@@ -2111,16 +2610,18 @@ describe('review handler — Gemini/Antigravity review agent', () => {
   // block for a human rather than fall through to success.
   function geminiRunnerWithMergeCheck(mergeCheck) {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
       { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
-      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification, issue #506)
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (pre-verification diff classification, issue #506)
       { stdout: 'ok', stderr: '', exitCode: 0 },            // verification
       { stdout: 'diff --git a/src/auth.ts', stderr: '', exitCode: 0 }, // git diff (full diff for prompt)
       { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // agy --print
-      { stdout: '', stderr: '', exitCode: 0 },              // post-review git status
-      mergeCheck,                                           // gh pr view
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      mergeCheck,                                           // gh pr view (live mergeability)
     ]);
   }
 
@@ -2155,23 +2656,29 @@ describe('review handler — Gemini/Antigravity review agent', () => {
     // mergeability guards above, this returns before the gh pr view call.)
     const hugeDiff = 'diff --git a/src/big.ts b/src/big.ts\n' + '+x\n'.repeat(30_000); // > 50k chars
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
       { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },              // gh pr checkout
-      { stdout: hugeDiff, stderr: '', exitCode: 0 },        // git diff (pre-verification, issue #506)
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: hugeDiff, stderr: '', exitCode: 0 },        // git diff (pre-verification diff classification, issue #506)
       { stdout: 'ok', stderr: '', exitCode: 0 },            // verification
       { stdout: hugeDiff, stderr: '', exitCode: 0 },        // git diff (oversized, for prompt)
       { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // agy --print (clean)
-      { stdout: '', stderr: '', exitCode: 0 },              // post-review git status
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
     ]);
     const result = await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
     expect(result.result).toBe('blocked');
     expect(result.message).toMatch(/truncated before review/);
     // The agent must have been given the truncation marker, and the merge check
-    // must NOT have run (we block before it).
+    // must NOT have run (we block before it). The Step 0 branch-validation `gh
+    // pr view` (call 0) is unrelated and still runs to resolve the review
+    // worktree; only the live-mergeability query (`--json mergeable,...`) is
+    // gated on the truncation check, so assert on its distinctive args rather
+    // than any `gh ... view` call.
     expect(runner.calls[AGY_IDX].args[1]).toContain('…(diff truncated)');
-    expect(runner.calls.some((c) => c.cmd === 'gh' && (c.args || []).includes('view'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'gh' && (c.args || []).includes('mergeable,mergeStateStatus'))).toBe(false);
   });
 
   test('Gemini pass transitions to ready_for_human', async () => {
@@ -2179,7 +2686,7 @@ describe('review handler — Gemini/Antigravity review agent', () => {
     await store.enqueueTask({
       sessionId: 'addon-dev', issueNumber: 200, phase: 'review',
       reviewAgent: 'gemini', now: '2026-06-07T00:00:00.000Z',
-      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/200', title: 'Gemini test' },
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/200', branch: 'ai/issue-77-run-impl-1', title: 'Gemini test' },
     });
 
     const outcome = await runNextPhase({
@@ -2199,7 +2706,10 @@ describe('review handler — Gemini/Antigravity review agent', () => {
 // ---------------------------------------------------------------------------
 
 describe('review handler — codex context-mode', () => {
-  const REVIEW_IDX = 6; // status(0) checkout(1) pull(2) gh-checkout(3) verify(4) git-diff(5) codex(6)
+  // codex call is at index 8 in the worktree-only happy-path runner sequence:
+  // gh-pr-view(0) fetch(1) rev-parse(2) pull(3) rev-list(4) status(5)
+  // diff-classification(6) npm-test(7) codex(8).
+  const REVIEW_IDX = 8;
 
   function readReviewProfile() {
     const raw = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8');
@@ -2304,6 +2814,91 @@ describe('review handler — codex context-mode', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Codex model selection (issue #609)
+// ---------------------------------------------------------------------------
+
+describe('review handler — codex model selection', () => {
+  // codex call is at index 8 in the worktree-only happy-path runner sequence:
+  // gh-pr-view(0) fetch(1) rev-parse(2) pull(3) rev-list(4) status(5)
+  // diff-classification(6) npm-test(7) codex(8).
+  const REVIEW_IDX = 8;
+
+  function readReviewProfile() {
+    const raw = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-context.json'), 'utf8');
+    return JSON.parse(raw).resolvedProfile;
+  }
+
+  test('no session.codex.model or CODEX_MODEL: no --model flag, compatibility mode metadata', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const { args } = runner.calls[REVIEW_IDX];
+    expect(args).not.toContain('--model');
+    const profile = readReviewProfile();
+    expect(profile).toMatchObject({ model: 'cli-default', modelSource: 'cli-default' });
+  });
+
+  test('session.codex.model: --model precedes the review subcommand, metadata records session-config', async () => {
+    const session = SESSION({ codex: { model: 'gpt-5-codex' } });
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+    const { args } = runner.calls[REVIEW_IDX];
+    const mIdx = args.indexOf('--model');
+    const reviewIdx = args.indexOf('review');
+    expect(mIdx).toBeGreaterThanOrEqual(0);
+    expect(args[mIdx + 1]).toBe('gpt-5-codex');
+    expect(mIdx).toBeLessThan(reviewIdx);
+    const profile = readReviewProfile();
+    expect(profile).toMatchObject({ model: 'gpt-5-codex', modelSource: 'session-config' });
+  });
+
+  test('CODEX_MODEL env var overrides session.codex.model', async () => {
+    process.env['CODEX_MODEL'] = 'o1-preview';
+    const session = SESSION({ codex: { model: 'gpt-5-codex' } });
+    const runner = happyRunner();
+    try {
+      await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
+    } finally {
+      delete process.env['CODEX_MODEL'];
+    }
+    const { args } = runner.calls[REVIEW_IDX];
+    const mIdx = args.indexOf('--model');
+    expect(args[mIdx + 1]).toBe('o1-preview');
+    const profile = readReviewProfile();
+    expect(profile).toMatchObject({ model: 'o1-preview', modelSource: 'env' });
+  });
+
+  test('CODEX_EFFORT env var overrides review-strength-derived effort', async () => {
+    process.env['CODEX_EFFORT'] = 'low';
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:high'] } });
+    const runner = happyRunner();
+    try {
+      await createReviewHandler(CONTEXT(), runner)(task);
+    } finally {
+      delete process.env['CODEX_EFFORT'];
+    }
+    const { args } = runner.calls[REVIEW_IDX];
+    expect(args.join(' ')).toContain('model_reasoning_effort=low');
+    const profile = readReviewProfile();
+    expect(profile).toMatchObject({ effort: 'low', effortSource: 'env' });
+  });
+
+  test('resolvedProfile records explicit effort/effortSource for the no-label default', async () => {
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(makeTask());
+    const profile = readReviewProfile();
+    expect(profile).toMatchObject({ effort: 'high', effortSource: 'default' });
+  });
+
+  test('resolvedProfile records explicit effort/effortSource for review:medium', async () => {
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:medium'] } });
+    const runner = happyRunner();
+    await createReviewHandler(CONTEXT(), runner)(task);
+    const profile = readReviewProfile();
+    expect(profile).toMatchObject({ effort: 'medium', effortSource: 'label' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Per-issue worktree review (issue #456)
 // ---------------------------------------------------------------------------
 
@@ -2375,7 +2970,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2430,7 +3025,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
       ok: true, locked: false, reason: 'lock_held',
       ownerContextId: 'other-run', ownerStartedAt: '2026-06-30T00:00:00.000Z',
     });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2458,7 +3053,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath(), { ok: false, error: 'diverged from origin' });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2487,7 +3082,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2512,7 +3107,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2546,7 +3141,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2575,7 +3170,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2607,7 +3202,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2636,7 +3231,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath(), { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2668,7 +3263,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -2721,7 +3316,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -2773,7 +3368,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -2822,7 +3417,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -2867,7 +3462,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -2911,7 +3506,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -2934,7 +3529,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -2976,7 +3571,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -3026,7 +3621,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -3080,7 +3675,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -3128,7 +3723,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -3164,7 +3759,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3198,7 +3793,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3221,7 +3816,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3244,7 +3839,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3283,7 +3878,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -3321,15 +3916,17 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     expect(result.context?.prUrl).toBe('https://github.com/m2dw/test-repo/pull/99');
   });
 
-  // P2: a GitHub worktree review with NEITHER prUrl NOR branch must fail closed with the
-  // same `No PR URL or branch` error the canonical `gh` path raises — not fall back to
-  // materializing `ai/issue-<n>` by convention (which would promote a task to
-  // `ready_for_human` with no PR to hand off). The lock is still released.
+  // issue #681: a GitHub worktree review with NEITHER prUrl NOR branch must fail closed
+  // with the same `No PR URL or branch` error the canonical `gh` path raises — not fall
+  // back to materializing `ai/issue-<n>` by convention (which would promote a task to
+  // `ready_for_human` with no PR to hand off). The review-admission preflight now catches
+  // this before the worktree lock is even acquired, so neither the lock nor the resolver
+  // is ever touched.
   test('fails closed (no PR selector) without materializing the convention branch on GitHub', async () => {
     const runner = sequenceRunner([]);
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -3345,12 +3942,12 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
 
     expect(result.result).toBe('failed');
     expect(result.error).toMatch(/No PR URL or branch/);
-    // No branch was materialized and no git/agent ran; the lock acquired by the worktree
-    // path is still released.
+    // The review-admission preflight (issue #681) fires before the worktree lock is
+    // acquired, before the resolver runs, and before any git/agent call.
     expect(resolver.calls).toHaveLength(0);
     expect(runner.calls).toHaveLength(0);
-    expect(lock.calls.acquire).toHaveLength(1);
-    expect(lock.calls.release).toHaveLength(1);
+    expect(lock.calls.acquire).toHaveLength(0);
+    expect(lock.calls.release).toHaveLength(0);
   });
 
   // P2 (issue #447): a NON-GitHub (e.g. Gitea) worktree review of a FORKED
@@ -3368,7 +3965,6 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
     const session = SESSION({
-      worktrees: { enabled: true },
       // A Gitea repo host: no `gh` runner is resolved, so the synthetic PR-ref path never
       // applies and the head-branch convention would otherwise adopt the fork `headRefName`.
       repoHostProvider: {
@@ -3442,7 +4038,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeConflictRunner();
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3472,7 +4068,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeConflictRunner({ stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 });
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3485,6 +4081,40 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     expect(result.message).toContain('conflict_resolution');
     // The removal was still attempted, and the lock is released regardless.
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(true);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // Artifact root inside the worktree is not freed (issue #729 review, P1): when
+  // `session.artifactRoot` is configured to live INSIDE the managed issue worktree,
+  // freeing that worktree before a `conflict` handoff would delete the artifact tree
+  // (including the just-written review-result.json etc.) that `context.artifactDir`
+  // still points to. The retained worktree is surfaced as a `blocked` human handoff,
+  // NOT a `conflict` auto-queue (issue #729 review, P1 fix): a downstream
+  // `conflict_resolution` runs in the canonical checkout and would fail immediately
+  // trying to check out the PR branch this worktree still holds.
+  test('escalates to a human instead of auto-queuing conflict_resolution when artifactRoot lives inside the worktree', async () => {
+    const wt = worktreePath();
+    mkdirSync(wt, { recursive: true });
+    const inWorktreeArtifactRoot = join(wt, '.n8n-artifacts');
+    const runner = worktreeConflictRunner();
+    const resolver = fakeWorktreeResolver(wt);
+    const lock = fakeLock();
+    const session = SESSION({ artifactRoot: inWorktreeArtifactRoot });
+
+    const result = await createReviewHandler(
+      CONTEXT({ session }), runner, resolver.resolve, lock,
+    )(wtTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.message).toContain('artifactRoot');
+    expect(result.message).toContain(wt);
+    // `git worktree remove` was never invoked — the worktree (and everything under
+    // artifactRoot inside it) is left in place instead of being deleted.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
+    expect(existsSync(wt)).toBe(true);
+    expect(result.context.artifactDir).toBe(join(inWorktreeArtifactRoot, 'runs', 'run-review-1'));
+    expect(existsSync(result.context.artifactDir)).toBe(true);
+    expect(existsSync(join(result.context.artifactDir, 'review-result.json'))).toBe(true);
     expect(lock.calls.release).toHaveLength(1);
   });
 
@@ -3526,7 +4156,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = syntheticNeedsFixRunner();
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3554,7 +4184,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = syntheticNeedsFixRunner({ stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 });
     const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3578,15 +4208,15 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = syntheticNeedsFixRunner();
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
-    // reviewCycles: 4 → this cycle is the 5th, hitting the default maxCycles=5 cap.
+    const session = SESSION({});
+    // reviewCycles: 9 → this cycle is the 10th, hitting the default maxCycles=10 cap.
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
         url: 'https://github.com/m2dw/test-repo/issues/77',
         prUrl: 'https://github.com/m2dw/test-repo/pull/99',
         labels: ['agent:codex', 'status:needs-review'],
-        reviewCycles: 4,
+        reviewCycles: 9,
       },
     });
 
@@ -3597,7 +4227,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     // The cap escalates to a human...
     expect(result.result).toBe('blocked');
     expect(result.context?.reviewLoopCapReached).toBe(true);
-    expect(result.context?.reviewCycles).toBe(5);
+    expect(result.context?.reviewCycles).toBe(10);
     expect(resolver.calls[0].branch).toBe('ai/pr-99');
     // ...but the synthetic worktree is removed first so a later requeue to implementation
     // can re-materialize the worktree on the PR's real head.
@@ -3623,7 +4253,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3662,7 +4292,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = syntheticSuccessRunner();
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3686,7 +4316,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = syntheticSuccessRunner({ stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 });
     const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3707,7 +4337,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3739,6 +4369,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
         basePrNumber: 88,
         baseHeadRefName: 'ai/issue-50',
         basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+        baseHeadSha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
       },
     },
   });
@@ -3764,7 +4395,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = depSyntheticBlockedRunner('ai/issue-50');
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3789,7 +4420,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = depSyntheticBlockedRunner('ai/issue-50', { stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 });
     const resolver = fakeWorktreeResolver(worktreePath(), { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3829,7 +4460,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = depSyntheticDirtyBlockedRunner('ai/issue-50');
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3874,7 +4505,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -3918,7 +4549,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3976,7 +4607,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -3998,7 +4629,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt, { branchReused: true });
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -4020,7 +4651,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     // fakeLock defaults to locked:true — if the handler were to call acquire() it
     // would succeed here. But passing phaseLockOwnerId must skip acquire entirely.
     const lock = fakeLock();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createReviewHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock, undefined, 'ctx-exec-id',
@@ -4041,7 +4672,7 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
       ok: true, locked: false, reason: 'lock_held',
       ownerContextId: 'other-run', ownerStartedAt: '2026-07-04T00:00:00.000Z',
     });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     // No phaseLockOwnerId → handler acquires the lock itself and must detect contention.
     const result = await createReviewHandler(
@@ -4054,22 +4685,6 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
     expect(lock.calls.release).toHaveLength(0);
   });
 
-  // Worktrees disabled keeps the canonical checkout: no worktree is resolved, no lock
-  // is acquired, and the canonical Step 2 `git checkout main` still runs.
-  test('worktrees disabled keeps the canonical checkout and never resolves a worktree or acquires a lock', async () => {
-    const runner = happyRunner();
-    const resolver = fakeWorktreeResolver(worktreePath());
-    const lock = fakeLock();
-
-    const result = await createReviewHandler(
-      CONTEXT(), runner, resolver.resolve, lock,
-    )(makeTask());
-
-    expect(result.result).toBe('success');
-    expect(resolver.calls).toHaveLength(0);
-    expect(lock.calls.acquire).toHaveLength(0);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args[1] === 'main')).toBe(true);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4082,16 +4697,18 @@ describe('review handler — per-issue worktree review (issue #456)', () => {
 // identify deleted CI workflows, test files, or agent instruction files
 // without inferring them from a large patch.
 //
-// Runner sequence for a Claude review (canonical, single-verification):
-//   0: git status --porcelain  (preflight)
-//   1: git checkout main       (Step 2)
-//   2: git pull --ff-only      (Step 2)
-//   3: gh pr checkout          (Step 3, via ghRunner → sequenceRunner)
-//   4: git diff main...HEAD    (pre-verification diff classification, issue #506)
-//   5: npm test                (Step 4 verification)
-//   6: git diff main...HEAD    (Step 5 full diff for prompt)
-//   7: claude -p               (Step 5 review agent)
-//   8: git status --porcelain  (Step 5.5 post-review cleanup check)
+// Runner sequence for a Claude review (worktree-only, issue #456/#699):
+//   0: gh pr view               (validate recorded branch)
+//   1: git fetch origin +main:refs/remotes/origin/main
+//   2: git rev-parse --verify --quiet refs/heads/<branch>
+//   3: git pull --ff-only
+//   4: git rev-list --count FETCH_HEAD..HEAD
+//   5: git status --porcelain  (preflight)
+//   6: git diff origin/main...HEAD (pre-verification diff classification, issue #506)
+//   7: npm test                (Step 4 verification)
+//   8: git diff origin/main...HEAD (Step 5 full diff for prompt)
+//   9: claude -p               (Step 5 review agent)
+//   10: git status --porcelain (Step 5.5 post-review cleanup check)
 // ---------------------------------------------------------------------------
 
 describe('review handler — diff classification in Claude prompt (issue #505)', () => {
@@ -4103,13 +4720,15 @@ describe('review handler — diff classification in Claude prompt (issue #505)',
 
   function claudeRunner({ diffOutput = '', reviewOutput = 'No issues found.' } = {}) {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                        // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                                        // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                        // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },                                        // gh pr checkout 99
-      { stdout: diffOutput, stderr: '', exitCode: 0 },                               // git diff main...HEAD (pre-verification, issue #506)
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: diffOutput, stderr: '', exitCode: 0 },                               // git diff origin/main...HEAD (pre-verification, issue #506)
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 },                       // npm test
-      { stdout: diffOutput, stderr: '', exitCode: 0 },                               // git diff main...HEAD (full diff for prompt)
+      { stdout: diffOutput, stderr: '', exitCode: 0 },                               // git diff origin/main...HEAD (full diff for prompt)
       { stdout: reviewOutput, stderr: '', exitCode: 0 },                             // claude -p
       { stdout: '', stderr: '', exitCode: 0 },                                        // git status (post-review)
     ]);
@@ -4257,14 +4876,17 @@ describe('review handler — conflict-specific review (issue #540)', () => {
   // Runner that returns a given review output on the Codex (default) path.
   function codexReviewRunner(reviewOutput) {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                 // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                                 // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                 // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 },                                 // gh pr checkout 99
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git diff origin/main...HEAD (diff classification)
       { stdout: 'All tests passed.', stderr: '', exitCode: 0 },                // npm test (verification)
-      { stdout: '', stderr: '', exitCode: 0 },                                 // git diff main...HEAD (diff classification)
       { stdout: reviewOutput, stderr: '', exitCode: 0 },                      // codex review
       { stdout: '', stderr: '', exitCode: 0 },                                 // git status (post-review)
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git worktree remove --force --force <wt> (free review worktree on conflict, issue #456)
     ]);
   }
 
@@ -4363,17 +4985,20 @@ describe('review handler — conflict-specific review (issue #540)', () => {
 describe('review handler — issue-required verification', () => {
   // Runner for the setup + verification steps without a review agent call.
   // Used when Step 4.5 is expected to block before the review agent runs.
-  // Actual order: git status → checkout → pull → gh pr checkout →
-  //               git diff (pre-classification) → npm test (verification)
-  //               [Step 4.5 blocks — no review agent call]
+  // Actual order (worktree-only, issue #456/#699): gh pr view → fetch base →
+  //               rev-parse branch exists → pull --ff-only → rev-list --count →
+  //               git status (preflight) → git diff (pre-classification) →
+  //               npm test (verification) [Step 4.5 blocks — no review agent call]
   function preReviewRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 }, // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 }, // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 }, // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 }, // gh pr checkout 99
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-classification, issue #506)
-      { stdout: '', stderr: '', exitCode: 0 }, // npm test (verification passes)
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse --verify --quiet refs/heads/<branch>
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull origin <branch> --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-classification, issue #506)
+      { stdout: '', stderr: '', exitCode: 0 },              // npm test (verification passes)
       // Step 4.5 returns blocked — no review agent call follows
     ]);
   }
@@ -4445,11 +5070,13 @@ describe('review handler — issue-required verification', () => {
       },
     });
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 }, // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 }, // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 }, // git pull --ff-only
-      { stdout: '', stderr: '', exitCode: 0 }, // gh pr checkout 99
-      { stdout: '', stderr: '', exitCode: 0 }, // git diff (pre-classification, issue #506)
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse --verify --quiet refs/heads/<branch>
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull origin <branch> --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-classification, issue #506)
       { stdout: '', stderr: 'FAIL src/foo.test.js', exitCode: 1 }, // npm test fails
     ]);
     const result = await createReviewHandler(CONTEXT(), runner)(task);

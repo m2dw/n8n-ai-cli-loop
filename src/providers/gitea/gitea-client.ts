@@ -242,15 +242,33 @@ export function redactGiteaSecrets(text: string, secrets: ReadonlyArray<string |
   return out;
 }
 
+/** Tuning for {@link createGiteaHttp}. */
+export interface GiteaHttpOptions {
+  /**
+   * Wall-clock bound on a single request, in milliseconds. The subprocess is
+   * killed once it expires and the transport throws, which callers see as a
+   * transport-level failure. Omitted (or `0`) leaves the request unbounded —
+   * the historical behaviour, kept as the default so the retry/backoff-driven
+   * runtime paths are not silently given a new failure mode.
+   */
+  timeoutMs?: number;
+}
+
 /**
- * Default synchronous Gitea HTTP transport. Node has no synchronous HTTP, so the
+ * Build a synchronous Gitea HTTP transport. Node has no synchronous HTTP, so the
  * request runs to completion in a short-lived child Node process via `spawnSync`.
  * The request descriptor (including the Authorization header) is passed on
  * stdin — never on argv — so secrets cannot leak into a process listing, and only
  * the `{status, statusText, body}` envelope is read back from stdout.
+ *
+ * A caller that must not block indefinitely (a read-only probe such as
+ * `admin session-audit`, where a server that accepts the connection but never
+ * answers would otherwise hang the whole command) passes `timeoutMs`.
  */
-export const defaultGiteaHttp: GiteaHttpRequest = (req) => {
-  const child = `
+export function createGiteaHttp(options: GiteaHttpOptions = {}): GiteaHttpRequest {
+  const timeoutMs = options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : undefined;
+  return (req) => {
+    const child = `
     const http = require("http");
     const https = require("https");
     const { URL } = require("url");
@@ -288,25 +306,53 @@ export const defaultGiteaHttp: GiteaHttpRequest = (req) => {
       req.end();
     });
   `;
-  const result = spawnSync(process.execPath, ["-e", child], {
-    input: JSON.stringify({
-      method: req.method,
-      url: req.url,
-      headers: req.headers,
-      ...(req.body !== undefined ? { body: req.body } : {}),
-    }),
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  if (result.status !== 0) {
-    // stderr carries only the network error message (never the token); redact
-    // regardless as defense in depth.
-    throw new Error(
-      redactGiteaSecrets(result.stderr?.trim() || `gitea request subprocess exited ${result.status}`, []),
-    );
-  }
-  return JSON.parse(result.stdout) as GiteaHttpResponse;
-};
+    const result = spawnSync(process.execPath, ["-e", child], {
+      input: JSON.stringify({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        ...(req.body !== undefined ? { body: req.body } : {}),
+      }),
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+    });
+    if (timeoutMs !== undefined && wasKilledByTimeout(result)) {
+      // The server may have accepted the connection and then gone quiet; say so
+      // explicitly rather than reporting a bare non-zero subprocess exit.
+      throw new Error(`gitea request timed out after ${timeoutMs}ms`);
+    }
+    if (result.status !== 0) {
+      // stderr carries only the network error message (never the token); redact
+      // regardless as defense in depth.
+      throw new Error(
+        redactGiteaSecrets(result.stderr?.trim() || `gitea request subprocess exited ${result.status}`, []),
+      );
+    }
+    return JSON.parse(result.stdout) as GiteaHttpResponse;
+  };
+}
+
+/**
+ * Whether `spawnSync` terminated the child because its `timeout` expired. Node
+ * reports that either through `error.code === "ETIMEDOUT"` or — depending on
+ * platform and how the child died — through the delivered kill signal alone.
+ */
+function wasKilledByTimeout(result: {
+  error?: Error;
+  status: number | null;
+  signal: NodeJS.Signals | null;
+}): boolean {
+  const code = (result.error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ETIMEDOUT" || (result.status === null && result.signal !== null);
+}
+
+/**
+ * Default synchronous Gitea HTTP transport: unbounded, as the retrying runtime
+ * paths have always used it. Bounded probes build their own with
+ * {@link createGiteaHttp}.
+ */
+export const defaultGiteaHttp: GiteaHttpRequest = createGiteaHttp();
 
 /** Injectable secret sources for resolving the Gitea API token. */
 export interface GiteaSecretDeps {

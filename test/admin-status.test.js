@@ -50,7 +50,7 @@ function writeSessions() {
         defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
         verification: { test: 'npm test' },
         labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-        worktrees: { enabled: true, root: worktreeRoot },
+        worktrees: { root: worktreeRoot },
       },
     ],
   };
@@ -670,6 +670,20 @@ describe('admin status — blocked / tool-request / capped classification', () =
     expect(e.classification).toBe('capped');
     expect(e.suggestedAction).toContain('recover-cap-handoff');
   });
+
+  test('review handoff with missing verification commands surfaces them in suggestedAction (issue #622)', async () => {
+    await enqueue(203);
+    await transition(203, 'queued', {
+      status: 'ready_for_human',
+      phase: 'review',
+      context: { missingVerificationCommands: ['npm run export -- --dry-run', 'npm run lint'] },
+    });
+    const e = entryFor(statusJson('--issue-number', '203'), 203);
+    expect(e.classification).toBe('needs_human');
+    expect(e.suggestedAction).toContain('npm run export -- --dry-run');
+    expect(e.suggestedAction).toContain('npm run lint');
+    expect(e.suggestedAction).toContain('review-verification resolve');
+  });
 });
 
 describe('admin status — closed tasks hidden by default', () => {
@@ -709,7 +723,7 @@ describe('admin status — repo not inspectable', () => {
         defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
         verification: { test: 'npm test' },
         labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-        worktrees: { enabled: true, root: worktreeRoot },
+        worktrees: { root: worktreeRoot },
       }],
     }, null, 2));
 
@@ -993,5 +1007,32 @@ describe('admin status — stale lock worktree-aware suggestion', () => {
     expect(e.suggestedAction).toContain('--force');
     expect(e.suggestedAction).toContain('--yes');
     expect(e.suggestedAction).not.toContain('--lock-dir');
+  });
+});
+
+describe('admin status — session pause (issue #531)', () => {
+  test('an unpaused session reports sessionPause.paused=false', async () => {
+    await enqueue(300);
+    const payload = statusJson();
+    expect(payload.sessionPause).toEqual({ paused: false });
+  });
+
+  test('a paused session surfaces the reason in JSON and human output', async () => {
+    await enqueue(301);
+    const pause = run(
+      'session', 'pause',
+      '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbPath,
+      '--reason', 'ops hold', '--json',
+    );
+    expect(pause.code).toBe(0);
+
+    const payload = statusJson();
+    expect(payload.sessionPause).toMatchObject({ paused: true, reason: 'ops hold', source: 'operator' });
+
+    const human = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain('SESSION PAUSED');
+    expect(human.stdout).toContain('ops hold');
+    expect(human.stdout).toContain('admin session resume --session-id addon-dev');
   });
 });

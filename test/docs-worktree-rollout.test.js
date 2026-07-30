@@ -34,20 +34,16 @@ describe('docs/worktree-rollout.md — disclaimer', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Enabling worktrees
+// Configuring the worktree root
 // ---------------------------------------------------------------------------
 
-describe('docs/worktree-rollout.md — enabling worktrees', () => {
+describe('docs/worktree-rollout.md — configuring the worktree root', () => {
   test('references sessions.json', () => {
     expect(doc).toMatch(/sessions\.json/);
   });
 
-  test('shows worktrees.enabled: true in a JSON snippet', () => {
-    expect(doc).toMatch(/"worktrees"/);
-    expect(doc).toMatch(/"enabled":\s*true/);
-  });
-
   test('documents the optional root field', () => {
+    expect(doc).toMatch(/"worktrees"/);
     expect(doc).toMatch(/"root"/);
   });
 
@@ -73,20 +69,6 @@ describe('docs/worktree-rollout.md — operational model', () => {
 
   test('documents IssueWorktreeLock concurrency guarantee', () => {
     expect(doc).toMatch(/IssueWorktreeLock|issue lock|lock_contended/);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Mid-flight enablement
-// ---------------------------------------------------------------------------
-
-describe('docs/worktree-rollout.md — mid-flight enablement', () => {
-  test('covers adding worktrees to a session with active tasks', () => {
-    expect(doc).toMatch(/[Mm]id.?[Ff]light/i);
-  });
-
-  test('states no database migration is required', () => {
-    expect(doc).toMatch(/[Nn]o database migration|[Nn]o DB migration|[Nn]o.*migration/);
   });
 });
 

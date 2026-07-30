@@ -6,6 +6,9 @@ import { DEFAULT_FLOW } from "../core/assignment.js";
 import type {
   AntigravityResearchConfig,
   AssignmentProfile,
+  ClaudeComplexityProfileOverride,
+  ClaudeComplexityProfilesConfig,
+  ClaudeConfig,
   CodexConfig,
   CodexContextModeConfig,
   DependencySyncConfig,
@@ -18,8 +21,11 @@ import type {
   ProviderAuthConfig,
   RepoHostProviderConfig,
   RepoHostProviderKind,
+  ReportOnlyConfig,
   ResearchConfig,
+  ResearchEvidenceConfig,
   ResolvedSession,
+  SessionAuditConfig,
   SessionConfig,
   SessionRegistry,
   SlackNotificationsConfig,
@@ -350,6 +356,10 @@ function validateSession(value: unknown, index: number): SessionConfig {
     config.codex = validateCodexConfig(session.codex, `sessions[${index}].codex`);
   }
 
+  if (session.claude !== undefined) {
+    config.claude = validateClaudeConfig(session.claude, `sessions[${index}].claude`);
+  }
+
   if (session.research !== undefined) {
     config.research = validateResearchConfig(session.research, `sessions[${index}].research`);
   }
@@ -359,6 +369,14 @@ function validateSession(value: unknown, index: number): SessionConfig {
       session.notifications,
       `sessions[${index}].notifications`,
     );
+  }
+
+  if (session.reportOnly !== undefined) {
+    config.reportOnly = validateReportOnly(session.reportOnly, `sessions[${index}].reportOnly`);
+  }
+
+  if (session.audit !== undefined) {
+    config.audit = validateAuditConfig(session.audit, `sessions[${index}].audit`);
   }
 
   if (
@@ -393,6 +411,7 @@ function resolveSession(config: SessionConfig): ResolvedSession {
     ...(config.environmentPrepare ? { environmentPrepare: cloneEnvironmentPrepare(config.environmentPrepare) } : {}),
     ...(config.worktrees ? { worktrees: { ...config.worktrees } } : {}),
     ...(config.codex ? { codex: cloneCodexConfig(config.codex) } : {}),
+    ...(config.claude ? { claude: cloneClaudeConfig(config.claude) } : {}),
     ...(config.research ? { research: cloneResearchConfig(config.research) } : {}),
     artifactRoot: resolve(config.repoRoot, config.artifactDir),
     githubOwner,
@@ -401,6 +420,8 @@ function resolveSession(config: SessionConfig): ResolvedSession {
     ...(config.flowRules ? { flowRules: cloneFlowRules(config.flowRules) } : {}),
     ...(config.defaultFlow !== undefined ? { defaultFlow: config.defaultFlow } : {}),
     ...(config.notifications ? { notifications: cloneNotificationsConfig(config.notifications) } : {}),
+    ...(config.reportOnly ? { reportOnly: cloneReportOnly(config.reportOnly) } : {}),
+    ...(config.audit ? { audit: cloneAuditConfig(config.audit) } : {}),
     workItemProvider: config.workItemProvider
       ? cloneProvider(config.workItemProvider)
       : { ...DEFAULT_WORK_ITEM_PROVIDER, auth: { ...DEFAULT_WORK_ITEM_PROVIDER.auth } },
@@ -551,17 +572,22 @@ function cloneEnvironmentPrepare(config: EnvironmentPrepareConfig): EnvironmentP
 }
 
 /**
- * Validate the per-issue worktree block (docs/per-issue-worktrees.md). `enabled`
- * is the required master switch; an optional `root` overrides the managed state
- * root and, when present, must be an absolute path so it can never resolve inside
- * committed source.
+ * Validate the per-issue worktree block (docs/per-issue-worktrees.md). Every
+ * session runs every phase in a per-issue worktree unconditionally (issue #731)
+ * — the legacy `enabled` master switch is rejected outright rather than
+ * silently ignored, per docs/worktree-only-migration-contract.md §2. An
+ * optional `root` overrides the managed state root and, when present, must be
+ * an absolute path so it can never resolve inside committed source.
  */
 function validateWorktreeConfig(value: unknown, path: string): WorktreeConfig {
   const obj = record(value, path);
-  if (typeof obj.enabled !== "boolean") {
-    throw new Error(`${path}.enabled must be a boolean`);
+  if (obj.enabled !== undefined) {
+    throw new Error(
+      `${path}.enabled is no longer supported — worktrees are always enabled and there is no shared-checkout mode ` +
+        `to opt out of. Remove "enabled" from ${path} (see docs/worktree-only-migration-contract.md).`,
+    );
   }
-  const config: WorktreeConfig = { enabled: obj.enabled };
+  const config: WorktreeConfig = {};
   if (obj.root !== undefined) {
     const root = requiredString(obj.root, `${path}.root`);
     if (!isAbsolute(root)) {
@@ -585,6 +611,9 @@ function validateCodexConfig(value: unknown, path: string): CodexConfig {
   const config: CodexConfig = {};
   if (obj.contextMode !== undefined) {
     config.contextMode = validateCodexContextMode(obj.contextMode, `${path}.contextMode`);
+  }
+  if (obj.model !== undefined) {
+    config.model = requiredString(obj.model, `${path}.model`);
   }
   return config;
 }
@@ -636,7 +665,69 @@ function cloneCodexConfig(config: CodexConfig): CodexConfig {
           },
         }
       : {}),
+    ...(config.model !== undefined ? { model: config.model } : {}),
   };
+}
+
+const COMPLEXITY_TIERS = ["low", "default", "high", "xhigh"] as const;
+
+/**
+ * Validate the Claude complexity-profile override block (issue #748):
+ * per-tier overrides of the model/effort/budget triple that
+ * `labelsToComplexity` (core/github-intake.ts) otherwise resolves from
+ * built-in defaults. Structural validation only — the exact model/effort
+ * values accepted are whatever the installed Claude CLI supports; this never
+ * guesses or hard-codes a specific model identifier.
+ */
+function validateClaudeConfig(value: unknown, path: string): ClaudeConfig {
+  const obj = record(value, path);
+  const config: ClaudeConfig = {};
+  if (obj.complexityProfiles !== undefined) {
+    config.complexityProfiles = validateClaudeComplexityProfiles(
+      obj.complexityProfiles,
+      `${path}.complexityProfiles`,
+    );
+  }
+  return config;
+}
+
+function validateClaudeComplexityProfiles(value: unknown, path: string): ClaudeComplexityProfilesConfig {
+  const obj = record(value, path);
+  const config: ClaudeComplexityProfilesConfig = {};
+  for (const tier of COMPLEXITY_TIERS) {
+    if (obj[tier] !== undefined) {
+      config[tier] = validateClaudeComplexityProfileOverride(obj[tier], `${path}.${tier}`);
+    }
+  }
+  return config;
+}
+
+function validateClaudeComplexityProfileOverride(value: unknown, path: string): ClaudeComplexityProfileOverride {
+  const obj = record(value, path);
+  const override: ClaudeComplexityProfileOverride = {};
+  if (obj.model !== undefined) {
+    override.model = requiredString(obj.model, `${path}.model`);
+  }
+  if (obj.effort !== undefined) {
+    override.effort = requiredString(obj.effort, `${path}.effort`);
+  }
+  if (obj.budget !== undefined) {
+    override.budget = requiredString(obj.budget, `${path}.budget`);
+  }
+  return override;
+}
+
+function cloneClaudeConfig(config: ClaudeConfig): ClaudeConfig {
+  if (!config.complexityProfiles) return {};
+  const profiles = config.complexityProfiles;
+  const cloned: ClaudeComplexityProfilesConfig = {};
+  for (const tier of COMPLEXITY_TIERS) {
+    const override = profiles[tier];
+    if (override !== undefined) {
+      cloned[tier] = { ...override };
+    }
+  }
+  return { complexityProfiles: cloned };
 }
 
 function validateResearchConfig(value: unknown, path: string): ResearchConfig {
@@ -644,6 +735,33 @@ function validateResearchConfig(value: unknown, path: string): ResearchConfig {
   const config: ResearchConfig = {};
   if (obj.antigravity !== undefined) {
     config.antigravity = validateAntigravityResearchConfig(obj.antigravity, `${path}.antigravity`);
+  }
+  if (obj.evidence !== undefined) {
+    config.evidence = validateResearchEvidenceConfig(obj.evidence, `${path}.evidence`);
+  }
+  return config;
+}
+
+function validateResearchEvidenceConfig(value: unknown, path: string): ResearchEvidenceConfig {
+  const obj = record(value, path);
+  const config: ResearchEvidenceConfig = {};
+  if (obj.enabled !== undefined) {
+    if (typeof obj.enabled !== "boolean") {
+      throw new Error(`${path}.enabled must be a boolean`);
+    }
+    config.enabled = obj.enabled;
+  }
+  if (obj.denyGlobs !== undefined) {
+    config.denyGlobs = stringArray(obj.denyGlobs, `${path}.denyGlobs`, { nonEmpty: false });
+  }
+  if (obj.generatedGlobs !== undefined) {
+    config.generatedGlobs = stringArray(obj.generatedGlobs, `${path}.generatedGlobs`, { nonEmpty: false });
+  }
+  if (obj.maxTurns !== undefined) {
+    if (typeof obj.maxTurns !== "number" || !Number.isInteger(obj.maxTurns) || obj.maxTurns < 1) {
+      throw new Error(`${path}.maxTurns must be a positive integer`);
+    }
+    config.maxTurns = obj.maxTurns;
   }
   return config;
 }
@@ -661,6 +779,15 @@ function validateAntigravityResearchConfig(value: unknown, path: string): Antigr
 function cloneResearchConfig(config: ResearchConfig): ResearchConfig {
   return {
     ...(config.antigravity ? { antigravity: { ...config.antigravity } } : {}),
+    ...(config.evidence ? { evidence: cloneResearchEvidenceConfig(config.evidence) } : {}),
+  };
+}
+
+function cloneResearchEvidenceConfig(config: ResearchEvidenceConfig): ResearchEvidenceConfig {
+  return {
+    ...config,
+    ...(config.denyGlobs ? { denyGlobs: [...config.denyGlobs] } : {}),
+    ...(config.generatedGlobs ? { generatedGlobs: [...config.generatedGlobs] } : {}),
   };
 }
 
@@ -876,6 +1003,51 @@ function cloneNotificationsConfig(config: NotificationsConfig): NotificationsCon
   };
 }
 
+/**
+ * Validate the `reportOnly` block (issue #532). `enabled` is the only field
+ * today and is the documented master switch: a session without this block
+ * (or with `enabled: false`) runs normal automation.
+ */
+function validateReportOnly(value: unknown, path: string): ReportOnlyConfig {
+  const obj = record(value, path);
+  if (typeof obj.enabled !== "boolean") {
+    throw new Error(`${path}.enabled must be a boolean`);
+  }
+  return { enabled: obj.enabled };
+}
+
+function cloneReportOnly(config: ReportOnlyConfig): ReportOnlyConfig {
+  return { ...config };
+}
+
+/**
+ * Validate the `audit` block (issue #533): operator-recorded dispositions for
+ * `admin session-audit` findings, keyed by the audit's stable check id. The keys
+ * are NOT validated against the audit's check ids here — that would couple the
+ * session registry to the audit's rule set — so a key naming no known check is
+ * reported by the audit itself as an acknowledgement that suppresses nothing.
+ * Each reason must be a non-empty string (enforced by {@link stringRecord}): an
+ * acknowledgement exists to record *why* a finding is accepted, so a blank one
+ * is rejected rather than stored.
+ */
+function validateAuditConfig(value: unknown, path: string): SessionAuditConfig {
+  const obj = record(value, path);
+  const config: SessionAuditConfig = {};
+  if (obj.acknowledge !== undefined) {
+    config.acknowledge = stringRecord(
+      record(obj.acknowledge, `${path}.acknowledge`),
+      `${path}.acknowledge`,
+    );
+  }
+  return config;
+}
+
+function cloneAuditConfig(config: SessionAuditConfig): SessionAuditConfig {
+  return {
+    ...(config.acknowledge ? { acknowledge: { ...config.acknowledge } } : {}),
+  };
+}
+
 function cloneAssignmentProfiles(
   profiles: Record<string, AssignmentProfile>,
 ): Record<string, AssignmentProfile> {
@@ -900,12 +1072,15 @@ function cloneSession(session: ResolvedSession | undefined): ResolvedSession | u
     ...(session.environmentPrepare ? { environmentPrepare: cloneEnvironmentPrepare(session.environmentPrepare) } : {}),
     ...(session.worktrees ? { worktrees: { ...session.worktrees } } : {}),
     ...(session.codex ? { codex: cloneCodexConfig(session.codex) } : {}),
+    ...(session.claude ? { claude: cloneClaudeConfig(session.claude) } : {}),
     ...(session.research ? { research: cloneResearchConfig(session.research) } : {}),
     ...(session.baseBranch !== undefined ? { baseBranch: session.baseBranch } : {}),
     ...(session.assignmentProfiles ? { assignmentProfiles: cloneAssignmentProfiles(session.assignmentProfiles) } : {}),
     ...(session.flowRules ? { flowRules: cloneFlowRules(session.flowRules) } : {}),
     ...(session.defaultFlow !== undefined ? { defaultFlow: session.defaultFlow } : {}),
     ...(session.notifications ? { notifications: cloneNotificationsConfig(session.notifications) } : {}),
+    ...(session.reportOnly ? { reportOnly: cloneReportOnly(session.reportOnly) } : {}),
+    ...(session.audit ? { audit: cloneAuditConfig(session.audit) } : {}),
     workItemProvider: cloneProvider(session.workItemProvider),
     repoHostProvider: cloneProvider(session.repoHostProvider),
     repoHostProviderConfigured: session.repoHostProviderConfigured,

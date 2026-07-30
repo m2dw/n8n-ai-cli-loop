@@ -58,7 +58,7 @@ import { resolve, dirname } from 'path';
 // value lives in the workflow.  SESSION_ID is accepted as a backward-compatible
 // fallback (a sessionId is itself a valid reference).
 const SESSION_REF = process.env['SESSION_REF'] ?? process.env['SESSION_ID'] ?? 'ai-cli-loop';
-const SUPPORTED_PHASES = 'implementation,review,conflict_resolution,research';
+const SUPPORTED_PHASES = 'implementation,review,conflict_resolution,research,content_research,content_draft,content_review';
 const SCHEDULE_MINUTES = 5;
 
 // Canonical, environment-independent sessionRef baked into the tracked docs/

@@ -628,6 +628,141 @@ describe('admin CLI — recover subcommand', () => {
     store2.close();
     expect(task?.status).toBe('ready_for_human');
   });
+
+  // issue #677: an operator running `admin recover --from ready_for_human --phase
+  // review` on an implementation Tool Request handoff (the exact shape the
+  // implementation handler leaves — see src/handlers/implementation.ts) must be
+  // refused, not silently routed into review with no PR/implementation-complete
+  // handoff behind it. See also the pure-store coverage in
+  // test/sqlite-task-store.test.js (recoverHandoff — unresolved Tool Request guard).
+  async function seedToolRequestTask(issueNumber, extraContext = {}) {
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({ sessionId: 'addon-dev', issueNumber, phase: 'implementation', implementationAgent: 'claude' });
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber },
+      { status: 'queued' },
+      {
+        status: 'ready_for_human',
+        phase: 'implementation',
+        context: {
+          labels: ['status:needs-implementation', 'agent:claude'],
+          toolRequest: {
+            command: 'npm install left-pad',
+            displayCommand: 'npm install left-pad',
+            reason: 'needed for the fix',
+            expectedFiles: ['package.json'],
+            necessity: 'required',
+            requestedBy: 'claude',
+            mode: 'new',
+            requestedAt: '2026-06-07T00:00:00.000Z',
+            resolved: false,
+          },
+          ...extraContext,
+        },
+      },
+    );
+    store.close();
+  }
+
+  test('--from ready_for_human --phase review rejects an unresolved implementation Tool Request handoff', async () => {
+    await seedToolRequestTask(300);
+
+    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '300',
+      '--from', 'ready_for_human', '--phase', 'review', '--db-path', dbPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out.recovered).toHaveLength(0);
+    expect(out.skipped).toHaveLength(1);
+    expect(out.skipped[0]).toMatchObject({ issueNumber: 300 });
+    expect(out.skipped[0].reason).toMatch(/tool_request_unresolved/);
+    expect(out.skipped[0].reason).toMatch(/tool-request resolve/);
+
+    // The handoff is completely untouched: same status/phase, Tool Request still
+    // unresolved and still resolvable via the dedicated flows — no branch/worktree
+    // cleanup or partial-implementation artifact side effects ran.
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 300 });
+    store2.close();
+    expect(task?.status).toBe('ready_for_human');
+    expect(task?.phase).toBe('implementation');
+    expect(task?.context.toolRequest.resolved).toBe(false);
+  });
+
+  test('--from ready_for_human --phase review --dry-run previews the tool_request_unresolved skip', async () => {
+    await seedToolRequestTask(300);
+
+    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '300',
+      '--from', 'ready_for_human', '--phase', 'review', '--dry-run', '--db-path', dbPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out.dryRun).toBe(true);
+    expect(out.wouldRecover).toHaveLength(0);
+    expect(out.wouldSkip).toHaveLength(1);
+    expect(out.wouldSkip[0]).toMatchObject({ issueNumber: 300 });
+    expect(out.wouldSkip[0].reason).toMatch(/tool_request_unresolved/);
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 300 });
+    store2.close();
+    expect(task?.status).toBe('ready_for_human');
+  });
+
+  test('--from ready_for_human --phase review rejects a dependency-started task (continuation base is another issue branch) with an unresolved Tool Request', async () => {
+    await seedToolRequestTask(301, {
+      dependencyBase: {
+        baseIssueNumber: 50,
+        basePrNumber: 88,
+        baseHeadRefName: 'ai/issue-50',
+        basePrUrl: 'https://github.com/m2dw/test-repo/pull/88',
+        baseHeadSha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+      },
+    });
+
+    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '301',
+      '--from', 'ready_for_human', '--phase', 'review', '--db-path', dbPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out.recovered).toHaveLength(0);
+    expect(out.skipped).toHaveLength(1);
+    expect(out.skipped[0].reason).toMatch(/tool_request_unresolved/);
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 301 });
+    store2.close();
+    expect(task?.status).toBe('ready_for_human');
+    expect(task?.context.dependencyBase).toMatchObject({ baseIssueNumber: 50 });
+    expect(task?.context.toolRequest.resolved).toBe(false);
+  });
+
+  test('--from ready_for_human --phase review still recovers a task whose Tool Request is already resolved', async () => {
+    await seedToolRequestTask(302);
+    // Resolve it as an operator would (mirrors admin tool-request resolve's
+    // stored shape) before attempting the recover.
+    const store = new SqliteTaskStore(dbPath);
+    const before = await store.getTask({ sessionId: 'addon-dev', issueNumber: 302 });
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 302 },
+      { status: 'ready_for_human' },
+      {
+        context: {
+          ...before.context,
+          toolRequest: {
+            ...before.context.toolRequest,
+            resolved: true,
+            resolution: { action: 'reject', resolvedAt: '2026-06-07T00:05:00.000Z' },
+          },
+        },
+      },
+    );
+    store.close();
+
+    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '302',
+      '--from', 'ready_for_human', '--phase', 'review', '--db-path', dbPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out.recovered).toHaveLength(1);
+    expect(out.recovered[0]).toMatchObject({ issueNumber: 302, status: 'queued', phase: 'review' });
+  });
 });
 
 describe('admin CLI — recover-cap-handoff subcommand', () => {
@@ -1191,7 +1326,7 @@ describe('admin CLI — session-doctor subcommand', () => {
     const out = parse(r);
     for (const check of out.checks) {
       expect(typeof check.name).toBe('string');
-      expect(['repo', 'github', 'aiCli']).toContain(check.category);
+      expect(['repo', 'github', 'aiCli', 'storage', 'worktree']).toContain(check.category);
       expect(typeof check.ok).toBe('boolean');
     }
   });
@@ -1292,6 +1427,133 @@ describe('admin CLI — session-doctor subcommand', () => {
     const r = run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('session-doctor');
+  });
+
+  const REQUIRED_LABELS = [
+    'agent:claude', 'agent:codex', 'agent:gemini',
+    'status:needs-implementation', 'status:needs-fix', 'status:needs-review',
+    'status:research-needed', 'status:needs-conflict-resolution', 'status:backlog',
+    'ai:active', 'ai:blocked', 'ai:ready-for-human',
+  ];
+
+  function writeGhStub(labelNames) {
+    const json = JSON.stringify(labelNames.map((n) => ({ name: n })));
+    const script = `#!/bin/sh\nif [ "$1" = "label" ] && [ "$2" = "list" ]; then\n  echo '${json}'\n  exit 0\nfi\nexit 0\n`;
+    writeFileSync(join(tmpBin, 'gh'), script, { mode: 0o755 });
+  }
+
+  test('ghRequiredLabels passes when all required labels are present', () => {
+    writeSession();
+    writeGhStub(REQUIRED_LABELS);
+    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'ghRequiredLabels');
+    expect(check.ok).toBe(true);
+  });
+
+  test('ghRequiredLabels fails and lists missing labels with a create remediation', () => {
+    writeSession();
+    writeGhStub(REQUIRED_LABELS.filter((l) => l !== 'status:backlog'));
+    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'ghRequiredLabels');
+    expect(check.ok).toBe(false);
+    expect(check.error).toContain('status:backlog');
+    expect(check.error).toContain('gh label create');
+  });
+
+  test('ghRequiredLabels is skipped when githubRepo is not configured', () => {
+    writeSession({ githubRepo: undefined });
+    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'ghRequiredLabels');
+    expect(check.ok).toBe(false);
+    expect(check.error).toMatch(/Skipped/);
+  });
+
+  test('artifactDirGitignored passes when artifactDir is listed in .gitignore', () => {
+    mkdirSync(repoRoot, { recursive: true });
+    execFileSync('git', ['init'], { cwd: repoRoot });
+    writeFileSync(join(repoRoot, '.gitignore'), '.n8n-artifacts/\n', 'utf8');
+    writeSession();
+    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'artifactDirGitignored');
+    expect(check.ok).toBe(true);
+  });
+
+  test('artifactDirGitignored fails with a fix remediation when artifactDir is not ignored', () => {
+    mkdirSync(repoRoot, { recursive: true });
+    execFileSync('git', ['init'], { cwd: repoRoot });
+    writeSession();
+    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'artifactDirGitignored');
+    expect(check.ok).toBe(false);
+    expect(check.error).toContain('.gitignore');
+  });
+
+  test('sqliteDbHealth passes when the db has not been created yet', () => {
+    writeSession();
+    const dbFile = join(tmpDir, 'not-yet-created.db');
+    const r = runDoctor(
+      'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbFile,
+    );
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'sqliteDbHealth');
+    expect(check.ok).toBe(true);
+  });
+
+  test('sqliteDbHealth passes for a healthy WAL-mode database', () => {
+    writeSession();
+    const dbFile = join(tmpDir, 'healthy.db');
+    const store = new SqliteTaskStore(dbFile);
+    store.close();
+    const r = runDoctor(
+      'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbFile,
+    );
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'sqliteDbHealth');
+    expect(check.ok).toBe(true);
+  });
+
+  test('sqliteDbHealth fails for a corrupt database file', () => {
+    writeSession();
+    const dbFile = join(tmpDir, 'corrupt.db');
+    writeFileSync(dbFile, 'not a real sqlite file', 'utf8');
+    const r = runDoctor(
+      'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbFile,
+    );
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'sqliteDbHealth');
+    expect(check.ok).toBe(false);
+  });
+
+  test('worktreeStateRoot fails when session.worktrees.root is relative', () => {
+    writeSession({ worktrees: { root: 'relative/worktrees' } });
+    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'worktreeStateRoot');
+    expect(check.ok).toBe(false);
+    expect(check.error).toMatch(/absolute/);
+  });
+
+  test('worktreeStateRoot passes for a valid absolute root', () => {
+    writeSession({ worktrees: { root: join(tmpDir, 'worktrees') } });
+    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    const check = out.checks.find((c) => c.name === 'worktreeStateRoot');
+    expect(check.ok).toBe(true);
   });
 });
 
@@ -1536,183 +1798,6 @@ describe('admin CLI — repo-lock release subcommand', () => {
     const r = run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('repo-lock release');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// admin CLI — quarantine subcommand
-// ---------------------------------------------------------------------------
-
-describe('admin CLI — quarantine subcommand', () => {
-  let sessionsPath;
-  let repoRoot;
-  let artifactRoot;
-  let quarantineMarkerPath;
-
-  beforeEach(() => {
-    sessionsPath = join(tmpDir, 'sessions.json');
-    repoRoot = join(tmpDir, 'repo');
-    mkdirSync(repoRoot, { recursive: true });
-    artifactRoot = join(repoRoot, '.n8n-artifacts');
-    mkdirSync(artifactRoot, { recursive: true });
-    quarantineMarkerPath = join(artifactRoot, 'implementation-quarantine.json');
-
-    // Minimal git repo so git commands inside the CLI work.
-    execFileSync('git', ['init'], { cwd: repoRoot, stdio: 'ignore' });
-    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoRoot, stdio: 'ignore' });
-    execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repoRoot, stdio: 'ignore' });
-    execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: repoRoot, stdio: 'ignore' });
-    writeFileSync(join(repoRoot, '.gitkeep'), '');
-    execFileSync('git', ['add', '.gitkeep'], { cwd: repoRoot, stdio: 'ignore' });
-    execFileSync('git', ['commit', '-m', 'init'], { cwd: repoRoot, stdio: 'ignore' });
-    try {
-      execFileSync('git', ['branch', '-M', 'main'], { cwd: repoRoot, stdio: 'ignore' });
-    } catch { /* already main */ }
-
-    writeFileSync(sessionsPath, JSON.stringify({
-      sessions: [{
-        sessionId: 'q-session',
-        repoKey: 'q-repo',
-        repoRoot,
-        githubRepo: 'm2dw/q-repo',
-        artifactDir: '.n8n-artifacts',
-        baseBranch: 'main',
-        defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
-        verification: {},
-        labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-      }],
-    }));
-  });
-
-  function writeMarker(overrides = {}) {
-    const marker = {
-      issueNumber: 202,
-      branch: 'ai/issue-202',
-      runId: 'run-impl-1',
-      sessionId: 'q-session',
-      step: 'git push',
-      quarantinedAt: new Date().toISOString(),
-      ...overrides,
-    };
-    writeFileSync(quarantineMarkerPath, JSON.stringify(marker));
-    return marker;
-  }
-
-  // ---- quarantine status ----
-
-  test('status: reports quarantineExists:false when no marker present', () => {
-    const r = run('quarantine', 'status', '--session-id', 'q-session', '--sessions-path', sessionsPath);
-    expect(r.code).toBe(0);
-    const out = parse(r);
-    expect(out).toMatchObject({ ok: true, sessionId: 'q-session', quarantineExists: false, marker: null });
-  });
-
-  test('status: reports quarantineExists:true with marker contents when marker exists', () => {
-    writeMarker();
-    const r = run('quarantine', 'status', '--session-id', 'q-session', '--sessions-path', sessionsPath);
-    expect(r.code).toBe(0);
-    const out = parse(r);
-    expect(out).toMatchObject({
-      ok: true,
-      quarantineExists: true,
-      marker: { issueNumber: 202, branch: 'ai/issue-202', runId: 'run-impl-1', step: 'git push' },
-    });
-    expect(typeof out.marker.quarantinedAt).toBe('string');
-  });
-
-  test('status: reports current git branch and worktree cleanliness', () => {
-    const r = run('quarantine', 'status', '--session-id', 'q-session', '--sessions-path', sessionsPath);
-    expect(r.code).toBe(0);
-    const out = parse(r);
-    expect(typeof out.currentBranch).toBe('string');
-    expect(out.currentBranch).toBe('main');
-    expect(out.worktreeClean).toBe(true);
-  });
-
-  test('status: missing --session-id exits non-zero', () => {
-    const r = run('quarantine', 'status', '--sessions-path', sessionsPath);
-    expect(r.code).not.toBe(0);
-    expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
-  });
-
-  test('status: unknown session-id exits non-zero', () => {
-    const r = run('quarantine', 'status', '--session-id', 'no-such-session', '--sessions-path', sessionsPath);
-    expect(r.code).not.toBe(0);
-    expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('no-such-session') });
-  });
-
-  // Regression (issue #400): a misconfigured (relative) worktree-root override
-  // must NOT break quarantine commands, which never touch worktrees. The root is
-  // resolved lazily in the worktree subcommands, not eagerly in loadSessionInfo.
-  test('status: tolerates a relative N8N_AI_WORKTREE_ROOT override', () => {
-    let code = 0;
-    let stdout = '';
-    try {
-      stdout = execFileSync(
-        process.execPath,
-        [CLI, 'quarantine', 'status', '--session-id', 'q-session', '--sessions-path', sessionsPath],
-        { encoding: 'utf8', env: { ...process.env, N8N_AI_WORKTREE_ROOT: 'relative/worktrees' } },
-      );
-    } catch (err) {
-      code = err.status ?? 1;
-      stdout = err.stdout ?? '';
-    }
-    expect(code).toBe(0);
-    expect(JSON.parse(stdout.trim())).toMatchObject({ ok: true, sessionId: 'q-session' });
-  });
-
-  // ---- quarantine clear ----
-
-  test('clear: requires --yes; refuses without it', () => {
-    writeMarker();
-    const r = run('quarantine', 'clear', '--session-id', 'q-session', '--sessions-path', sessionsPath);
-    expect(r.code).not.toBe(0);
-    expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('--yes') });
-  });
-
-  test('clear: with --yes checks out base branch, deletes marker, and prints JSON', () => {
-    writeMarker();
-    const r = run('quarantine', 'clear', '--session-id', 'q-session', '--sessions-path', sessionsPath, '--yes');
-    expect(r.code).toBe(0);
-    const out = parse(r);
-    expect(out).toMatchObject({
-      ok: true,
-      sessionId: 'q-session',
-      checkedOutBranch: 'main',
-      markerDeleted: true,
-      previousMarker: { issueNumber: 202, branch: 'ai/issue-202' },
-    });
-    expect(existsSync(quarantineMarkerPath)).toBe(false);
-  });
-
-  test('clear: with --yes refuses when no quarantine marker exists', () => {
-    // No marker written.
-    const r = run('quarantine', 'clear', '--session-id', 'q-session', '--sessions-path', sessionsPath, '--yes');
-    expect(r.code).not.toBe(0);
-    expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('No quarantine') });
-  });
-
-  test('clear: refuses when repo lock is held by another context', () => {
-    writeMarker();
-    const sessionLockFile = join(lockDir, 'q-session.lock');
-    mkdirSync(lockDir, { recursive: true });
-    writeFileSync(sessionLockFile, JSON.stringify({
-      contextId: 'other-ctx-123',
-      sessionId: 'q-session',
-      startedAt: new Date().toISOString(),
-    }));
-    const r = run('quarantine', 'clear', '--session-id', 'q-session', '--sessions-path', sessionsPath, '--yes', '--lock-dir', lockDir);
-    expect(r.code).not.toBe(0);
-    expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('other-ctx-123') });
-    // Marker should NOT have been deleted.
-    expect(existsSync(quarantineMarkerPath)).toBe(true);
-  });
-
-  test('quarantine status and clear appear in help output', () => {
-    const r = run('help');
-    expect(r.code).toBe(0);
-    expect(r.stdout).toContain('quarantine status');
-    expect(r.stdout).toContain('quarantine clear');
   });
 });
 

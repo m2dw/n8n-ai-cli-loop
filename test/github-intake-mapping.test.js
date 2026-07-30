@@ -154,6 +154,79 @@ describe('labelsToPhase', () => {
       reviewAgent: 'gemini',
     });
   });
+
+  test('stale content-research agent:gemini does NOT steal a Codex review (issue #625)', () => {
+    // A failed or pre-existing content-research handoff leaves agent:gemini +
+    // status:content-needed on the issue. When an operator later queues a Codex
+    // review (agent:codex + status:needs-review), the stale content-research pair
+    // must NOT suppress the Codex branch — status:content-needed is a stale-lane
+    // marker just like status:research-needed (issue #292).
+    expect(
+      labelsToPhase(['agent:gemini', 'status:content-needed', 'agent:codex', 'status:needs-review']),
+    ).toMatchObject({
+      phase: 'review',
+      reviewAgent: 'codex',
+    });
+  });
+
+  test('stale content-research agent:gemini does NOT steal a Claude review (issue #625)', () => {
+    // Same as above but with agent:claude as the intended reviewer.
+    expect(
+      labelsToPhase(['agent:gemini', 'status:content-needed', 'agent:claude', 'status:needs-review']),
+    ).toMatchObject({
+      phase: 'review',
+      reviewAgent: 'claude',
+    });
+  });
+
+  test('explicit Gemini review still wins even with a lingering status:content-needed', () => {
+    // When the operator queues a Gemini review (agent:gemini + status:needs-review)
+    // with no competing review agent, the requested Gemini review must win even if a
+    // stale status:content-needed lingers — there is no Codex/Claude review to protect.
+    expect(
+      labelsToPhase(['agent:gemini', 'status:needs-review', 'status:content-needed']),
+    ).toMatchObject({
+      phase: 'review',
+      reviewAgent: 'gemini',
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Content-research lane (issue #625)
+  // ---------------------------------------------------------------------------
+
+  test('agent:gemini + status:content-needed -> content_research with researchAgent gemini', () => {
+    expect(labelsToPhase(['agent:gemini', 'status:content-needed'])).toMatchObject({
+      phase: 'content_research',
+      researchAgent: 'gemini',
+    });
+  });
+
+  test('status:content-needed without a supported agent label -> undefined (no routing)', () => {
+    // Only gemini is supported by the content-research runner. Without an agent:gemini
+    // label, intake must not route to content_research (fail closed — no task created
+    // for an unsupported assignment).
+    expect(labelsToPhase(['status:content-needed'])).toBeUndefined();
+  });
+
+  test('agent:claude + status:content-needed -> undefined (unsupported agent, no routing)', () => {
+    expect(labelsToPhase(['agent:claude', 'status:content-needed'])).toBeUndefined();
+  });
+
+  test('agent:codex + status:content-needed -> undefined (unsupported agent, no routing)', () => {
+    expect(labelsToPhase(['agent:codex', 'status:content-needed'])).toBeUndefined();
+  });
+
+  test('content-research lane wins over new-implementation even when status:needs-implementation lingers', () => {
+    // A stale status:needs-implementation label must not misroute a content-research
+    // issue (same guard as the research lane, issue #292).
+    expect(
+      labelsToPhase(['agent:gemini', 'status:content-needed', 'status:needs-implementation']),
+    ).toMatchObject({
+      phase: 'content_research',
+      researchAgent: 'gemini',
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -190,19 +263,36 @@ describe('labelsToComplexity', () => {
       .toEqual({ model: 'opus', effort: 'high', budget: '10' });
   });
 
-  test('complexity:xhigh -> opus / xhigh / $20', () => {
-    expect(labelsToComplexity(['agent:claude', 'status:needs-implementation', 'complexity:xhigh']))
-      .toEqual({ model: 'opus', effort: 'xhigh', budget: '20' });
+  test('complexity:xhigh -> fable / high / $20 (not opus / xhigh)', () => {
+    const result = labelsToComplexity(['agent:claude', 'status:needs-implementation', 'complexity:xhigh']);
+    expect(result).toEqual({ model: 'fable', effort: 'high', budget: '20' });
+    expect(result).not.toEqual({ model: 'opus', effort: 'xhigh', budget: '20' });
   });
 
   test('complexity:xhigh beats complexity:high (xhigh wins)', () => {
     expect(labelsToComplexity(['complexity:high', 'complexity:xhigh']))
-      .toEqual({ model: 'opus', effort: 'xhigh', budget: '20' });
+      .toEqual({ model: 'fable', effort: 'high', budget: '20' });
   });
 
   test('all three complexity labels -> xhigh wins (xhigh > high > low)', () => {
     expect(labelsToComplexity(['complexity:low', 'complexity:high', 'complexity:xhigh']))
-      .toEqual({ model: 'opus', effort: 'xhigh', budget: '20' });
+      .toEqual({ model: 'fable', effort: 'high', budget: '20' });
+  });
+
+  test('session override retargets only the xhigh tier, other tiers unchanged', () => {
+    const overrides = { xhigh: { model: 'claude-fable-5' } };
+    expect(labelsToComplexity(['complexity:xhigh'], overrides))
+      .toEqual({ model: 'claude-fable-5', effort: 'high', budget: '20' });
+    expect(labelsToComplexity(['complexity:high'], overrides))
+      .toEqual({ model: 'opus', effort: 'high', budget: '10' });
+    expect(labelsToComplexity([], overrides))
+      .toEqual({ model: 'sonnet', effort: 'high', budget: '5' });
+  });
+
+  test('session override can fully replace effort/budget for a tier', () => {
+    const overrides = { xhigh: { effort: 'max', budget: '30' } };
+    expect(labelsToComplexity(['complexity:xhigh'], overrides))
+      .toEqual({ model: 'fable', effort: 'max', budget: '30' });
   });
 });
 

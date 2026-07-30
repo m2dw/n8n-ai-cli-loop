@@ -8,6 +8,7 @@ import { join } from 'path';
 import { SqliteTaskStore } from '../dist/stores/sqlite-task-store.js';
 import { SqliteOutboxStore } from '../dist/stores/sqlite-outbox-store.js';
 import { runNextPhase } from '../dist/core/phase-runner.js';
+import { checkReportOnlyAdmission } from '../dist/handlers/report-only-admission.js';
 
 let tmpDir;
 let dbPath;
@@ -1396,6 +1397,85 @@ describe('runNextPhase outbox — review phase posts to PR timeline', () => {
     expect(prComment.payload.body).not.toContain('Reason:');
   });
 
+  test('reviewFeedback containing its own ```diff fence does not close the outer excerpt fence early (issue #706)', async () => {
+    // Reproduces the #606/#705 comment shape: the review agent's own findings
+    // embed a "## Suggested Changes" section wrapped in a ```diff fenced block.
+    // A fixed triple-backtick outer fence would be closed by that embedded
+    // fence, spilling the heading, diff body, and trailing fence outside the
+    // intended <details> block.
+    await enqueueTask('review', { prUrl: 'https://github.com/org/repo/pull/7', branch: 'ai/issue-99' });
+    const reviewFeedback = [
+      '[P1] Missing null check in handler',
+      '',
+      '## Suggested Changes (review agent edits)',
+      '',
+      '```diff',
+      '--- a/src/handler.ts',
+      '+++ b/src/handler.ts',
+      '@@ -10,6 +10,9 @@',
+      '-function handle(x) {',
+      '+function handle(x) {',
+      '+  if (!x) return;',
+      ' }',
+      '```',
+      '',
+      'Apply the diff above before requeuing.',
+    ].join('\n');
+    const handler = async () => ({
+      result: 'needs_fix',
+      context: { reviewFeedback },
+      message: 'Review output contains blocking findings',
+    });
+
+    await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { review: handler },
+      outboxStore,
+      session: SESSION,
+      now: NOW,
+    });
+
+    const pending = await outboxStore.listPending();
+    const issueComment = pending.find(e => e.topic === 'gh:comment' && e.payload.issueNumber === 99);
+    expect(issueComment).toBeDefined();
+    const body = issueComment.payload.body;
+
+    // Balanced <details>/</details> tags: the embedded fence must not have
+    // closed the outer one early, which would otherwise leave one of the two
+    // <details> blocks (excerpt + run metadata) without its closing tag, or
+    // strand a stray </details> from the embedded content outside a block.
+    const openCount = (body.match(/<details>/g) || []).length;
+    const closeCount = (body.match(/<\/details>/g) || []).length;
+    expect(openCount).toBe(closeCount);
+    expect(openCount).toBeGreaterThanOrEqual(1);
+
+    // The excerpt section must be delimited by a fence strictly longer than
+    // the longest backtick run inside the excerpt (3, from the embedded
+    // ```diff block), so the embedded fence cannot close it early.
+    const excerptStart = body.indexOf('<summary>Review findings excerpt</summary>');
+    expect(excerptStart).toBeGreaterThan(-1);
+    const afterSummary = body.slice(excerptStart);
+    const fenceMatch = afterSummary.match(/\n(`{3,})\n/);
+    expect(fenceMatch).not.toBeNull();
+    const outerFenceLen = fenceMatch[1].length;
+    expect(outerFenceLen).toBeGreaterThan(3);
+
+    // The full excerpt — heading, diff fence, and trailing prose — renders
+    // entirely inside the <details> block, before its closing tag.
+    const excerptDetailsEnd = body.indexOf('</details>', excerptStart);
+    expect(excerptDetailsEnd).toBeGreaterThan(-1);
+    const suggestedIdx = body.indexOf('## Suggested Changes (review agent edits)');
+    const diffFenceIdx = body.indexOf('```diff');
+    const trailingProseIdx = body.indexOf('Apply the diff above before requeuing.');
+    expect(suggestedIdx).toBeGreaterThan(excerptStart);
+    expect(suggestedIdx).toBeLessThan(excerptDetailsEnd);
+    expect(diffFenceIdx).toBeGreaterThan(excerptStart);
+    expect(diffFenceIdx).toBeLessThan(excerptDetailsEnd);
+    expect(trailingProseIdx).toBeGreaterThan(excerptStart);
+    expect(trailingProseIdx).toBeLessThan(excerptDetailsEnd);
+  });
+
   test('review blocked enqueues comment on both issue and PR', async () => {
     await enqueueTask('review', { prUrl: 'https://github.com/org/repo/pull/8', branch: 'ai/issue-99' });
     const handler = async () => ({
@@ -2079,6 +2159,41 @@ describe('runNextPhase outbox side effects — conflict_resolution blocked (huma
     expect(body).not.toContain('agent-abc123');
     // Core semantic conflict content still present.
     expect(body).toMatch(/escalated/i);
+  });
+});
+
+describe('runNextPhase outbox side effects — conflict_resolution report-only admission hold (issue #532 review)', () => {
+  test('does NOT clear the conflict-resolution queue labels — the hold must stay resumable for intake reactivation', async () => {
+    await enqueueTask('conflict_resolution', { prUrl: 'https://github.com/org/repo/pull/5', branch: 'ai/issue-99' });
+    const reportOnlySession = { ...SESSION, reportOnly: { enabled: true } };
+    let handlerRan = false;
+
+    const outcome = await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { conflict_resolution: async () => { handlerRan = true; return { result: 'success' }; } },
+      admitPhase: (task) => checkReportOnlyAdmission(reportOnlySession, task),
+      outboxStore,
+      session: reportOnlySession,
+      now: NOW,
+    });
+
+    // The admission preflight rejects before the handler ever runs (side-effect-free contract).
+    expect(handlerRan).toBe(false);
+    expect(outcome.status).toBe('completed');
+    // A hold, not a terminal ready_for_human handoff — must stay eligible for
+    // intake reactivation once reportOnly.enabled is turned off (transitions.ts).
+    expect(outcome.task).toMatchObject({ status: 'blocked', phase: 'conflict_resolution' });
+
+    const pending = await outboxStore.listPending();
+    const removed = pending.filter(e => e.topic === 'gh:label:remove').map(e => e.payload.label);
+    // Unlike a genuine handler-decided escalation (see the "human handoff" describe
+    // block above), an admission-originated hold must NOT strip the queue labels:
+    // intake re-derives the conflict_resolution phase from these labels when it
+    // scans the issue again after report-only mode is disabled. Removing them here
+    // would strand the task in `blocked` forever (issue #532 review).
+    expect(removed).not.toContain('status:needs-conflict-resolution');
+    expect(removed).not.toContain('status:conflict-resolution-in-progress');
   });
 });
 
@@ -2845,6 +2960,54 @@ describe('runNextPhase outbox — run metadata block in comments', () => {
     expect(prComment.payload.body).not.toContain('Latest review findings');
   });
 
+  test('review loop cap findings excerpt with an embedded ```diff fence stays balanced (issue #706)', async () => {
+    await enqueueTask('review', { prUrl: 'https://github.com/org/repo/pull/5', branch: 'ai/issue-99' });
+    const reviewFeedback = [
+      '[P1] Latest blocking finding from review',
+      '',
+      '## Suggested Changes (review agent edits)',
+      '',
+      '```diff',
+      '-return null;',
+      '+return undefined;',
+      '```',
+    ].join('\n');
+    const handler = async () => ({
+      result: 'blocked',
+      context: {
+        classification: 'needs_fix',
+        reviewLoopCapReached: true,
+        reviewCycles: 5,
+        reviewLoopMaxCycles: 5,
+        reviewFeedback,
+      },
+      message: 'Review loop cap reached',
+    });
+
+    await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { review: handler },
+      outboxStore,
+      session: SESSION,
+      now: NOW,
+    });
+
+    const pending = await outboxStore.listPending();
+    const issueComment = pending.find(e => e.topic === 'gh:comment' && e.payload.issueNumber === 99);
+    const body = issueComment.payload.body;
+    const openCount = (body.match(/<details>/g) || []).length;
+    const closeCount = (body.match(/<\/details>/g) || []).length;
+    expect(openCount).toBe(closeCount);
+
+    const excerptStart = body.indexOf('<summary>Latest review findings</summary>');
+    expect(excerptStart).toBeGreaterThan(-1);
+    const excerptDetailsEnd = body.indexOf('</details>', excerptStart);
+    const diffFenceIdx = body.indexOf('```diff');
+    expect(diffFenceIdx).toBeGreaterThan(excerptStart);
+    expect(diffFenceIdx).toBeLessThan(excerptDetailsEnd);
+  });
+
   test('claude review with env model source shows model source in block', async () => {
     await enqueueTask('review', { prUrl: 'https://github.com/org/repo/pull/5', branch: 'ai/issue-99' });
     const handler = async () => ({
@@ -3550,5 +3713,308 @@ describe('runNextPhase outbox side effects — gitea-issues work-item routing', 
     // The GitHub path is unchanged: a legacy gh:comment row, no workitem:* rows.
     expect(pending.find(e => e.topic === 'gh:comment')).toBeDefined();
     expect(pending.filter(e => e.topic.startsWith('workitem:'))).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// content_research outbox side effects (issue #625)
+// ---------------------------------------------------------------------------
+
+describe('runNextPhase outbox side effects — content_research success', () => {
+  const SESSION_WITH_RESEARCH = {
+    ...SESSION,
+    defaults: { ...SESSION.defaults, researchAgent: 'gemini' },
+  };
+
+  test('enqueues a fixed-outcome success comment without research findings', async () => {
+    // Public-status contract: only a fixed outcome status string is published.
+    // Research findings, agent output, or any raw content must never appear in
+    // the public comment (docs/content-research-mvp-contract.md §Public-Status Contract).
+    await enqueueTask('content_research', {});
+    const handler = async () => ({
+      result: 'success',
+      context: {
+        artifactDir: '/tmp/content-research-artifacts/run-1',
+        contentResearchOutput: 'This is raw research findings — MUST NOT appear in public comment.',
+        contentResearchAgentUsed: 'gemini',
+      },
+    });
+
+    await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { content_research: handler },
+      outboxStore,
+      session: SESSION_WITH_RESEARCH,
+      now: NOW,
+    });
+
+    const pending = await outboxStore.listPending();
+    const comment = pending.find(e => e.topic === 'gh:comment');
+    expect(comment).toBeDefined();
+    expect(comment.payload.body).toContain('Content research complete');
+    // Raw findings and agent output must never appear in the public comment.
+    expect(comment.payload.body).not.toContain('raw research findings');
+    expect(comment.payload.body).not.toContain('/tmp/content-research-artifacts');
+  });
+
+  test('success clears the content-research lane labels on content_draft transition', async () => {
+    // content_research is NOT terminal: nextPhaseAfter("content_research", "success") advances
+    // to queued/content_draft. The content-research lane labels (agent:gemini +
+    // status:content-needed) must be removed so a later intake scan does not
+    // re-enqueue the same issue as content_research or misroute a subsequent
+    // review to Gemini (stale agent:gemini causes the same problem as issue #264).
+    await enqueueTask('content_research', { artifactDir: '/tmp/content-research-artifacts' });
+    const handler = async () => ({
+      result: 'success',
+      context: { artifactDir: '/tmp/content-research-artifacts', contentResearchAgentUsed: 'gemini' },
+    });
+
+    const outcome = await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { content_research: handler },
+      outboxStore,
+      session: SESSION_WITH_RESEARCH,
+      now: NOW,
+    });
+
+    expect(outcome.task.status).toBe('queued');
+
+    const pending = await outboxStore.listPending();
+    const removedLabels = pending.filter(e => e.topic === 'gh:label:remove').map(e => e.payload.label);
+    expect(removedLabels).toContain('status:content-needed');
+    expect(removedLabels).toContain('agent:gemini');
+  });
+});
+
+describe('runNextPhase outbox side effects — content_research failure', () => {
+  const SESSION_WITH_RESEARCH = {
+    ...SESSION,
+    defaults: { ...SESSION.defaults, researchAgent: 'gemini' },
+  };
+
+  test('enqueues a fixed-outcome failure comment without error details', async () => {
+    // Public-status contract: only a fixed status string is published on failure.
+    // Raw error output, stderr, diagnostic strings must not appear in the comment.
+    await enqueueTask('content_research', {});
+    const handler = async () => ({
+      result: 'failed',
+      error: 'agy: quota exceeded — MUST NOT appear in public comment',
+      context: { artifactDir: '/tmp/content-research-artifacts/run-1' },
+    });
+
+    await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { content_research: handler },
+      outboxStore,
+      session: SESSION_WITH_RESEARCH,
+      now: NOW,
+    });
+
+    const pending = await outboxStore.listPending();
+    const comment = pending.find(e => e.topic === 'gh:comment');
+    expect(comment).toBeDefined();
+    expect(comment.payload.body).toContain('Content research failed');
+    // Raw error detail must never appear in the public comment.
+    expect(comment.payload.body).not.toContain('quota exceeded');
+    expect(comment.payload.body).not.toContain('/tmp/content-research-artifacts');
+  });
+
+  test('failure removes content-research lane labels so intake does not re-advertise the task', async () => {
+    // Terminal failure must remove status:content-needed and agent:gemini so the
+    // failed issue is not picked up again by a label-driven intake scan.
+    await enqueueTask('content_research', { artifactDir: '/tmp/content-research-artifacts' });
+    const handler = async () => ({
+      result: 'failed',
+      error: 'agy: command not found (exit 127)',
+      context: { artifactDir: '/tmp/content-research-artifacts' },
+    });
+
+    const outcome = await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { content_research: handler },
+      outboxStore,
+      session: SESSION_WITH_RESEARCH,
+      now: NOW,
+    });
+
+    expect(outcome.task.status).toBe('failed');
+
+    const pending = await outboxStore.listPending();
+    const removedLabels = pending.filter(e => e.topic === 'gh:label:remove').map(e => e.payload.label);
+    expect(removedLabels).toContain('status:content-needed');
+    expect(removedLabels).toContain('agent:gemini');
+  });
+
+  test('failure removes configured needsContentResearch label when session overrides the default', async () => {
+    const sessionWithConfiguredLabel = {
+      ...SESSION_WITH_RESEARCH,
+      labels: { ...SESSION_WITH_RESEARCH.labels, needsContentResearch: 'custom:content-queue' },
+    };
+    await enqueueTask('content_research', {});
+    const handler = async () => ({
+      result: 'failed',
+      error: 'agy: exit 1',
+      context: { artifactDir: '/tmp/artifacts' },
+    });
+
+    await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { content_research: handler },
+      outboxStore,
+      session: sessionWithConfiguredLabel,
+      now: NOW,
+    });
+
+    const pending = await outboxStore.listPending();
+    const removedLabels = pending.filter(e => e.topic === 'gh:label:remove').map(e => e.payload.label);
+    expect(removedLabels).toContain('custom:content-queue');
+    expect(removedLabels).not.toContain('status:content-needed');
+  });
+
+  test('Slack failure notification omits reason — content_research public-status contract', async () => {
+    // Public-status contract: Slack notifications for content_research must carry
+    // only fixed outcome/status values. Variable diagnostic text from result.error
+    // must never be forwarded to Slack.
+    const sessionWithSlack = {
+      ...SESSION_WITH_RESEARCH,
+      notifications: {
+        slack: { enabled: true, webhookUrlEnv: 'SLACK_WEBHOOK_URL' },
+      },
+    };
+    await enqueueTask('content_research', {});
+    const handler = async () => ({
+      result: 'failed',
+      error: 'agy: unsupported-agent — MUST NOT appear in Slack reason',
+      context: { artifactDir: '/tmp/content-research-artifacts/run-1' },
+    });
+
+    await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { content_research: handler },
+      outboxStore,
+      session: sessionWithSlack,
+      now: NOW,
+    });
+
+    const pending = await outboxStore.listPending();
+    const slackEntry = pending.find(e => e.topic === 'slack:notification');
+    expect(slackEntry).toBeDefined();
+    expect(slackEntry.payload.phase).toBe('content_research');
+    expect(slackEntry.payload.transition).toBe('failed');
+    // reason must be absent — no diagnostic text forwarded to Slack
+    expect(slackEntry.payload.reason).toBeUndefined();
+  });
+});
+
+describe('runNextPhase outbox side effects — content_review needs_fix cycle cap (issue #603 review follow-up)', () => {
+  const SESSION_WITH_CONTENT = {
+    ...SESSION,
+    defaults: { ...SESSION.defaults, researchAgent: 'gemini' },
+  };
+  const needsFixHandler = async () => ({
+    result: 'needs_fix',
+    context: { artifactDir: '/tmp/content-review-artifacts/run-1' },
+    message: 'Editorial findings require revision',
+  });
+
+  test('under the cap: requeues to content_draft and reports "returned to draft phase"', async () => {
+    await enqueueTask('content_review', {});
+
+    const outcome = await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { content_review: needsFixHandler },
+      outboxStore,
+      session: SESSION_WITH_CONTENT,
+      now: NOW,
+    });
+
+    expect(outcome.task.status).toBe('queued');
+    expect(outcome.task.phase).toBe('content_draft');
+    expect(outcome.task.context.contentReviewNeedsFixCycles).toBe(1);
+
+    const pending = await outboxStore.listPending();
+    const comment = pending.find(e => e.topic === 'gh:comment');
+    expect(comment.payload.body).toContain('Returned to draft phase');
+    expect(comment.payload.body).not.toContain('escalated for human review');
+  });
+
+  test('cap reached: escalates to ready_for_human and reports the human handoff, not a draft return', async () => {
+    // Seed the task as if two real needs_fix cycles have already completed.
+    await enqueueTask('content_review', { contentReviewNeedsFixCycles: 2 });
+
+    const outcome = await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { content_review: needsFixHandler },
+      outboxStore,
+      session: SESSION_WITH_CONTENT,
+      now: NOW,
+    });
+
+    expect(outcome.task.status).toBe('ready_for_human');
+    expect(outcome.task.phase).toBe('content_review');
+
+    const pending = await outboxStore.listPending();
+    const comment = pending.find(e => e.topic === 'gh:comment');
+    expect(comment.payload.body).toContain('escalated for human review');
+    expect(comment.payload.body).not.toContain('Returned to draft phase');
+  });
+
+  test('quota-delayed reclaims do not count toward the cap (issue #603 review follow-up)', async () => {
+    // Two quota/rate-limit delays followed by the first real needs_fix must NOT
+    // reach the cap — attempts.content_review is inflated by claim-time retries
+    // that never produced an editorial verdict.
+    await enqueueTask('content_review', {});
+    const delayedHandler = async () => ({
+      result: 'delayed',
+      context: { artifactDir: '/tmp/content-review-artifacts/run-1' },
+      retryAfterMs: 1000,
+    });
+
+    const delay1 = await runNextPhase({
+      store: taskStore,
+      request: { ...REQUEST, runId: 'run-delay-1' },
+      handlers: { content_review: delayedHandler },
+      outboxStore,
+      session: SESSION_WITH_CONTENT,
+      now: NOW,
+    });
+    expect(delay1.status).toBe('delayed');
+
+    const afterFirstDelay = new Date(Date.parse(NOW) + 2000).toISOString();
+    const delay2 = await runNextPhase({
+      store: taskStore,
+      request: { ...REQUEST, runId: 'run-delay-2' },
+      handlers: { content_review: delayedHandler },
+      outboxStore,
+      session: SESSION_WITH_CONTENT,
+      now: afterFirstDelay,
+    });
+    expect(delay2.status).toBe('delayed');
+
+    const afterSecondDelay = new Date(Date.parse(NOW) + 4000).toISOString();
+    const outcome = await runNextPhase({
+      store: taskStore,
+      request: { ...REQUEST, runId: 'run-needs-fix-1' },
+      handlers: { content_review: needsFixHandler },
+      outboxStore,
+      session: SESSION_WITH_CONTENT,
+      now: afterSecondDelay,
+    });
+
+    // Two delayed reclaims inflated attempts.content_review to 3 (the old cap
+    // threshold), but only one real needs_fix cycle has completed — so this
+    // must requeue to content_draft, not escalate to ready_for_human.
+    expect(outcome.task.attempts.content_review).toBe(3);
+    expect(outcome.task.status).toBe('queued');
+    expect(outcome.task.phase).toBe('content_draft');
+    expect(outcome.task.context.contentReviewNeedsFixCycles).toBe(1);
   });
 });

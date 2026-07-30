@@ -6,8 +6,12 @@ import {
   findCircularDeps,
   makeBadge,
   coverageColor,
+  measureText,
+  makeSvgBadge,
+  metricsValuesEqual,
+  main,
 } from '../scripts/metrics.mjs';
-import { mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -315,5 +319,136 @@ describe('coverageColor', () => {
     [0, 'red'],
   ])('%i% → %s', (pct, expected) => {
     expect(coverageColor(pct)).toBe(expected);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// measureText
+// ---------------------------------------------------------------------------
+
+describe('measureText', () => {
+  test('returns a positive number for non-empty text', () => {
+    expect(measureText('hello')).toBeGreaterThan(0);
+  });
+
+  test('narrow characters produce smaller width than wide ones', () => {
+    expect(measureText('iii')).toBeLessThan(measureText('mmm'));
+  });
+
+  test('width scales with text length', () => {
+    expect(measureText('aa')).toBeGreaterThan(measureText('a'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// makeSvgBadge
+// ---------------------------------------------------------------------------
+
+describe('makeSvgBadge', () => {
+  test('returns a string containing an svg element', () => {
+    const svg = makeSvgBadge('coverage', '85%', 'brightgreen');
+    expect(svg).toContain('<svg');
+    expect(svg).toContain('</svg>');
+  });
+
+  test('embeds label and message in svg content', () => {
+    const svg = makeSvgBadge('tests', '42', 'blue');
+    expect(svg).toContain('tests');
+    expect(svg).toContain('42');
+  });
+
+  test('uses the correct hex color for known color names', () => {
+    expect(makeSvgBadge('x', 'y', 'brightgreen')).toContain('#4c1');
+    expect(makeSvgBadge('x', 'y', 'yellow')).toContain('#dfb317');
+    expect(makeSvgBadge('x', 'y', 'orange')).toContain('#fe7d37');
+    expect(makeSvgBadge('x', 'y', 'informational')).toContain('#007ec6');
+  });
+
+  test('falls back to grey hex for unknown color names', () => {
+    expect(makeSvgBadge('x', 'y', 'unknown-color')).toContain('#9f9f9f');
+  });
+
+  test('longer messages produce a wider overall badge width', () => {
+    const short = makeSvgBadge('label', 'x', 'blue');
+    const long = makeSvgBadge('label', 'a much longer message', 'blue');
+    const parseWidth = svg => parseInt(svg.match(/width="(\d+)"/)[1]);
+    expect(parseWidth(long)).toBeGreaterThan(parseWidth(short));
+  });
+
+  test('escapes XML special characters in label and message', () => {
+    const svg = makeSvgBadge('a&b', '<val>', 'blue');
+    expect(svg).toContain('&amp;b');
+    expect(svg).toContain('&lt;val&gt;');
+    expect(svg).not.toMatch(/a&b/);
+    expect(svg).not.toContain('<val>');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// metricsValuesEqual
+// ---------------------------------------------------------------------------
+
+describe('metricsValuesEqual', () => {
+  test('returns true when only the generated timestamp differs', () => {
+    const a = { generated: '2026-01-01T00:00:00.000Z', src: { files: 1 } };
+    const b = { generated: '2026-06-01T00:00:00.000Z', src: { files: 1 } };
+    expect(metricsValuesEqual(a, b)).toBe(true);
+  });
+
+  test('returns false when a metric value differs', () => {
+    const a = { generated: '2026-01-01T00:00:00.000Z', src: { files: 1 } };
+    const b = { generated: '2026-01-01T00:00:00.000Z', src: { files: 2 } };
+    expect(metricsValuesEqual(a, b)).toBe(false);
+  });
+
+  test('returns false when either side is missing', () => {
+    expect(metricsValuesEqual(null, { generated: 'x' })).toBe(false);
+    expect(metricsValuesEqual({ generated: 'x' }, undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// main — idempotent generation (issue #739)
+// ---------------------------------------------------------------------------
+
+describe('main', () => {
+  function makeProjectRoot(name) {
+    const root = join(TMP, name);
+    mkdirSync(join(root, 'src'), { recursive: true });
+    mkdirSync(join(root, 'test'), { recursive: true });
+    writeFileSync(join(root, 'src', 'a.ts'), 'export const a = 1;\n');
+    return root;
+  }
+
+  function readLatest(root) {
+    return {
+      json: JSON.parse(readFileSync(join(root, 'docs', 'metrics', 'latest.json'), 'utf8')),
+      md: readFileSync(join(root, 'docs', 'metrics', 'latest.md'), 'utf8'),
+    };
+  }
+
+  test('re-running against unchanged source leaves latest.json/.md byte-identical', () => {
+    const root = makeProjectRoot('idempotent');
+    main(root);
+    const first = readLatest(root);
+
+    main(root);
+    const second = readLatest(root);
+
+    expect(second.json).toEqual(first.json);
+    expect(second.md).toBe(first.md);
+  });
+
+  test('a genuine metric change still produces a fresh timestamp and updated values', () => {
+    const root = makeProjectRoot('changed');
+    main(root);
+    const first = readLatest(root);
+
+    writeFileSync(join(root, 'src', 'b.ts'), 'export const b = 2;\n');
+    main(root);
+    const second = readLatest(root);
+
+    expect(second.json.src.files).toBe(first.json.src.files + 1);
+    expect(second.json.generated).not.toBe(first.json.generated);
   });
 });

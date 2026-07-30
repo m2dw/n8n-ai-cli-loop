@@ -19,12 +19,19 @@ import { JsonSessionRegistry, DEFAULT_SESSIONS_PATH } from "../registries/json-s
 import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
 import { SqliteOutboxStore } from "../stores/sqlite-outbox-store.js";
 import { SqliteContextStore } from "../stores/sqlite-context-store.js";
+import { SqliteSessionControlStore } from "../stores/sqlite-session-control-store.js";
+import { recordRunAndEvaluate, resolveCircuitBreakerPolicy } from "../core/session-control.js";
 import { runNextPhase } from "../core/phase-runner.js";
 import type { PhaseHandlerContext, PhaseHandlers } from "../core/phase-runner.js";
 import { createResearchHandler } from "../handlers/research.js";
 import { createImplementationHandler } from "../handlers/implementation.js";
 import { createReviewHandler } from "../handlers/review.js";
+import { checkReviewAdmission } from "../handlers/review-admission.js";
+import { checkReportOnlyAdmission } from "../handlers/report-only-admission.js";
 import { createConflictResolutionHandler } from "../handlers/conflict-resolution.js";
+import { createContentResearchHandler } from "../handlers/content-research.js";
+import { createContentDraftHandler } from "../handlers/content-draft.js";
+import { createContentReviewHandler } from "../handlers/content-review.js";
 import { resolveWorktreeExecutionContext } from "../handlers/worktree-context.js";
 import { IssueWorktreeLock } from "../handlers/worktree.js";
 import type { PhaseLockAcquisition } from "../core/phase-runner.js";
@@ -44,21 +51,20 @@ import {
 } from "../providers/gitea/gitea-client.js";
 import type { GiteaHttpRequest } from "../providers/gitea/gitea-client.js";
 import type { DependencyChecker } from "../core/github-intake.js";
-import type { ResolvedSession } from "../core/session.js";
 import type { TaskPhase } from "../core/task.js";
 import { emit, die } from "./cli-io.js";
 import { tokenizeArgs } from "./admin-command.js";
 import { fileURLToPath } from "url";
 
 const ALL_PHASES = new Set<TaskPhase>([
-  "implementation", "review", "conflict_resolution", "research", "planner",
+  "implementation", "review", "conflict_resolution", "research", "content_research", "content_draft", "content_review", "planner",
 ]);
-const DEFAULT_SUPPORTED_PHASES: TaskPhase[] = ["research"];
+const DEFAULT_SUPPORTED_PHASES: TaskPhase[] = ["research", "content_research", "content_draft", "content_review"];
 
 // Phases that operate inside the repository checkout and therefore run in the
-// per-issue worktree when a session opts in (issue #438). Research/planner do not
-// touch the issue branch, so they keep the shared checkout and never trigger
-// worktree (and `ai/issue-<n>` branch) creation prematurely.
+// per-issue worktree unconditionally (issue #438; issue #731 dropped the
+// shared-checkout mode entirely). Research/planner do not touch the issue
+// branch, so they never trigger worktree (and `ai/issue-<n>` branch) creation.
 const WORKTREE_PHASES = new Set<TaskPhase>([
   "implementation", "review", "conflict_resolution",
 ]);
@@ -66,24 +72,22 @@ const WORKTREE_PHASES = new Set<TaskPhase>([
 /**
  * Acquire the issue-scoped worktree lock around phase execution (issue #440).
  *
- * For a worktree-enabled session running a repo-working phase this takes the
- * `<session>::issue-<n>` lock so the SAME issue cannot run concurrently while
- * DIFFERENT issues (distinct lock scopes) proceed in parallel — independent of
- * whether n8n prevents overlapping executions. A worktree-disabled session (or a
- * research/planner phase that never touches the issue branch) returns a no-op
- * acquisition so the handler proceeds exactly as before — preserving today's
- * shared-checkout behavior. The owner id ties the lock to this run's execution so
- * `admin worktree recovery` / `release-lock` can attribute a stale lock to its
- * origin. The session repo lock is left to canonical-repo / worktree-registry
- * mutations (admin commands) and is intentionally NOT taken here.
+ * Every repo-working phase (`WORKTREE_PHASES`) takes the `<session>::issue-<n>`
+ * lock so the SAME issue cannot run concurrently while DIFFERENT issues
+ * (distinct lock scopes) proceed in parallel — independent of whether n8n
+ * prevents overlapping executions. A research/planner phase that never
+ * touches the issue branch gets a no-op acquisition. The owner id ties the
+ * lock to this run's execution so `admin worktree recovery` / `release-lock`
+ * can attribute a stale lock to its origin. The session repo lock is left to
+ * canonical-repo / worktree-registry mutations (admin commands) and is
+ * intentionally NOT taken here.
  */
 function acquireIssuePhaseLock(
   lock: IssueWorktreeLock,
   ownerId: string,
-  session: ResolvedSession,
   task: AiTask,
 ): PhaseLockAcquisition {
-  if (session.worktrees?.enabled !== true || !WORKTREE_PHASES.has(task.phase)) {
+  if (!WORKTREE_PHASES.has(task.phase)) {
     return { ok: true, acquired: true, handle: { release() {} } };
   }
   let result: AcquireResult;
@@ -299,17 +303,22 @@ export async function createPhaseHandlers(
       return checker.getBlockedBy(issueNumber);
     },
   };
-  // When this session uses per-issue worktrees, the phase runner acquires the
-  // issue-scoped worktree lock before invoking the review handler (via acquirePhaseLock).
-  // Pass the pre-acquisition owner ID so the review handler skips its own acquire;
-  // without this it would see the lock already held and return `blocked` (issue #515).
-  const phaseLockOwnerId = session.worktrees?.enabled ? (context.contextId ?? context.runId) : undefined;
+  // The phase runner always acquires the issue-scoped worktree lock before
+  // invoking these handlers (via acquirePhaseLock). Pass the pre-acquisition
+  // owner ID so the handler skips its own acquire; without this it would see
+  // the lock already held and return `blocked` (issue #515).
+  const runnerLockOwnerId = context.contextId ?? context.runId;
+  const reviewPhaseLockOwnerId = runnerLockOwnerId;
+  const conflictPhaseLockOwnerId = runnerLockOwnerId;
 
   return {
     research: createResearchHandler(context),
+    content_research: createContentResearchHandler(context),
+    content_draft: createContentDraftHandler(context),
+    content_review: createContentReviewHandler(context),
     implementation: createImplementationHandler(context, undefined, depChecker),
-    review: createReviewHandler(context, undefined, undefined, undefined, undefined, phaseLockOwnerId),
-    conflict_resolution: createConflictResolutionHandler(context, undefined, undefined, undefined, phaseLockOwnerId),
+    review: createReviewHandler(context, undefined, undefined, undefined, undefined, reviewPhaseLockOwnerId),
+    conflict_resolution: createConflictResolutionHandler(context, undefined, undefined, undefined, conflictPhaseLockOwnerId),
   };
 }
 
@@ -362,9 +371,10 @@ async function main(): Promise<void> {
     die(`Failed to resolve GitHub provider auth: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // Open SQLite stores (outbox shares the same DB file as tasks)
+  // Open SQLite stores (outbox and session control share the same DB file as tasks)
   const store = new SqliteTaskStore(dbPath);
   const outboxStore = new SqliteOutboxStore(dbPath);
+  const sessionControlStore = new SqliteSessionControlStore(dbPath);
 
   // Issue-scoped worktree lock taken around phase execution (issue #440). The
   // owner id ties a held lock to this run's execution (contextId when n8n supplies
@@ -386,22 +396,59 @@ async function main(): Promise<void> {
       session,
       contextId,
       // Record the per-issue worktree's deterministic identity before repo-working
-      // phases when the session opts in (issue #438). This is intentionally
-      // NON-mutating: the handlers in this slice still run in the canonical
-      // checkout (`session.repoRoot`), so creating/checking out `ai/issue-<n>` in a
-      // separate worktree here would collide with the handler's own branch
-      // checkout. The resolver defaults to `create: false`, computing the id +
-      // path with no git side effect. Worktree-disabled sessions short-circuit to
-      // `enabled: false`, so this is a no-op for them.
-      resolveWorktreeContext: (task) =>
-        WORKTREE_PHASES.has(task.phase)
-          ? resolveWorktreeExecutionContext({ session, issueNumber: task.issueNumber })
-          : { ok: true, context: { enabled: false } },
+      // phases (issue #438). This is intentionally NON-mutating: the resolver
+      // defaults to `create: false`, computing the id + path with no git side
+      // effect. Non-repo phases (research/planner/content-*) never touch the
+      // issue branch, so they resolve to `{ enabled: false }`.
+      resolveWorktreeContext: async (task) => {
+        if (!WORKTREE_PHASES.has(task.phase)) {
+          return { ok: true, context: { enabled: false } };
+        }
+        const resolved = resolveWorktreeExecutionContext({ session, issueNumber: task.issueNumber });
+        if (!resolved.ok) return resolved;
+        return { ok: true, context: { enabled: true, ...resolved.context } };
+      },
       // Take the issue-scoped worktree lock around phase execution (issue #440) so
       // the same issue never runs concurrently while different issues stay
-      // independent. Worktree-disabled sessions / non-repo phases get a no-op lock,
-      // preserving today's shared-checkout behavior.
-      acquirePhaseLock: (task) => acquireIssuePhaseLock(issueLock, lockOwnerId, session, task),
+      // independent. Non-repo phases get a no-op lock.
+      acquirePhaseLock: (task) => acquireIssuePhaseLock(issueLock, lockOwnerId, task),
+      // Review-admission preflight (issue #681) and report-only-mode admission
+      // (issue #532), run before the issue lock is taken or the worktree is
+      // resolved so a rejection never acquires the lock, materializes the
+      // worktree, or invokes the handler. Every other phase is admitted as-is.
+      admitPhase: (task) =>
+        task.phase === "review" ? checkReviewAdmission(task) : checkReportOnlyAdmission(session, task),
+      // Session pause gate (issue #531): a paused session claims and executes
+      // nothing. Pause state lives in the runner-owned SQLite store (see
+      // `admin session pause|resume|status`), never in GitHub labels.
+      checkSessionPause: () => sessionControlStore.getPauseState(sessionId),
+      // Per-run cost/result ledger + circuit breaker (issue #531): record every
+      // executed phase and pause the session automatically after repeated
+      // failed outcomes (session-wide or same-issue+phase; thresholds are
+      // env-tunable, see resolveCircuitBreakerPolicy). An automatic pause never
+      // overwrites an operator's pause. The breaker trip is also recorded as a
+      // task event so the pause is attributable from the event log.
+      recordRunResult: async (entry) => {
+        const evaluation = await recordRunAndEvaluate(
+          sessionControlStore, entry, resolveCircuitBreakerPolicy(),
+        );
+        if (evaluation.tripped && evaluation.pausedNow && evaluation.decision.trip) {
+          await store.appendEvent({
+            task: { sessionId: entry.sessionId, issueNumber: entry.issueNumber },
+            type: "session.paused",
+            runId,
+            message: evaluation.decision.reason,
+            data: {
+              source: "circuit_breaker",
+              rule: evaluation.decision.rule,
+              count: evaluation.decision.count,
+              threshold: evaluation.decision.threshold,
+              ...(contextId !== undefined ? { contextId } : {}),
+            },
+            createdAt: entry.createdAt,
+          });
+        }
+      },
     });
 
     const ctx = contextId !== undefined ? { contextId } : {};
@@ -409,6 +456,24 @@ async function main(): Promise<void> {
     switch (outcome.status) {
       case "idle":
         emit({ ok: true, outcome: "idle", sessionId, supportedPhases, repoRoot: session.repoRoot, ...ctx });
+        break;
+
+      case "paused":
+        // Session pause (issue #531): no task was claimed or executed. Exit 0
+        // with a clear JSON outcome — a deliberately paused session is an
+        // expected state, not a workflow crash. Resume with
+        // `admin session resume --session-id <id>`.
+        emit({
+          ok: true,
+          outcome: "paused",
+          sessionId,
+          ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}),
+          ...(outcome.pausedAt !== undefined ? { pausedAt: outcome.pausedAt } : {}),
+          ...(outcome.pausedBy !== undefined ? { pausedBy: outcome.pausedBy } : {}),
+          ...(outcome.source !== undefined ? { source: outcome.source } : {}),
+          repoRoot: session.repoRoot,
+          ...ctx,
+        });
         break;
 
       case "claim_lost":
@@ -472,6 +537,7 @@ async function main(): Promise<void> {
   } finally {
     store.close();
     outboxStore.close();
+    sessionControlStore.close();
   }
 }
 

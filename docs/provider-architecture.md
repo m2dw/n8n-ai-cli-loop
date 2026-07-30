@@ -237,10 +237,11 @@ drains. Two topic families coexist on the same outbox table:
   back to the same `GhWorkItemProvider` / `GhRepoHostProvider`, producing
   byte-identical `gh` argv to the legacy topics (proven by
   `test/outbox-provider-neutral.test.js`). A kind with no wired provider is a
-  **retryable** per-entry failure: the row stays pending instead of being
-  dropped or mis-routed to GitHub, so enabling the provider later drains the
-  backlog. Idempotency keys use the same `makeOutboxKey` scheme, so dedup
-  behavior is identical across both families.
+  **retryable** per-entry failure: the row stays pending (with bounded backoff
+  between attempts, issue #606) instead of being dropped or mis-routed to
+  GitHub, so enabling the provider before the row exhausts its retry budget
+  drains the backlog. Idempotency keys use the same `makeOutboxKey` scheme, so
+  dedup behavior is identical across both families.
 
 These three provider-neutral comment topics map onto three distinct comment
 **surfaces**, each with a maximum disclosure tier. The policy is enforced in one
@@ -443,7 +444,7 @@ dependency checks, outbox dispatch) instead of silently reading the GitHub repo.
 {
   "sessionId": "n8n-ai-cli-loop",
   "repoKey": "n8n-ai-cli-loop",
-  "repoRoot": "/Users/you/git/n8n-ai-cli-loop",
+  "repoRoot": "/path/to/n8n-ai-cli-loop",
   "githubRepo": "m2dw/n8n-ai-cli-loop",
   "artifactDir": ".n8n-artifacts",
   "defaults": { "implementationAgent": "claude", "reviewAgent": "codex" },
@@ -465,7 +466,7 @@ omitting both fields.
 {
   "sessionId": "n8n-ai-cli-loop-app",
   "repoKey": "n8n-ai-cli-loop",
-  "repoRoot": "/Users/you/git/n8n-ai-cli-loop",
+  "repoRoot": "/path/to/n8n-ai-cli-loop",
   "githubRepo": "m2dw/n8n-ai-cli-loop",
   "artifactDir": ".n8n-artifacts",
   "defaults": { "implementationAgent": "claude", "reviewAgent": "codex" },
@@ -618,7 +619,7 @@ future capability is turned on.
 {
   "sessionId": "acme-app",
   "repoKey": "acme-app",
-  "repoRoot": "/Users/you/git/acme-app",
+  "repoRoot": "/path/to/acme-app",
   "githubRepo": "acme/acme-app",
   "artifactDir": ".n8n-artifacts",
   "defaults": { "implementationAgent": "claude", "reviewAgent": "codex" },
@@ -656,7 +657,7 @@ keeping branches and PRs on GitHub (the pairing specified in
 {
   "sessionId": "acme-private",
   "repoKey": "acme-private",
-  "repoRoot": "/Users/you/git/acme",
+  "repoRoot": "/path/to/acme",
   "githubRepo": "acme/acme",
   "artifactDir": ".n8n-artifacts",
   "defaults": { "implementationAgent": "claude", "reviewAgent": "codex" },
@@ -720,7 +721,7 @@ while an unconfigured session stays on the GitHub default:
 {
   "sessionId": "acme-gitea-prs",
   "repoKey": "acme-gitea-prs",
-  "repoRoot": "/Users/you/git/acme",
+  "repoRoot": "/path/to/acme",
   "githubRepo": "acme/acme",
   "artifactDir": ".n8n-artifacts",
   "defaults": { "implementationAgent": "claude", "reviewAgent": "codex" },

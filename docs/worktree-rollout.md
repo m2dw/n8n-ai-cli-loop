@@ -1,8 +1,8 @@
 # Per-Issue Worktree Rollout
 
-This document covers the **operational** path for enabling per-issue worktrees
-in a running session: how to opt in, what to expect at runtime, how to verify
-the feature, and how to recover from common failure modes.
+This document covers the **operational** path for per-issue worktrees in a
+running session: what to expect at runtime, how to verify the feature, and
+how to recover from common failure modes.
 
 For the underlying design see [docs/per-issue-worktrees.md](per-issue-worktrees.md).
 
@@ -11,43 +11,41 @@ For the underlying design see [docs/per-issue-worktrees.md](per-issue-worktrees.
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Enabling Worktrees in sessions.json](#enabling-worktrees-in-sessionsjson)
+2. [Configuring the Worktree Root](#configuring-the-worktree-root)
 3. [Operational Model](#operational-model)
-4. [Mid-Flight Enablement](#mid-flight-enablement)
-5. [Smoke-Test Checklist](#smoke-test-checklist)
-6. [Cleanup, Prune, and Recovery](#cleanup-prune-and-recovery)
-7. [Security Notes — Path Confidentiality](#security-notes--path-confidentiality)
+4. [Smoke-Test Checklist](#smoke-test-checklist)
+5. [Cleanup, Prune, and Recovery](#cleanup-prune-and-recovery)
+6. [Security Notes — Path Confidentiality](#security-notes--path-confidentiality)
 
 ---
 
 ## Overview
 
 Per-issue worktrees give each work item its own isolated git checkout under a
-managed state root. Phases (implementation, review, conflict resolution, Tool
-Request) execute inside the issue worktree rather than in the shared session
-`repoRoot`. The canonical `repoRoot` continues to act as the source for fetch,
-prune, and worktree registry operations.
-
-The feature is **opt-in** (default off). A session without the `worktrees`
-block keeps today's shared-checkout behavior unchanged.
+managed state root. Every phase (implementation, review, conflict resolution,
+Tool Request) executes inside the issue worktree unconditionally — there is no
+shared-checkout execution mode (removed in issue #731; see
+[docs/worktree-only-migration-contract.md](worktree-only-migration-contract.md)
+for the migration history). The canonical `repoRoot` continues to act as the
+source for fetch, prune, and worktree registry operations.
 
 ---
 
-## Enabling Worktrees in sessions.json
+## Configuring the Worktree Root
 
-Add a `worktrees` block to the target session entry in `sessions.json`
-(default path: `~/.config/n8n-ai-cli-loop/sessions.json`):
+No configuration is required to use per-issue worktrees — every session uses
+them. The only optional per-session setting is a custom worktree root:
 
 ```json
 {
   "sessions": [
     {
       "sessionId": "ai-cli-loop",
-      "repoRoot": "/Users/you/git/my-repo",
+      "repoRoot": "/path/to/workspace/my-repo",
       "githubRepo": "owner/my-repo",
       "artifactDir": ".n8n-artifacts",
       "worktrees": {
-        "enabled": true
+        "root": "/fast-disk/worktrees"
       },
       "defaults": {
         "implementationAgent": "claude",
@@ -66,20 +64,10 @@ Add a `worktrees` block to the target session entry in `sessions.json`
 }
 ```
 
-### Optional: custom worktree root
-
-By default the runtime stores worktrees at
-`~/.local/state/n8n-ai-cli-loop/worktrees/<session>/<issue>/repo/`. To
-override the root for one session only, add the `root` field:
-
-```json
-"worktrees": {
-  "enabled": true,
-  "root": "/fast-disk/worktrees"
-}
-```
-
-The `root` value must be an **absolute path** outside committed source. It is
+By default (when the `worktrees` block or its `root` field is omitted) the
+runtime stores worktrees at
+`~/.local/state/n8n-ai-cli-loop/worktrees/<session>/<issue>/repo/`. The `root`
+value, when set, must be an **absolute path** outside committed source. It is
 also configurable globally via the `N8N_AI_WORKTREE_ROOT` environment variable
 (session-level `root` takes precedence over the env var).
 
@@ -89,8 +77,9 @@ also configurable globally via the `N8N_AI_WORKTREE_ROOT` environment variable
 node dist/cli/run-one-phase.js --session-id ai-cli-loop --dry-run
 ```
 
-A malformed `worktrees` block (e.g. a non-absolute `root`) causes the CLI to
-exit with a validation error before any work runs.
+A malformed `worktrees` block (e.g. a non-absolute `root`, or a legacy
+`enabled` field) causes the CLI to exit with a validation error before any
+work runs.
 
 ---
 
@@ -103,8 +92,8 @@ exit with a validation error before any work runs.
 | `repoRoot` (canonical) | Fetch, worktree registry, `git worktree add/prune/list` |
 | `<worktree root>/<session>/issue-<n>/repo/` | Phase execution cwd for issue N |
 
-The canonical checkout is never modified by phase handlers once worktrees are
-enabled. It stays on whatever branch it was on when the session started.
+The canonical checkout is never modified by phase handlers. It stays on
+whatever branch it was on when the session started.
 
 ### Worktree lifecycle per issue
 
@@ -138,36 +127,14 @@ trigger for the same issue is rejected with `lock_contended`.
 
 ---
 
-## Mid-Flight Enablement
-
-You can add `"worktrees": { "enabled": true }` to a session that already has
-active tasks:
-
-- Issues whose tasks have **not yet started** (or are in `queued` state) pick
-  up worktrees automatically on their first phase run.
-- Issues that **already have work in the shared checkout** continue to use that
-  checkout for any phase that runs before their first worktree-native phase.
-  On the first phase after enablement `resolveIssueWorktree` creates the
-  worktree and records it in the task context; later phases use it.
-- No database migration is needed: `worktreeId` is recomputable from session +
-  issue number if it is not already recorded.
-- Issues already in a terminal state (`done`, `failed`) are unaffected.
-
-There is no need to drain the queue before enabling; existing active issues
-complete on the shared checkout if they are mid-flight when you change the
-config, then pick up worktrees on the next trigger.
-
----
-
 ## Smoke-Test Checklist
 
-This is a **manual checklist**. Run it after enabling worktrees for the first
-time on a session, or after upgrading to a new release that changes worktree
-behaviour. It is not run automatically by the test suite.
+This is a **manual checklist**. Run it after setting up a new session, or
+after upgrading to a new release that changes worktree behaviour. It is not
+run automatically by the test suite.
 
 ### Prerequisites
 
-- [ ] `worktrees.enabled: true` is set in `sessions.json` for the target session.
 - [ ] At least one open GitHub issue labelled `ai:active` exists in the target repo.
 - [ ] n8n parent and child workflows are imported and active.
 - [ ] CLI is at the expected version (`node dist/cli/run-one-phase.js --version`).
@@ -209,7 +176,7 @@ behaviour. It is not run automatically by the test suite.
 - [ ] Run `admin tool-request grant --session-id <id> --issue-number <n>
       --on-changes` and confirm the grant operates inside the issue worktree.
 - [ ] Confirm the worktree directory persists after the grant (it is not
-      removed on handoff, unlike the shared-checkout model).
+      removed on handoff).
 
 ### Cleanup path
 

@@ -1093,6 +1093,80 @@ describe('SqliteHistoryStore', () => {
       store.close();
     }
   });
+
+  test('falls back to a pruned issue\'s persisted rollup when the live task/events rows are gone (issue #611 review)', () => {
+    const dbPath = join(tmpDir, 'pruned.db');
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE tasks (session_id TEXT, issue_number INTEGER, status TEXT, phase TEXT, attempts TEXT, context TEXT, last_error TEXT, updated_at TEXT, PRIMARY KEY (session_id, issue_number));
+      CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, issue_number INTEGER, type TEXT, run_id TEXT, message TEXT, data TEXT, created_at TEXT);
+      CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT UNIQUE, topic TEXT, payload TEXT, created_at TEXT, sent_at TEXT);
+      CREATE TABLE retention_issue_history_rollup (session_id TEXT, issue_number INTEGER, task_snapshot TEXT, events TEXT, archived_at TEXT, PRIMARY KEY (session_id, issue_number));
+    `);
+    // No row in `tasks`/`events` — this issue was already pruned. Only the
+    // rollup and the (never-pruned) outbox comment survive.
+    db.prepare(
+      'INSERT INTO retention_issue_history_rollup (session_id, issue_number, task_snapshot, events, archived_at) VALUES (?,?,?,?,?)',
+    ).run(
+      'addon-dev',
+      309,
+      JSON.stringify({
+        status: 'done',
+        phase: 'review',
+        attempts: JSON.stringify({ implementation: 1, review: 1 }),
+        context: JSON.stringify({}),
+        lastError: null,
+        updatedAt: 't',
+      }),
+      JSON.stringify([{ type: 'phase.completed', message: null, data: JSON.stringify({ phase: 'review', result: 'success' }), createdAt: 't' }]),
+      't',
+    );
+    db.prepare('INSERT INTO outbox (idempotency_key, topic, payload, created_at, sent_at) VALUES (?,?,?,?,?)').run(
+      'addon-dev:309:r1:gh:comment:review', 'gh:comment',
+      JSON.stringify({ topic: 'gh:comment', owner: 'm2dw', repo: 'demo-repo', issueNumber: 309, body: 'Review done' }),
+      't', 't',
+    );
+    db.close();
+
+    const store = new SqliteHistoryStore(dbPath);
+    try {
+      const history = store.readHistory('addon-dev', 309);
+      expect(history.task).toMatchObject({ status: 'done', phase: 'review', attempts: { implementation: 1, review: 1 } });
+      expect(history.events).toHaveLength(1);
+      expect(history.events[0]).toMatchObject({ type: 'phase.completed', data: { result: 'success' } });
+      expect(history.comments).toHaveLength(1);
+      expect(history.comments[0]).toMatchObject({ body: 'Review done' });
+    } finally {
+      store.close();
+    }
+  });
+
+  test('a live task row is never shadowed by a stale rollup entry for the same issue', () => {
+    const dbPath = join(tmpDir, 'live-wins.db');
+    seedDb(dbPath);
+    const db = new Database(dbPath, { readonly: false });
+    db.exec(
+      'CREATE TABLE retention_issue_history_rollup (session_id TEXT, issue_number INTEGER, task_snapshot TEXT, events TEXT, archived_at TEXT, PRIMARY KEY (session_id, issue_number))',
+    );
+    db.prepare(
+      'INSERT INTO retention_issue_history_rollup (session_id, issue_number, task_snapshot, events, archived_at) VALUES (?,?,?,?,?)',
+    ).run(
+      'addon-dev',
+      309,
+      JSON.stringify({ status: 'stale', phase: 'stale', attempts: '{}', context: '{}', lastError: null, updatedAt: 't' }),
+      JSON.stringify([]),
+      't',
+    );
+    db.close();
+
+    const store = new SqliteHistoryStore(dbPath);
+    try {
+      const history = store.readHistory('addon-dev', 309);
+      expect(history.task.status).toBe('done'); // the live row, not the stale rollup
+    } finally {
+      store.close();
+    }
+  });
 });
 
 describe('EmptyHistoryStore', () => {

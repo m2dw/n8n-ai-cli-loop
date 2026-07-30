@@ -38,6 +38,22 @@ function run(...args) {
   }
 }
 
+// Runs with the fake agy resolved via PATH under its real name instead of an
+// ANTIGRAVITY_BIN override, so cmdSource is "cli-default" — quota/rate-limit
+// classification only trusts stderr from that path (issue #672 review; an
+// ANTIGRAVITY_BIN-overridden binary's stderr cannot be shown to originate
+// from the vetted CLI, so it is withheld from automatic retry classification).
+function runWithAgyOnPath(binDir, ...args) {
+  const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}` };
+  delete env.ANTIGRAVITY_BIN;
+  try {
+    const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env });
+    return { code: 0, stdout };
+  } catch (err) {
+    return { code: err.status ?? 1, stdout: err.stdout ?? '' };
+  }
+}
+
 function parseOutput(result) {
   return JSON.parse(result.stdout.trim());
 }
@@ -340,14 +356,20 @@ describe('run-one-phase CLI — supported phase gating', () => {
     // quota message rather than a spawn ENOENT.
     mkdirSync(repoRoot, { recursive: true });
     // Fake agy simulating quota exhaustion: nonzero exit + a rate-limit message.
-    writeFileSync(fakeAgyPath, '#!/bin/sh\necho "Error: HTTP 429 rate limit exceeded, try again later" 1>&2\nexit 1\n', 'utf8');
-    chmodSync(fakeAgyPath, 0o755);
+    // Resolved via PATH under its real name (cmdSource "cli-default"), not
+    // ANTIGRAVITY_BIN — see runWithAgyOnPath.
+    const binDir = join(tmpDir, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const agyPath = join(binDir, 'agy');
+    writeFileSync(agyPath, '#!/bin/sh\necho "Error: HTTP 429 rate limit exceeded, try again later" 1>&2\nexit 1\n', 'utf8');
+    chmodSync(agyPath, 0o755);
 
     const store = new SqliteTaskStore(dbPath);
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 250, phase: 'research', now: '2026-06-07T00:00:00.000Z' });
     store.close();
 
-    const result = run(
+    const result = runWithAgyOnPath(
+      binDir,
       '--session-id', 'addon-dev', '--run-id', 'run-delayed',
       '--sessions-path', sessionsPath, '--db-path', dbPath,
       '--supported-phases', 'research',
@@ -569,5 +591,78 @@ describe('run-one-phase CLI — contextId-only resolution (no --session-id)', ()
       contextId: 'exec-standalone-2',
       task: { issueNumber: 500 },
     });
+  });
+});
+
+describe('run-one-phase CLI — report-only mode admission (issue #532)', () => {
+  function writeReportOnlySession() {
+    const session = { ...SESSION, repoRoot, artifactDir: '.n8n-artifacts', reportOnly: { enabled: true } };
+    writeFileSync(sessionsPath, JSON.stringify({ sessions: [session] }), 'utf8');
+  }
+
+  test('blocks a queued implementation task before any lock/worktree/handler side effect', async () => {
+    writeReportOnlySession();
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 600, phase: 'implementation', now: '2026-07-28T00:00:00.000Z' });
+    store.close();
+
+    const result = run(
+      '--session-id', 'addon-dev', '--run-id', 'run-report-only-1',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+      '--supported-phases', 'implementation',
+    );
+    expect(result.code).toBe(0);
+    const out = parseOutput(result);
+    expect(out).toMatchObject({ ok: true, outcome: 'completed', result: 'blocked', task: { issueNumber: 600 } });
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 600 });
+    store2.close();
+    // Dependency-blocked-style hold (transitions.ts): eligible for re-enqueue,
+    // never touched the branch/worktree/agent.
+    expect(task?.status).toBe('blocked');
+    expect(task?.context.worktreeId).toBeUndefined();
+    expect(task?.context.worktreePath).toBeUndefined();
+    expect(task?.context.branch).toBeUndefined();
+    expect(task?.context.prUrl).toBeUndefined();
+  });
+
+  test('blocks a queued conflict_resolution task', async () => {
+    writeReportOnlySession();
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 601, phase: 'conflict_resolution', now: '2026-07-28T00:00:00.000Z' });
+    store.close();
+
+    const result = run(
+      '--session-id', 'addon-dev', '--run-id', 'run-report-only-2',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+      '--supported-phases', 'conflict_resolution',
+    );
+    expect(result.code).toBe(0);
+    const out = parseOutput(result);
+    expect(out).toMatchObject({ ok: true, outcome: 'completed', result: 'blocked', task: { issueNumber: 601 } });
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 601 });
+    store2.close();
+    // Dependency-blocked-style hold (transitions.ts, issue #532 review): stays
+    // resumable so intake can reactivate it once report-only mode is disabled,
+    // instead of a terminal ready_for_human handoff that would strand it.
+    expect(task?.status).toBe('blocked');
+  });
+
+  test('does not block research when the session is in report-only mode', async () => {
+    writeReportOnlySession();
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 602, phase: 'research', now: '2026-07-28T00:00:00.000Z' });
+    store.close();
+
+    const result = run(
+      '--session-id', 'addon-dev', '--run-id', 'run-report-only-3',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+      '--supported-phases', 'research',
+    );
+    expect(result.code).toBe(0);
+    expect(parseOutput(result)).toMatchObject({ ok: true, outcome: 'completed', result: 'success', task: { issueNumber: 602 } });
   });
 });

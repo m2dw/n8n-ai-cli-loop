@@ -5,17 +5,20 @@ import type { PhaseHandler, PhaseHandlerContext, PhaseHandlerResult } from "../c
 import { defaultCommandRunner } from "./command-runner.js";
 import type { CommandRunner } from "./command-runner.js";
 import { labelsToComplexity } from "../core/github-intake.js";
-import { runArtifactDir, writeAssignmentFailureArtifact } from "./artifact-dir.js";
+import type { ClaudeConfig } from "../core/session.js";
+import { runArtifactDir, writeAssignmentFailureArtifact, ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "./artifact-dir.js";
 import { agentForPhase, readResolvedAssignment } from "../core/assignment.js";
-import { classifyQuotaExhaustion } from "../core/quota-classifier.js";
+import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory } from "../core/quota-classifier.js";
+import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
 import { resolveFixPr } from "./pr-helpers.js";
 import { ghRunnerFromCommandRunner } from "../providers/github/gh-runner.js";
 import { resolveSessionRepoHost } from "../providers/repo-host-factory.js";
 import type { SessionRepoHost } from "../providers/repo-host-factory.js";
 import { parseShellTokens, MAX_VERIFICATION_BUFFER_BYTES } from "./verification.js";
 import { ensureEnvironmentPrepared } from "./environment-prepare.js";
-import { resolveIssueWorktree, IssueWorktreeLock, issueLockScope } from "./worktree.js";
-import { boundedExcerpt } from "../core/outbox-effects.js";
+import { resolveIssueWorktree, IssueWorktreeLock, issueLockScope, canonicalizePath, isPathInside } from "./worktree.js";
+import { resolveWorktreeRoot, issueWorktreePath } from "../core/worktree-paths.js";
+import { boundedExcerpt } from "../core/text-sanitize.js";
 
 // ---------------------------------------------------------------------------
 // Conflict-resolution allowed tools — strictly scoped per the phase contract.
@@ -103,8 +106,8 @@ export interface ResolvedConflictProfile {
   maxBudgetUsd: string;
 }
 
-function resolveClaudeConflictProfile(labels: string[]): ResolvedConflictProfile {
-  const labelProfile = labelsToComplexity(labels);
+function resolveClaudeConflictProfile(labels: string[], claudeConfig?: ClaudeConfig): ResolvedConflictProfile {
+  const labelProfile = labelsToComplexity(labels, claudeConfig?.complexityProfiles);
   const model = process.env["CLAUDE_MODEL"] ?? labelProfile.model;
   const budget = process.env["CLAUDE_MAX_BUDGET_USD"] ?? labelProfile.budget;
   const effort = process.env["CLAUDE_EFFORT"] ?? labelProfile.effort;
@@ -122,10 +125,11 @@ function resolveClaudeConflictProfile(labels: string[]): ResolvedConflictProfile
 function conflictResolutionCommand(
   agentId: string | undefined,
   labels: string[],
+  claudeConfig?: ClaudeConfig,
 ): { profile: ResolvedConflictProfile } | { error: string } {
   const agent = agentId ?? "claude";
   if (agent === "claude") {
-    return { profile: resolveClaudeConflictProfile(labels) };
+    return { profile: resolveClaudeConflictProfile(labels, claudeConfig) };
   }
   return { error: `Unsupported conflict-resolution agent: ${agent}. Supported: claude` };
 }
@@ -448,14 +452,15 @@ function buildConflictPrompt(input: ConflictPromptInput): string {
 // ---------------------------------------------------------------------------
 // Conflict-resolution phase handler factory
 //
-// Worktree mode (issue #457): when the session enables per-issue worktrees, the
-// resolution runs INSIDE the issue worktree on the PR head branch under the
-// issue-scoped worktree lock, instead of the canonical checkout. Steps 2–4 are
-// replaced by: acquire the lock → fetch (in the canonical repo) → materialize the
+// Per-issue worktree execution (issue #457/#730): the resolution always runs
+// INSIDE the issue worktree on the PR head branch, under the issue-scoped
+// worktree lock, never in the canonical checkout — there is no shared/canonical
+// path to select between. Steps 2–4 are: acquire the lock → fetch (in the
+// canonical repo, whose object store the worktree shares) → materialize the
 // worktree on the PR head → reject a dirty worktree → `git reset --hard
-// refs/remotes/origin/<prBranch>` (the canonical `git checkout -B` would fail
-// because the PR branch is already checked out in the worktree). Steps 5+ run with
-// `cwd` set to the worktree. A worktree-disabled session is byte-for-byte unchanged.
+// refs/remotes/origin/<prBranch>` (a `git checkout -B` would fail because the PR
+// branch is already checked out in the worktree). Steps 5+ run with `cwd` set to
+// the worktree.
 //
 // Orchestration order (handler owns ALL repository operations):
 //   1. Resolve the open PR for the issue (gh pr list). No PR → ready_for_human.
@@ -464,8 +469,8 @@ function buildConflictPrompt(input: ConflictPromptInput): string {
 //                    <prBranch>:refs/remotes/origin/<prBranch>
 //      Explicit refspecs guarantee fresh, checkoutable remote-tracking refs even
 //      in a fresh / single-branch clone.
-//   4. git checkout -B <prBranch> refs/remotes/origin/<prBranch>
-//      Reset the local branch to the fetched remote head (never a stale local).
+//   4. git reset --hard refs/remotes/origin/<prBranch>
+//      Pin the worktree's PR branch to the fetched remote head (never a stale local).
 //   5. git merge --no-commit --no-ff refs/remotes/origin/<base>
 //      - clean merge with no MERGE_HEAD (already up to date) → abort (no-op) and
 //        return success so review re-runs.
@@ -499,9 +504,9 @@ export function createConflictResolutionHandler(
   // Injectable so the per-issue worktree materialization can be stubbed in tests,
   // mirroring the review/implementation handlers' resolveWorktree seam.
   resolveWorktree: typeof resolveIssueWorktree = resolveIssueWorktree,
-  // Issue-scoped advisory lock that serializes one issue's worktree execution. Only
-  // used in worktree mode. Injectable so tests point it at a temp lock dir; in
-  // production it defaults to the managed lock dir `admin doctor` already inspects.
+  // Issue-scoped advisory lock that serializes one issue's worktree execution.
+  // Injectable so tests point it at a temp lock dir; in production it defaults to
+  // the managed lock dir `admin doctor` already inspects.
   issueLock?: IssueWorktreeLock,
   // When set, the phase runner already acquired the issue-scoped worktree lock under
   // this owner ID before invoking this handler. The handler must NOT acquire the lock
@@ -514,34 +519,57 @@ export function createConflictResolutionHandler(
   return async (task: AiTask): Promise<PhaseHandlerResult> => {
     const { session, runId } = context;
     const artifactDir = runArtifactDir(session.artifactRoot, runId);
-    // `cwd` is the canonical checkout until a worktree-enabled run materializes the
-    // per-issue worktree below and operates there instead.
+    // `cwd` starts at the canonical checkout (`session.repoRoot`); the worktree
+    // setup below always materializes the per-issue worktree and switches `cwd`
+    // to run there instead.
     let cwd = session.repoRoot;
     const baseBranch = session.baseBranch ?? "main";
-    const worktreeMode = session.worktrees?.enabled === true;
 
     const agentId = agentForPhase(task, session, "conflictResolution");
     const taskLabels = Array.isArray(task.context["labels"])
       ? task.context["labels"] as string[]
       : [];
-    const cmdSpec = conflictResolutionCommand(agentId, taskLabels);
+    const cmdSpec = conflictResolutionCommand(agentId, taskLabels, session.claude);
     if ("error" in cmdSpec) {
-      writeAssignmentFailureArtifact(artifactDir, {
-        phase: "conflict_resolution", agentId, sessionId: task.sessionId, issueNumber: task.issueNumber, runId, error: cmdSpec.error,
-      });
-      return { result: "failed", error: cmdSpec.error, context: { artifactDir, assignmentError: { phase: "conflict_resolution", agent: agentId ?? null } } };
-    }
-    const resolvedProfile = cmdSpec.profile;
-
-    try {
-      mkdirSync(artifactDir, { recursive: true });
-    } catch (err) {
+      // Skip the artifact write when it would land INSIDE the not-yet-materialized
+      // issue worktree (issue #730 review, P1 — mirrors the implementation/review
+      // handlers' issue #732/#729 fixes). `writeAssignmentFailureArtifact`
+      // `mkdirSync(artifactDir, { recursive: true })`s eagerly, and this check runs
+      // before the worktree setup below materializes it. When `session.artifactRoot`
+      // is configured inside that future worktree path (issue #629), the eager
+      // mkdir would leave a non-empty directory tree at the target `git worktree
+      // add` requires empty — so a later run, after the operator fixes the agent
+      // assignment, would fail to materialize the worktree at all. Computing the
+      // future worktree path is pure (no git side effect), so this check is safe to
+      // run before materialization; a root-resolution failure here just means
+      // materialization would have failed closed on the same error anyway, so fall
+      // back to the normal write.
+      let artifactDirInsideFutureWorktree = false;
+      try {
+        const futureWorktreeRoot = resolveWorktreeRoot({ sessionRoot: session.worktrees?.root });
+        const futureWorktreePath = canonicalizePath(
+          issueWorktreePath(futureWorktreeRoot, task.sessionId, task.issueNumber),
+        );
+        artifactDirInsideFutureWorktree = isPathInside(canonicalizePath(artifactDir), futureWorktreePath);
+      } catch {
+        artifactDirInsideFutureWorktree = false;
+      }
+      if (!artifactDirInsideFutureWorktree) {
+        writeAssignmentFailureArtifact(artifactDir, {
+          phase: "conflict_resolution", agentId, sessionId: task.sessionId, issueNumber: task.issueNumber, runId, error: cmdSpec.error,
+        });
+      }
       return {
         result: "failed",
-        context: { artifactDir, resolvedProfile },
-        error: `Failed to create artifact dir: ${err instanceof Error ? err.message : String(err)}`,
+        error: cmdSpec.error,
+        context: {
+          artifactDir,
+          [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true,
+          assignmentError: { phase: "conflict_resolution", agent: agentId ?? null },
+        },
       };
     }
+    const resolvedProfile = cmdSpec.profile;
 
     // Resolve the session's repo-host provider so the PR lookup routes through the
     // configured backend: GitHub (`gh` executor, resolved as the GitHub App when
@@ -560,7 +588,7 @@ export function createConflictResolutionHandler(
     } catch (err) {
       return {
         result: "failed",
-        context: { artifactDir, resolvedProfile },
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
         error: `Failed to resolve repo-host provider: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
@@ -877,13 +905,13 @@ export function createConflictResolutionHandler(
       if (prInfo.kind === "lookup-failed") {
         return {
           result: "failed",
-          context: { artifactDir, resolvedProfile },
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
           error: prInfo.error,
         };
       }
       return {
         result: "blocked",
-        context: { artifactDir, resolvedProfile },
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
         message: prInfo.error,
       };
     }
@@ -891,167 +919,141 @@ export function createConflictResolutionHandler(
     const prUrl = prInfo.url;
     const prNumber = extractPrNumber(prUrl);
 
-    // Issue #457: per-issue worktree conflict resolution. When the session enables
-    // worktrees the resolution runs INSIDE this issue's worktree on the PR head branch
-    // instead of the canonical checkout. The canonical path's `git checkout -B
-    // <prBranch>` (Step 4) fails in worktree mode because the PR branch is already
-    // checked out in the issue worktree (Git refuses a branch held by another
-    // worktree). A worktree-disabled session keeps `cwd === session.repoRoot` and its
-    // behavior is byte-for-byte unchanged. `prBranch` is the live PR head, so a
-    // NON-conventional head (an externally-created PR whose head is not `ai/issue-<n>`)
-    // is supported exactly as on the canonical path.
+    // Issue #457/#730: per-issue worktree conflict resolution. The resolution always
+    // runs INSIDE this issue's worktree on the PR head branch, instead of the
+    // canonical checkout — a `git checkout -B <prBranch>` there would fail because the
+    // PR branch is already checked out in the issue worktree (Git refuses a branch
+    // held by another worktree), so the worktree's held branch is reset in place
+    // instead (Step 4 below). `prBranch` is the live PR head, so a NON-conventional
+    // head (an externally-created PR whose head is not `ai/issue-<n>`) is supported.
     const conflictLockScope = issueLockScope(task.sessionId, task.issueNumber);
-    // Held across the whole worktree-mode resolution and released in the `finally`
-    // below — on every return path AND on a thrown error — so the next phase for this
-    // issue is never blocked by a leaked lock. Stays undefined when worktrees are
-    // disabled, so the canonical path is unchanged.
+    // Held across the whole resolution and released in the `finally` below — on every
+    // return path AND on a thrown error — so the next phase for this issue is never
+    // blocked by a leaked lock. Stays undefined only when `phaseLockOwnerId` is set,
+    // meaning the phase runner already acquired the lock and owns releasing it.
     let releaseLock: (() => void) | undefined;
 
     try {
-    if (worktreeMode) {
-      // Fail closed on a FORKED (cross-repository) PR head before fetching or pushing by
-      // branch name (issue #457 review, P2; mirrors implementation.ts's worktree fix
-      // guard). A forked PR head lives on the contributor's fork, not `origin`, so the
-      // `git fetch origin <prBranch>` below either fails (no such branch on origin) or —
-      // worse — fetches an unrelated same-named base-repo branch, and the later `git push
-      // origin <prBranch>` then advances that base-repo branch while the real PR on the
-      // fork stays untouched. Detection is the PROVIDER's confirmed `isCrossRepository`
-      // flag, NOT a `prUrl` heuristic: a SAME-repository non-conventional head pushed to
-      // `origin` fetches/pushes by branch name and works fine, so it must not be refused.
-      // Until the PR head repository/remote is carried through, refuse rather than touch
-      // the wrong branch. The canonical (worktree-disabled) path is unaffected.
-      if (prInfo.isCrossRepository === true) {
-        return {
-          result: "failed",
-          context: { artifactDir, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
-          error:
-            `Refusing to resolve conflicts for issue #${task.issueNumber}${prNumber !== undefined ? ` on PR #${prNumber}` : ""}: its head is on a fork (a cross-repository PR head lives on the contributor's fork, not origin), so fetching/pushing '${prBranch}' on origin would touch an unrelated base-repo branch instead of the PR head. Carry the PR head repository/remote through before resolving conflicts for forked PRs in worktree mode.`,
-        };
-      }
-      if (phaseLockOwnerId === undefined) {
-        // No pre-acquired lock: acquire it here and register release for the finally.
-        // When phaseLockOwnerId IS set the phase runner holds the lock already (issue
-        // #524) — skip acquire and release; the phase runner releases after we return.
-        const lock = issueLock ?? new IssueWorktreeLock();
-        const acquired = lock.acquire(runId, task.sessionId, task.issueNumber);
-        if (!acquired.locked) {
-          return {
-            result: "blocked",
-            context: { artifactDir, prUrl, branch: prBranch, resolvedProfile, conflictLockScope, conflictLockHeldBy: acquired.ownerContextId },
-            message: `Issue #${task.issueNumber} conflict resolution skipped: worktree lock '${conflictLockScope}' is held by ${acquired.ownerContextId} (since ${acquired.ownerStartedAt}) — another execution owns this issue's worktree. Escalating to human.`,
-          };
-        }
-        // Lock held — register release for the finally before any further return.
-        releaseLock = () => { lock.release(runId, task.sessionId, task.issueNumber); };
-      }
-
-      // Step 3 equivalent: fetch base + PR head into fresh remote-tracking refs. Runs
-      // in the canonical repo whose object store the worktree shares; the leading `+`
-      // forces the refs to update even on a non-fast-forward move so the worktree
-      // resets to the true remote head below. The PR head (`prBranch`) is fetched by
-      // its actual ref name, so a non-conventional head is fetched correctly.
-      const fetchResult = runner.run("git", [
-        "fetch", "origin",
-        `+${baseBranch}:refs/remotes/origin/${baseBranch}`,
-        `+${prBranch}:refs/remotes/origin/${prBranch}`,
-      ], { cwd: session.repoRoot });
-      if (fetchResult.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
-          error: `git fetch origin ${baseBranch} ${prBranch} failed (exit ${fetchResult.exitCode}): ${(fetchResult.stderr || fetchResult.stdout).slice(0, 300)}`,
-        };
-      }
-
-      // Materialize the per-issue worktree on the PR head branch. The worktree was
-      // typically removed by the worktree-mode review when it routed the PR to conflict
-      // resolution, so this usually re-creates it from the still-present local issue
-      // branch (or, on a fresh clone, from the freshly-fetched `origin/<prBranch>`).
-      // The resolution resets it to the remote head immediately below, so accept a
-      // merely-behind (fast-forwardable) local ref via `allowFastForward`; only a
-      // genuinely diverged (force-pushed) head is rejected.
-      const materialized = resolveWorktree({
-        repoRoot: session.repoRoot,
-        sessionId: task.sessionId,
-        issueNumber: task.issueNumber,
-        branch: prBranch,
-        baseRef: `refs/remotes/origin/${prBranch}`,
-        allowFastForward: true,
-        ...(session.worktrees?.root ? { worktreeRoot: session.worktrees.root } : {}),
-        runner,
-      });
-      if (!materialized.ok) {
-        return {
-          result: "failed",
-          context: { artifactDir, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
-          error: `Failed to prepare issue #${task.issueNumber} conflict-resolution worktree: ${materialized.error}`,
-        };
-      }
-      cwd = materialized.path;
-
-      // Step 2 equivalent: reject a dirty worktree before touching it, so unrelated
-      // residue left by a prior phase is escalated to a human rather than silently
-      // discarded by the reset below.
-      const statusResult = runner.run("git", ["status", "--porcelain"], { cwd });
-      if (statusResult.stdout.trim().length > 0) {
+    // Fail closed on a FORKED (cross-repository) PR head before fetching or pushing by
+    // branch name (issue #457 review, P2; mirrors implementation.ts's worktree fix
+    // guard). A forked PR head lives on the contributor's fork, not `origin`, so the
+    // `git fetch origin <prBranch>` below either fails (no such branch on origin) or —
+    // worse — fetches an unrelated same-named base-repo branch, and the later `git push
+    // origin <prBranch>` then advances that base-repo branch while the real PR on the
+    // fork stays untouched. Detection is the PROVIDER's confirmed `isCrossRepository`
+    // flag, NOT a `prUrl` heuristic: a SAME-repository non-conventional head pushed to
+    // `origin` fetches/pushes by branch name and works fine, so it must not be refused.
+    // Until the PR head repository/remote is carried through, refuse rather than touch
+    // the wrong branch.
+    if (prInfo.isCrossRepository === true) {
+      return {
+        result: "failed",
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
+        error:
+          `Refusing to resolve conflicts for issue #${task.issueNumber}${prNumber !== undefined ? ` on PR #${prNumber}` : ""}: its head is on a fork (a cross-repository PR head lives on the contributor's fork, not origin), so fetching/pushing '${prBranch}' on origin would touch an unrelated base-repo branch instead of the PR head. Carry the PR head repository/remote through before resolving conflicts for forked PRs in worktree mode.`,
+      };
+    }
+    if (phaseLockOwnerId === undefined) {
+      // No pre-acquired lock: acquire it here and register release for the finally.
+      // When phaseLockOwnerId IS set the phase runner holds the lock already (issue
+      // #524) — skip acquire and release; the phase runner releases after we return.
+      const lock = issueLock ?? new IssueWorktreeLock();
+      const acquired = lock.acquire(runId, task.sessionId, task.issueNumber);
+      if (!acquired.locked) {
         return {
           result: "blocked",
-          context: { artifactDir, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
-          message: `Working tree is dirty before conflict resolution; aborting to avoid touching unrelated changes:\n${statusResult.stdout.slice(0, 300)}`,
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch: prBranch, resolvedProfile, conflictLockScope, conflictLockHeldBy: acquired.ownerContextId },
+          message: `Issue #${task.issueNumber} conflict resolution skipped: worktree lock '${conflictLockScope}' is held by ${acquired.ownerContextId} (since ${acquired.ownerStartedAt}) — another execution owns this issue's worktree. Escalating to human.`,
         };
       }
+      // Lock held — register release for the finally before any further return.
+      releaseLock = () => { lock.release(runId, task.sessionId, task.issueNumber); };
+    }
 
-      // Step 4 equivalent: pin the worktree's PR branch to the freshly-fetched remote
-      // head (never a stale local) — the same guarantee the canonical `git checkout -B
-      // <prBranch> refs/remotes/origin/<prBranch>` provides. A `git checkout -B` here
-      // would fail because the branch is already checked out in this worktree, so reset
-      // the held branch in place instead.
-      const resetResult = runner.run("git", ["reset", "--hard", `refs/remotes/origin/${prBranch}`], { cwd });
-      if (resetResult.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
-          error: `git reset --hard refs/remotes/origin/${prBranch} (pin worktree to PR head) failed (exit ${resetResult.exitCode}): ${(resetResult.stderr || resetResult.stdout).slice(0, 300)}`,
-        };
-      }
-    } else {
-      // Step 2: Preflight — reject a dirty working tree (handoff, no merge yet).
-      const statusResult = runner.run("git", ["status", "--porcelain"], { cwd });
-      if (statusResult.stdout.trim().length > 0) {
-        return {
-          result: "blocked",
-          context: { artifactDir, prUrl, branch: prBranch, resolvedProfile },
-          message: `Working tree is dirty before conflict resolution; aborting to avoid touching unrelated changes:\n${statusResult.stdout.slice(0, 300)}`,
-        };
-      }
+    // Step 3: fetch base + PR head into fresh remote-tracking refs. Runs in the
+    // canonical repo whose object store the worktree shares; the leading `+`
+    // forces the refs to update even on a non-fast-forward move so the worktree
+    // resets to the true remote head below. The PR head (`prBranch`) is fetched by
+    // its actual ref name, so a non-conventional head is fetched correctly.
+    const fetchResult = runner.run("git", [
+      "fetch", "origin",
+      `+${baseBranch}:refs/remotes/origin/${baseBranch}`,
+      `+${prBranch}:refs/remotes/origin/${prBranch}`,
+    ], { cwd: session.repoRoot });
+    if (fetchResult.exitCode !== 0) {
+      return {
+        result: "failed",
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
+        error: `git fetch origin ${baseBranch} ${prBranch} failed (exit ${fetchResult.exitCode}): ${(fetchResult.stderr || fetchResult.stdout).slice(0, 300)}`,
+      };
+    }
 
-      // Step 3: Fetch base and PR head with explicit refspecs so the refs used for
-      // checkout and merge are fresh and checkoutable even in a single-branch clone.
-      // The leading `+` forces the remote-tracking refs to update even on a
-      // non-fast-forward move (e.g. after a rebase or amended automation commit),
-      // so checkout/merge resets to the true remote head instead of failing.
-      const fetchResult = runner.run("git", [
-        "fetch", "origin",
-        `+${baseBranch}:refs/remotes/origin/${baseBranch}`,
-        `+${prBranch}:refs/remotes/origin/${prBranch}`,
-      ], { cwd });
-      if (fetchResult.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, prUrl, branch: prBranch, resolvedProfile },
-          error: `git fetch origin ${baseBranch} ${prBranch} failed (exit ${fetchResult.exitCode}): ${(fetchResult.stderr || fetchResult.stdout).slice(0, 300)}`,
-        };
-      }
+    // Materialize the per-issue worktree on the PR head branch. The worktree was
+    // typically removed by the worktree review when it routed the PR to conflict
+    // resolution, so this usually re-creates it from the still-present local issue
+    // branch (or, on a fresh clone, from the freshly-fetched `origin/<prBranch>`).
+    // The resolution resets it to the remote head immediately below, so accept a
+    // merely-behind (fast-forwardable) local ref via `allowFastForward`; only a
+    // genuinely diverged (force-pushed) head is rejected.
+    const materialized = resolveWorktree({
+      repoRoot: session.repoRoot,
+      sessionId: task.sessionId,
+      issueNumber: task.issueNumber,
+      branch: prBranch,
+      baseRef: `refs/remotes/origin/${prBranch}`,
+      allowFastForward: true,
+      ...(session.worktrees?.root ? { worktreeRoot: session.worktrees.root } : {}),
+      runner,
+    });
+    if (!materialized.ok) {
+      return {
+        result: "failed",
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
+        error: `Failed to prepare issue #${task.issueNumber} conflict-resolution worktree: ${materialized.error}`,
+      };
+    }
+    cwd = materialized.path;
 
-      // Step 4: Reset the PR branch to the fetched remote head (never a stale local).
-      const checkoutResult = runner.run("git", ["checkout", "-B", prBranch, `refs/remotes/origin/${prBranch}`], { cwd });
-      if (checkoutResult.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, prUrl, branch: prBranch, resolvedProfile },
-          error: `git checkout -B ${prBranch} failed (exit ${checkoutResult.exitCode}): ${(checkoutResult.stderr || checkoutResult.stdout).slice(0, 300)}`,
-        };
-      }
+    // Create the artifact dir AFTER worktree materialization, not before (issue
+    // #730 review, P1 — mirrors the implementation/review handlers' issue
+    // #732/#729 fixes): a session may configure `artifactRoot` to live INSIDE the
+    // managed worktree (issue #629), a path that does not exist until
+    // `resolveWorktree` above runs `git worktree add`. Creating it earlier would
+    // pre-populate that path with an empty directory tree, and `git worktree add`
+    // refuses to materialize a worktree at an already-existing, non-empty target.
+    try {
+      mkdirSync(artifactDir, { recursive: true });
+    } catch (err) {
+      return {
+        result: "failed",
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
+        error: `Failed to create artifact dir: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    // Step 2: reject a dirty worktree before touching it, so unrelated residue
+    // left by a prior phase is escalated to a human rather than silently
+    // discarded by the reset below.
+    const statusResult = runner.run("git", ["status", "--porcelain"], { cwd });
+    if (statusResult.stdout.trim().length > 0) {
+      return {
+        result: "blocked",
+        context: { artifactDir, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
+        message: `Working tree is dirty before conflict resolution; aborting to avoid touching unrelated changes:\n${statusResult.stdout.slice(0, 300)}`,
+      };
+    }
+
+    // Step 4: pin the worktree's PR branch to the freshly-fetched remote head
+    // (never a stale local). A `git checkout -B` here would fail because the
+    // branch is already checked out in this worktree, so reset the held branch
+    // in place instead.
+    const resetResult = runner.run("git", ["reset", "--hard", `refs/remotes/origin/${prBranch}`], { cwd });
+    if (resetResult.exitCode !== 0) {
+      return {
+        result: "failed",
+        context: { artifactDir, prUrl, branch: prBranch, resolvedProfile, conflictLockScope },
+        error: `git reset --hard refs/remotes/origin/${prBranch} (pin worktree to PR head) failed (exit ${resetResult.exitCode}): ${(resetResult.stderr || resetResult.stdout).slice(0, 300)}`,
+      };
     }
 
     // Step 5: Attempt the merge without committing. --no-ff forces a merge so
@@ -1295,7 +1297,7 @@ export function createConflictResolutionHandler(
       // Quota/rate-limit exhaustion is recoverable on its own (issue #25): the
       // merge was aborted and the worktree restored, so delay the retry instead
       // of failing the task to a human.
-      const quota = classifyQuotaExhaustion(`${agentResult.stdout}\n${agentResult.stderr}`, agentId);
+      const quota = classifyQuotaExhaustion(extractAgentFailureDiagnostic(agentId, agentResult));
       writeResult({
         exitCode: agentResult.exitCode, success: false, step: "agent", conflictedFiles,
         ...(quota.isQuotaExhaustion ? { delayed: true, quotaSignal: quota.signal } : {}),
@@ -1303,8 +1305,10 @@ export function createConflictResolutionHandler(
       if (quota.isQuotaExhaustion) {
         return {
           result: "delayed",
-          context: { artifactDir, prUrl, branch: prBranch, conflictedFiles, resolvedProfile, quotaSignal: quota.signal },
-          message: `Conflict-resolution agent (${agentId}) hit a quota/rate-limit (signal: "${quota.signal}"); delaying retry`,
+          context: { artifactDir, prUrl, branch: prBranch, conflictedFiles, resolvedProfile, quotaSignal: quota.signal, category: quota.category },
+          message: `Conflict-resolution agent (${agentId}) hit a ${describeFailureCategory(quota.category)} condition (signal: "${quota.signal}"); delaying retry`,
+          retryAfterMs: resolveRetryDelayOverrideMsForCategory(quota.category),
+          category: quota.category,
         };
       }
       return {
@@ -1472,8 +1476,8 @@ export function createConflictResolutionHandler(
     return commitAndPush({ reason: "conflicts-resolved", conflictedFiles, clean: false, mergeRationale });
     } finally {
       // Release the issue-scoped worktree lock on every return path (and on a thrown
-      // error). `releaseLock` is undefined when worktrees are disabled, so the
-      // canonical path is unaffected.
+      // error). `releaseLock` is undefined only when `phaseLockOwnerId` is set — the
+      // phase runner already acquired the lock and owns releasing it.
       if (releaseLock) releaseLock();
     }
   };

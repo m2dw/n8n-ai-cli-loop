@@ -4,10 +4,10 @@
  * Generates project metrics reports (report-only, never blocks CI):
  *   docs/metrics/latest.md          — markdown summary
  *   docs/metrics/latest.json        — structured JSON
- *   docs/metrics/badges/coverage.json
- *   docs/metrics/badges/ts-loc.json
- *   docs/metrics/badges/tests.json
- *   docs/metrics/badges/cycles.json
+ *   docs/metrics/badges/coverage.json  (and .svg)
+ *   docs/metrics/badges/ts-loc.json    (and .svg)
+ *   docs/metrics/badges/tests.json     (and .svg)
+ *   docs/metrics/badges/cycles.json    (and .svg)
  *
  * Run: npm run metrics
  */
@@ -156,6 +156,96 @@ export function makeBadge(label, message, color) {
   return { schemaVersion: 1, label, message: String(message), color };
 }
 
+/**
+ * Compare two metrics payloads ignoring the `generated` timestamp field.
+ * Used to keep metrics generation idempotent: re-running the generator
+ * against unchanged source should not rewrite the timestamp (and therefore
+ * should not dirty a worktree with a timestamp-only diff).
+ */
+export function metricsValuesEqual(a, b) {
+  if (!a || !b) return false;
+  const { generated: _ga, ...restA } = a;
+  const { generated: _gb, ...restB } = b;
+  return JSON.stringify(restA) === JSON.stringify(restB);
+}
+
+// ---------------------------------------------------------------------------
+// SVG badge generation
+// ---------------------------------------------------------------------------
+
+const BADGE_COLORS = {
+  brightgreen: '#4c1',
+  green: '#97ca00',
+  yellow: '#dfb317',
+  orange: '#fe7d37',
+  red: '#e05d44',
+  blue: '#007ec6',
+  lightgrey: '#9f9f9f',
+  informational: '#007ec6',
+};
+
+/** Approximate text width in px for Verdana 11px (used for SVG badge layout). */
+export function measureText(text) {
+  const widths = {
+    f: 4.1, i: 2.9, j: 2.9, l: 2.9, r: 4.0, t: 5.0,
+    ' ': 3.5, '.': 3.5, ',': 3.5, ':': 3.5, ';': 3.5, '|': 3.5,
+    I: 3.0, '(': 4.0, ')': 4.0, '[': 4.0, ']': 4.0,
+    m: 10.0, w: 9.5, M: 9.0, W: 10.0,
+    '%': 7.5, '@': 11.0,
+  };
+  let total = 0;
+  for (const ch of text) total += widths[ch] ?? 6.5;
+  return total;
+}
+
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Generate a flat-style SVG badge without external dependencies. */
+export function makeSvgBadge(label, message, color) {
+  const hex = BADGE_COLORS[color] ?? '#9f9f9f';
+  const pad = 10;
+  const lTextW = measureText(label);
+  const mTextW = measureText(String(message));
+  const lw = Math.round(lTextW + pad);
+  const mw = Math.round(mTextW + pad);
+  const width = lw + mw;
+  const lx = Math.round((lw / 2) * 10);
+  const mx = Math.round((lw + mw / 2) * 10);
+  const ltl = Math.round(lTextW * 10);
+  const mtl = Math.round(mTextW * 10);
+  const sl = escapeXml(label);
+  const sm = escapeXml(String(message));
+  return [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="20" role="img" aria-label="${sl}: ${sm}">`,
+    `  <title>${sl}: ${sm}</title>`,
+    `  <linearGradient id="s" x2="0" y2="100%">`,
+    `    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>`,
+    `    <stop offset="1" stop-opacity=".1"/>`,
+    `  </linearGradient>`,
+    `  <clipPath id="r">`,
+    `    <rect width="${width}" height="20" rx="3" fill="#fff"/>`,
+    `  </clipPath>`,
+    `  <g clip-path="url(#r)">`,
+    `    <rect width="${lw}" height="20" fill="#555"/>`,
+    `    <rect x="${lw}" width="${mw}" height="20" fill="${hex}"/>`,
+    `    <rect width="${width}" height="20" fill="url(#s)"/>`,
+    `  </g>`,
+    `  <g fill="#fff" text-anchor="middle" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="110">`,
+    `    <text x="${lx}" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="${ltl}" lengthAdjust="spacing">${sl}</text>`,
+    `    <text x="${lx}" y="140" transform="scale(.1)" textLength="${ltl}" lengthAdjust="spacing">${sl}</text>`,
+    `    <text x="${mx}" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="${mtl}" lengthAdjust="spacing">${sm}</text>`,
+    `    <text x="${mx}" y="140" transform="scale(.1)" textLength="${mtl}" lengthAdjust="spacing">${sm}</text>`,
+    `  </g>`,
+    `</svg>`,
+  ].join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -215,15 +305,30 @@ export function main(rootDir) {
     console.warn('Warning: Circular dependency analysis failed; dependency metrics omitted.');
   }
 
-  // 5. Assemble metrics object
-  const generated = new Date().toISOString();
-  const metrics = {
-    generated,
+  // 5. Assemble metrics object. Reuse the previous `generated` timestamp when
+  // the underlying values haven't changed, so re-running the generator (e.g.
+  // during CI or verification) against unchanged source is a no-op rather
+  // than a timestamp-only dirty diff.
+  const candidateMetrics = {
+    generated: new Date().toISOString(),
     src: { files: tsFiles.length, lines: loc.total, nonBlankLines: loc.nonBlank },
     tests: { files: testFiles.length, suites: tests.suites, cases: tests.cases },
     coverage,
     dependencies: { circularCycles: cycleCount, filesInCycles: cycleFiles },
   };
+  const previousMetricsPath = join(outDir, 'latest.json');
+  let previousMetrics = null;
+  if (existsSync(previousMetricsPath)) {
+    try {
+      previousMetrics = JSON.parse(readFileSync(previousMetricsPath, 'utf8'));
+    } catch {
+      previousMetrics = null;
+    }
+  }
+  const unchanged = metricsValuesEqual(candidateMetrics, previousMetrics);
+  const metrics = unchanged
+    ? { ...candidateMetrics, generated: previousMetrics.generated }
+    : candidateMetrics;
 
   // 6. Write latest.json
   writeFileSync(join(outDir, 'latest.json'), JSON.stringify(metrics, null, 2) + '\n');
@@ -258,6 +363,7 @@ export function main(rootDir) {
   ];
   for (const [path, badge] of writes) {
     writeFileSync(path, JSON.stringify(badge, null, 2) + '\n');
+    writeFileSync(path.replace(/\.json$/, '.svg'), makeSvgBadge(badge.label, badge.message, badge.color) + '\n');
   }
 
   // 8. Write latest.md
@@ -265,7 +371,7 @@ export function main(rootDir) {
   const lines = [
     '# Project Metrics',
     '',
-    `Generated: ${generated}`,
+    `Generated: ${metrics.generated}`,
     '',
     '## Source',
     '',
@@ -305,13 +411,17 @@ export function main(rootDir) {
   lines.push('');
   writeFileSync(join(outDir, 'latest.md'), lines.join('\n'));
 
-  console.log(`Metrics written to ${outDir}`);
+  console.log(
+    unchanged
+      ? `Metrics unchanged; timestamp preserved (${outDir})`
+      : `Metrics written to ${outDir}`
+  );
   console.log(`  latest.json`);
   console.log(`  latest.md`);
-  console.log(`  badges/coverage.json  (${pctOrNA(linePct)})`);
-  console.log(`  badges/ts-loc.json    (${loc.nonBlank} non-blank lines)`);
-  console.log(`  badges/tests.json     (${tests.cases} cases)`);
-  console.log(`  badges/cycles.json    (${cycleCount} cycles)`);
+  console.log(`  badges/coverage.json+svg  (${pctOrNA(linePct)})`);
+  console.log(`  badges/ts-loc.json+svg    (${loc.nonBlank} non-blank lines)`);
+  console.log(`  badges/tests.json+svg     (${tests.cases} cases)`);
+  console.log(`  badges/cycles.json+svg    (${cycleCount} cycles)`);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

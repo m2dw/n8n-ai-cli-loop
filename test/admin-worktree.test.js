@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { resolveIssueWorktree, issueWorktreePath, canonicalizePath } from '../dist/index.js';
-import { sanitizeBody, sessionRedactionPaths } from '../dist/core/outbox-effects.js';
+import { sessionRedactionPaths } from '../dist/core/outbox-effects.js';
+import { sanitizeBody } from '../dist/core/text-sanitize.js';
 
 const CLI = new URL('../dist/cli/admin.js', import.meta.url).pathname;
 
@@ -37,7 +38,7 @@ function writeSessions() {
         defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
         verification: { test: 'npm test' },
         labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-        worktrees: { enabled: true, root: worktreeRoot },
+        worktrees: { root: worktreeRoot },
       },
     ],
   };
@@ -182,7 +183,7 @@ describe('worktree path redaction in published comments', () => {
   const session = {
     repoRoot: '/srv/repo',
     artifactRoot: '/srv/repo/.n8n-artifacts',
-    worktrees: { enabled: true, root: '/var/lib/n8n-wt/worktrees' },
+    worktrees: { root: '/var/lib/n8n-wt/worktrees' },
   };
 
   test('sessionRedactionPaths includes the worktree state root', () => {

@@ -303,3 +303,35 @@ test('session-doctor omits environmentPrepare suggestion when it is already conf
   expect(msgs).not.toMatch(/environmentPrepare is not configured/);
   expect(msgs).not.toMatch(/No verification commands/);
 });
+
+// ---------------------------------------------------------------------------
+// session-doctor and the legacy worktrees.enabled field (issue #731)
+// ---------------------------------------------------------------------------
+
+test('session-doctor dies with an actionable error when the session sets the legacy worktrees.enabled field', () => {
+  initRepo();
+  writeSession({ worktrees: { enabled: false } });
+  const r = run(
+    '--json',
+    'session-doctor',
+    '--session-id', 'test-session',
+    '--sessions-path', sessionsPath,
+  );
+  const out = parse(r);
+  expect(out.ok).toBe(false);
+  expect(out.error).toMatch(/worktrees\.enabled is no longer supported/);
+  expect(out.error).toMatch(/worktree-only-migration-contract\.md/);
+});
+
+test('session-doctor runs cleanly when the session omits the worktrees block', () => {
+  initRepo();
+  writeSession();
+  const r = run(
+    '--json',
+    'session-doctor',
+    '--session-id', 'test-session',
+    '--sessions-path', sessionsPath,
+  );
+  const out = parse(r);
+  expect(out.ok).toBe(true);
+});

@@ -199,6 +199,20 @@ export interface ResolvedIssueWorktree {
    * onto an updated start point (issue #455).
    */
   branchReused: boolean;
+  /**
+   * True when the branch did not exist locally but WAS recovered from an existing
+   * `refs/remotes/origin/<branch>` (a prior PR head) instead of being created fresh
+   * from `baseRef`. `branchReused` is false in this case (no local branch existed to
+   * reuse), but the branch's history still predates this call and may not descend
+   * from the `baseRef` a caller intended as its start point — e.g. a dependency
+   * blocker head fetched moments before this call, when the recovered PR was
+   * originally created from an OLDER blocker head. Callers that validate a
+   * dependency start point's ancestry must treat this the same as `branchReused`
+   * (issue #667 review, P1); only a branch created fresh from `baseRef` itself
+   * (`branchReused: false` AND `startedFromRemoteHead: false`) is guaranteed to
+   * start exactly at `baseRef`.
+   */
+  startedFromRemoteHead: boolean;
 }
 
 export type ResolveIssueWorktreeResult = ResolvedIssueWorktree | { ok: false; error: string };
@@ -373,7 +387,7 @@ export function resolveIssueWorktree(input: ResolveIssueWorktreeInput): ResolveI
           error: `Worktree at ${path} is on ${input.branch}, which has diverged from origin/${input.branch}; refusing to reuse the stale local ref. Reconcile it (e.g. \`git fetch\` then fast-forward or reset ${input.branch} to origin/${input.branch} in ${path}) before resuming.`,
         };
       }
-      return { ok: true, path, worktreeId, branch: input.branch, created: false, branchReused: true };
+      return { ok: true, path, worktreeId, branch: input.branch, created: false, branchReused: true, startedFromRemoteHead: false };
     }
   }
 
@@ -526,7 +540,19 @@ export function resolveIssueWorktree(input: ResolveIssueWorktreeInput): ResolveI
   // already present it was checked out into the new worktree (REUSED, regardless of the
   // path being freshly created here — e.g. after the prior worktree dir was pruned);
   // otherwise the branch was created fresh from `baseRef`/`origin/<branch>` (issue #455).
-  return { ok: true, path, worktreeId, branch: input.branch, created: true, branchReused: branchExists };
+  // `remoteRefExists` further distinguishes that fresh-creation sub-path: `-b` from
+  // `baseRef` (a genuinely new branch, guaranteed to start exactly at `baseRef`) vs
+  // `--track` from `origin/<branch>` (a recovered pre-existing PR head, whose history
+  // predates this call and may not descend from `baseRef` at all — issue #667 review, P1).
+  return {
+    ok: true,
+    path,
+    worktreeId,
+    branch: input.branch,
+    created: true,
+    branchReused: branchExists,
+    startedFromRemoteHead: remoteRefExists,
+  };
 }
 
 /**

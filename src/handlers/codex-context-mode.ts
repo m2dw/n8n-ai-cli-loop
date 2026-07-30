@@ -29,6 +29,18 @@ import type { CodexConfig } from "../core/session.js";
 // env var only toggles context-mode on/off; the invocation form still comes from
 // session config, so `CODEX_CONTEXT_MODE=on` with no configured form is an error
 // rather than a guess.
+//
+// `resolveCodexModel()` below (issue #609) resolves the Codex model with the
+// same env-overrides-session shape: `CODEX_MODEL` > `session.codex.model` >
+// unset (compatibility mode — the Codex CLI's own config/default selects the
+// model, exactly as it did before this option existed). Unlike context-mode,
+// there is no label- or escalation-driven model selection for Codex: models
+// are trusted-config/operator-env only, and effort (not model) is what
+// escalates on a review-loop retry — mirroring how Claude's `CLAUDE_MODEL`
+// stays fixed while only its effort escalates (see `resolveClaudeProfile`,
+// `src/handlers/implementation.ts`). Assignment profiles
+// (`docs/assignment-profiles.md`) select the *agent*, never its model/effort —
+// that boundary is unchanged by this option (issue #694 decision 5).
 // ---------------------------------------------------------------------------
 
 export type CodexContextModeStatus = "enabled" | "unset";
@@ -137,6 +149,38 @@ export function resolveCodexContextMode(
     config,
     ...(profile.length > 0 ? { profile } : {}),
   };
+}
+
+export type CodexModelSource = "env" | "session-config" | "unset";
+
+export interface CodexModelResolution {
+  /** Resolved model name, or the literal "cli-default" when unset (compatibility mode). */
+  model: string;
+  source: CodexModelSource;
+}
+
+/**
+ * Resolve the explicit Codex model for an invocation (`codex exec` for
+ * implementation, `codex review` for review) from the session's `codex.model`
+ * config and the process environment. Precedence: `CODEX_MODEL` env var >
+ * `session.codex.model` > unset (compatibility mode — the caller passes no
+ * `--model` flag and the Codex CLI's own config/authenticated default
+ * applies, matching pre-#609 behavior). See the module header for the full
+ * precedence rationale.
+ */
+export function resolveCodexModel(
+  codex: CodexConfig | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): CodexModelResolution {
+  const rawEnv = env["CODEX_MODEL"];
+  const envModel = typeof rawEnv === "string" ? rawEnv.trim() : "";
+  if (envModel.length > 0) return { model: envModel, source: "env" };
+
+  const rawSession = codex?.model;
+  const sessionModel = typeof rawSession === "string" ? rawSession.trim() : "";
+  if (sessionModel.length > 0) return { model: sessionModel, source: "session-config" };
+
+  return { model: "cli-default", source: "unset" };
 }
 
 /**

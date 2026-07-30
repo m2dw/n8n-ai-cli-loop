@@ -3,6 +3,9 @@ export type TaskPhase =
   | "review"
   | "conflict_resolution"
   | "research"
+  | "content_research"
+  | "content_draft"
+  | "content_review"
   | "planner";
 
 export type TaskStatus =
@@ -12,7 +15,12 @@ export type TaskStatus =
   | "blocked"
   | "ready_for_human"
   | "done"
-  | "failed";
+  | "failed"
+  // Terminal, operator-initiated cancellation (issue #608). Reachable from any
+  // non-terminal status via `TaskStore.cancelTask`; never set by a phase
+  // handler result. See `nextPhaseAfter`/`isRunnable` — a cancelled task is
+  // never claimable and never advances to another phase.
+  | "cancelled";
 
 export type AgentId = "claude" | "codex" | "gemini";
 
@@ -48,6 +56,16 @@ export interface AiTask {
   lastError?: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Monotonic write counter, incremented by the store on every mutation
+   * (issue #622 review, P2). Two writers can read the same `updatedAt` when
+   * their clocks land in the same millisecond, which lets a stale
+   * `updatedAt`-only CAS check silently pass; `revision` only ever moves by
+   * exactly 1 per write, so it cannot collide the way a wall-clock
+   * timestamp can. Defaults to 0 for tasks written before this field
+   * existed.
+   */
+  revision: number;
 }
 
 export interface EnqueueTaskInput {
@@ -68,7 +86,7 @@ export interface TaskKey {
 }
 
 export type TaskExpected = Partial<
-  Pick<AiTask, "status" | "phase" | "ownerRunId" | "leaseExpiresAt">
+  Pick<AiTask, "status" | "phase" | "ownerRunId" | "leaseExpiresAt" | "updatedAt" | "revision">
 >;
 
 export type TaskPatch = Partial<
@@ -101,7 +119,16 @@ export interface ClaimNextTaskRequest {
   supportedPhases?: TaskPhase[];
 }
 
-export type StoreResultCode = "not_found" | "conflict" | "already_exists";
+export type StoreResultCode =
+  | "not_found"
+  | "conflict"
+  | "already_exists"
+  | "tool_request_unresolved"
+  // A repeated `cancelTask` call on a task that is already `cancelled` (issue
+  // #608). Distinct from `conflict` (a task that reached a DIFFERENT terminal
+  // status — done/failed — and so can never be cancelled) so callers can
+  // treat a repeat cancellation as an informative no-op rather than an error.
+  | "already_cancelled";
 
 export type StoreResult<T> =
   | { ok: true; value: T; reactivated?: boolean }

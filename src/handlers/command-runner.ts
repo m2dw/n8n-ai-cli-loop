@@ -20,11 +20,25 @@ export interface CommandRunner {
   run(cmd: string, args: string[], opts: CommandRunOptions): CommandRunResult;
 }
 
+/**
+ * The environment children are spawned with. This is the same value both
+ * `execFileSync` and `spawnSync` already default to, but that default is read
+ * from the *real* process object, while a test sandbox hands this module a copy
+ * of `process.env`: without passing it explicitly, a child (and its `PATH`
+ * lookup) silently uses the real environment instead of the one the caller can
+ * observe — e.g. the host's `agy` rather than the stub a test put on `PATH`.
+ * Mirrors src/cli/session-audit.ts, which passes it for the same reason.
+ */
+function spawnEnv(): NodeJS.ProcessEnv {
+  return process.env;
+}
+
 export const defaultCommandRunner: CommandRunner = {
   run(cmd, args, opts) {
     try {
       const stdout = execFileSync(cmd, args, {
         cwd: opts.cwd,
+        env: spawnEnv(),
         encoding: "utf8",
         input: opts.stdin,
         stdio: opts.stdin !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
@@ -55,6 +69,7 @@ export const bothStreamsCommandRunner: CommandRunner = {
   run(cmd, args, opts) {
     const result = spawnSync(cmd, args, {
       cwd: opts.cwd,
+      env: spawnEnv(),
       encoding: "utf8",
       input: opts.stdin,
       stdio: opts.stdin !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],

@@ -2,15 +2,19 @@
 
 A workflow template for queuing GitHub Issues and running local CLI agents sequentially from n8n.
 
-> **Note:** This is a public snapshot mirror. Development happens on a private
-> repository, and the automation loop runs only against that private repository
-> — nothing on this mirror is processed automatically. The mirror is updated
-> periodically.
+> **Public mirror note:** This is a periodic, read-only snapshot mirror.
+> Development happens on a private source-of-truth repository, and the
+> automation loop itself runs only against that private repository —
+> nothing on this mirror is processed automatically, and it does not accept
+> issues or pull requests. This note is carried into the mirror
+> automatically by the export described in
+> [docs/copybara-public-export.md](docs/copybara-public-export.md) rather
+> than edited on the mirror directly.
 
-[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fm2dw%2Fn8n-ai-cli-loop%2Fmain%2Fdocs%2Fmetrics%2Fbadges%2Fcoverage.json)](docs/metrics/latest.md)
-[![ts-loc](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fm2dw%2Fn8n-ai-cli-loop%2Fmain%2Fdocs%2Fmetrics%2Fbadges%2Fts-loc.json)](docs/metrics/latest.md)
-[![tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fm2dw%2Fn8n-ai-cli-loop%2Fmain%2Fdocs%2Fmetrics%2Fbadges%2Ftests.json)](docs/metrics/latest.md)
-[![cycles](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fm2dw%2Fn8n-ai-cli-loop%2Fmain%2Fdocs%2Fmetrics%2Fbadges%2Fcycles.json)](docs/metrics/latest.md)
+[![coverage](docs/metrics/badges/coverage.svg)](docs/metrics/latest.md)
+[![ts-loc](docs/metrics/badges/ts-loc.svg)](docs/metrics/latest.md)
+[![tests](docs/metrics/badges/tests.svg)](docs/metrics/latest.md)
+[![cycles](docs/metrics/badges/cycles.svg)](docs/metrics/latest.md)
 
 ## New here? Start with the install guide
 
@@ -104,7 +108,7 @@ npm test
 ### Command format
 
 ```sh
-node /Users/you/git/n8n-ai-cli-loop/dist/cli/run-one-phase.js \
+node /path/to/n8n-ai-cli-loop/dist/cli/run-one-phase.js \
   --session-id "addon-dev" \
   --run-id "{{ $execution.id }}"
 ```
@@ -144,7 +148,7 @@ Define sessions in `~/.config/n8n-ai-cli-loop/sessions.json` using the following
     {
       "sessionId": "addon-dev",
       "repoKey": "thunderbird-auth-results-filter",
-      "repoRoot": "/Users/you/git/thunderbird-auth-results-filter",
+      "repoRoot": "/path/to/thunderbird-auth-results-filter",
       "githubRepo": "m2dw/thunderbird-auth-results-filter",
       "artifactDir": ".n8n-artifacts",
       "defaults": {
@@ -170,7 +174,7 @@ Define sessions in `~/.config/n8n-ai-cli-loop/sessions.json` using the following
 ### Command format
 
 ```sh
-node /Users/you/git/n8n-ai-cli-loop/dist/cli/enqueue-task.js \
+node /path/to/n8n-ai-cli-loop/dist/cli/enqueue-task.js \
   --session-id "addon-dev" \
   --issue-number 123 \
   --phase implementation \
@@ -217,7 +221,7 @@ Duplicate (idempotent):
 ### Command format
 
 ```sh
-node /Users/you/git/n8n-ai-cli-loop/dist/cli/github-intake.js \
+node /path/to/n8n-ai-cli-loop/dist/cli/github-intake.js \
   --session-id "addon-dev"
 ```
 
@@ -335,6 +339,13 @@ human review. Covers the `ai/issue-<N>` branch convention, `ai:ready-for-human`
 label, what each automation phase does, the fix/review cycle, and when to
 intervene manually:
 👉 **[docs/idea-to-implementation.md](docs/idea-to-implementation.md)**
+
+The equivalent operator guide for the content pipeline (content request →
+research → draft → editorial review → the fixed `ready_for_human` handoff)
+is specified in
+[docs/content-human-ready-handoff.md](docs/content-human-ready-handoff.md).
+Automated publication is explicitly out of scope — every export decision is
+manual.
 
 The contract for Tool Request handoff (what an agent does when it needs a
 command outside its allowed tool set) and handler-owned dependency sync

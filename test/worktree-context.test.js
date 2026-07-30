@@ -2,8 +2,6 @@
  * Per-issue worktree execution-context resolver (issue #438).
  *
  * Covers:
- *   - worktree-disabled sessions resolve to `{ enabled: false }` with NO git side
- *     effect (no worktree directory is ever created);
  *   - the default non-mutating mode reports the deterministic id + path with NO
  *     git side effect (no worktree dir, no `ai/issue-<n>` branch registered), so
  *     repo-working handlers in the canonical checkout cannot collide with it;
@@ -72,29 +70,12 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe('resolveWorktreeExecutionContext — disabled', () => {
-  test('a session without a worktrees block resolves to enabled:false and touches no git', () => {
-    const r = resolveWorktreeExecutionContext({ session: makeSession(), issueNumber: 7 });
-    expect(r).toEqual({ ok: true, context: { enabled: false } });
-    // No worktree directory was created.
-    expect(existsSync(worktreeRoot)).toBe(false);
-  });
-
-  test('worktrees.enabled:false resolves to enabled:false', () => {
-    const session = makeSession({ worktrees: { enabled: false, root: worktreeRoot } });
-    const r = resolveWorktreeExecutionContext({ session, issueNumber: 7 });
-    expect(r).toEqual({ ok: true, context: { enabled: false } });
-    expect(existsSync(worktreeRoot)).toBe(false);
-  });
-});
-
-describe('resolveWorktreeExecutionContext — enabled, non-mutating default', () => {
+describe('resolveWorktreeExecutionContext — non-mutating default', () => {
   test('computes the deterministic id + path with NO git side effect (no create flag)', () => {
-    const session = makeSession({ worktrees: { enabled: true, root: worktreeRoot } });
+    const session = makeSession({ worktrees: { root: worktreeRoot } });
     const r = resolveWorktreeExecutionContext({ session, issueNumber: 7, env: {} });
 
     expect(r.ok).toBe(true);
-    expect(r.context.enabled).toBe(true);
     // Nothing was created in the default mode.
     expect(r.context.created).toBe(false);
     expect(r.context.branch).toBe('ai/issue-7');
@@ -109,8 +90,15 @@ describe('resolveWorktreeExecutionContext — enabled, non-mutating default', ()
     expect(list).not.toContain('branch refs/heads/ai/issue-7');
   });
 
+  test('a session without a worktrees block still computes the deterministic id + path', () => {
+    const r = resolveWorktreeExecutionContext({ session: makeSession(), issueNumber: 7, env: {} });
+    expect(r.ok).toBe(true);
+    expect(r.context.created).toBe(false);
+    expect(r.context.worktreeId).toBe(issueWorktreeId('addon-dev', 7));
+  });
+
   test('still validates the configured root before reporting (relative root fails closed)', () => {
-    const session = makeSession({ worktrees: { enabled: true, root: 'relative/worktrees' } });
+    const session = makeSession({ worktrees: { root: 'relative/worktrees' } });
     const r = resolveWorktreeExecutionContext({ session, issueNumber: 7, env: {} });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/absolute path/);
@@ -122,7 +110,7 @@ describe('resolveWorktreeExecutionContext — enabled, non-mutating default', ()
     // rejects this; the non-mutating default must apply the same outside-checkout
     // validation rather than reporting an unusable in-repo worktree identity.
     const insideRoot = join(repoRoot, 'worktrees');
-    const session = makeSession({ worktrees: { enabled: true, root: insideRoot } });
+    const session = makeSession({ worktrees: { root: insideRoot } });
     const r = resolveWorktreeExecutionContext({ session, issueNumber: 7, env: {} });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/must live outside the canonical checkout/);
@@ -131,13 +119,12 @@ describe('resolveWorktreeExecutionContext — enabled, non-mutating default', ()
   });
 });
 
-describe('resolveWorktreeExecutionContext — enabled, create:true', () => {
+describe('resolveWorktreeExecutionContext — create:true', () => {
   test('creates the deterministic issue worktree on first use', () => {
-    const session = makeSession({ worktrees: { enabled: true, root: worktreeRoot } });
+    const session = makeSession({ worktrees: { root: worktreeRoot } });
     const r = resolveWorktreeExecutionContext({ session, issueNumber: 7, env: {}, create: true });
 
     expect(r.ok).toBe(true);
-    expect(r.context.enabled).toBe(true);
     expect(r.context.created).toBe(true);
     expect(r.context.branch).toBe('ai/issue-7');
     expect(r.context.worktreeId).toBe(issueWorktreeId('addon-dev', 7));
@@ -153,20 +140,19 @@ describe('resolveWorktreeExecutionContext — enabled, create:true', () => {
   });
 
   test('reuses the existing worktree on a later resolve (created:false, same path)', () => {
-    const session = makeSession({ worktrees: { enabled: true, root: worktreeRoot } });
+    const session = makeSession({ worktrees: { root: worktreeRoot } });
     const first = resolveWorktreeExecutionContext({ session, issueNumber: 7, env: {}, create: true });
     expect(first.context.created).toBe(true);
 
     const second = resolveWorktreeExecutionContext({ session, issueNumber: 7, env: {}, create: true });
     expect(second.ok).toBe(true);
-    expect(second.context.enabled).toBe(true);
     expect(second.context.created).toBe(false);
     expect(second.context.worktreePath).toBe(first.context.worktreePath);
     expect(second.context.worktreeId).toBe(first.context.worktreeId);
   });
 
   test('honors the N8N_AI_WORKTREE_ROOT env override when no session root is set', () => {
-    const session = makeSession({ worktrees: { enabled: true } });
+    const session = makeSession();
     const r = resolveWorktreeExecutionContext({
       session,
       issueNumber: 9,
@@ -178,7 +164,7 @@ describe('resolveWorktreeExecutionContext — enabled, create:true', () => {
   });
 
   test('fails closed with a typed error when the configured root is relative', () => {
-    const session = makeSession({ worktrees: { enabled: true, root: 'relative/worktrees' } });
+    const session = makeSession({ worktrees: { root: 'relative/worktrees' } });
     const r = resolveWorktreeExecutionContext({ session, issueNumber: 7, env: {}, create: true });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/absolute path/);

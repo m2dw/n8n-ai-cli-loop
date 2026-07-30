@@ -325,9 +325,11 @@ describe('docs/minimal-self-driving.md — smoke-test checklist', () => {
     expect(doc).not.toMatch(/action:\s*"candidate"/);
   });
 
-  test('clarifies that research phase does not produce a bot comment', () => {
-    // research only emits label effects — no comment outbox entry
-    expect(doc).toMatch(/research.*no.*comment|comment.*not.*research|research.*comment.*expected|missing.*comment.*research/is);
+  test('clarifies that research phase produces a bounded findings comment', () => {
+    // research now emits a bounded findings comment on success and an error
+    // comment on failure (content-research-mvp-contract.md §Public-Status Contract)
+    expect(doc).toMatch(/research.*comment|comment.*research/is);
+    expect(doc).toMatch(/bounded|findings|content-research-mvp-contract/i);
   });
 });
 

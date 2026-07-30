@@ -5,6 +5,7 @@
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import Database from 'better-sqlite3';
 import { renderPrSummary, PR_SUMMARY_MARKER } from '../dist/core/pr-summary.js';
 import { SqliteOutboxStore } from '../dist/stores/sqlite-outbox-store.js';
 import { dispatchOutbox } from '../dist/handlers/gh-dispatcher.js';
@@ -817,6 +818,37 @@ describe('SqliteOutboxStore.replacePendingPrSummary — coalescing', () => {
     );
     expect(r2.enqueued).toBe(false);
     expect(await store.listPending()).toHaveLength(1);
+  });
+
+  test('does not delete a dead-lettered entry for the same PR (issue #606 review follow-up)', async () => {
+    await store.enqueue({ idempotencyKey: 'run-a', topic: 'repohost:pr-summary', payload: makePayload('old body') });
+    const [entry] = await store.listPending();
+    // Exhaust the retry budget so run-a is dead-lettered rather than deleted.
+    let result;
+    for (let i = 0; i < 8; i++) {
+      result = await store.markFailed(entry.id, `err-${i}`, '2026-01-01T00:00:00.000Z');
+    }
+    expect(result).toEqual({ deadLettered: true });
+    expect(await store.listPending()).toHaveLength(0);
+
+    // run-B supersedes run-a, but run-a's dead-lettered row must survive.
+    await store.replacePendingPrSummary(
+      { idempotencyKey: 'run-b', topic: 'repohost:pr-summary', payload: makePayload('new body') },
+      SUMMARY_KEY,
+    );
+
+    const pending = await store.listPending();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].idempotencyKey).toBe('run-b');
+
+    const raw = new Database(dbPath);
+    try {
+      const row = raw.prepare('SELECT idempotency_key, dead_letter_at FROM outbox WHERE idempotency_key = ?').get('run-a');
+      expect(row).toBeDefined();
+      expect(row.dead_letter_at).not.toBeNull();
+    } finally {
+      raw.close();
+    }
   });
 });
 

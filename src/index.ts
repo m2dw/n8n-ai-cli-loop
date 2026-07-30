@@ -19,6 +19,7 @@ export type {
   DependencySyncConfig,
   FlowRule,
   ResolvedSession,
+  SessionAuditConfig,
   SessionConfig,
   SessionDefaults,
   SessionLabels,
@@ -34,6 +35,23 @@ export type {
   GitHubAppAuthConfig,
   ApiTokenAuthConfig,
 } from "./core/session.js";
+export type {
+  AuditCategory,
+  AuditCheck,
+  AuditSeverity,
+  AuditStatus,
+  AuditSummary,
+  AuditVerdict,
+  LabelLookup,
+  RepoVisibility,
+  SessionAuditFacts,
+  SessionAuditPayload,
+} from "./core/session-audit.js";
+export {
+  FIXED_WORK_ITEM_ROUTING_LABELS,
+  buildSessionAudit,
+  requiredWorkItemLabels,
+} from "./core/session-audit.js";
 export type { ResolvedAssignment, PhaseAgentKind } from "./core/assignment.js";
 export {
   ASSIGNMENT_CONTEXT_KEY,
@@ -43,11 +61,72 @@ export {
   resolveAssignment,
 } from "./core/assignment.js";
 export type { TaskStore } from "./core/task-store.js";
-export type { PhaseHandler, PhaseHandlerContext, PhaseHandlerResult, PhaseHandlers, PhaseRunOutcome, RunNextPhaseOptions, WorktreeContextResolution, PhaseLockHandle, PhaseLockAcquisition } from "./core/phase-runner.js";
+export type { PhaseHandler, PhaseHandlerContext, PhaseHandlerResult, PhaseHandlers, PhaseRunOutcome, RunNextPhaseOptions, WorktreeContextResolution, PhaseLockHandle, PhaseLockAcquisition, PhaseAdmissionResult } from "./core/phase-runner.js";
 export { runNextPhase } from "./core/phase-runner.js";
+export type {
+  SessionPauseState,
+  SessionPauseRecord,
+  SessionControlStore,
+  RunLedgerEntry,
+  RunLedgerEntryInput,
+  RunLedgerOutcome,
+  CircuitBreakerPolicy,
+  CircuitBreakerDecision,
+  CircuitBreakerRule,
+  RecordRunEvaluation,
+} from "./core/session-control.js";
+export {
+  resolveCircuitBreakerPolicy,
+  evaluateCircuitBreaker,
+  fetchCircuitBreakerWindows,
+  countConsecutiveFailures,
+  extractRunMetadata,
+  recordRunAndEvaluate,
+  isFailureOutcome,
+  DEFAULT_MAX_CONSECUTIVE_FAILURES,
+  DEFAULT_MAX_ISSUE_PHASE_FAILURES,
+  CIRCUIT_BREAKER_EVAL_WINDOW,
+  circuitBreakerEvalWindow,
+} from "./core/session-control.js";
 export { applyTaskPatch, isClaimExpired, isDelayed, isRunnable, leaseExpiry, nextPhaseAfter, priorityRank } from "./core/transitions.js";
-export { classifyQuotaExhaustion, resolveQuotaRetryDelayMs, DEFAULT_QUOTA_RETRY_DELAY_MS } from "./core/quota-classifier.js";
+export {
+  classifyQuotaExhaustion,
+  resolveQuotaRetryDelayMs,
+  DEFAULT_QUOTA_RETRY_DELAY_MS,
+  resolveTransientRetryDelayMs,
+  DEFAULT_TRANSIENT_RETRY_DELAY_MS,
+  resolveRetryDelayMsForCategory,
+  resolveRetryDelayOverrideMsForCategory,
+  describeFailureCategory,
+} from "./core/quota-classifier.js";
 export type { QuotaClassification } from "./core/quota-classifier.js";
+export {
+  classifyPermissionDenial,
+  describeDeniedOperation,
+  MAX_DENIAL_EVIDENCE_LINES,
+  MAX_DENIAL_OPERATION_TOKENS,
+  MAX_DENIAL_SIGNAL_CHARS,
+} from "./core/permission-denial-classifier.js";
+export type {
+  DeniedOperationClass,
+  DenialChannel,
+  DenialEvidence,
+  PermissionDenialClassification,
+} from "./core/permission-denial-classifier.js";
+export {
+  extractAgentFailureDiagnostic,
+  extractClaudeDiagnostic,
+  extractCodexDiagnostic,
+  extractGeminiDiagnostic,
+  MAX_DIAGNOSTIC_TEXT_LENGTH,
+} from "./core/agent-diagnostics.js";
+export type {
+  AgentFailureDiagnostic,
+  AgentFailureKind,
+  AgentDiagnosticSource,
+  AgentCommandOutput,
+  AgentDiagnosticOptions,
+} from "./core/agent-diagnostics.js";
 export {
   classifyIntervention,
   isCountableIntervention,
@@ -117,8 +196,9 @@ export type {
   OutboxPayload,
   OutboxStore,
   OutboxTopic,
+  OutboxDeliveryStatus,
 } from "./core/outbox.js";
-export { makeOutboxKey } from "./core/outbox.js";
+export { makeOutboxKey, categorizeOutboxEntry } from "./core/outbox.js";
 export { parseToolRequest, redactCommand, toolRequestPromptSection, toolRequestResolutionPromptSection, normalizeToolRequestCommand, TOOL_REQUEST_OPEN, TOOL_REQUEST_CLOSE } from "./core/tool-request.js";
 export type { ToolRequest, StoredToolRequest, ToolRequestResolution, ToolRequestNecessity, ToolRequestDisposition, ToolRequestCapturedResult } from "./core/tool-request.js";
 export {
@@ -160,6 +240,7 @@ export { MemoryTaskStore } from "./stores/memory-task-store.js";
 export { SqliteTaskStore } from "./stores/sqlite-task-store.js";
 export { SqliteOutboxStore, DEFAULT_DB_PATH } from "./stores/sqlite-outbox-store.js";
 export { SqliteContextStore } from "./stores/sqlite-context-store.js";
+export { SqliteSessionControlStore } from "./stores/sqlite-session-control-store.js";
 export { RepoLockStore, DEFAULT_LOCK_DIR } from "./stores/repo-lock-store.js";
 export type { AcquireResult, ReleaseResult, InspectResult, ForceReleaseResult } from "./stores/repo-lock-store.js";
 export type { WorktreeConfig } from "./core/session.js";
@@ -189,16 +270,11 @@ export type {
   ResolveIssueWorktreeResult,
   ResolvedIssueWorktree,
 } from "./handlers/worktree.js";
-export {
-  resolveWorktreeExecutionContext,
-  resolveWorktreeMigration,
-} from "./handlers/worktree-context.js";
+export { resolveWorktreeExecutionContext } from "./handlers/worktree-context.js";
 export type {
   WorktreeExecutionContextInput,
   WorktreeExecutionContext,
   ResolveWorktreeExecutionContextResult,
-  WorktreeMigrationInput,
-  WorktreeMigrationResult,
 } from "./handlers/worktree-context.js";
 export { assessWorktreeRecovery } from "./core/worktree-recovery.js";
 export type {
@@ -207,6 +283,12 @@ export type {
   WorktreeRecoverySnapshot,
   WorktreeRecoveryAssessment,
 } from "./core/worktree-recovery.js";
+export { createContentResearchHandler } from "./handlers/content-research.js";
+export type { ResolvedContentResearchProfile, ContentResearchOutcome } from "./handlers/content-research.js";
+export { createContentDraftHandler } from "./handlers/content-draft.js";
+export type { ResolvedContentDraftProfile, ContentDraftOutcome } from "./handlers/content-draft.js";
+export { createContentReviewHandler } from "./handlers/content-review.js";
+export type { ResolvedContentReviewProfile, ContentReviewOutcome } from "./handlers/content-review.js";
 export type { GhRunner, GhRunResult, DispatchResult, DispatchOptions } from "./handlers/gh-dispatcher.js";
 export { dispatchOutbox, defaultGhRunner } from "./handlers/gh-dispatcher.js";
 export type {
@@ -230,6 +312,7 @@ export type { GiteaWorkItemProviderOptions } from "./providers/gitea/gitea-work-
 export {
   createGiteaClient,
   defaultGiteaHttpSync,
+  createGiteaHttp,
   defaultGiteaHttp,
   redactGiteaSecrets,
   resolveGiteaToken,
@@ -246,6 +329,7 @@ export type {
   GiteaHttpRequest,
   GiteaHttpRequestInput,
   GiteaHttpResponse,
+  GiteaHttpOptions,
   GiteaSecretDeps,
 } from "./providers/gitea/gitea-client.js";
 export { resolveRepoHostProvider, resolveSessionRepoHost, defaultGiteaClientBuilder } from "./providers/repo-host-factory.js";

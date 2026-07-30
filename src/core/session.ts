@@ -36,15 +36,12 @@ export interface ConflictResolutionLoopConfig {
 // ---------------------------------------------------------------------------
 // Per-issue worktrees (docs/per-issue-worktrees.md, issue #400)
 //
-// Opt-in isolation: when enabled, each issue/work-item runs in its own durable
-// git worktree (keyed by session + issue) instead of contending on the shared
-// session checkout. Disabled by default so a session without this block (or with
-// `enabled: false`) keeps today's shared-`repoRoot` behavior unchanged.
+// Every issue/work-item unconditionally runs in its own durable git worktree
+// (keyed by session + issue); there is no shared-checkout execution mode
+// (removed in issue #731 — see docs/worktree-only-migration-contract.md).
 // ---------------------------------------------------------------------------
 
 export interface WorktreeConfig {
-  /** Master switch. Defaults to off; when false the shared session checkout is used. */
-  enabled: boolean;
   /**
    * Optional override for the managed worktree state root for this session. When
    * absent the runtime resolves it from the `N8N_AI_WORKTREE_ROOT` env var, then
@@ -164,6 +161,54 @@ export interface CodexContextModeConfig {
 export interface CodexConfig {
   /** Context-mode runtime capability for Codex agent invocations. */
   contextMode?: CodexContextModeConfig;
+  /**
+   * Optional explicit Codex model, passed as `--model <model>` (a global Codex
+   * CLI option, spliced before the `exec`/`review` subcommand) to both the
+   * implementation and review Codex invocations when set. When absent, the
+   * Codex CLI's own config/authenticated default selects the model — the
+   * documented compatibility mode for sessions that intentionally track the
+   * CLI default; resolved profile metadata records this as `model:
+   * "cli-default"` (issue #609). `CODEX_MODEL` overrides this when set.
+   */
+  model?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Claude complexity-profile overrides (issue #748)
+//
+// The built-in complexity-label -> Claude model/effort/budget mapping (see
+// core/github-intake.ts labelsToComplexity) is intentionally kept out of
+// source as a permanent hard-coded assumption: a session may override any
+// field of any tier so a future Claude model rename or effort-policy change
+// is a config edit, not a source rewrite.
+// ---------------------------------------------------------------------------
+
+/**
+ * Overrides one or more of a complexity tier's model/effort/budget. Fields
+ * left unset fall back to that tier's built-in default.
+ */
+export interface ClaudeComplexityProfileOverride {
+  model?: string;
+  effort?: string;
+  budget?: string;
+}
+
+/** Per-tier overrides, keyed by the same tiers `labelsToComplexity` resolves. */
+export interface ClaudeComplexityProfilesConfig {
+  low?: ClaudeComplexityProfileOverride;
+  default?: ClaudeComplexityProfileOverride;
+  high?: ClaudeComplexityProfileOverride;
+  xhigh?: ClaudeComplexityProfileOverride;
+}
+
+export interface ClaudeConfig {
+  /**
+   * Overrides the built-in complexity-label -> Claude model/effort/budget
+   * mapping. Optional and a no-op when absent: a session without it uses the
+   * built-in defaults (e.g. `complexity:xhigh` -> Fable 5 / high / $20),
+   * preserving today's behavior.
+   */
+  complexityProfiles?: ClaudeComplexityProfilesConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +227,32 @@ export interface AntigravityResearchConfig {
   model?: string;
 }
 
+/**
+ * Constrained read-only repository evidence for headless research (issue
+ * #806, docs/research-evidence-contract.md). Off by default: with `enabled`
+ * absent or false the research phase behaves exactly as before — one
+ * invocation, no evidence sections, no new artifacts, no new outcomes.
+ */
+export interface ResearchEvidenceConfig {
+  /** Master switch for the evidence turn loop. Default false. */
+  enabled?: boolean;
+  /**
+   * Additive-only additions to the fixed deny floor (contract §4.7).
+   * Configuration can tighten the floor, never loosen it.
+   */
+  denyGlobs?: string[];
+  /** Globs for generated files excluded from bulk list/search results
+   * (contract §4.6). Default empty. */
+  generatedGlobs?: string[];
+  /** May only LOWER the fixed MAX_EVIDENCE_TURNS ceiling (contract §13 S5). */
+  maxTurns?: number;
+}
+
 export interface ResearchConfig {
   /** Antigravity-specific research model configuration. */
   antigravity?: AntigravityResearchConfig;
+  /** Repository evidence configuration (issue #806). */
+  evidence?: ResearchEvidenceConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +515,50 @@ export interface NotificationsConfig {
   slack?: SlackNotificationsConfig;
 }
 
+// ---------------------------------------------------------------------------
+// Report-only rollout mode (issue #532)
+//
+// L1/report-only rollout gate for newly onboarded sessions: intake still
+// discovers and analyzes candidate issues, but the phases that mutate the
+// repository (`implementation`, `conflict_resolution` — branch creation,
+// commits, PR pushes, write-authority agent runs) are refused before any
+// side effect runs, both at intake (the task is never enqueued) and, as a
+// defense-in-depth backstop, at phase admission (a pre-existing or
+// otherwise-enqueued task is blocked before the handler runs). See
+// src/handlers/report-only-admission.ts.
+//
+// Disabled unless a session opts in (`enabled: true`). Toggling `enabled`
+// back to `false` resumes normal automation without redefining the session.
+// ---------------------------------------------------------------------------
+
+export interface ReportOnlyConfig {
+  /** Master switch. Defaults to off; when false the session runs normal automation. */
+  enabled: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Loop design audit (issue #533)
+//
+// Operator-recorded dispositions for `admin session-audit` findings. The audit
+// itself derives everything else from the rest of the session config plus
+// read-only observations; this block exists only so a deliberate deviation
+// ("this repository has nothing to verify", "work items are public on purpose")
+// can be documented in the session rather than re-argued at every audit run.
+//
+// An acknowledged finding is still reported — with its original severity and
+// the recorded reason — but no longer drags the overall verdict down.
+// ---------------------------------------------------------------------------
+
+export interface SessionAuditConfig {
+  /**
+   * Documented reasons for accepting an audit finding, keyed by the audit's
+   * stable check id (e.g. `verification-commands`). The value is the rationale
+   * shown next to the finding; it is never empty. An entry whose key matches no
+   * check id suppresses nothing and is reported by the audit as a typo.
+   */
+  acknowledge?: Record<string, string>;
+}
+
 export interface SessionConfig {
   sessionId: string;
   /**
@@ -476,9 +588,10 @@ export interface SessionConfig {
   reviewLoop?: ReviewLoopConfig;
   conflictResolutionLoop?: ConflictResolutionLoopConfig;
   /**
-   * Per-issue worktree isolation (issue #400). Optional and disabled by default:
-   * a session without it runs every phase in the shared `repoRoot` checkout,
-   * preserving today's behavior.
+   * Per-issue worktree isolation (issue #400). Optional — only present to
+   * carry a `root` override; every session runs every phase in its own
+   * per-issue worktree unconditionally (issue #731,
+   * docs/worktree-only-migration-contract.md).
    */
   worktrees?: WorktreeConfig;
   /**
@@ -499,6 +612,12 @@ export interface SessionConfig {
    * for non-Codex agents; a session without it preserves today's Codex behavior.
    */
   codex?: CodexConfig;
+  /**
+   * Claude-specific runtime configuration (e.g. complexity-profile
+   * overrides). Optional and a no-op when absent: a session without it uses
+   * the built-in complexity mapping, preserving today's behavior.
+   */
+  claude?: ClaudeConfig;
   /**
    * Research-phase agent configuration. Optional and a no-op when absent: a
    * session without it uses the CLI default model for the research agent,
@@ -535,12 +654,27 @@ export interface SessionConfig {
    * without this block sends no external notifications, preserving today's behavior.
    */
   notifications?: NotificationsConfig;
+  /**
+   * Report-only rollout mode (issue #532). Optional and disabled by default: a
+   * session without it (or with `enabled: false`) runs normal automation. When
+   * enabled, intake still finds and analyzes candidate issues, but the
+   * `implementation` and `conflict_resolution` phases are refused before any
+   * branch, commit, or PR is created — see {@link ReportOnlyConfig}.
+   */
+  reportOnly?: ReportOnlyConfig;
+  /**
+   * Loop-design audit dispositions (issue #533). Optional and a no-op when
+   * absent; read only by `admin session-audit`, never by a phase handler.
+   */
+  audit?: SessionAuditConfig;
 }
 
 export interface ResolvedSession extends SessionConfig {
   artifactRoot: string;
   githubOwner: string;
   githubName: string;
+  /** See {@link SessionConfig.worktrees}. */
+  worktrees?: WorktreeConfig;
   /** Always resolved: defaults to GitHub Issues over `gh` when not configured. */
   workItemProvider: WorkItemProviderConfig;
   /** Always resolved: defaults to GitHub over `gh` when not configured. */

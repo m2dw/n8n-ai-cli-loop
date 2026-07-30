@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createConflictResolutionHandler } from '../dist/handlers/conflict-resolution.js';
+import { createConflictResolutionHandler as _createConflictResolutionHandler } from '../dist/handlers/conflict-resolution.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -10,6 +10,63 @@ import { createConflictResolutionHandler } from '../dist/handlers/conflict-resol
 let tmpDir;
 let repoRoot;
 let artifactRoot;
+
+// ---------------------------------------------------------------------------
+// Worktree + lock fixtures (issue #457/#730: conflict resolution always resolves
+// a per-issue worktree and an issue-scoped advisory lock — there is no more
+// canonical-checkout path). Shared, module-scope versions so every describe
+// block below gets safe defaults without redefining them; the dedicated
+// "per-issue worktree" / "phase-runner pre-acquired lock" describe blocks
+// further down define their OWN local copies (same shape) which shadow these
+// within that block — left untouched since those blocks already correctly
+// target worktree mechanics.
+// ---------------------------------------------------------------------------
+
+const worktreePath = () => join(tmpDir, 'worktrees', 'addon-dev', 'issue-209');
+
+// Records every resolveWorktree() input and returns a fixed worktree path so the
+// handler's cwd switch is exercised without a real `git worktree`.
+function fakeWorktreeResolver(path, { ok = true, error, created = false, branchReused = true } = {}) {
+  const calls = [];
+  return {
+    calls,
+    resolve(input) {
+      calls.push(input);
+      if (!ok) return { ok: false, error: error ?? 'resolve failed' };
+      return { ok: true, path, worktreeId: `${input.sessionId}/issue-${input.issueNumber}`, branch: input.branch, created, branchReused };
+    },
+  };
+}
+
+// Duck-typed IssueWorktreeLock: records acquire/release and returns a configurable
+// acquire result so a held lock (concurrent execution) can be simulated.
+function fakeLock(acquireResult = { ok: true, locked: true, contextId: 'run-conflict-1', sessionId: 'addon-dev' }) {
+  const calls = { acquire: [], release: [] };
+  return {
+    calls,
+    acquire(ownerId, sessionId, issueNumber) { calls.acquire.push({ ownerId, sessionId, issueNumber }); return acquireResult; },
+    release(ownerId, sessionId, issueNumber) { calls.release.push({ ownerId, sessionId, issueNumber }); return { ok: true, released: true }; },
+  };
+}
+
+// Every call site historically invoked `createConflictResolutionHandler(context,
+// runner)` and relied on the canonical-checkout path. Since #457/#730 removed
+// that path, conflict resolution always resolves a per-issue worktree and a real
+// IssueWorktreeLock; tests that don't care about worktree/lock mechanics get
+// deterministic fakes so `runner` only ever sees the git calls the handler itself
+// issues, not `resolveIssueWorktree`'s or `IssueWorktreeLock`'s internals. Tests
+// that DO care about worktree resolution or lock behavior pass their own fakes as
+// the 3rd/4th args, which this wrapper leaves untouched. `phaseLockOwnerId` (5th)
+// is a plain pass-through.
+function createConflictResolutionHandler(context, runner, resolveWorktree, issueLock, phaseLockOwnerId) {
+  return _createConflictResolutionHandler(
+    context,
+    runner,
+    resolveWorktree ?? fakeWorktreeResolver(worktreePath()).resolve,
+    issueLock ?? fakeLock(),
+    phaseLockOwnerId,
+  );
+}
 
 const SESSION = (overrides = {}) => ({
   sessionId: 'addon-dev',
@@ -83,13 +140,14 @@ const VALID_AGENT_OUTPUT = [
   'MERGE_RATIONALE_END',
 ].join('\n');
 
-// Common prefix steps: gh pr list -> git status (clean) -> git fetch -> git checkout -B
+// Common prefix steps: gh pr list -> git fetch (canonical) -> git status (worktree,
+// clean) -> git reset --hard (pin worktree to PR head).
 function setupSteps(extra = []) {
   return [
     { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 }, // gh pr list
-    { stdout: '', stderr: '', exitCode: 0 },           // git status --porcelain (clean)
-    { stdout: '', stderr: '', exitCode: 0 },           // git fetch origin <refspecs>
-    { stdout: '', stderr: '', exitCode: 0 },           // git checkout -B <prBranch>
+    { stdout: '', stderr: '', exitCode: 0 },           // git fetch origin <refspecs> (canonical repo)
+    { stdout: '', stderr: '', exitCode: 0 },           // git status --porcelain (worktree, clean)
+    { stdout: '', stderr: '', exitCode: 0 },           // git reset --hard refs/remotes/origin/<prBranch>
     ...extra,
   ];
 }
@@ -121,7 +179,7 @@ function findCall(calls, cmd, argMatch) {
 // ---------------------------------------------------------------------------
 
 describe('conflict resolution — setup command order', () => {
-  test('runs gh pr list, status, fetch, checkout -B, merge in order (clean merge)', async () => {
+  test('runs gh pr list, fetch, status, reset --hard, merge in order (clean merge)', async () => {
     const runner = sequenceRunner(setupSteps([
       { stdout: '', stderr: '', exitCode: 0 }, // git merge --no-commit --no-ff (clean)
       { stdout: '', stderr: 'fatal: Needed a single revision', exitCode: 1 }, // git rev-parse MERGE_HEAD (none → no-op)
@@ -132,9 +190,9 @@ describe('conflict resolution — setup command order', () => {
     expect(result.result).toBe('success');
     const seq = runner.calls.map((c) => `${c.cmd} ${c.args.join(' ')}`);
     expect(seq[0]).toContain('gh pr list');
-    expect(seq[1]).toBe('git status --porcelain');
-    expect(seq[2]).toContain('git fetch origin');
-    expect(seq[3]).toContain('git checkout -B ai/issue-209');
+    expect(seq[1]).toContain('git fetch origin');
+    expect(seq[2]).toBe('git status --porcelain');
+    expect(seq[3]).toContain('git reset --hard refs/remotes/origin/ai/issue-209');
     expect(seq[4]).toContain('git merge --no-commit --no-ff');
   });
 
@@ -194,9 +252,11 @@ describe('conflict resolution — fetch refspecs', () => {
       '+main:refs/remotes/origin/main',
       '+ai/issue-209:refs/remotes/origin/ai/issue-209',
     ]);
-    // Checkout resets to the freshly fetched remote head, not a stale local branch.
-    const checkout = findCall(runner.calls, 'git', (a) => a[0] === 'checkout');
-    expect(checkout.args).toEqual(['checkout', '-B', 'ai/issue-209', 'refs/remotes/origin/ai/issue-209']);
+    // The worktree's held branch is reset to the freshly fetched remote head, never a
+    // stale local branch (a `git checkout -B` would fail — the branch is already
+    // checked out in the worktree).
+    const reset = findCall(runner.calls, 'git', (a) => a[0] === 'reset' && a[1] === '--hard');
+    expect(reset.args).toEqual(['reset', '--hard', 'refs/remotes/origin/ai/issue-209']);
     // Merge targets the fetched remote base ref.
     const merge = findCall(runner.calls, 'git', (a) => a[0] === 'merge' && a[1] === '--no-commit');
     expect(merge.args).toContain('refs/remotes/origin/main');
@@ -223,17 +283,18 @@ describe('conflict resolution — fetch refspecs', () => {
 // ---------------------------------------------------------------------------
 
 describe('conflict resolution — dirty worktree preflight', () => {
-  test('blocks before any fetch/merge when the worktree is dirty', async () => {
+  test('blocks before any reset/merge when the worktree is dirty', async () => {
     const runner = sequenceRunner([
       { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },        // gh pr list
-      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },     // git status (dirty)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch (canonical)
+      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },     // git status (worktree, dirty)
     ]);
     const result = await createConflictResolutionHandler(CONTEXT(), runner)(makeTask());
 
     expect(result.result).toBe('blocked');
     expect(result.message).toMatch(/dirty/i);
-    // No merge state was entered: no fetch, checkout, or merge.
-    expect(findCall(runner.calls, 'git', (a) => a[0] === 'fetch')).toBeFalsy();
+    // No merge state was entered: no reset or merge.
+    expect(findCall(runner.calls, 'git', (a) => a[0] === 'reset')).toBeFalsy();
     expect(findCall(runner.calls, 'git', (a) => a[0] === 'merge')).toBeFalsy();
   });
 });
@@ -280,25 +341,24 @@ describe('conflict resolution — missing PR / branch', () => {
     expect(runner.calls.every((c) => c.cmd !== 'git')).toBe(true);
   });
 
-  test('fails when the PR branch cannot be checked out', async () => {
+  test('fails when the worktree cannot be reset to the PR head', async () => {
     const runner = sequenceRunner([
       { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },                 // gh pr list
-      { stdout: '', stderr: '', exitCode: 0 },                           // git status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                           // git fetch
-      { stdout: '', stderr: 'fatal: no such ref', exitCode: 1 },         // git checkout -B (fails)
+      { stdout: '', stderr: '', exitCode: 0 },                           // git fetch (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                           // git status (worktree, clean)
+      { stdout: '', stderr: 'fatal: no such ref', exitCode: 1 },         // git reset --hard (fails)
     ]);
     const result = await createConflictResolutionHandler(CONTEXT(), runner)(makeTask());
 
     expect(result.result).toBe('failed');
-    expect(result.error).toMatch(/checkout -B/);
-    // Checkout failed before merge state — no merge or abort.
+    expect(result.error).toMatch(/reset --hard/);
+    // Reset failed before merge state — no merge or abort.
     expect(findCall(runner.calls, 'git', (a) => a[0] === 'merge')).toBeFalsy();
   });
 
   test('fails when git fetch fails', async () => {
     const runner = sequenceRunner([
       { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },          // gh pr list
-      { stdout: '', stderr: '', exitCode: 0 },                    // git status (clean)
       { stdout: '', stderr: 'network error', exitCode: 1 },       // git fetch (fails)
     ]);
     const result = await createConflictResolutionHandler(CONTEXT(), runner)(makeTask());
@@ -706,6 +766,28 @@ describe('conflict resolution — merge abort / cleanup', () => {
     expect(findCall(runner.calls, 'git', (a) => a[0] === 'clean')).toBeFalsy();
   });
 
+  test('delays the retry with category metadata when the agent hits a rate limit (issue #672)', async () => {
+    const runner = sequenceRunner(setupSteps([
+      { stdout: '', stderr: 'CONFLICT', exitCode: 1 },             // merge (conflicts)
+      { stdout: TEXT_CONFLICT_LS_FILES, stderr: '', exitCode: 0 }, // ls-files -u
+      { stdout: '12\t3\tsrc/foo.ts\n', stderr: '', exitCode: 0 },  // diff --numstat (foo text)
+      { stdout: '4\t5\tsrc/bar.ts\n', stderr: '', exitCode: 0 },   // diff --numstat (bar text)
+      { stdout: 'src/foo.ts\nsrc/bar.ts\n', stderr: '', exitCode: 0 }, // diff --cached --name-only (baseline)
+      { stdout: '', stderr: '', exitCode: 0 },                     // git diff prBranch...baseBranch (main-side changes)
+      { stdout: '', stderr: 'Error: HTTP 429 too many requests', exitCode: 1 }, // claude — rate-limited
+      { stdout: '', stderr: '', exitCode: 0 },                     // status --porcelain (no residue from the delayed agent)
+      { stdout: '', stderr: '', exitCode: 0 },                     // merge --abort
+    ]));
+    const result = await createConflictResolutionHandler(CONTEXT(), runner)(makeTask());
+
+    expect(result.result).toBe('delayed');
+    expect(result.category).toBe('rate_limit');
+    expect(result.context.category).toBe('rate_limit');
+    expect(result.retryAfterMs).toBeLessThan(60 * 60 * 1000);
+    expect(result.message).toMatch(/rate limit/i);
+    expect(result.message).not.toMatch(/usage quota/i);
+  });
+
   test('cleans agent residue when the agent exits non-zero after creating untracked/unstaged files', async () => {
     const runner = sequenceRunner(setupSteps([
       { stdout: '', stderr: 'CONFLICT', exitCode: 1 },             // merge (conflicts)
@@ -1048,7 +1130,7 @@ describe('conflict resolution — per-issue worktree mode (issue #444)', () => {
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
     const runner = worktreeConflictRunner();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createConflictResolutionHandler(CONTEXT({ session }), runner, resolver, lock)(makeTask());
 
@@ -1077,7 +1159,7 @@ describe('conflict resolution — per-issue worktree mode (issue #444)', () => {
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
     const runner = worktreeConflictRunner();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     await createConflictResolutionHandler(CONTEXT({ session }), runner, resolver, lock)(makeTask());
 
@@ -1094,7 +1176,7 @@ describe('conflict resolution — per-issue worktree mode (issue #444)', () => {
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
     const runner = worktreeConflictRunner();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     await createConflictResolutionHandler(CONTEXT({ session }), runner, resolver, lock)(makeTask());
 
@@ -1111,7 +1193,7 @@ describe('conflict resolution — per-issue worktree mode (issue #444)', () => {
     const runner = sequenceRunner([
       { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 }, // gh pr list (needed to get prBranch for lock scope)
     ]);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createConflictResolutionHandler(CONTEXT({ session }), runner, resolver, lock)(makeTask());
 
@@ -1130,7 +1212,7 @@ describe('conflict resolution — per-issue worktree mode (issue #444)', () => {
       { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 }, // gh pr list
       { stdout: '', stderr: '', exitCode: 0 },           // git fetch origin <refspecs> (canonical)
     ]);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createConflictResolutionHandler(CONTEXT({ session }), runner, resolver, lock)(makeTask());
 
@@ -1282,7 +1364,7 @@ describe('conflict resolution — per-issue worktree (issue #457)', () => {
     const runner = worktreeNoopRunner();
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
-    const session = { worktrees: { enabled: true } };
+    const session = {};
 
     const result = await createConflictResolutionHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -1351,7 +1433,7 @@ describe('conflict resolution — per-issue worktree (issue #457)', () => {
     ]);
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock();
-    const session = { worktrees: { enabled: true } };
+    const session = {};
 
     // The review handoff records the non-conventional PR's identity in the task context.
     const task = makeTask({
@@ -1402,7 +1484,7 @@ describe('conflict resolution — per-issue worktree (issue #457)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = { worktrees: { enabled: true } };
+    const session = {};
 
     const result = await createConflictResolutionHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -1430,7 +1512,7 @@ describe('conflict resolution — per-issue worktree (issue #457)', () => {
       ok: true, locked: false, reason: 'lock_held',
       ownerContextId: 'other-run', ownerStartedAt: '2026-06-30T00:00:00.000Z',
     });
-    const session = { worktrees: { enabled: true } };
+    const session = {};
 
     const result = await createConflictResolutionHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -1456,7 +1538,7 @@ describe('conflict resolution — per-issue worktree (issue #457)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath(), { ok: false, error: 'diverged from origin' });
     const lock = fakeLock();
-    const session = { worktrees: { enabled: true } };
+    const session = {};
 
     const result = await createConflictResolutionHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -1478,7 +1560,7 @@ describe('conflict resolution — per-issue worktree (issue #457)', () => {
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
     const lock = fakeLock();
-    const session = { worktrees: { enabled: true } };
+    const session = {};
 
     const result = await createConflictResolutionHandler(
       CONTEXT({ session }), runner, resolver.resolve, lock,
@@ -1552,7 +1634,7 @@ describe('conflict resolution — phase-runner pre-acquired lock (issue #524)', 
     const resolver = fakeWorktreeResolver(wt);
     // Lock that would return `blocked` if acquired — simulates the phase runner holding it.
     const lock = fakeLock({ locked: false, ownerContextId: 'phase-runner-owner', ownerStartedAt: '2026-07-05T14:20:42.265Z' });
-    const session = { worktrees: { enabled: true } };
+    const session = {};
 
     const result = await createConflictResolutionHandler(
       CONTEXT({ session }), runner, resolver, lock, 'phase-runner-owner',
@@ -1571,7 +1653,7 @@ describe('conflict resolution — phase-runner pre-acquired lock (issue #524)', 
     const runner = worktreeNoopRunner();
     const resolver = fakeWorktreeResolver(wt);
     const lock = fakeLock({ locked: true });
-    const session = { worktrees: { enabled: true } };
+    const session = {};
 
     await createConflictResolutionHandler(
       CONTEXT({ session }), runner, resolver, lock,

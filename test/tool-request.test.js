@@ -465,6 +465,29 @@ test('captured stderr is replayed and oversized output is truncated', () => {
   expect(section).not.toContain(big);
 });
 
+test('failed guided run replays the captured failure output and tells the agent to diagnose it (issue #678)', () => {
+  const section = toolRequestResolutionPromptSection(
+    resolvedRequest({
+      action: 'guided-run',
+      resolvedAt: '2026-06-08T09:00:00.000Z',
+      commandHash: 'jkl012',
+      disposition: 'failed',
+      capturedResult: { exitCode: 1, stdout: 'Tests: 128 passed, 1 failed', stderr: 'AssertionError: expected 1 option, got 3' },
+    }),
+  ).join('\n');
+  expect(section).toContain('The operator responded: guided-run (command failed)');
+  expect(section).toContain('Captured command output (exit code 1):');
+  expect(section).toContain('Tests: 128 passed, 1 failed');
+  expect(section).toContain('AssertionError: expected 1 option, got 3');
+  // A non-zero exit is diagnostic information, not a reason to stop: the agent
+  // must be told to diagnose and continue, not that "the command has been run"
+  // (the generic phrasing used for success dispositions, which would misread a
+  // failure as a green light to proceed unchanged).
+  expect(section).toContain('FAILED');
+  expect(section).toContain('Diagnose the failure');
+  expect(section).not.toContain('The command has been run.');
+});
+
 test('no captured result (manual-done) -> no captured-output block', () => {
   const section = toolRequestResolutionPromptSection(
     resolvedRequest({ action: 'manual-done', resolvedAt: '2026-06-08T08:00:00.000Z' }),

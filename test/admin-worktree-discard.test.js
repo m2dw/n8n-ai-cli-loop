@@ -39,7 +39,7 @@ function writeSessions() {
         defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
         verification: { test: 'npm test' },
         labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-        worktrees: { enabled: true, root: worktreeRoot },
+        worktrees: { root: worktreeRoot },
       },
     ],
   };
@@ -299,7 +299,7 @@ describe('admin worktree discard', () => {
           defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
           verification: { test: 'npm test' },
           labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-          worktrees: { enabled: true, root: insideRoot },
+          worktrees: { root: insideRoot },
         },
       ],
     };
@@ -320,41 +320,31 @@ describe('admin worktree discard', () => {
     expect(out.error).toMatch(/inside the canonical repository root/);
   });
 
-  test('refuses when session has worktrees.enabled: false', () => {
-    const disabledSessions = {
-      sessions: [
-        {
-          sessionId: 'addon-dev',
-          repoKey: 'test-repo',
-          repoRoot,
-          githubRepo: 'm2dw/test-repo',
-          artifactDir: '.n8n-artifacts',
-          baseBranch: 'main',
-          defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
-          verification: { test: 'npm test' },
-          labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-          worktrees: { enabled: false, root: worktreeRoot },
-        },
-      ],
-    };
-    const disabledSessionsPath = join(tmpDir, 'sessions-disabled.json');
-    writeFileSync(disabledSessionsPath, JSON.stringify(disabledSessions, null, 2));
+  test('allows discard of a registered worktree (issue #732 review)', () => {
+    // The implementation phase materializes the per-issue worktree
+    // UNCONDITIONALLY, so an operator must be able to recover it through the
+    // lock-aware discard command rather than falling back to manual git
+    // operations.
+    const wt = createIssueWorktree(603);
+    writeFileSync(join(wt.path, 'dirty.txt'), 'x');
 
     const r = run(
       'worktree', 'discard',
       '--session-id', 'addon-dev',
-      '--sessions-path', disabledSessionsPath,
+      '--sessions-path', sessionsPath,
       '--lock-dir', lockDir,
-      '--issue-number', '601',
+      '--issue-number', '603',
+      '--yes',
       '--json',
     );
-    expect(r.code).toBe(1);
+    expect(r.code).toBe(0);
     const out = JSON.parse(r.stdout.trim());
-    expect(out.ok).toBe(false);
-    expect(out.error).toMatch(/worktrees are not enabled/);
+    expect(out.ok).toBe(true);
+    expect(out.discarded).toBe(true);
+    expect(existsSync(join(wt.path, 'dirty.txt'))).toBe(false);
   });
 
-  test('refuses when session omits the worktrees key entirely', () => {
+  test('treats a session that omits the worktrees key as usable and no-ops when nothing is registered', () => {
     const noWorktreesSessions = {
       sessions: [
         {
@@ -381,10 +371,11 @@ describe('admin worktree discard', () => {
       '--issue-number', '602',
       '--json',
     );
-    expect(r.code).toBe(1);
+    expect(r.code).toBe(0);
     const out = JSON.parse(r.stdout.trim());
-    expect(out.ok).toBe(false);
-    expect(out.error).toMatch(/worktrees are not enabled/);
+    expect(out.ok).toBe(true);
+    expect(out.discarded).toBe(false);
+    expect(out.reason).toBe('not_found');
   });
 
   test('fails closed when git status cannot inspect the worktree (probe returns ok:false)', () => {
