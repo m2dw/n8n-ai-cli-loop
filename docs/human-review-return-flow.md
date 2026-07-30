@@ -42,6 +42,7 @@ enqueued for fix mode:
 | `github-app-comment` | Feedback extracted from a GitHub PR comment by the GitHub App automation. |
 | `operator_input` | Feedback provided directly by an operator via `admin.js human-review-return` (`--feedback` / `--feedback-file`). |
 | `human_comment` | Latest human issue comment forwarded by an operator via `admin.js human-review-return --feedback-source issue-comment`. |
+| `human_gate_no_go` | Feedback recorded at the Human Gate via `admin.js human-gate no-go` and carried into fix mode by a continuation disposition. See [`human-gate-no-go-flow.md`](human-gate-no-go-flow.md). |
 
 Labels (`status:needs-fix`, agent label) are routing signals set by whichever
 path populates the context. They are not the feedback payload.

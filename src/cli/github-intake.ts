@@ -37,13 +37,14 @@ import { resolveGiteaToken, redactGiteaSecrets } from "../providers/gitea/gitea-
 import type { GiteaHttpRequest } from "../providers/gitea/gitea-client.js";
 import type { WorkItem } from "../providers/types.js";
 import type { TaskPhase } from "../core/task.js";
+import { REPORT_ONLY_BLOCKED_PHASES, describeReportOnlyDeferral } from "../handlers/report-only-admission.js";
 import { emit, die } from "./cli-io.js";
 import { tokenizeArgs } from "./admin-command.js";
 
 const ALL_PHASES = new Set<TaskPhase>([
-  "implementation", "review", "conflict_resolution", "research", "planner",
+  "implementation", "review", "conflict_resolution", "research", "content_research", "content_draft", "content_review", "planner",
 ]);
-const DEFAULT_SUPPORTED_PHASES: TaskPhase[] = ["research"];
+const DEFAULT_SUPPORTED_PHASES: TaskPhase[] = ["research", "content_research"];
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -463,6 +464,8 @@ export async function runIntake(
   const results: Array<Record<string, unknown>> = [];
   let enqueuedCount = 0;
   let alreadyExistsCount = 0;
+  let reportOnlyDeferredCount = 0;
+  const reportOnlyEnabled = session.reportOnly?.enabled === true;
 
   if (!args.dryRun) {
     const store = new SqliteTaskStore(args.dbPath);
@@ -477,6 +480,32 @@ export async function runIntake(
     const workItemOutboxStore = workItemOutbox(outboxStore, session);
     try {
       for (const candidate of candidates) {
+        // Resolve the assignment before any report-only deferral so an invalid
+        // assignment profile (e.g. an unsupported conflict_resolution agent)
+        // still fails intake the same way normal (non-report-only) intake does,
+        // rather than being silently skipped by the deferral below (issue #532
+        // review follow-up).
+        const assignment = resolveAssignment(session, candidate.labels, now, {
+          ...(candidate.implementationAgent !== undefined ? { implementationAgent: candidate.implementationAgent } : {}),
+          ...(candidate.reviewAgent !== undefined ? { reviewAgent: candidate.reviewAgent } : {}),
+          ...(candidate.researchAgent !== undefined ? { researchAgent: candidate.researchAgent } : {}),
+        });
+        // Report-only rollout mode (issue #532): a candidate that would run a
+        // repo-mutating phase is never enqueued as that phase — intake still
+        // found and analyzed the issue, but no implementation task, branch, or
+        // PR is created. The candidate's message states what would have
+        // happened under normal automation so the operator has a clear report.
+        if (reportOnlyEnabled && REPORT_ONLY_BLOCKED_PHASES.has(candidate.phase)) {
+          reportOnlyDeferredCount++;
+          results.push({
+            issueNumber: candidate.issueNumber,
+            action: "report_only_deferred",
+            phase: candidate.phase,
+            title: candidate.title,
+            message: describeReportOnlyDeferral(session, candidate.issueNumber, candidate.phase),
+          });
+          continue;
+        }
         const result = await store.enqueueTask({
           sessionId,
           issueNumber: candidate.issueNumber,
@@ -494,11 +523,7 @@ export async function runIntake(
             // are passed as overrides so explicit agent labels are honored
             // over the session's built-in default (issue #260). Persisted verbatim so
             // later edits to sessions.json never change this task's agents (issue #259).
-            assignment: resolveAssignment(session, candidate.labels, now, {
-              ...(candidate.implementationAgent !== undefined ? { implementationAgent: candidate.implementationAgent } : {}),
-              ...(candidate.reviewAgent !== undefined ? { reviewAgent: candidate.reviewAgent } : {}),
-              ...(candidate.researchAgent !== undefined ? { researchAgent: candidate.researchAgent } : {}),
-            }),
+            assignment,
             ...(candidate.implementationMode !== undefined
               ? { implementationMode: candidate.implementationMode }
               : {}),
@@ -541,6 +566,23 @@ export async function runIntake(
     }
   } else {
     for (const candidate of candidates) {
+      // Mirror the report-only deferral classification used in the write path
+      // above so `--dry-run` accurately previews what a live intake run would
+      // do: a candidate whose phase would be blocked by report-only mode is
+      // reported as `report_only_deferred` (not `dry_run`), with the same
+      // count and message an operator would see without --dry-run (issue #532
+      // review follow-up).
+      if (reportOnlyEnabled && REPORT_ONLY_BLOCKED_PHASES.has(candidate.phase)) {
+        reportOnlyDeferredCount++;
+        results.push({
+          issueNumber: candidate.issueNumber,
+          action: "report_only_deferred",
+          phase: candidate.phase,
+          title: candidate.title,
+          message: describeReportOnlyDeferral(session, candidate.issueNumber, candidate.phase),
+        });
+        continue;
+      }
       results.push({ issueNumber: candidate.issueNumber, action: "dry_run", phase: candidate.phase, title: candidate.title });
     }
   }
@@ -556,6 +598,8 @@ export async function runIntake(
     candidates: candidates.length,
     enqueued: enqueuedCount,
     alreadyExists: alreadyExistsCount,
+    reportOnly: reportOnlyEnabled,
+    reportOnlyDeferred: reportOnlyDeferredCount,
     dryRun: args.dryRun,
     results,
   });

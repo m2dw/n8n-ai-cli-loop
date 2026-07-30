@@ -202,6 +202,7 @@ export function renderHumanGateSummary(input: HumanGateSummaryInput): string {
     lines.push(`- Review agent: ${agentLabel(reviewAgentUsed)}`);
   }
   if (resolvedProfile) {
+    const provider = typeof resolvedProfile.provider === "string" ? resolvedProfile.provider : undefined;
     const model = typeof resolvedProfile.model === "string" ? resolvedProfile.model : undefined;
     const effort =
       typeof resolvedProfile.effort === "string"
@@ -209,7 +210,13 @@ export function renderHumanGateSummary(input: HumanGateSummaryInput): string {
         : typeof resolvedProfile.reviewStrength === "string"
           ? resolvedProfile.reviewStrength
           : undefined;
-    if (model && model !== "cli-default") lines.push(`- Model: ${model}`);
+    if (provider) lines.push(`- Provider: ${provider}`);
+    // "cli-default" is the literal model value an unconfigured Codex or Gemini
+    // profile sets (Claude always resolves a real model name) — say so explicitly
+    // rather than omitting the line (issue #609: distinguishable in metadata).
+    if (model) {
+      lines.push(`- Model: ${model === "cli-default" ? "CLI default (compatibility mode)" : model}`);
+    }
     if (effort) lines.push(`- Effort/strength: ${effort}`);
   }
   lines.push(

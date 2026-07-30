@@ -5,6 +5,11 @@ This document defines the command-line contract for `dist/cli/admin.js` (issue
 resets, task inspection, and diagnostics, while preserving the stable
 machine-readable output that n8n workflows and scripts depend on.
 
+For how `admin.js` decides *which* command you invoked in the first place —
+catalog-only entrypoints vs. dispatchable commands, aliases, hidden commands,
+compound-command matching, and invalid/incomplete command handling — see
+[`admin-command-registry-contract.md`](admin-command-registry-contract.md).
+
 ## Output modes
 
 Every command runs in exactly one output mode:
@@ -54,8 +59,21 @@ position:
 | `0` | Success, or a safe no-op (e.g. nothing to recover). |
 | non-zero | A real failure: validation error, missing session, setup problem. |
 
-Currently the only non-zero exit code is `1`. Any command that introduces a
-distinct non-zero code must document it in its `admin help <command>` output.
+Currently the only non-zero exit code shared across `die()`-routed commands
+is `1`. `admin ui` is an existing, intentional exception to this, but only
+for its own normal-quit, non-TTY, and cancellation outcomes: those three
+paths own a separate `0`/`2`/`130` exit-code vocabulary and bypass `die()`
+entirely. `admin ui` does **not** bypass `die()` end-to-end — argument
+parsing errors (e.g. `admin ui --bad`) still go through `die()` and exit `1`
+like every other command, and this happens before the non-TTY check runs.
+The non-TTY check itself runs *before* session resolution: a non-interactive
+invocation (e.g. `printf '' | admin ui --session-ref no-such-session`) exits
+`2` from the non-TTY path without ever calling `resolveSessionIds`, so a
+session-resolution failure can only reach `die()` and exit `1` on an
+interactive (TTY) invocation — see
+[`admin-cli-parsing-contract.md`](admin-cli-parsing-contract.md) §7 for the
+full specification. Any other command that introduces a distinct non-zero
+code must document it in its `admin help <command>` output.
 
 ## Common option names
 
@@ -95,7 +113,18 @@ The validation runs in the shared parser (`tokenizeArgs` /
 GitHub/Gitea, or filesystem mutation, so an unrecognized option fails fast. The
 same parser is reused by the non-admin CLI entrypoints (`enqueue-task`,
 `github-intake`, `run-one-phase`, `dispatch-outbox`, `issue-plan`,
-`issue-discuss`) so the contract holds across every command-line surface.
+`issue-discuss`) so the contract holds across every command-line surface —
+with standing, pre-existing exceptions: `admin worktree prune` hand-rolls its
+own argv scan and silently accepts (and discards) an unrecognized flag rather
+than rejecting it, and `admin worktree cleanup`/`release-lock`/`discard` and
+`admin review-lock status`/`release` hand-roll a second parser
+(`parseStrictArgs`) that does reject unrecognized flags but — unlike this
+section's "reject another `--flag` as that value" claim — will consume a
+following `--flag` token as a value flag's value instead of rejecting it. See
+[`admin-cli-parsing-contract.md`](admin-cli-parsing-contract.md) §1
+("Pre-existing exceptions: commands that bypass the shared parser") for the
+specifics; a later implementation must close these gaps rather than assume
+this section already describes the affected commands' current behavior.
 
 ## Help
 
@@ -137,7 +166,7 @@ node dist/cli/admin.js recover-cap-handoff --session-ref 1 --issue-number 302 --
 These default to JSON to preserve existing automation stdout contracts. They
 still accept the global flags; `--json` is the default and an explicit no-op.
 This set includes `context create`, `repo-lock acquire|release|status|
-force-release`, `session-doctor`, `session-init`, `quarantine`, `worktree
+force-release`, `session-doctor`, `session-init`, `worktree
 list|prune`, `task-assign`, `tool-request`, `human-review-return`,
 `github-app-review-return`, and `issue-discuss`. Operator-facing human rendering is rolled out to these commands
 incrementally; the recovery/inspection commands above are the representative

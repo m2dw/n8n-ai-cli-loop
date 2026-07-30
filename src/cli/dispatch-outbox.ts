@@ -164,6 +164,23 @@ export async function main(
   // scoped to A's repo — from dispatching session B's rows under the wrong
   // identity; B's rows stay pending until B's own dispatch run drains them.
   let entryFilter: ((entry: { payload: { owner: string; repo: string } }) => boolean) | undefined;
+  // Scopes the persisted scan cursor to this session (issue #606 review
+  // follow-up) so repeated runs eventually advance past a large shared due
+  // backlog that doesn't belong to this session, instead of re-scanning the
+  // same non-matching prefix from row 1 every time. Set alongside `entryFilter`
+  // below, since a cursor is only meaningful together with a filter. The key
+  // also folds in the resolved ownership scope (githubOwner/githubName and,
+  // for a Gitea work-item session, the Gitea owner/repo/baseUrl) — not just
+  // `sessionId` — so that if an operator repoints a session's GitHub or Gitea
+  // repository configuration, the cursor for the *old* scope is orphaned
+  // rather than reused under the new `entryFilter`. Reusing a stale cursor
+  // here would be wrong: rows for the new target sitting below the old
+  // cursor's position would have been confirmed non-matching (foreign) under
+  // the old filter and so are permanently skipped by `id > afterId`, even
+  // though they match the new one (P2 review follow-up to issue #606). An
+  // orphaned old-scope cursor row is harmless — it is simply never looked up
+  // again once the key changes.
+  let scanCursorKey: string | undefined;
   // Provider factory for provider-neutral outbox rows. Left undefined for
   // GitHub-only sessions so dispatchOutbox uses its default (GitHub) factory
   // unchanged. A session-bound factory is built below when the session selects
@@ -209,6 +226,19 @@ export async function main(
       if (gitea && owner === gitea.owner && repo === gitea.repo) return true;
       return false;
     };
+    // JSON.stringify of an array of primitive strings/null is injective — each
+    // distinct (sessionId, githubOwner, githubName, giteaOwner, giteaRepo,
+    // giteaBaseUrl) tuple produces a distinct key — so no extra delimiter
+    // escaping is needed to keep two differently-scoped sessions (or the same
+    // session before/after a repo config change) from colliding on one cursor.
+    scanCursorKey = JSON.stringify([
+      sessionId,
+      githubOwner,
+      githubName,
+      gitea?.owner ?? null,
+      gitea?.repo ?? null,
+      gitea?.baseUrl ?? null,
+    ]);
     // Wire the session's configured provider auth (GitHub App when set) into the
     // dispatcher runners so outbox side effects run as the App; `gh` mode returns
     // the injected runner unchanged. The runner refreshes its token per
@@ -429,6 +459,7 @@ export async function main(
       cwd: effectiveCwd,
       limit,
       filter: entryFilter,
+      ...(scanCursorKey ? { scanCursorKey } : {}),
       repoHostRunner: resolveRepoHostRunner,
       ...(providerFactory ? { providers: providerFactory } : {}),
     });
@@ -438,6 +469,7 @@ export async function main(
       dispatched: result.dispatched,
       failed: result.failed,
       errors: result.errors,
+      deadLettered: result.deadLettered,
       ...(sessionId ? { sessionId } : {}),
       ...(contextId ? { contextId } : {}),
     });

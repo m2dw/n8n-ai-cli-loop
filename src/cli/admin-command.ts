@@ -27,6 +27,9 @@ export const VALID_PHASES: readonly TaskPhase[] = [
   "review",
   "conflict_resolution",
   "research",
+  "content_research",
+  "content_draft",
+  "content_review",
   "planner",
 ];
 

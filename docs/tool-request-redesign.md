@@ -109,7 +109,7 @@ These terms are fixed for all follow-up issues.
 | **Tool Request** | A structured handoff emitted by an implementation/fix/conflict agent when it needs a command outside its allowed tool set. Emission rules unchanged (tool-request-and-dependency-sync.md §2.1–2.2). |
 | **operator** | The human with access to the private control plane who decides what happens to a Tool Request. |
 | **`manual-done`** | Operator response meaning *"I already ran the command myself, outside the orchestrator, and committed/pushed any effects on the issue branch."* The orchestrator runs nothing; it only re-queues. (Unchanged from §2.6.) |
-| **`reject`** | Operator response meaning *"do not run this; this is not the right action."* Records the decision and the reason, leaves the task as a human handoff, runs nothing. (Unchanged from §2.6.) |
+| **`reject`** | Operator response meaning *"do not run this; this is not the right action."* Records the decision and the reason and runs nothing. Since issue #678, the rejection itself is delivered to the requesting agent as continuation context and the task **re-queues automatically**, unless a safety guard (dirty tree, unpushed base, no usable continuation point) blocks the requeue — in which case it stays a human handoff exactly as before #678, with the rejection still recorded. |
 | **guided run** | Operator response meaning *"run this command for me in the low-impact execution environment, capture the result, and show it to me before anything lands."* This is the redesigned successor to `grant`: it reuses the grant scope/execution engine but separates **execution** from the **disposition** of any produced changes (§4.3). |
 | **operator response** | The structured record of whichever action the operator took (`manual-done` / `reject` / `guided run` + disposition), plus any note and the captured execution result. It is the unit that flows into the next prompt (§7). |
 | **execution environment** | *Where* a guided run actually executes: host, restricted host, issue worktree, or an isolated runtime (Docker/VM). Resolved by the executor/config layer (§6), never described in workflow JSON. |
@@ -187,10 +187,18 @@ A guided run has two distinct phases the old grant fused together:
      changes are reverted on the issue branch; the request is left a human
      handoff (or re-runnable) per operator intent. The partial-diff snapshot
      safeguard (§2.7) still applies so nothing is lost irrecoverably.
-   - **non-zero exit**: no auto-commit; the task stays a human handoff and the
-     captured failure output is available. The operator may `retry` (with a
+   - **non-zero exit**: no auto-commit. Since issue #678, a non-zero exit is
+     diagnostic information for the implementation agent, not by itself a reason
+     to stop at a human handoff: when the failing command left the tree clean
+     (the common case — a verification command like `npm test` that fails
+     without touching files), the captured failure output is folded into the
+     operator response and the task **re-queues automatically** so the agent can
+     diagnose and continue. When the command left changes behind, auto-requeueing
+     would immediately fail the implementation preflight's dirty-tree check —
+     repository state cannot be preserved safely — so that case stays a human
+     handoff exactly as before #678, and the operator may `retry` (with a
      corrected command, which re-authorizes), `reject`, or fall back to
-     `manual-done`. A failing command never silently loops.
+     `manual-done`. A failing command never silently loops either way.
 
 The authorization remains tightly scoped (session + issue + phase + repo root +
 exact normalized command), one-shot, and short-lived, exactly as today — but the
@@ -323,6 +331,12 @@ an incidental side effect.
                        └──────────────┘
 ```
 
+Since issue #678, `reject` and `fail` are no longer unconditional dead ends into
+"human handoff (no re-queue)": both auto-requeue with continuation context
+whenever it is safe to do so (clean tree, usable resume point), and fall back to
+the human handoff shown above only when a safety guard blocks the requeue. See
+the transition bullets below for the exact conditions.
+
 The required transitions, spelled out:
 
 - **requested** — agent emitted the request; orchestrator classified it as a
@@ -338,11 +352,16 @@ The required transitions, spelled out:
   **commit** (orchestrator commits/pushes on the issue branch, re-queues) or
   **discard** (changes reverted, partial-diff safeguard §2.7 applies, stays a
   handoff or re-runnable).
-- **command fails** (non-zero exit) — no auto-commit; stays a human handoff with
-  the captured failure available; operator may `retry` / `reject` /
-  `manual-done`. Never loops silently.
-- **operator rejects** — decision + reason recorded; stays a human handoff; runs
-  nothing; the rejection is continuation context if the task is later re-queued.
+- **command fails** (non-zero exit) — no auto-commit. Since issue #678: if the
+  failure left the tree clean, the captured failure becomes continuation context
+  and the task **re-queues automatically**, same as a no-op success. If it left
+  changes behind, it stays a human handoff with the captured failure available;
+  operator may `retry` / `reject` / `manual-done`. Never loops silently either
+  way.
+- **operator rejects** — decision + reason recorded; runs nothing. Since issue
+  #678, the rejection becomes continuation context and the task **re-queues
+  automatically**, unless a safety guard blocks the requeue, in which case it
+  stays a human handoff exactly as before #678.
 - **missing branch / continuation point** — if there is no usable continuation
   point (no resume branch landed-and-pushed, no PR head to resume; §2.7), the
   flow **fails closed** rather than re-queueing into a dead loop, and points the

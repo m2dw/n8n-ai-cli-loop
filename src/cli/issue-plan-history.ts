@@ -31,6 +31,7 @@ import {
   JsonSessionRegistry,
 } from "../registries/json-session-registry.js";
 import { DEFAULT_DB_PATH } from "../stores/sqlite-outbox-store.js";
+import { ISSUE_HISTORY_ROLLUP_TABLE } from "../stores/sqlite-retention-store.js";
 import { emit, die } from "./cli-io.js";
 import { tokenizeArgs } from "./admin-command.js";
 import { computeFingerprint, defaultIssueDiscussReader } from "./issue-discuss.js";
@@ -344,6 +345,60 @@ export class SqliteHistoryStore implements HistoryStore {
           data: r.data ? safeJsonObject(r.data) : undefined,
           createdAt: r.created_at,
         });
+      }
+    }
+
+    // issue #611 review: a pruned issue has no live `tasks`/`events` rows
+    // (they're deleted together — see `sqlite-retention-store.ts`'s
+    // `pruneTasks`), but before deleting them prune persists a per-issue
+    // rollup durably in `retention_issue_history_rollup`. Fall back to it
+    // only when nothing live was found, so a merge never shadows fresher
+    // live data with a stale archived snapshot.
+    if (!task && events.length === 0 && this.#tableExists(ISSUE_HISTORY_ROLLUP_TABLE)) {
+      const row = this.#db
+        .prepare(
+          `SELECT task_snapshot, events FROM ${ISSUE_HISTORY_ROLLUP_TABLE} WHERE session_id = ? AND issue_number = ?`,
+        )
+        .get(sessionId, issueNumber) as { task_snapshot: string; events: string } | undefined;
+      if (row) {
+        try {
+          const snap = JSON.parse(row.task_snapshot) as {
+            status: string;
+            phase: string;
+            attempts: string;
+            context: string;
+            lastError: string | null;
+            updatedAt: string;
+          };
+          task = {
+            status: snap.status,
+            phase: snap.phase,
+            attempts: safeJsonObject(snap.attempts) as Record<string, number>,
+            context: safeJsonObject(snap.context),
+            lastError: snap.lastError ?? undefined,
+            updatedAt: snap.updatedAt,
+          };
+        } catch {
+          // Corrupt rollup row: leave `task` undefined, same as no history.
+        }
+        try {
+          const archivedEvents = JSON.parse(row.events) as Array<{
+            type: string;
+            message: string | null;
+            data: string | null;
+            createdAt: string;
+          }>;
+          for (const e of archivedEvents) {
+            events.push({
+              type: e.type,
+              message: e.message ?? undefined,
+              data: e.data ? safeJsonObject(e.data) : undefined,
+              createdAt: e.createdAt,
+            });
+          }
+        } catch {
+          // Corrupt rollup row: leave `events` empty, same as no history.
+        }
       }
     }
 
@@ -1108,6 +1163,11 @@ export function deriveOutcomeSignals(history: IssueHistory): OutcomeSignals {
   } else if (capReached) {
     finality = "final";
     finalityReason = "Review-loop cap reached; concluded with a human handoff.";
+  } else if (finalStatus === "cancelled") {
+    // Issue #608: cancelled is terminal, but never a completed outcome — the
+    // generic "Non-terminal local status" fallback below would misdescribe it.
+    finality = "incomplete";
+    finalityReason = "Task was cancelled by an operator; not a completed outcome.";
   } else if (finalStatus && INCOMPLETE_STATUSES.has(finalStatus)) {
     finality = "incomplete";
     finalityReason = `Local status \`${finalStatus}\` is not a completed outcome.`;

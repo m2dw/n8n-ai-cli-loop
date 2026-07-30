@@ -187,7 +187,7 @@ Example session context:
 ```json
 {
   "sessionId": "addon-dev",
-  "repoRoot": "/Users/you/git/thunderbird-auth-results-filter",
+  "repoRoot": "/path/to/thunderbird-auth-results-filter",
   "artifactDir": ".n8n-artifacts",
   "workflow": "github-issue-ai-dev-loop",
   "defaults": {
@@ -199,8 +199,8 @@ Example session context:
 
 n8n can then manage multiple workflows or targets in one instance:
 
-- one session for `/Users/you/git/thunderbird-auth-results-filter`
-- one session for `/Users/you/git/n8n-ai-cli-loop`
+- one session for `/path/to/thunderbird-auth-results-filter`
+- one session for `/path/to/n8n-ai-cli-loop`
 
 Each phase should resolve its `repoRoot` from the session context, not from the process cwd and not from a repeated command literal.
 
@@ -458,7 +458,7 @@ The ideal n8n node type may be Execute JavaScript or Code, but this depends on t
 If Execute JavaScript is too constrained, use thin Execute Command nodes as an intermediate step:
 
 ```sh
-node /Users/you/git/n8n-ai-cli-loop/dist/cli/run-one-phase.js \
+node /path/to/n8n-ai-cli-loop/dist/cli/run-one-phase.js \
   --session-id "$SESSION_ID" \
   --supported-phases review
 ```

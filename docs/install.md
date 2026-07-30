@@ -15,7 +15,7 @@ Complete each step in order; the smoke-test at the end verifies the whole stack.
 6. [Configure sessions.json](#6-configure-sessionsjson)
 7. [Generate and import the n8n workflows](#7-generate-and-import-the-n8n-workflows)
 8. [Configure the parent workflow](#8-configure-the-parent-workflow)
-9. [Optional: enable per-issue worktrees](#9-optional-enable-per-issue-worktrees)
+9. [Optional: custom worktree root](#9-optional-custom-worktree-root)
 10. [Smoke-test checklist](#10-smoke-test-checklist)
 11. [Basic operations](#11-basic-operations)
 
@@ -229,6 +229,7 @@ mkdir -p ~/.config/n8n-ai-cli-loop
 | `labels.readyForHuman` | ✓ | Label applied when an issue needs human attention |
 | `sessionNo` | | Optional short numeric reference (e.g. `1`). Lets the n8n Config node use `1` instead of the full `sessionId` |
 | `aliases` | | Optional string aliases (e.g. `["proj", "mp"]`). Same purpose as `sessionNo`. Each must be unique across the registry |
+| `audit.acknowledge` | | Documented reasons for accepting a [`session-audit`](#loop-design-audit) finding, keyed by check id (e.g. `{"verification-commands": "docs-only repo"}`). Each reason must be a non-empty string |
 
 #### SQLite database
 
@@ -300,26 +301,24 @@ and stores the session identity internally — neither `sessionRef` nor
 
 ---
 
-## 9. Optional: enable per-issue worktrees
+## 9. Optional: custom worktree root
 
-By default each session uses a single shared checkout (`repoRoot`). Per-issue
-worktrees give each work item an isolated git checkout, so a failed run in one
-issue cannot dirty the state for another.
+Every session runs each work item in its own isolated per-issue git
+checkout, so a failed run in one issue cannot dirty the state for another.
+This is unconditional — there is no config to enable or disable it.
 
-To opt in, add a `worktrees` block to the session in `sessions.json`:
+Worktrees are stored under `~/.local/state/n8n-ai-cli-loop/worktrees/` by
+default. To use a different location for one session, add a `worktrees`
+block with a `root` override in `sessions.json`:
 
 ```json
 "worktrees": {
-  "enabled": true
+  "root": "/absolute/path"
 }
 ```
 
-Worktrees are stored under `~/.local/state/n8n-ai-cli-loop/worktrees/` by
-default. Set `"root": "/absolute/path"` inside the block to use a different
-location.
-
-For the full rollout guide — including mid-flight enablement, cleanup, lock
-release, and recovery — see [`docs/worktree-rollout.md`](worktree-rollout.md).
+For the full operational guide — including cleanup, lock release, and
+recovery — see [`docs/worktree-rollout.md`](worktree-rollout.md).
 
 ---
 
@@ -439,6 +438,81 @@ node dist/cli/admin.js session-doctor --session-id my-project
 Probes `gh` auth, `repoRoot` accessibility, `sessions.json` validity, database
 state, and agent CLI availability. Reports each check as pass/fail with
 remediation hints.
+
+### Loop design audit
+
+```sh
+node dist/cli/admin.js session-audit --session-id my-project
+```
+
+Where `session-doctor` asks "can this machine run the loop?", `session-audit`
+asks "is this session designed to run unattended?". It checks the required
+work-item labels, artifact hygiene (`artifactDir` location and gitignore
+status), verification commands, handoff notifications and their secret, the
+worktree state root, environment-prepare / dependency-sync coherence with the
+detected ecosystem, the circuit-breaker kill switch, explicit agent assignment
+(every configured flow rule, not just the default flow — intake picks the flow
+from the issue's labels), and whether work-item comments land on a public
+tracker.
+
+The required-label check is per session, not one fixed list: it covers the
+literal routing labels intake matches (`status:needs-implementation`,
+`status:content-needed`, `agent:*`, …) **plus** the effective names this session's
+transitions actually write — the values of its `labels` block (`active`,
+`blocked`, `readyForHuman` and any optional key such as `needsReview` or
+`stackReady`), each falling back to its default (`status:stack-ready`,
+`status:conflict-resolution-failed`, …) when unset. Renaming a label in the
+session therefore moves the requirement to the new name rather than silently
+certifying a tracker whose outbound writes will fail.
+
+The two tracker checks (labels, visibility) work for both wired work-item
+providers: a `github-issues` session is read with `gh label list` / `gh repo
+view`, a `gitea-issues` session with the Gitea REST reads
+`GET /repos/{owner}/{repo}[/labels]` (the API token is resolved from the session's
+`auth.tokenEnv`). A tracker whose visibility cannot be established is reported as
+a warning rather than assumed private — work-item comments carry internal detail,
+so the audit never certifies that boundary it has not observed.
+
+Both probes fail closed and fail fast. A label list that cannot be proved
+complete (a repository with more labels than one request returns) is reported as
+*unavailable* rather than as missing labels, and every tracker request is bounded
+by a timeout plus a per-run budget, so an unresponsive instance ends the probe
+with a warning instead of hanging the command. That budget is shared by the label
+and visibility probes — one wall-clock bound per audit run, not one per probe —
+and each request's own timeout is clamped to whatever is left of it, so a request
+started late cannot run past the run-wide bound.
+
+The audit is read-only: it never runs a project command (no test/build/install)
+and never mutates GitHub, Gitea, or the SQLite store. Each finding is graded
+`error` / `warning` / `suggestion` and carries a concrete remedy; the exit code
+stays 0 and the overall `verdict` (`ready` / `needs-attention` / `not-ready`)
+is reported in the output.
+
+```sh
+# Stable machine payload for automation:
+node dist/cli/admin.js session-audit --session-id my-project --json
+
+# Skip the read-only tracker probes (no gh / Gitea credentials on this host):
+node dist/cli/admin.js session-audit --session-id my-project --offline
+```
+
+A deliberate deviation is recorded in the session rather than re-argued at every
+run. Add the check's id to the session's `audit.acknowledge` block with the
+reason:
+
+```json
+"audit": {
+  "acknowledge": {
+    "verification-commands": "documentation-only repository; nothing to run"
+  }
+}
+```
+
+An acknowledged finding is still listed — with its original severity and the
+recorded reason — but no longer counts against the verdict. A key that names no
+check suppresses nothing and is reported by the `audit-acknowledgements` check,
+which is itself never acknowledgeable: it is the check that validates the block,
+so accepting it would hide invalid keys rather than record a trade-off.
 
 ### Worktree cleanup (if worktrees are enabled)
 

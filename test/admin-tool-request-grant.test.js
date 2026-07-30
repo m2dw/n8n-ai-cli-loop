@@ -1230,10 +1230,61 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
 // ---------------------------------------------------------------------------
 
 describe('admin CLI — tool-request grant: execution failure', () => {
-  test('a non-zero exit leaves a human handoff, does not requeue, and does not loop', async () => {
+  test('a non-zero exit that leaves the tree clean requeues automatically with the failure delivered to the agent (issue #678)', async () => {
+    // A failing verification command (e.g. `npm test`) that changes no files is
+    // the motivating case for issue #678: the exit code and captured output are
+    // diagnostic information for the agent, not by themselves a reason to stop at
+    // a human handoff. `false` fails without touching the tree, so nothing is at
+    // risk — the failure is folded into the resolution and the task requeues
+    // exactly like a true no-op.
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'false' });
+    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out).toMatchObject({
+      ok: true,
+      action: 'grant',
+      executed: true,
+      success: false,
+      requeued: true,
+      status: 'queued',
+      phase: 'implementation',
+    });
+    expect(out.exitCode).not.toBe(0);
+
+    const task = await getTask(123);
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('implementation');
+    expect(task.context.toolRequest.resolved).toBe(true);
+    const resolution = task.context.toolRequest.resolution;
+    expect(resolution.action).toBe('grant');
+    expect(resolution.disposition).toBe('failed');
+    // The captured failure output is the deliverable folded into the next prompt.
+    expect(resolution.capturedResult.exitCode).not.toBe(0);
+    // The consumed grant is still recorded so the exact command cannot be re-run.
+    expect(task.context.toolRequestGrant.uses).toBe(1);
+    expect(task.context.toolRequestGrant.lastResult.exitCode).not.toBe(0);
+
+    const outbox = await getOutbox();
+    const comment = outbox.find(e => e.topic === 'gh:comment');
+    expect(comment.payload.body).toContain('failed');
+    expect(comment.payload.body).toContain('returned to the agent');
+    expect(comment.payload.body).not.toContain(repoRoot);
+    // Re-queued to the implementation lane, same as a successful guided run.
+    const added = outbox.filter(e => e.topic === 'gh:label:add').map(e => e.payload.label);
+    expect(added).toContain('status:needs-implementation');
+  });
+
+  test('a non-zero exit that leaves changes behind stays a human handoff, does not requeue, and does not loop', async () => {
+    // When the failing command leaves repository state behind, auto-requeueing
+    // would immediately fail the implementation preflight's dirty-tree check —
+    // repository state cannot be preserved safely (issue #678), so this case is
+    // unchanged from before: a human handoff, not resolved, so an operator can act.
+    writeSession();
+    initRepo();
+    await seedToolRequestTask(123, { command: 'sh -c "echo dirty > leftover.txt; exit 1"' });
     const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
@@ -1264,7 +1315,116 @@ describe('admin CLI — tool-request grant: execution failure', () => {
     expect(added).not.toContain('status:needs-implementation');
   });
 
-  test('the same exact command cannot be granted again after a failure (one-shot)', async () => {
+  test('a failing command that pushes a base-branch mutation to origin stays a human handoff, not an auto-requeue (issue #678 review)', async () => {
+    // Defense-in-depth: a failing command can check out the base, commit, and
+    // *push* that commit to origin before returning to the issue branch and
+    // exiting non-zero. That leaves the tree clean, HEAD back on the issue
+    // branch, and `origin/<base>..<base>` at 0 (origin now matches the mutated
+    // base) — the ahead-count probe alone would misread this as safe and
+    // auto-requeue implementation from the contaminated base. The base-SHA
+    // snapshot taken before the command ran must catch this instead.
+    writeSession();
+    initRepo({ withRemote: true });
+    await seedToolRequestTask(123, {
+      command:
+        'sh -c "git checkout -q main && git commit --allow-empty -q -m base-contamination && ' +
+        'git push -q origin main && git checkout -q ai/issue-123; exit 1"',
+    });
+    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out).toMatchObject({
+      ok: true,
+      action: 'grant',
+      executed: true,
+      success: false,
+      requeued: false,
+      baseAheadAfter: 0,
+      baseMovedAfter: true,
+      branch: 'ai/issue-123',
+      status: 'ready_for_human',
+    });
+
+    const task = await getTask(123);
+    // Request stays open (operator must resolve the contaminated base) and is
+    // NOT re-queued, so a later issue run never branches off the pushed commit.
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.toolRequest.resolved).toBe(false);
+    expect(task.context.toolRequestGrant.uses).toBe(1);
+
+    const outbox = await getOutbox();
+    const comment = outbox.find(e => e.topic === 'gh:comment');
+    expect(comment.payload.body).toContain('ai/issue-123');
+    expect(comment.payload.body).toMatch(/move the commit/i);
+    expect(comment.payload.body).toMatch(/do NOT push .*`?main`?/i);
+    // Not re-queued: no implementation-lane labels added.
+    const added = outbox.filter(e => e.topic === 'gh:label:add').map(e => e.payload.label);
+    expect(added).not.toContain('status:needs-implementation');
+  });
+
+  test('a failing command that pushes directly to the remote base via a refspec (without moving local base) stays a human handoff (issue #678 review)', async () => {
+    // Defense-in-depth (2): a failing command can move the *remote* base directly
+    // via a refspec push (e.g. `git push origin <sha>:main`) without ever
+    // checking out or moving the *local* base branch. That leaves the local base
+    // SHA unchanged (the local-base-moved check above misses it) and
+    // `origin/<base>..<base>` at 0 for the same reason an ordinary base push is
+    // missed — Git updates the local `origin/<base>` tracking ref to the new
+    // remote tip as a side effect of a successful push, even a refspec-only one
+    // that never touches the local branch. Only comparing `origin/<base>` itself
+    // before/after the command catches this.
+    writeSession();
+    initRepo({ withRemote: true });
+    await seedToolRequestTask(123, {
+      command:
+        'NEW=$(git commit-tree -p main main^{tree} -m base-contamination) && ' +
+        'git push -q origin "$NEW":refs/heads/main; exit 1',
+    });
+    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out).toMatchObject({
+      ok: true,
+      action: 'grant',
+      executed: true,
+      success: false,
+      requeued: false,
+      baseAheadAfter: 0,
+      baseMovedAfter: false,
+      baseRemoteMovedAfter: true,
+      branch: 'ai/issue-123',
+      status: 'ready_for_human',
+    });
+
+    const task = await getTask(123);
+    // Request stays open (operator must resolve the contaminated remote base) and
+    // is NOT re-queued, so a later issue run never branches off the pushed commit.
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.toolRequest.resolved).toBe(false);
+    expect(task.context.toolRequestGrant.uses).toBe(1);
+
+    const outbox = await getOutbox();
+    const comment = outbox.find(e => e.topic === 'gh:comment');
+    expect(comment.payload.body).toMatch(/do NOT push .*`?main`?/i);
+    // Not re-queued: no implementation-lane labels added.
+    const added = outbox.filter(e => e.topic === 'gh:label:add').map(e => e.payload.label);
+    expect(added).not.toContain('status:needs-implementation');
+  });
+
+  test('the same exact command cannot be granted again after a failure that leaves changes behind (one-shot)', async () => {
+    writeSession();
+    initRepo();
+    await seedToolRequestTask(123, { command: 'sh -c "echo dirty > leftover.txt; exit 1"' });
+    expect(run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath).code).toBe(0);
+
+    const second = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(second.code).not.toBe(0);
+    expect(parse(second)).toMatchObject({ ok: false, error: expect.stringContaining('one-shot') });
+  });
+
+  test('the same exact command cannot be granted again after a failure that auto-requeued (already resolved, issue #678)', async () => {
+    // A clean-failure grant now resolves and requeues the request (see above), so
+    // a second attempt hits the earlier, broader "already resolved" gate instead
+    // of the one-shot grant check — delivery stays idempotent either way.
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'false' });
@@ -1272,7 +1432,7 @@ describe('admin CLI — tool-request grant: execution failure', () => {
 
     const second = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(second.code).not.toBe(0);
-    expect(parse(second)).toMatchObject({ ok: false, error: expect.stringContaining('one-shot') });
+    expect(parse(second)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
   });
 });
 
@@ -1370,18 +1530,17 @@ describe('admin CLI — tool-request grant: repo lock', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Worktree-enabled sessions (issue #454)
+// Per-issue worktree sessions (issue #454)
 //
-// When `session.worktrees.enabled` is true the implementation phase ran in the
-// per-issue worktree and left `ai/issue-<n>` checked out THERE. The grant must
-// run the approved command in that worktree, not the canonical checkout: git
-// refuses to check the issue branch out a second time in `repoRoot`, so the old
-// canonical-only path could no longer move onto the branch and the approved
-// command failed before it ran. The grant must also isolate its dirty preflight
-// to the issue worktree.
+// The implementation phase runs in the per-issue worktree and leaves
+// `ai/issue-<n>` checked out THERE. The grant must run the approved command in
+// that worktree, not the canonical checkout: git refuses to check the issue
+// branch out a second time in `repoRoot`, so a canonical-only path could no
+// longer move onto the branch and the approved command failed before it ran.
+// The grant must also isolate its dirty preflight to the issue worktree.
 // ---------------------------------------------------------------------------
 
-describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
+describe('admin CLI — tool-request grant: per-issue worktree sessions', () => {
   // Deterministic per-issue worktree layout: <root>/<session>/issue-<n>/repo.
   function worktreeRoot() {
     return join(tmpDir, 'wt');
@@ -1419,7 +1578,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
     execFileSync('git', ['rev-list', '--count', `main..${branch}`], { cwd, encoding: 'utf8' }).trim();
 
   test('runs the granted command in the issue worktree, leaving the canonical checkout untouched', async () => {
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo();
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     await seedToolRequestTask(123, { command: 'touch generated.txt' });
@@ -1455,7 +1614,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
     execFileSync('git', ['ls-remote', '--heads', join(tmpDir, 'origin.git'), branch], { cwd: repoRoot, encoding: 'utf8' }).trim() !== '';
 
   test('a dirty canonical checkout does not block the grant when the issue worktree is clean', async () => {
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo({ dirty: true, withRemote: true });
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     await seedToolRequestTask(123, { command: 'true' });
@@ -1491,7 +1650,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
     // would let the requeued implementation accept the committed no-op, skip the
     // push (nothing to stage), then fail at `gh pr create --head ai/issue-123`
     // because origin lacks the branch. Refuse instead (issue #454 review).
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo();
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     await seedToolRequestTask(123, { command: 'true' });
@@ -1510,7 +1669,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
   });
 
   test('a dirty issue worktree still blocks the grant', async () => {
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo();
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     // Dirty the issue worktree (not the canonical checkout).
@@ -1535,7 +1694,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
     // the shared `origin/main..main`, so leaving it active in worktree mode would
     // refuse valid grants solely because the canonical checkout's base is ahead, even
     // though no unpushed canonical commit can leak into the issue branch.
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo({ withRemote: true });
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     // An unrelated, unpushed commit advances the canonical `main` past origin/main.
@@ -1564,7 +1723,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
     // must be probed/cleaned from the canonical checkout before requeue — otherwise it
     // would dirty-block the next phase even though the worktree itself is clean
     // (issue #458).
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo({ gitignoreArtifacts: false });
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     await seedToolRequestTask(123, { command: 'true' });
@@ -1603,7 +1762,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
     run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath, ...extra);
 
   test('commit: commits to the issue branch in the worktree and pushes, canonical untouched', async () => {
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo({ withRemote: true });
     const wtPath = addIssueWorktree(123);
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
@@ -1642,7 +1801,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
   });
 
   test('keep: leaves the changes uncommitted in the worktree, canonical untouched', async () => {
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo();
     const wtPath = addIssueWorktree(123);
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
@@ -1671,7 +1830,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
   });
 
   test('discard: drops the worktree changes (tracked and untracked), canonical untouched', async () => {
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo();
     const wtPath = addIssueWorktree(123);
     await seedToolRequestTask(123, { command: 'echo updated >> package.json && echo gen > generated.txt' });
@@ -1701,7 +1860,7 @@ describe('admin CLI — tool-request grant: worktree-enabled sessions', () => {
 
   test('commit: a push failure keeps the local commit in the worktree for recovery', async () => {
     // No origin remote, so `git push origin ai/issue-123` from the worktree fails.
-    writeSession({ worktrees: { enabled: true, root: worktreeRoot() } });
+    writeSession({ worktrees: { root: worktreeRoot() } });
     initRepo();
     const wtPath = addIssueWorktree(123);
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
@@ -1863,9 +2022,10 @@ describe('admin CLI — tool-request grant: fresh repeated Tool Request (issue #
     // AFTER grantedAt) is allowed through.
     writeSession();
     initRepo();
-    // Use 'false' so the command fails: the task stays ready_for_human with the
-    // same resolved=false Tool Request, keeping requestedAt < grantedAt.
-    await seedToolRequestTask(123, { command: 'false' });
+    // Use a command that fails AND leaves changes behind (issue #678: a clean
+    // failure now auto-resolves and requeues) so the task stays ready_for_human
+    // with the same resolved=false Tool Request, keeping requestedAt < grantedAt.
+    await seedToolRequestTask(123, { command: 'sh -c "echo dirty > leftover.txt; exit 1"' });
 
     // First grant: runs but fails — grant consumed (uses=1), task not requeued.
     const first = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);

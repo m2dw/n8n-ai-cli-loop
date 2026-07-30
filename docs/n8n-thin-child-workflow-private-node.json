@@ -23,7 +23,7 @@
       "parameters": {
         "operation": "githubIntake",
         "contextId": "={{ $(\"When Called by Parent\").first().json.contextId }}",
-        "supportedPhases": "implementation,review,conflict_resolution,research"
+        "supportedPhases": "implementation,review,conflict_resolution,research,content_research,content_draft,content_review"
       },
       "typeVersion": 1
     },
@@ -39,7 +39,7 @@
         "operation": "runOnePhase",
         "contextId": "={{ $(\"When Called by Parent\").first().json.contextId }}",
         "runId": "={{ $execution.id || (\"run-\" + $now.toMillis()) }}",
-        "supportedPhases": "implementation,review,conflict_resolution,research"
+        "supportedPhases": "implementation,review,conflict_resolution,research,content_research,content_draft,content_review"
       },
       "typeVersion": 1
     },

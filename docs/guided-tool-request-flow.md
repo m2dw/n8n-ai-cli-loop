@@ -116,12 +116,12 @@ audit it reads the local run artifact directly.
   recorded branch, the flow fails closed with a clear message:
   `worktree branch '<actual>' does not match expected '<recorded>'`. The
   operator must resolve the discrepancy manually before retrying.
-- **No worktree.** If the worktree does not exist and the session has worktrees
-  enabled (`session.worktrees.enabled`), the flow fails closed. The worktree
-  must be re-created from the issue branch before the flow can proceed.
-- **Shared-checkout guard.** When `session.worktrees.enabled` is `true`, the
-  flow must not operate in the canonical `repoRoot`. If the resolved worktree
-  path equals `repoRoot`, the flow fails closed (§5 security boundary).
+- **No worktree.** If the worktree does not exist, the flow fails closed. The
+  worktree must be re-created from the issue branch before the flow can
+  proceed.
+- **Canonical-checkout guard.** The flow must not operate in the canonical
+  `repoRoot`. If the resolved worktree path equals `repoRoot`, the flow fails
+  closed (§5 security boundary).
 
 ### 3.4 Show pre-run dirty state
 
@@ -344,29 +344,22 @@ not be lost.
   surface.
 - **Unknown inputs at operator prompts fail fast.** The flow does not proceed on
   ambiguous input.
-- **The flow must not operate in the canonical shared checkout** when per-issue
-  worktrees are enabled for the session. The shared-checkout guard (§5.1)
-  enforces this.
+- **The flow must not operate in the canonical checkout.** The
+  canonical-checkout guard (§5.1) enforces this.
 
 ---
 
 ## 7. Interaction with per-issue worktrees
 
-When `session.worktrees.enabled` is `true`:
+Every session runs the flow inside the per-issue worktree unconditionally:
 
 - All command execution (§3.6) and git operations (§3.3, §3.4, §3.7, §4.5,
   §4.7) happen inside the issue worktree, not the canonical `repoRoot`.
 - The `IssueWorktreeLock` is held for the duration of §3.3 through §3.9 to
   prevent concurrent phase execution in the same worktree.
 - The `partialDiffArtifact` snapshot (tool-request-and-dependency-sync.md
-  §2.7) is not needed for worktree-enabled sessions: the worktree itself is the
-  durable continuation point, so uncommitted partial work is already preserved
-  in place.
-
-When `session.worktrees.enabled` is `false`, the flow falls back to the shared
-checkout. In that case the `partialDiffArtifact` path applies if present, and
-the branch-discipline rules from tool-request-and-dependency-sync.md §2.6
-govern where changes land.
+  §2.7) is not needed: the worktree itself is the durable continuation point,
+  so uncommitted partial work is already preserved in place.
 
 ---
 

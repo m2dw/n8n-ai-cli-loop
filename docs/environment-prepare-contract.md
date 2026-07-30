@@ -2,8 +2,8 @@
 
 This document defines the contract for two runner-owned mechanisms:
 
-1. **`environmentPrepare`** — prepares an issue worktree (or shared checkout) for
-   execution before a phase or verification runs.
+1. **`environmentPrepare`** — prepares the per-issue worktree for execution
+   before a phase or verification runs.
 2. **`verification`** — runs configured correctness checks after an agent produces
    work, without requiring the implementation agent to request those commands
    through Tool Request.
@@ -99,22 +99,20 @@ Fields:
 
 ### 2.3 Where it runs
 
-- When **per-issue worktrees** are enabled (`session.worktrees.enabled: true`),
-  `environmentPrepare` runs inside the **issue worktree** directory
-  (`task.context.worktreePath`).
-- When worktrees are disabled, it runs in the **session checkout** (`repoRoot`).
+`environmentPrepare` always runs inside the **issue worktree** directory
+(`task.context.worktreePath`) — every phase runs in its own per-issue worktree
+unconditionally (see [docs/per-issue-worktrees.md](per-issue-worktrees.md)).
 
-The runner never materialises dependencies into the canonical repo directory when
-an issue worktree is available, because doing so would contaminate a shared
-mutable state — exactly the problem worktrees exist to solve.
+The runner never materialises dependencies into the canonical repo directory,
+because doing so would contaminate a shared mutable state — exactly the
+problem worktrees exist to solve.
 
 ### 2.4 Prepare stamp and caching
 
 The runner maintains a **prepare stamp** to avoid redundant reinstalls. The stamp
 is keyed by:
 
-1. **Worktree identity** — `worktreeId` when in worktree mode, otherwise the
-   canonical `repoRoot`.
+1. **Worktree identity** — `worktreeId`.
 2. **Command fingerprint** — the SHA-256 of the whitespace-normalised
    `environmentPrepare.command` string. A command change (even adding a flag)
    invalidates the stamp.

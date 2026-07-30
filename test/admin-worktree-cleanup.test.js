@@ -45,7 +45,7 @@ function writeSessions() {
         defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
         verification: { test: 'npm test' },
         labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
-        worktrees: { enabled: true, root: worktreeRoot },
+        worktrees: { root: worktreeRoot },
       },
     ],
   };

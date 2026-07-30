@@ -22,10 +22,12 @@ import type { AiTask, TaskPhase, TaskStatus } from "./task.js";
 import type { ResolvedSession, WorkItemProviderKind } from "./session.js";
 import type { OutboxStore, OutboxEnqueueInput } from "./outbox.js";
 import type { PhaseHandlerResult } from "./phase-runner.js";
+import type { AgentFailureKind } from "./agent-diagnostics.js";
 import { makeOutboxKey } from "./outbox.js";
 import { agentForPhase, readResolvedAssignment } from "./assignment.js";
 import { redactCommand } from "./tool-request.js";
 import { enqueueRepoHostPrComment, enqueueRepoHostPrSummary } from "./outbox-visibility.js";
+import { boundedExcerpt, fencedDetailsExcerpt, sanitizeBody } from "./text-sanitize.js";
 import { realpathSync } from "fs";
 import { resolveWorktreeRoot } from "./worktree-paths.js";
 import { renderPrSummary, PR_SUMMARY_MARKER } from "./pr-summary.js";
@@ -68,35 +70,6 @@ export function sessionRedactionPaths(session: ResolvedSession): string[] {
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
-
-/** Truncate `text` to at most `maxChars`, appending an ellipsis if cut. */
-export function boundedExcerpt(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  return text.slice(0, maxChars) + "\n\n…(truncated)";
-}
-
-/**
- * Replace absolute Unix filesystem paths with a placeholder so that
- * server-side paths are never exposed in public GitHub comments.
- *
- * Configured paths (repoRoot, artifactRoot) are redacted explicitly so that
- * installations under non-standard top-level directories are covered.
- */
-export function sanitizeBody(text: string, configuredPaths: string[] = []): string {
-  let result = text
-    .replace(/file:\/\/[^\s<>"'`\]})]*\/[^\s<>"'`\]})]*/g, "<path>")
-    .replace(
-      /(?<![:/\w])\/(private|tmp|home|Users|var|opt|run|srv|data|mnt|root|proc|sys|dev|etc|workspace|build|usr|bin|sbin|Applications|Library|System|Volumes)(?:\/[^\s<>"'`\]})]*)*/g,
-      "<path>",
-    );
-  // Redact explicitly configured roots and any sub-paths under them.
-  for (const p of configuredPaths) {
-    if (!p || !p.startsWith("/")) continue;
-    const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    result = result.replace(new RegExp(`(?<![:/\\w])${escaped}(?:/[^\\s<>"'\`\\]})]*)?`, "g"), "<path>");
-  }
-  return result;
-}
 
 /**
  * Format a duration in milliseconds as a human-readable string.
@@ -205,7 +178,17 @@ export function workItemOutbox(outboxStore: OutboxStore, session: ResolvedSessio
     enqueue: (input) => outboxStore.enqueue(rewriteWorkItemEnqueue(input, provider, owner, repo)),
     replacePendingPrSummary: (input, key) => outboxStore.replacePendingPrSummary(input, key),
     listPending: (limit) => outboxStore.listPending(limit),
-    markSent: (id, sentAt) => outboxStore.markSent(id, sentAt),
+    listPendingEntries: (opts) => outboxStore.listPendingEntries(opts),
+    markSent: (id, sentAt, claimToken) => outboxStore.markSent(id, sentAt, claimToken),
+    markFailed: (id, error, now, claimToken) => outboxStore.markFailed(id, error, now, claimToken),
+    getScanCursor: (key) => outboxStore.getScanCursor(key),
+    setScanCursor: (key, id) => outboxStore.setScanCursor(key, id),
+    getById: (id) => outboxStore.getById(id),
+    listUnsent: () => outboxStore.listUnsent(),
+    retryEntry: (id, now) => outboxStore.retryEntry(id, now),
+    cancelEntry: (id, now) => outboxStore.cancelEntry(id, now),
+    claimForDispatch: (id, now) => outboxStore.claimForDispatch(id, now),
+    renewClaim: (id, claimedAt, now) => outboxStore.renewClaim(id, claimedAt, now),
   };
 }
 
@@ -498,6 +481,16 @@ export async function enqueueStatusLabelEffects(
     // or modify/delete) to a human, clear the conflict-resolution lane labels so
     // the issue is no longer advertised as pending automated conflict resolution
     // while it actually awaits human judgement.
+    //
+    // This whole block is gated by `newStatus === "ready_for_human"` (the
+    // enclosing `if` above), so it never runs for a report-only-mode admission
+    // rejection (issue #532 review): `nextPhaseAfter` holds that case at
+    // `blocked`, not `ready_for_human` (transitions.ts), specifically so these
+    // queue labels stay in place for intake to reactivate later. Do not widen
+    // this condition to also match `newStatus === "blocked"` — that would strip
+    // the labels the reactivation path depends on. See the
+    // "conflict_resolution report-only admission hold" tests in
+    // phase-runner-outbox.test.js for the pinned regression coverage.
     if (phase === "conflict_resolution" && result?.result === "blocked") {
       const needsConflictResolution =
         (session.labels["needsConflictResolution"] as string | undefined) ?? "status:needs-conflict-resolution";
@@ -557,6 +550,8 @@ export async function enqueueStatusLabelEffects(
         });
       }
     }
+
+
   }
 
   // When a conflict-resolution run fails (agent failure, verification failure,
@@ -586,6 +581,35 @@ export async function enqueueStatusLabelEffects(
       payload: { topic: "gh:label:add", owner, repo, issueNumber: task.issueNumber, label: conflictResolutionFailed },
       now,
     });
+  }
+
+  // When a content-research run fails, remove the content-research lane labels
+  // so the issue is no longer advertised as a runnable content-research task.
+  // Failure is a terminal outcome: the task transitions to `failed` and will not
+  // automatically retry. Without this cleanup, the stale agent:gemini +
+  // status:content-needed pair would cause intake scans to re-enqueue the same
+  // task. A failing content-research result has already written diagnostics to
+  // the local artifact directory; nothing is published to GitHub beyond a fixed
+  // outcome status comment (docs/content-research-mvp-contract.md §Public-Status Contract).
+  if (newStatus === "failed" && phase === "content_research") {
+    const resolvedContentResearchAgentId = agentForPhase(task, session, "research");
+    const contentResearchAgentLabel: string | undefined = resolvedContentResearchAgentId
+      ? `agent:${resolvedContentResearchAgentId}`
+      : (session.labels["agentContentResearch"] as string | undefined);
+    const needsContentResearch: string =
+      (session.labels["needsContentResearch"] as string | undefined) ?? "status:content-needed";
+    const contentResearchLabelsToRemove: string[] = [
+      needsContentResearch,
+      ...(contentResearchAgentLabel ? [contentResearchAgentLabel] : []),
+    ];
+    for (const label of contentResearchLabelsToRemove) {
+      await outboxStore.enqueue({
+        idempotencyKey: makeOutboxKey(session.sessionId, task.issueNumber, runId, "gh:label:remove", label),
+        topic: "gh:label:remove",
+        payload: { topic: "gh:label:remove", owner, repo, issueNumber: task.issueNumber, label },
+        now,
+      });
+    }
   }
 
   // Sync review-queue labels when task is re-queued for a new phase.
@@ -814,6 +838,30 @@ export async function enqueueStatusLabelEffects(
         payload: { topic: "gh:label:add", owner, repo, issueNumber: task.issueNumber, label: implAgentLabel },
         now,
       });
+    } else if (nextPhase === "content_draft") {
+      // content_research succeeded → queued for content_draft: clear the
+      // content-research lane labels so intake scans do not re-route the issue
+      // back to content_research while the draft phase is running (same risk as
+      // the research lane, issue #264). Removal of an absent label is a no-op
+      // for the dispatcher (404 treated as ok).
+      const resolvedContentResearchAgentId = agentForPhase(task, session, "research");
+      const contentResearchAgentLabel: string | undefined = resolvedContentResearchAgentId
+        ? `agent:${resolvedContentResearchAgentId}`
+        : (session.labels["agentContentResearch"] as string | undefined);
+      const needsContentResearch: string =
+        (session.labels["needsContentResearch"] as string | undefined) ?? "status:content-needed";
+      const contentResearchLabelsToRemove: string[] = [
+        needsContentResearch,
+        ...(contentResearchAgentLabel ? [contentResearchAgentLabel] : []),
+      ];
+      for (const label of contentResearchLabelsToRemove) {
+        await outboxStore.enqueue({
+          idempotencyKey: makeOutboxKey(session.sessionId, task.issueNumber, runId, "gh:label:remove", label),
+          topic: "gh:label:remove",
+          payload: { topic: "gh:label:remove", owner, repo, issueNumber: task.issueNumber, label },
+          now,
+        });
+      }
     }
   }
 }
@@ -906,7 +954,16 @@ function buildRunMetadataBlock(
 // paths, or any artifact reference.
 // ---------------------------------------------------------------------------
 
-/** Map a task phase to the agent-assignment slot used to resolve its agent. */
+/**
+ * Map a task phase to the agent-assignment slot used to resolve its agent.
+ *
+ * `content_draft` and `content_review` are mapped to the `research` slot, not
+ * `implementation`/`review`, because that is the slot their handlers actually
+ * resolve through (see `agentForPhase(task, session, "research")` in
+ * content-draft.ts and content-review.ts) — the content workflow has no
+ * dedicated draft/review agent config and reuses the single research-agent
+ * assignment for every content phase.
+ */
 function phaseToAgentKind(phase: TaskPhase): Parameters<typeof agentForPhase>[2] {
   switch (phase) {
     case "review":
@@ -914,6 +971,9 @@ function phaseToAgentKind(phase: TaskPhase): Parameters<typeof agentForPhase>[2]
     case "conflict_resolution":
       return "conflictResolution";
     case "research":
+    case "content_research":
+    case "content_draft":
+    case "content_review":
       return "research";
     case "implementation":
     case "planner":
@@ -936,6 +996,26 @@ function formatRetryTimestamp(notBefore: string): string {
   return `${iso.slice(0, 10)} ${iso.slice(11, 19)} UTC`;
 }
 
+/**
+ * Category-appropriate title/reason copy for the quota-delay comment (issue
+ * #672). `category` is undefined for callers that have not classified a
+ * normalized category (or that pre-date issue #671) — that case keeps the
+ * original generic "quota/rate-limit" wording. A `provider_capacity` failure
+ * is deliberately never worded as the caller having exhausted a usage quota.
+ */
+function quotaDelayCommentCopy(category: AgentFailureKind | undefined): { title: string; reason: string } {
+  switch (category) {
+    case "usage_quota":
+      return { title: "Agent usage quota delay", reason: "reported it has exhausted its usage quota" };
+    case "rate_limit":
+      return { title: "Agent rate-limit delay", reason: "reported a rate-limit condition" };
+    case "provider_capacity":
+      return { title: "Provider capacity delay", reason: "reported the upstream provider is at capacity" };
+    default:
+      return { title: "Agent quota/rate-limit delay", reason: "reported a retryable quota/rate-limit condition" };
+  }
+}
+
 export async function enqueueQuotaDelayCommentEffect(
   outboxStore: OutboxStore,
   session: ResolvedSession,
@@ -943,6 +1023,7 @@ export async function enqueueQuotaDelayCommentEffect(
   phase: TaskPhase,
   notBefore: string,
   now: string,
+  category?: AgentFailureKind,
 ): Promise<void> {
   // Route this quota-delay status comment through the session's work-item
   // provider. No-op passthrough for a GitHub session; for a non-GitHub provider
@@ -956,11 +1037,11 @@ export async function enqueueQuotaDelayCommentEffect(
   const agentId = agentForPhase(task, session, phaseToAgentKind(phase));
   const agentName = agentId ? agentDisplayName(agentId) : "the agent";
   const retryTime = formatRetryTimestamp(notBefore);
+  const { title, reason } = quotaDelayCommentCopy(category);
 
   const body = sanitizeBody(
-    `⏳ **Agent quota/rate-limit delay**\n\n` +
-      `The workflow delayed the next \`${phase}\` attempt because ${agentName} reported a ` +
-      `retryable quota/rate-limit condition.\n\n` +
+    `⏳ **${title}**\n\n` +
+      `The workflow delayed the next \`${phase}\` attempt because ${agentName} ${reason}.\n\n` +
       `Expected retry time: \`${retryTime}\`.\n\n` +
       `No manual action is required unless we want to bypass the wait by changing the agent ` +
       `assignment or manually clearing the delay.`,
@@ -1042,9 +1123,14 @@ export async function enqueueSlackNotificationEffect(
   const sanitizedReason = rawReason
     ? sanitizeBody(rawReason, sessionRedactionPaths(session)).trim()
     : undefined;
-  const reason = sanitizedReason
-    ? boundedExcerpt(sanitizedReason, 500)
-    : undefined;
+  // content_research / content_draft / content_review public-status contract:
+  // Slack notifications must carry only fixed outcome/status values — variable
+  // diagnostics (result.error, stderr, validation text, findings) must not be forwarded.
+  const reason = (phase === "content_research" || phase === "content_draft" || phase === "content_review")
+    ? undefined
+    : sanitizedReason
+      ? boundedExcerpt(sanitizedReason, 500)
+      : undefined;
 
   const transition: "ready_for_human" | "failed" =
     result.result === "failed" ? "failed" : "ready_for_human";
@@ -1103,13 +1189,71 @@ export async function enqueueHandlerCommentEffect(
 
   if (phase === "research") {
     if (result.result === "success") {
+      // Security (issue #794 review): when the prompt interpolated an untrusted
+      // Issue body, the research handler withholds `researchOutput` from this
+      // context entirely — a body-steered agent could otherwise echo local
+      // secrets/config into its stdout, and this comment is published to the
+      // public GitHub issue. Fall back to a fixed-status message in that case;
+      // findings stay available locally in research-output.md.
+      const bodyIncluded = ctx.bodyIncluded === true;
+      // issue #806 (§10.1 of docs/research-evidence-contract.md): when
+      // repository evidence was enabled for the run, served file content can
+      // reach agent stdout, so the excerpt is suppressed even for an Issue
+      // with no body. The two conditions are ORed; neither is narrowed.
+      const evidenceEnabled = ctx.evidenceEnabled === true;
       const researchOutput = typeof ctx.researchOutput === "string" ? ctx.researchOutput : "";
       const excerptSection = researchOutput
         ? `\n\n<details>\n<summary>Research findings</summary>\n\n\`\`\`\n${boundedExcerpt(researchOutput, 3000)}\n\`\`\`\n</details>`
         : "";
-      body = `🔬 **Research complete** for issue #${task.issueNumber}.${excerptSection}`;
+      body = bodyIncluded || evidenceEnabled
+        ? `🔬 **Research complete** for issue #${task.issueNumber}. Findings recorded locally (not published here because ${evidenceEnabled ? "repository evidence was enabled for the run" : "the Issue body was included as agent input"}).`
+        : `🔬 **Research complete** for issue #${task.issueNumber}.${excerptSection}`;
     } else if (result.result === "failed") {
       body = `❌ **Research failed** for issue #${task.issueNumber}.\n\nError: ${result.error}`;
+    }
+  } else if (phase === "content_research") {
+    // Public-status contract (docs/content-research-mvp-contract.md §Public-Status Contract):
+    // Only fixed outcome/status text is published. Research findings, agent output,
+    // stderr excerpts, validation text, and local paths must never appear here.
+    suppressRunMetadata = true;
+    if (result.result === "success") {
+      body = `✅ **Content research complete** for issue #${task.issueNumber}.`;
+    } else if (result.result === "failed") {
+      body = `❌ **Content research failed** for issue #${task.issueNumber}.`;
+    }
+  } else if (phase === "content_draft") {
+    // Public-status contract (docs/content-draft-mvp-contract.md §Outcome enums):
+    // Only the fixed outcome enum is published. Draft text, editorial findings,
+    // fix feedback, source excerpts, validation text, and local paths must never appear here.
+    // The outcome enum must appear in every GitHub-visible update so callers can
+    // distinguish input_invalid from draft_failed.
+    suppressRunMetadata = true;
+    if (result.result === "success") {
+      body = `✅ **Content draft complete** for issue #${task.issueNumber}. Outcome: \`draft_complete\`.`;
+    } else if (result.result === "failed") {
+      const draftOutcome = ctx.outcome === "input_invalid" ? "input_invalid" : "draft_failed";
+      body = `❌ **Content draft failed** for issue #${task.issueNumber}. Outcome: \`${draftOutcome}\`.`;
+    }
+  } else if (phase === "content_review") {
+    // Public-status contract (docs/content-review-mvp-contract.md §Public-Status Contract):
+    // Only fixed outcome/status text is published. Editorial findings, fix feedback,
+    // draft text, source excerpts, validation text, and local paths must never appear here.
+    suppressRunMetadata = true;
+    if (result.result === "success") {
+      body = `✅ **Content review passed** for issue #${task.issueNumber}. Ready for human review. Outcome: \`success\`.`;
+    } else if (result.result === "needs_fix") {
+      // The task (already transitioned by the time this runs) tells us which
+      // outcome actually happened: the editorial cycle cap
+      // (DEFAULT_MAX_CONTENT_REVIEW_CYCLES in transitions.ts) may have sent this
+      // `needs_fix` straight to a human handoff instead of back to content_draft,
+      // and the public status must not claim an automated revision is coming
+      // when none will run.
+      body =
+        task.status === "ready_for_human"
+          ? `🔄 **Content review: needs revision** for issue #${task.issueNumber}. Editorial cycle limit reached — escalated for human review. Outcome: \`needs_fix\`.`
+          : `🔄 **Content review: needs revision** for issue #${task.issueNumber}. Returned to draft phase. Outcome: \`needs_fix\`.`;
+    } else if (result.result === "failed" || result.result === "blocked") {
+      body = `❌ **Content review blocked** for issue #${task.issueNumber}. Outcome: \`blocked\`.`;
     }
   } else if (phase === "implementation") {
     if (result.result === "success") {
@@ -1366,7 +1510,7 @@ export async function enqueueHandlerCommentEffect(
       const reason = typeof result.message === "string" ? result.message : "Review found blocking findings";
       const reviewFeedback = typeof ctx.reviewFeedback === "string" ? ctx.reviewFeedback : "";
       const excerptSection = reviewFeedback
-        ? `\n\n<details>\n<summary>Review findings excerpt</summary>\n\n\`\`\`\n${boundedExcerpt(reviewFeedback, 3000)}\n\`\`\`\n</details>`
+        ? fencedDetailsExcerpt("Review findings excerpt", reviewFeedback, 3000)
         : "";
       body = `🔄 **Review found blocking findings for ${issueSideRef} — automatically requeuing to fix mode.**\n\nReason: ${reason}${excerptSection}`;
       // Public PR comment (Tier 2) must be a public-safe summary. Omit BOTH the
@@ -1389,7 +1533,7 @@ export async function enqueueHandlerCommentEffect(
         const capNote = `\n\nAutomatic implementation/review has been paused to avoid further quota consumption.\nNext suggested action: inspect the latest PR manually, split or redesign the issue, or run a stronger model deliberately.`;
         const reviewFeedback = typeof ctx.reviewFeedback === "string" ? ctx.reviewFeedback : "";
         const excerptSection = reviewFeedback
-          ? `\n\n<details>\n<summary>Latest review findings</summary>\n\n\`\`\`\n${boundedExcerpt(reviewFeedback, 3000)}\n\`\`\`\n</details>`
+          ? fencedDetailsExcerpt("Latest review findings", reviewFeedback, 3000)
           : "";
         body = `🛑 **Review loop cap reached** for ${issueSideRef}.\n\nBlocking review cycles: ${completedCycles}/${maxCycles}.${capNote}${excerptSection}`;
         // Public PR comment (Tier 2): omit the raw latest-review-findings excerpt.

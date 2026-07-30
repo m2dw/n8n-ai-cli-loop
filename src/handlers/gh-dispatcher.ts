@@ -1,4 +1,4 @@
-import type { OutboxEntry, OutboxStore, SlackNotificationPayload } from "../core/outbox.js";
+import { OUTBOX_CLAIM_STALE_MS, type OutboxEntry, type OutboxStore, type SlackNotificationPayload } from "../core/outbox.js";
 import { sanitizeLegacyPrCommentBody } from "../core/outbox-visibility.js";
 
 /** Minimal fetch-compatible function type for Slack webhook dispatch (issue #465). */
@@ -59,10 +59,25 @@ export const defaultOutboxProviderFactory: OutboxProviderFactory = {
 // Dispatcher
 // ---------------------------------------------------------------------------
 
+/**
+ * How often an in-flight dispatch attempt renews its claim (issue #607
+ * review follow-up). Half of {@link OUTBOX_CLAIM_STALE_MS} so a renewal is
+ * always attempted well before the claim would otherwise be treated as
+ * abandoned, tolerating one missed tick (e.g. a slow event-loop turn) without
+ * a concurrent dispatcher's staleness check racing ahead of it.
+ */
+const OUTBOX_CLAIM_RENEW_MS = OUTBOX_CLAIM_STALE_MS / 2;
+
 export interface DispatchResult {
   dispatched: number;
   failed: number;
   errors: Array<{ id: number; error: string }>;
+  /**
+   * Count of failed rows that exhausted their retry budget on this run and
+   * were dead-lettered (issue #606). Included in `failed` above — this is a
+   * breakdown, not an additional bucket.
+   */
+  deadLettered: number;
 }
 
 export interface DispatchOptions {
@@ -77,6 +92,52 @@ export interface DispatchOptions {
    * for the run that owns them. When omitted, every pending entry is dispatched.
    */
   filter?: (entry: OutboxEntry) => boolean;
+  /**
+   * Upper bound on how many due rows a single run will fetch and JSON-parse
+   * while paging toward `limit` filter-matching rows (review follow-up to
+   * issue #606). Without this bound, a session-scoped `filter` that matches
+   * few or none of a large shared due backlog (e.g. many other repos' rows
+   * accumulated by an abandoned session) makes the loop page through the
+   * *entire* due set every run — each foreign row still fetched and parsed
+   * before being discarded by the filter — turning the bounded drain back
+   * into an unbounded scan. Defaults to a generous multiple of the fetch
+   * page size, but only when `scanCursorKey` is also set — that default is
+   * only ever safe together with a persisted cursor (see `scanCursorKey`),
+   * which lets scan progress accumulate across runs; otherwise every run
+   * would restart at row 1 and a delayed (not-yet-due) prefix bigger than the
+   * default could permanently prevent the scan from ever reaching a newer due
+   * row (P2 review follow-up). Without a `scanCursorKey`, the default is
+   * unbounded — the scan runs to `limit` matches or pending exhaustion —
+   * unless the caller supplies an explicit `scanLimit`, which is always
+   * honored regardless of `scanCursorKey`. Hitting the cap simply ends the
+   * run early with whatever owned rows were already found rather than
+   * continuing to scan the remainder of the due set. When `scanCursorKey` is
+   * set, the persisted delayed-zone re-walk (Phase A, below) is capped at
+   * exactly this value, but the bulk forward scan past that zone (Phase B)
+   * gets its own additional reserve on top of it — so a zone that alone spans
+   * `scanLimit` rows can never leave Phase B with zero budget to reach a
+   * newer due row past it (P1 review follow-up).
+   */
+  scanLimit?: number;
+  /**
+   * Identity that scopes a persisted scan cursor across separate invocations
+   * (issue #606 review follow-up). Only meaningful together with `filter`:
+   * without a persisted cursor, a session-bound dispatch whose filter matches
+   * few or none of a large shared due backlog re-scans that same non-matching
+   * prefix from row 1 every run — each run individually bounded by
+   * `scanLimit`, but never advancing past that prefix because the in-process
+   * `afterId` pagination cursor does not survive between invocations (this
+   * CLI runs as a fresh process each time). When set, the scan resumes after
+   * the prefix the *previous* run for this key confirmed does not match
+   * `filter`, so repeated runs eventually reach newer due rows that do.
+   * Left undefined (the default) when no `filter` is given. An unfiltered
+   * dispatch has no non-matching prefix to skip, but it can still have a
+   * *delayed* one (rows still in backoff) — that prefix is handled instead by
+   * `scanLimit` defaulting to unbounded when `scanCursorKey` is unset, rather
+   * than by a persisted cursor, since there is no non-matching content to
+   * remember skipping past.
+   */
+  scanCursorKey?: string;
   /**
    * Provider factory used to construct the work-item / repo-host provider for
    * provider-neutral topics. Defaults to {@link defaultOutboxProviderFactory}
@@ -118,7 +179,10 @@ export type GhRunnerResolver = GhRunner | (() => Promise<GhRunner>);
  * Drain pending outbox entries, calling the appropriate `gh` command for each.
  *
  * - On success: marks the entry as sent.
- * - On failure: leaves the entry un-sent (retryable on next call).
+ * - On failure: leaves the entry un-sent and records the attempt (issue #606).
+ *   It becomes eligible again after a bounded backoff delay, or — once it has
+ *   exhausted its retry budget (`OUTBOX_MAX_ATTEMPTS` in core/outbox.ts) — is
+ *   dead-lettered and excluded from all future dispatch selection.
  * - Duplicate idempotency keys are never re-sent (INSERT OR IGNORE at enqueue time).
  *
  * When `runner` is a factory it is resolved lazily — only after pending entries
@@ -137,29 +201,236 @@ export async function dispatchOutbox(
   opts: DispatchOptions,
 ): Promise<DispatchResult> {
   const limit = opts.limit ?? 50;
-  // Apply the ownership filter *before* the limit. If we fetched only `limit`
-  // rows first, a shared DB with `limit` older pending rows for other repos
-  // ahead of this session's rows would fill the entire fetch window; those rows
-  // would all be filtered out and this session's own pending entries would never
-  // be reached — starving it across repeated runs. So when a filter is present
-  // we fetch every pending row, drop the ones this invocation does not own (e.g.
-  // another session's repo rows, which stay pending for the run that owns them
-  // and never get dispatched under the wrong identity), and only then cap to
-  // `limit`. Without a filter the store-side limit already bounds the fetch.
-  const fetched = await outboxStore.listPending(opts.filter ? undefined : limit);
-  const owned = opts.filter ? fetched.filter(opts.filter) : fetched;
-  const pending = owned.length > limit ? owned.slice(0, limit) : owned;
   const now = opts.now ?? new Date().toISOString();
+  // Apply due-time eligibility and the ownership filter *before* the limit. A
+  // delayed row (a future `nextAttemptAt`, issue #606) or a foreign-repo row
+  // must never occupy the fetch/limit window ahead of a newer, due, owned row —
+  // otherwise a handful of backed-off or foreign rows sitting at the front of
+  // the table would starve every row behind them on each run. The ownership
+  // filter (which cannot be pushed into SQL — it's an arbitrary predicate) is
+  // applied page by page; due-time is checked here too, in JS, rather than in
+  // SQL (`listPendingEntries` returns delayed rows same as `listPending`) —
+  // an owned-but-delayed row must still be *seen* by this scan. Pagination
+  // stops as soon as `limit` owned+due rows are collected, the pending set is
+  // exhausted, or `scanLimit` rows have been fetched — the last of which
+  // bounds the worst case (a filter matching little/none of a large shared
+  // backlog) to a fixed amount of work instead of scanning the entire pending
+  // set every run (review follow-up to issue #606).
+  const pageSize = Math.max(limit, 200);
+  // The bounded default is only safe together with `scanCursorKey`: a capped
+  // scan that finds nothing needs a persisted cursor so the *next* run can
+  // resume past the prefix this run already ruled out, or forward progress
+  // never accumulates. Without `scanCursorKey` there is no persisted cursor —
+  // every run restarts the scan at row 1 — so a capped default would let a
+  // delayed (not-yet-due) prefix larger than the cap permanently hide any due
+  // row behind it, even though nothing here is foreign or ownership-filtered
+  // (P2 review follow-up to issue #606). Defaulting to unbounded in that case
+  // instead scans to `limit` matches or pending exhaustion every run, which
+  // is exactly the pre-`scanLimit` behavior for a cursorless dispatch. An
+  // explicit `opts.scanLimit` is always honored, cursor or not.
+  const scanLimit = opts.scanLimit ?? (opts.scanCursorKey ? pageSize * 10 : Infinity);
+  // Phase B gets its own dedicated allowance on top of `scanLimit`, reserved
+  // for scanning *past* the protected delayed zone (P1 review follow-up to
+  // issue #606). Phase A (the zone re-walk below) stays capped at `scanLimit`
+  // exactly as before — that cap is what keeps the zone itself bounded to at
+  // most `scanLimit` rows across runs. But when a key legitimately owns a
+  // zone's worth of simultaneously delayed/failing rows (e.g. `scanLimit`
+  // rows in backoff at once), Phase A alone can exhaust the entire budget
+  // re-confirming them, leaving nothing for Phase B to reach a newer, due row
+  // for the same key sitting just past the zone — starving it until the
+  // delayed rows age out of backoff. `phaseBReserve` guarantees Phase B always
+  // gets to scan at least one page beyond wherever Phase A stopped, so that
+  // newer due rows are never skipped purely because the zone happened to be
+  // scanLimit-sized. Adding a fixed reserve rather than raising `scanLimit`
+  // itself keeps the zone-size invariant Phase A relies on unchanged.
+  const phaseBReserve = pageSize;
+  const pending: OutboxEntry[] = [];
+
+  // Three persisted cursors per `scanCursorKey` (issue #606 review follow-up,
+  // revised for a P1 finding: with the earlier two-cursor design, two or more
+  // simultaneously delayed owned rows ahead of a foreign backlog larger than
+  // `scanLimit` froze forward progress indefinitely, because the single
+  // "fwd" cursor was pinned at the second delayed row's position on every
+  // run and any progress Phase B made scanning past it into the backlog was
+  // discarded each time.
+  //
+  // `floorKey` protects the single earliest row this key owns that is still
+  // pending after a run (delayed, or repeatedly failing) — a future scan must
+  // always be able to reach it, so `floorKey` never advances past its id.
+  //
+  // `zoneEndKey` (the "fwd"-role derived key, kept from the original design)
+  // marks the far edge of the small "protected zone" spanning every row this key currently
+  // still owns — from `floorKey` through the *last* one — whenever there is
+  // more than one. That whole zone is re-walked in full every run ("Phase A"
+  // below), so no still-open row is silently dropped just because bulk
+  // scanning has raced ahead of it. The zone stays small across runs: it only
+  // ever grows to the position of the furthest *currently* still-open row,
+  // never to the confirmed-foreign extent beyond it. When at most one row is
+  // still open, `zoneEndKey` is left stale rather than rewritten — `floorKey`
+  // advancing past it (once nothing remains to protect) naturally invalidates
+  // it, and while exactly one row is open, Phase A's single-row check below
+  // covers it without needing the zone walk at all.
+  //
+  // `bulkKey` (the "bulk"-role derived key) is the pure bulk-scan resume point ("Phase B"
+  // below) — the furthest position confirmed foreign/resolved. It advances
+  // every run based on how far Phase B actually scanned, independent of how
+  // many rows the zone still protects, so forward progress into a large
+  // foreign backlog always accumulates across runs instead of being reset to
+  // just past the last still-open row found.
+  const floorKey = opts.scanCursorKey;
+  // Length-prefixed rather than a plain suffix: session ids are only
+  // validated as nonempty strings, so two valid sessions like `foo` and
+  // `foo::fwd` would otherwise collide — the former's zone-end cursor key
+  // would equal the latter's own floor cursor key, letting `foo::fwd` read
+  // an unrelated cursor and skip its own older pending rows permanently (P2
+  // review follow-up to issue #606). Prefixing with `floorKey`'s length
+  // makes the encoding injective per role: the id portion is unambiguously
+  // delimited by its own length, so no two distinct (sessionId, role) pairs
+  // can ever produce the same derived key. Still plain TEXT, so any tooling
+  // that inspects the cursor table directly reads an ordinary string.
+  const deriveCursorKey = (role: "fwd" | "bulk"): string => `${floorKey!.length}:${floorKey}:${role}`;
+  const zoneEndKey = floorKey ? deriveCursorKey("fwd") : undefined;
+  const bulkKey = floorKey ? deriveCursorKey("bulk") : undefined;
+  const floorAfterId = floorKey ? await outboxStore.getScanCursor(floorKey) : undefined;
+  const persistedZoneEndAfterId = zoneEndKey ? await outboxStore.getScanCursor(zoneEndKey) : undefined;
+  const zoneEndAfterId =
+    persistedZoneEndAfterId !== undefined && persistedZoneEndAfterId > (floorAfterId ?? 0)
+      ? persistedZoneEndAfterId
+      : undefined;
+  const persistedBulkAfterId = bulkKey ? await outboxStore.getScanCursor(bulkKey) : undefined;
+  const bulkAfterId =
+    persistedBulkAfterId !== undefined && persistedBulkAfterId > (floorAfterId ?? 0)
+      ? persistedBulkAfterId
+      : undefined;
+
+  let scanned = 0;
+  // Matched rows seen this run, in ascending (scan) order, with whether each
+  // was due (attempted) or delayed (known open without needing dispatch).
+  // Resolved into "still open after this run" once dispatch outcomes are
+  // known, below.
+  const matchedCandidates: { id: number; due: boolean }[] = [];
+  // The furthest id this run can confirm is safe to skip on a future scan:
+  // everything up to and including it is either foreign or (once dispatch
+  // outcomes are folded in below) resolved. Starts at the previous floor
+  // since nothing beyond it has been re-examined yet.
+  let scanExtentId: number | undefined = floorAfterId;
+
+  const recordScannedEntry = (entry: OutboxEntry): void => {
+    if (!opts.filter || opts.filter(entry)) {
+      const due = isEntryDue(entry, now);
+      if (due) pending.push(entry);
+      matchedCandidates.push({ id: entry.id, due });
+    } else {
+      scanExtentId = entry.id;
+    }
+  };
+
+  // Phase A — re-verify every row the persisted state says this key still
+  // owns and hasn't resolved, without re-walking the (possibly huge)
+  // confirmed-foreign backlog beyond them.
+  let zoneCursor = floorAfterId;
+  if (floorKey && zoneEndAfterId !== undefined) {
+    // Two or more rows were still open last run: walk the whole protected
+    // zone from the floor through `zoneEndAfterId`. That span is bounded by
+    // whatever a single prior run could scan to build it (at most
+    // `scanLimit`), so this is never more expensive than, and is usually far
+    // cheaper than, a full bulk scan.
+    while (pending.length < limit && scanned < scanLimit && (zoneCursor ?? 0) < zoneEndAfterId) {
+      const remaining = Math.min(pageSize, scanLimit - scanned, zoneEndAfterId - (zoneCursor ?? 0));
+      const page = await outboxStore.listPendingEntries({ limit: remaining, afterId: zoneCursor });
+      if (page.length === 0) break;
+      // `zoneCursor` must only advance through entries actually passed to
+      // `recordScannedEntry` — if the dispatch cap (`limit`) is hit partway
+      // through this page, the remaining rows are never examined and must
+      // stay unexamined for the zone-walk-incomplete check below. Jumping
+      // `zoneCursor` straight to the fetched page's last id regardless would
+      // mark those trailing rows as scanned without ever recording them,
+      // letting the post-run cursor math (which narrows the protected zone
+      // to just `matchedCandidates`) forget them even though they were never
+      // looked at (P1 review follow-up to issue #606).
+      let limitHit = false;
+      for (const entry of page) {
+        if (pending.length >= limit) {
+          limitHit = true;
+          break;
+        }
+        recordScannedEntry(entry);
+        zoneCursor = entry.id;
+      }
+      scanned += page.length;
+      if (limitHit) break;
+      if (page.length < remaining) break;
+    }
+  } else if (floorKey && bulkAfterId !== undefined) {
+    // At most one row was still open last run: it is guaranteed to be the
+    // very next pending row after `floorAfterId` (nothing else can sit
+    // between them, by the invariant maintained below), so a single 1-row
+    // fetch suffices.
+    const [row] = await outboxStore.listPendingEntries({ limit: 1, afterId: floorAfterId });
+    scanned++;
+    if (row) {
+      recordScannedEntry(row);
+      zoneCursor = row.id;
+    }
+  }
+
+  // Phase B — bulk forward scan, resuming from whichever is further along:
+  // the zone edge Phase A just re-confirmed this run, or the persisted bulk
+  // extent (which may already reach past it, from prior runs' accumulated
+  // progress). Already confirmed foreign/resolved territory is never
+  // re-fetched, and this cursor is never reset back to just past the last
+  // still-open row the way the single "fwd" cursor used to be.
+  //
+  // Exception: if Phase A ran out of `scanLimit` budget before finishing the
+  // zone walk (`zoneCursor` still short of `zoneEndAfterId`), `bulkAfterId`
+  // must NOT be used to resume here even though it may reach further — it
+  // can have been recorded by an earlier, larger-limit run whose bigger
+  // `scanLimit` walked past this entire zone in one pass. Jumping to it would
+  // skip the zone's unvisited remainder outright, and since that remainder
+  // never enters `matchedCandidates`, the persisted zone/floor cursors below
+  // would then shrink to just the scanned prefix — permanently forgetting
+  // those still-open rows even once their backoff expires (P1 review
+  // follow-up to issue #606). Resuming from `zoneCursor` instead lets Phase
+  // B's own budget (topped up by `phaseBReserve` below) continue the zone
+  // walk in order, so no still-open row is ever skipped over.
+  const zoneWalkIncomplete =
+    zoneCursor !== undefined && zoneEndAfterId !== undefined && zoneCursor < zoneEndAfterId;
+  let afterId: number | undefined = zoneWalkIncomplete
+    ? zoneCursor
+    : zoneCursor !== undefined && bulkAfterId !== undefined
+      ? Math.max(zoneCursor, bulkAfterId)
+      : (zoneCursor ?? bulkAfterId);
+  // The reserve only kicks in once Phase A has actually consumed the entire
+  // `scanLimit` budget re-walking a protected zone — that's the only case
+  // that can leave Phase B with zero budget to reach a newer due row past
+  // it. When Phase A did little or no work (no zone to walk, or a zone
+  // smaller than `scanLimit`), the plain `scanLimit` ceiling already gives
+  // Phase B all the remaining budget; adding the reserve on top of that
+  // would let a single run scan `scanLimit + phaseBReserve` rows even with
+  // no zone in play, silently blowing past a caller-supplied `scanLimit`.
+  const phaseAScanned = scanned;
+  const scanCeiling = phaseAScanned >= scanLimit ? phaseAScanned + phaseBReserve : scanLimit;
+  while (pending.length < limit && scanned < scanCeiling) {
+    // Each fetch is capped by the remaining scan allowance, not just `pageSize`,
+    // so a caller-supplied `scanLimit` smaller than `pageSize` (e.g. limit: 50,
+    // scanLimit: 1) still bounds the rows actually fetched/parsed to `scanLimit`
+    // (plus the Phase B reserve) instead of overshooting on the first page.
+    const remaining = Math.min(pageSize, scanCeiling - scanned);
+    const page = await outboxStore.listPendingEntries({ limit: remaining, afterId });
+    if (page.length === 0) break;
+    afterId = page[page.length - 1].id;
+    scanned += page.length;
+    for (const entry of page) {
+      if (pending.length >= limit) break;
+      recordScannedEntry(entry);
+    }
+    if (page.length < remaining) break;
+  }
+
   let dispatched = 0;
   let failed = 0;
+  let deadLettered = 0;
   const errors: DispatchResult["errors"] = [];
-
-  // Nothing to dispatch: return before resolving the runner so an empty (or
-  // fully filtered-out) outbox never performs credential resolution or any
-  // GitHub side effect.
-  if (pending.length === 0) {
-    return { dispatched, failed, errors };
-  }
 
   const providers = opts.providers ?? defaultOutboxProviderFactory;
 
@@ -183,7 +454,44 @@ export async function dispatchOutbox(
 
   const fetchImpl: FetchFn = opts.fetchImpl ?? (globalThis as unknown as { fetch: FetchFn }).fetch;
   const env = opts.env ?? process.env;
+  // Ids resolved this run — sent, or dead-lettered — so no longer pending and
+  // safe to skip past when persisting the cursors below.
+  const resolvedIds = new Set<number>();
   for (const entry of pending) {
+    // Atomically claim the row immediately before its external side effect
+    // (issue #607 review follow-up): `pending` was built from a `SELECT` scan
+    // that ran moments ago, so an `admin outbox cancel` may have landed on
+    // this row in the gap since. `claimForDispatch` uses the same atomic
+    // claim/check mechanism `cancelEntry` does, so a row a concurrent cancel
+    // already won is never dispatched here — skip it without touching
+    // dispatched/failed counts.
+    //
+    // Stamped fresh per entry, not with the batch-start `now` (P2 review
+    // follow-up): a sequential batch can take minutes to drain, so reusing
+    // `now` here would claim a later entry with an already-stale timestamp —
+    // an overlapping dispatcher checking claim staleness against its own
+    // current time would then treat that still-active claim as abandoned and
+    // reclaim it, dispatching the same row twice. `opts.now`, when supplied,
+    // still wins so tests stay deterministic.
+    const claimedAt = opts.now ?? new Date().toISOString();
+    const claimed = await outboxStore.claimForDispatch(entry.id, claimedAt);
+    if (!claimed) {
+      // A failed claim does NOT mean this row is resolved (P1 review
+      // follow-up): it may be held by a concurrent dispatcher's still-active
+      // claim, not a cancel. Folding it into `resolvedIds` unconditionally
+      // let the scan cursor advance past a row that was never actually sent,
+      // dead-lettered, or cancelled — if the other dispatcher then failed and
+      // scheduled a retry, later runs would resume after this id and strand
+      // the row forever. Re-read it and only mark it resolved once it is
+      // confirmed sent/dead-lettered (cancellation always sets
+      // `deadLetterAt` too, per `cancelEntry`); otherwise leave it open so a
+      // future scan keeps finding it once the foreign claim clears.
+      const fresh = await outboxStore.getById(entry.id);
+      if (fresh?.sentAt !== undefined || fresh?.deadLetterAt !== undefined) {
+        resolvedIds.add(entry.id);
+      }
+      continue;
+    }
     // Pick the runner for this row's auth domain. The selected runner is
     // guaranteed resolved: its domain was detected as pending above. Slack notification rows
     // (`slack:notification`) use `fetch` directly and never need a runner — they
@@ -201,22 +509,134 @@ export async function dispatchOutbox(
     // deterministic-exit contract n8n depends on. The row stays pending and the
     // (secret-free, config-reference) message is reported, so fixing the config
     // and re-running drains it.
+    //
+    // The claim is renewed on a timer while the external call is in flight
+    // (P1 review follow-up): `gh` and the Slack webhook fetch have no
+    // request timeout, so a single slow call can outlive
+    // `OUTBOX_CLAIM_STALE_MS`. Without renewal, a concurrent dispatcher's
+    // `claimForDispatch` would then treat this still-live claim as abandoned
+    // and reclaim + re-dispatch the same row, duplicating the external
+    // effect. `renewClaim` is a compare-and-swap on the claim token this
+    // attempt currently holds, so a renewal that loses the race (claim
+    // already released or reclaimed) is a safe no-op rather than
+    // resurrecting a claim this attempt no longer owns.
+    let claimToken = claimedAt;
+    const renewTimer = setInterval(() => {
+      outboxStore
+        .renewClaim(entry.id, claimToken)
+        .then((renewedAt) => {
+          if (renewedAt !== undefined) claimToken = renewedAt;
+        })
+        .catch(() => {});
+    }, OUTBOX_CLAIM_RENEW_MS);
     let result: Awaited<ReturnType<typeof dispatchEntry>>;
     try {
       result = await dispatchEntry(entry, entryRunner, opts.cwd, providers, fetchImpl, env);
     } catch (err) {
       result = { ok: false, error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      clearInterval(renewTimer);
     }
     if (result.ok) {
-      await outboxStore.markSent(entry.id, now);
-      dispatched++;
+      // Fenced on `claimToken` (P2 review follow-up), the current (possibly
+      // renewed) value held above: if this row's claim expired and was
+      // reclaimed by another dispatcher while this attempt's external call
+      // was still in flight, this completion must not clear that newer claim
+      // or duplicate the side effect being reported as sent here.
+      //
+      // Only counted as dispatched/resolved once `markSent` confirms it
+      // actually persisted `sentAt` (P2 review follow-up): a fenced update
+      // rejected by a stale claim token is a no-op on the row, but the
+      // external side effect already happened — the row's new owner still
+      // holds the live claim and will report its own outcome. Counting this
+      // rejected completion anyway would advance the scan cursor past a row
+      // that is not actually resolved yet; if the new owner then fails and
+      // schedules a retry, the row would be stranded behind the cursor.
+      const { updated } = await outboxStore.markSent(entry.id, claimedAt, claimToken);
+      if (updated) {
+        dispatched++;
+        resolvedIds.add(entry.id);
+      }
     } else {
       failed++;
       errors.push({ id: entry.id, error: result.error });
+      // Scheduled from the actual failure time, not the batch-start `now` — a
+      // dispatch that blocks for at least the base backoff delay (e.g. the
+      // default `gh` runner has no timeout) would otherwise write a past
+      // `next_attempt_at` and defeat the backoff entirely (issue #606 review
+      // follow-up). `opts.now`, when supplied, still wins so tests stay
+      // deterministic.
+      const failedAt = opts.now ?? new Date().toISOString();
+      // Same claim-token fencing as the success path above.
+      const { deadLettered: rowDeadLettered } = await outboxStore.markFailed(
+        entry.id,
+        result.error,
+        failedAt,
+        claimToken,
+      );
+      if (rowDeadLettered) {
+        deadLettered++;
+        resolvedIds.add(entry.id);
+      }
     }
   }
 
-  return { dispatched, failed, errors };
+  if (floorKey) {
+    // `matchedCandidates` is already in ascending (scan) order. The smallest
+    // still-open id becomes the next floor (Phase A / the zone walk protects
+    // it); the largest becomes the next zone end whenever more than one row
+    // remains open, so *every* still-open row in between stays protected too
+    // — not just the first and second. `bulkKey` always takes the furthest
+    // confirmed-foreign extent reached this run (never gated by how many
+    // rows remain open), so it is never reset back to just past the last
+    // protected row and forward progress into a large foreign backlog keeps
+    // accumulating across runs.
+    const stillOpen = matchedCandidates.filter((c) => !c.due || !resolvedIds.has(c.id)).map((c) => c.id);
+    const nextFloor = stillOpen.length > 0 ? stillOpen[0] - 1 : scanExtentId;
+    // A computed value of 0 means "nothing confirmed yet" (the open/only row
+    // is the very first one) — leave the cursor unset rather than persisting
+    // a redundant 0, matching `listPendingEntries`' `afterId ?? 0` default.
+    if (nextFloor !== undefined && nextFloor > 0) {
+      await outboxStore.setScanCursor(floorKey, nextFloor);
+    }
+    if (zoneEndKey && (stillOpen.length > 1 || zoneWalkIncomplete)) {
+      // Unlike `floorKey`/`bulkKey` (both `afterId`-style: "resume scanning
+      // strictly after this id"), `zoneEndAfterId` is compared against the
+      // zone walk's own cumulative cursor (also `afterId`-style) as an
+      // inclusive stopping threshold — so it must be the last still-open
+      // row's *own* id, not one less, or the walk would stop just short of
+      // ever examining that row.
+      //
+      // When this run's zone walk didn't reach the end of the *previously*
+      // known zone (`zoneWalkIncomplete` — whether from `scanLimit` or from
+      // the dispatch `limit` filling `pending` mid-zone, per the corrected
+      // `zoneCursor` tracking above), `stillOpen`'s last entry only reflects
+      // what was actually examined this run, not the true remaining extent.
+      // Persisting that narrower value would drop protection for the
+      // unexamined tail — rows this key still owns but never got a chance to
+      // re-verify this run — even though they were never confirmed
+      // foreign/resolved. Floor the next zone end at the prior
+      // `zoneEndAfterId` so an incomplete walk can only ever grow the
+      // protected zone, never shrink it (P1 review follow-up to issue #606).
+      const nextZoneEnd = zoneWalkIncomplete
+        ? Math.max(stillOpen[stillOpen.length - 1] ?? 0, zoneEndAfterId ?? 0)
+        : stillOpen[stillOpen.length - 1];
+      if (nextZoneEnd > 0) {
+        await outboxStore.setScanCursor(zoneEndKey, nextZoneEnd);
+      }
+    }
+    if (bulkKey) {
+      // Guarded to be monotonic: a run whose Phase B loop never executes (or
+      // never crosses a foreign row) must not regress the bulk cursor behind
+      // progress an earlier run already confirmed.
+      const nextBulk = Math.max(scanExtentId ?? 0, persistedBulkAfterId ?? 0);
+      if (nextBulk > 0) {
+        await outboxStore.setScanCursor(bulkKey, nextBulk);
+      }
+    }
+  }
+
+  return { dispatched, failed, errors, deadLettered };
 }
 
 /**
@@ -266,6 +686,17 @@ function isLegacyPrCommentEntry(entry: OutboxEntry): boolean {
  */
 function isSlackEntry(entry: OutboxEntry): boolean {
   return entry.payload.topic === "slack:notification";
+}
+
+/**
+ * Whether an outbox row is currently eligible for another dispatch attempt: it
+ * has never failed (no `nextAttemptAt`), or its backoff delay has elapsed as
+ * of `now`. `listPendingEntries` returns delayed rows too (issue #606 review
+ * follow-up), so the scan loop checks this itself before treating a scanned
+ * row as dispatch-eligible this run.
+ */
+function isEntryDue(entry: OutboxEntry, now: string): boolean {
+  return !entry.nextAttemptAt || entry.nextAttemptAt <= now;
 }
 
 // ---------------------------------------------------------------------------

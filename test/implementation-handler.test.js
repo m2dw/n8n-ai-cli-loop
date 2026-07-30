@@ -2,8 +2,10 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, chmodSync
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { execFileSync } from 'child_process';
-import { createImplementationHandler } from '../dist/handlers/implementation.js';
-import { SqliteTaskStore, runNextPhase, TOOL_REQUEST_OPEN, TOOL_REQUEST_CLOSE } from '../dist/index.js';
+import { createImplementationHandler as _createImplementationHandler } from '../dist/handlers/implementation.js';
+import { resolveIssueWorktree, canonicalizePath } from '../dist/handlers/worktree.js';
+import { issueWorktreePath } from '../dist/core/worktree-paths.js';
+import { SqliteTaskStore, runNextPhase, TOOL_REQUEST_OPEN, TOOL_REQUEST_CLOSE, applyTaskPatch, IssueWorktreeLock } from '../dist/index.js';
 
 const CLI = new URL('../dist/cli/run-one-phase.js', import.meta.url).pathname;
 
@@ -76,34 +78,29 @@ function sequenceRunner(steps) {
   };
 }
 
-// Happy-path runner reflecting the new orchestration order:
-// status -> checkout base -> pull -> rev-parse HEAD -> checkout -b -> claude -> diff -> verification -> ls-files -> add -> commit -> push -> gh pr
-function happyRunner(prUrl = 'https://github.com/m2dw/test-repo/pull/99', stageableOutput = 'src/foo.ts\0', baseBranch = 'main') {
-  return sequenceRunner([
-    { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean)
-    { stdout: '', stderr: '', exitCode: 0 },                      // git checkout <base>
-    { stdout: '', stderr: '', exitCode: 0 },                      // git pull --ff-only
-    { stdout: baseBranch, stderr: '', exitCode: 0 },              // git rev-parse --abbrev-ref HEAD (== base)
-    { stdout: '', stderr: '', exitCode: 0 },                      // git checkout -b <branch> <base>
-    { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // claude
-    { stdout: '2 files changed', stderr: '', exitCode: 0 },       // git diff --stat HEAD
-    { stdout: 'PASS', stderr: '', exitCode: 0 },                  // verification (npm test)
-    { stdout: stageableOutput, stderr: '', exitCode: 0 },         // git ls-files -z
-    { stdout: '', stderr: '', exitCode: 0 },                      // git add -- <paths>
-    { stdout: '', stderr: '', exitCode: 0 },                      // git commit
-    { stdout: '', stderr: '', exitCode: 0 },                      // git push
-    { stdout: prUrl, stderr: '', exitCode: 0 },                   // gh pr create
-  ]);
+// Happy-path runner reflecting the worktree-only orchestration (issue #732):
+// every task — fix or new-impl — materializes its per-issue worktree
+// unconditionally, so the command sequence is: fetch base (canonical) ->
+// status (canonical) -> status (worktree) -> claude -> diff -> verification ->
+// ls-files -> add -> commit -> push -> gh pr -> worktree remove (canonical,
+// frees the branch for the downstream review checkout). `resolveWorktree`
+// itself is stubbed (see `createImplementationHandler` wrapper below), so no
+// step here represents the worktree materialization call itself. The
+// `baseBranch` param is accepted for call-site compatibility (some callers
+// still pass it for readability / to pair with a non-default session
+// baseBranch) but no longer changes any canned return value — the old
+// post-checkout `rev-parse --abbrev-ref HEAD` verification step it fed no
+// longer exists (issue #732).
+function happyRunner(prUrl = 'https://github.com/m2dw/test-repo/pull/99', stageableOutput = 'src/foo.ts\0', _baseBranch = 'main') {
+  return worktreeHappyRunner(prUrl, stageableOutput);
 }
 
-// Fails on the claude step — preflight steps (incl. HEAD verification) succeed
+// Fails on the claude step — preflight (base fetch + both status checks) succeeds.
 function fakeFail(stderr = 'claude: auth error') {
   return sequenceRunner([
-    { stdout: '', stderr: '', exitCode: 0 },     // git status — clean
-    { stdout: '', stderr: '', exitCode: 0 },     // git checkout main
-    { stdout: '', stderr: '', exitCode: 0 },     // git pull --ff-only
-    { stdout: 'main', stderr: '', exitCode: 0 }, // git rev-parse --abbrev-ref HEAD (== main)
-    { stdout: '', stderr: '', exitCode: 0 },     // git checkout -b
+    { stdout: '', stderr: '', exitCode: 0 },     // git fetch origin main:refs/remotes/origin/main (canonical)
+    { stdout: '', stderr: '', exitCode: 0 },     // git status --porcelain (canonical — clean)
+    { stdout: '', stderr: '', exitCode: 0 },     // git status --porcelain (worktree — clean)
     { stdout: '', stderr, exitCode: 1 },         // claude — fails
   ]);
 }
@@ -156,7 +153,7 @@ function worktreeHappyRunner(prUrl = 'https://github.com/m2dw/test-repo/pull/99'
 // creates the branch (not reused); a `created: false` reused worktree reuses it — but
 // can be set explicitly to model the recoverable delayed-run case where the branch
 // survives while its pruned worktree dir is recreated (`created: true, branchReused: true`).
-function fakeWorktreeResolver(worktreePath, { created = true, branchReused = !created } = {}) {
+function fakeWorktreeResolver(worktreePath, { created = true, branchReused = !created, startedFromRemoteHead = false } = {}) {
   const calls = [];
   const resolve = (input) => {
     calls.push(input);
@@ -169,9 +166,44 @@ function fakeWorktreeResolver(worktreePath, { created = true, branchReused = !cr
       // quota discard kept `ai/issue-<n>` and its worktree (issue #454 review).
       created,
       branchReused,
+      // True when no local branch existed but `resolveWorktree` recovered one from
+      // an existing `origin/<branch>` (a prior PR head) instead of creating it fresh
+      // from `baseRef` (issue #667 review, P1).
+      startedFromRemoteHead,
     };
   };
   return { calls, resolve };
+}
+
+// The worktree path used by default when a test does not construct its own
+// `fakeWorktreeResolver(...)` (issue #732). Matches the path shape used
+// throughout the per-issue worktree describe blocks (#454, #455) so tests that
+// do assert on cwd can reuse this helper directly.
+function defaultWorktreePath() {
+  return join(tmpDir, 'wt', 'addon-dev', 'issue-77', 'repo');
+}
+
+// Wraps the real handler factory so every test gets per-issue worktree
+// materialization stubbed by default. Worktree materialization is now
+// unconditional (issue #732: there is no shared-checkout mode left to select
+// out of), so every run — fix or new-impl — calls the injected 4th-param
+// resolver. Without a default here, every one of this file's many
+// `createImplementationHandler(context, runner)` call sites would fall through
+// to the REAL `resolveIssueWorktree`, which would drive actual `git worktree`
+// machinery through the mock command runner and desync its canned step queue.
+// Tests that need a specific worktree path / branch-reuse / remote-head shape
+// still construct and pass their own `fakeWorktreeResolver(...).resolve` as the
+// 4th arg, which this wrapper simply forwards unchanged. The handful of
+// end-to-end tests that drive a REAL git repository pass the real
+// `resolveIssueWorktree` (imported above) explicitly as the 4th arg for the
+// same reason.
+function createImplementationHandler(context, runner, depChecker, resolveWorktree) {
+  return _createImplementationHandler(
+    context,
+    runner,
+    depChecker,
+    resolveWorktree ?? fakeWorktreeResolver(defaultWorktreePath()).resolve,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -192,12 +224,15 @@ describe('implementation handler — artifacts', () => {
     expect(existsSync(join(dir, 'implementation-result.json'))).toBe(true);
   });
 
-  test('prompt includes issue number, title, and repoRoot', async () => {
+  test('prompt includes issue number, title, and the worktree repository root', async () => {
     await createImplementationHandler(CONTEXT(), happyRunner())(makeTask());
     const prompt = readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-prompt.md'), 'utf8');
     expect(prompt).toContain('77');
     expect(prompt).toContain('Add login rate limiting');
-    expect(prompt).toContain(repoRoot);
+    // The prompt's "Repository root" is the managed issue worktree, not the
+    // canonical checkout — the agent runs and edits inside the worktree
+    // (issue #732).
+    expect(prompt).toContain(defaultWorktreePath());
   });
 
   test('prompt includes the issue body under an Issue Description heading', async () => {
@@ -331,13 +366,77 @@ describe('implementation handler — artifacts', () => {
   });
 });
 
+// Issue #732 review (P1, second round): when `session.artifactRoot` is
+// configured INSIDE the managed worktree (the supported issue #629 setup),
+// the success path must NOT free (remove) the worktree — `removeWorktree`
+// deletes the worktree's entire directory tree, and relocating the run's
+// artifacts to a path outside `artifactRoot` first (an earlier fix here)
+// leaves `artifactDir` pointing outside the session's configured artifact
+// root, which backup-restore validation (`isSafeArtifactDirAfterRun`) and
+// retention both rely on. Skipping the worktree removal keeps `artifactDir`
+// exactly where it always was — still real, still under `artifactRoot`.
+describe('implementation handler — artifact root inside worktree is not freed (issue #732 review, P1)', () => {
+  test('does not remove the worktree when artifactRoot lives inside it, keeping artifactDir under artifactRoot', async () => {
+    const worktreePath = join(tmpDir, 'wt-inplace');
+    mkdirSync(worktreePath, { recursive: true });
+    const inWorktreeArtifactRoot = join(worktreePath, '.n8n-artifacts');
+    const session = SESSION({ artifactRoot: inWorktreeArtifactRoot });
+    const resolver = fakeWorktreeResolver(worktreePath);
+    const runner = worktreeHappyRunner();
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('success');
+    // `git worktree remove` was never invoked for this run.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
+    // The worktree itself, and the artifacts inside it, are still present.
+    expect(existsSync(worktreePath)).toBe(true);
+    // The returned artifactDir was never relocated — it stays under the
+    // session-configured artifactRoot.
+    expect(result.context.artifactDir).toBe(join(inWorktreeArtifactRoot, 'runs', 'run-impl-1'));
+    expect(existsSync(result.context.artifactDir)).toBe(true);
+    expect(existsSync(join(result.context.artifactDir, 'implementation-output.md'))).toBe(true);
+    const resultJson = JSON.parse(
+      readFileSync(join(result.context.artifactDir, 'implementation-result.json'), 'utf8'),
+    );
+    expect(resultJson).toMatchObject({ success: true, artifactDir: result.context.artifactDir });
+  });
+
+  test('does not fail closed when artifactRoot lives inside the worktree (issue #729: review is worktree-only)', async () => {
+    const worktreePath = join(tmpDir, 'wt-inplace-disabled');
+    mkdirSync(worktreePath, { recursive: true });
+    const inWorktreeArtifactRoot = join(worktreePath, '.n8n-artifacts');
+    const session = SESSION({ artifactRoot: inWorktreeArtifactRoot });
+    const resolver = fakeWorktreeResolver(worktreePath);
+    const runner = worktreeHappyRunner();
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    // Review always materializes its own worktree now (issue #729), so retaining
+    // this worktree for review to reuse is safe.
+    expect(result.result).toBe('success');
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
+    expect(existsSync(worktreePath)).toBe(true);
+    const resultJson = JSON.parse(
+      readFileSync(join(inWorktreeArtifactRoot, 'runs', 'run-impl-1', 'implementation-result.json'), 'utf8'),
+    );
+    expect(resultJson).toMatchObject({ success: true, artifactDir: result.context.artifactDir });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Command execution
 // ---------------------------------------------------------------------------
 
 describe('implementation handler — command execution', () => {
-  // Claude is now calls[5]: status(0) checkout-main(1) pull(2) rev-parse(3) checkout-b(4) claude(5) ...
-  const CLAUDE_IDX = 5;
+  // Claude is now calls[3]: fetch-base(0) status-canonical(1) status-worktree(2) claude(3) ...
+  // (issue #732: worktree materialization is unconditional, so there is no
+  // separate checkout/pull/rev-parse/checkout-b sequence before the agent runs).
+  const CLAUDE_IDX = 3;
 
   test('passes prompt via stdin, not as a positional argv arg', async () => {
     const runner = happyRunner();
@@ -349,12 +448,21 @@ describe('implementation handler — command execution', () => {
     expect(claudeCall.args).not.toContain(claudeCall.opts.stdin);
   });
 
-  test('uses session.repoRoot as cwd for all commands', async () => {
+  // Issue #732: worktree materialization is unconditional, so only the
+  // canonical-repo-scoped commands (the base fetch, the canonical dirty-tree
+  // preflight, the `gh pr create` — issued through the repo-host provider
+  // constructed against `canonicalRoot` before materialization — and the final
+  // branch-freeing `git worktree remove`) run with `cwd === repoRoot`; every
+  // other working-tree command (claude, diff, verification, staging, commit,
+  // push) runs inside the per-issue worktree instead.
+  test('uses canonicalRoot as cwd for canonical-repo commands and the worktree cwd for worktree commands', async () => {
     const runner = happyRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    for (const call of runner.calls) {
-      expect(call.opts.cwd).toBe(repoRoot);
-    }
+    const canonicalIdx = new Set([0, 1, 10, 11]);
+    const wt = defaultWorktreePath();
+    runner.calls.forEach((call, i) => {
+      expect(call.opts.cwd).toBe(canonicalIdx.has(i) ? repoRoot : wt);
+    });
   });
 
   test('invokes "claude" for claude agent with -p flag', async () => {
@@ -445,24 +553,70 @@ describe('implementation handler — command execution', () => {
     expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('5');
   });
 
-  test('complexity:xhigh label -> opus / xhigh / $20', async () => {
+  test('complexity:xhigh label -> fable / high / $20 (not opus / xhigh)', async () => {
     const runner = happyRunner();
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:claude', 'status:needs-implementation', 'complexity:xhigh'] } });
     await createImplementationHandler(CONTEXT(), runner)(task);
     const { args } = runner.calls[CLAUDE_IDX];
-    expect(args[args.indexOf('--model') + 1]).toBe('opus');
-    expect(args[args.indexOf('--effort') + 1]).toBe('xhigh');
+    expect(args[args.indexOf('--model') + 1]).toBe('fable');
+    expect(args[args.indexOf('--effort') + 1]).toBe('high');
     expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('20');
+    // Explicitly reject the pre-#748 Opus 5 / xhigh invocation.
+    expect(args[args.indexOf('--model') + 1]).not.toBe('opus');
+    expect(args[args.indexOf('--effort') + 1]).not.toBe('xhigh');
   });
 
-  test('complexity:xhigh beats complexity:high (xhigh > high)', async () => {
+  test('complexity:xhigh beats complexity:high (xhigh > high) -> still fable / high', async () => {
     const runner = happyRunner();
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:claude', 'status:needs-implementation', 'complexity:high', 'complexity:xhigh'] } });
     await createImplementationHandler(CONTEXT(), runner)(task);
     const { args } = runner.calls[CLAUDE_IDX];
-    expect(args[args.indexOf('--model') + 1]).toBe('opus');
-    expect(args[args.indexOf('--effort') + 1]).toBe('xhigh');
+    expect(args[args.indexOf('--model') + 1]).toBe('fable');
+    expect(args[args.indexOf('--effort') + 1]).toBe('high');
     expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('20');
+  });
+
+  test('session claude.complexityProfiles override retargets the xhigh model', async () => {
+    const runner = happyRunner();
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:claude', 'status:needs-implementation', 'complexity:xhigh'] } });
+    const context = CONTEXT({ session: SESSION({ claude: { complexityProfiles: { xhigh: { model: 'claude-fable-5' } } } }) });
+    await createImplementationHandler(context, runner)(task);
+    const { args } = runner.calls[CLAUDE_IDX];
+    expect(args[args.indexOf('--model') + 1]).toBe('claude-fable-5');
+    expect(args[args.indexOf('--effort') + 1]).toBe('high');
+    expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('20');
+  });
+
+  test('Claude CLI rejecting an unavailable/unauthenticated Fable 5 model fails closed with the CLI error and no fallback', async () => {
+    const wt = defaultWorktreePath();
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },  // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },  // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },  // git status --porcelain (worktree — CLEAN preflight)
+      {
+        stdout: '',
+        stderr: 'Error: model "fable" is not available for this account. Run `claude setup-token` to authenticate.',
+        exitCode: 1,
+      },                                         // claude — rejects the model, no files touched
+      { stdout: '\0', stderr: '', exitCode: 0 }, // git status --porcelain -z --untracked-files=all (post-exit capture — clean)
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:claude', 'status:needs-implementation', 'complexity:xhigh'] } });
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(task);
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/model "fable" is not available/);
+    expect(result.error).toMatch(/setup-token/);
+    // Fail closed: exactly one claude invocation targeting fable — no silent
+    // fallback to opus or any other model.
+    const claudeCalls = runner.calls.filter((c) => c.cmd === 'claude');
+    expect(claudeCalls).toHaveLength(1);
+    const { args } = claudeCalls[0];
+    expect(args[args.indexOf('--model') + 1]).toBe('fable');
   });
 
   test('env vars override complexity label defaults', async () => {
@@ -513,7 +667,7 @@ describe('implementation handler — command execution', () => {
     expect(args[args.indexOf('--effort') + 1]).toBe('high');
   });
 
-  test('escalatedEffort never downgrades complexity:xhigh to high', async () => {
+  test('escalatedEffort is a no-op on complexity:xhigh (already resolves to high)', async () => {
     const runner = happyRunner();
     const task = makeTask({
       context: {
@@ -524,60 +678,53 @@ describe('implementation handler — command execution', () => {
     });
     await createImplementationHandler(CONTEXT(), runner)(task);
     const { args } = runner.calls[CLAUDE_IDX];
-    // xhigh outranks the 'high' escalation target — escalation must not downgrade it
-    expect(args[args.indexOf('--effort') + 1]).toBe('xhigh');
+    // complexity:xhigh now resolves to 'high' effort (Fable 5), same as the
+    // escalation target — no rank change, so effort stays 'high'.
+    expect(args[args.indexOf('--effort') + 1]).toBe('high');
+    expect(args[args.indexOf('--model') + 1]).toBe('fable');
   });
 
-  test('preflight order: status -> checkout main -> pull -> rev-parse HEAD -> checkout -b -> claude -> diff -> verification -> ls-files -> add -> commit -> push -> gh', async () => {
+  test('preflight order: fetch base -> status (canonical) -> status (worktree) -> claude -> diff -> verification -> ls-files -> add -> commit -> push -> gh -> worktree remove', async () => {
     const runner = happyRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeTask());
     const calls = runner.calls;
-    expect(calls[0]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
-    expect(calls[1]).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
-    expect(calls[2]).toMatchObject({ cmd: 'git', args: ['pull', '--ff-only'] });
-    expect(calls[3]).toMatchObject({ cmd: 'git', args: ['rev-parse', '--abbrev-ref', 'HEAD'] });  // verify HEAD is at base
-    expect(calls[4]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['checkout', '-b']) });
-    expect(calls[5].cmd).toBe('claude');   // claude runs AFTER branch is created
-    expect(calls[6]).toMatchObject({ cmd: 'git', args: ['diff', '--stat', 'HEAD'] });
-    expect(calls[7]).toMatchObject({ cmd: 'npm', args: ['test'] });  // verification runs before staging
-    expect(calls[8]).toMatchObject({ cmd: 'git', args: ['ls-files', '--modified', '--deleted', '--others', '--exclude-standard', '-z'] });
-    expect(calls[9]).toMatchObject({ cmd: 'git', args: ['add', '--', 'src/foo.ts'] });
-    expect(calls[10]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['commit']) });
-    expect(calls[11]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['push']) });
-    expect(calls[12].cmd).toBe('gh');
+    expect(calls[0]).toMatchObject({ cmd: 'git', args: ['fetch', 'origin', '+main:refs/remotes/origin/main'] });
+    expect(calls[1]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
+    expect(calls[2]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
+    expect(calls[3].cmd).toBe('claude');   // claude runs inside the already-materialized worktree
+    expect(calls[4]).toMatchObject({ cmd: 'git', args: ['diff', '--stat', 'HEAD'] });
+    expect(calls[5]).toMatchObject({ cmd: 'npm', args: ['test'] });  // verification runs before staging
+    expect(calls[6]).toMatchObject({ cmd: 'git', args: ['ls-files', '--modified', '--deleted', '--others', '--exclude-standard', '-z'] });
+    expect(calls[7]).toMatchObject({ cmd: 'git', args: ['add', '--', 'src/foo.ts'] });
+    expect(calls[8]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['commit']) });
+    expect(calls[9]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['push']) });
+    expect(calls[10].cmd).toBe('gh');
+    expect(calls[11]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['worktree', 'remove']) });
   });
 
-  test('new-impl branch is created explicitly from the base branch', async () => {
-    const runner = happyRunner();
-    await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    expect(runner.calls[4]).toMatchObject({ cmd: 'git', args: ['checkout', '-b', 'ai/issue-77', 'main'] });
-  });
-
-  test('aborts before branch creation when HEAD is not at the base branch after checkout/pull', async () => {
-    const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                 // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                 // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                 // git pull --ff-only
-      { stdout: 'ai/issue-202', stderr: '', exitCode: 0 },     // rev-parse — wrong branch!
-    ]);
-    const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    expect(r.result).toBe('failed');
-    expect(r.error).toMatch(/Expected HEAD to be on base branch 'main'/);
-    expect(r.error).toMatch(/ai\/issue-202/);
-    // Must NOT have created a branch
-    expect(runner.calls.some((c) => c.args.includes('-b'))).toBe(false);
+  // Issue #732: branch creation is now entirely owned by the (stubbed)
+  // `resolveWorktree` call — the handler itself never runs an explicit `git
+  // checkout -b`.
+  test('new-impl worktree is resolved for the conventional issue branch from the base branch', async () => {
+    const worktreePath = defaultWorktreePath();
+    const resolver = fakeWorktreeResolver(worktreePath);
+    const runner = worktreeHappyRunner();
+    await createImplementationHandler(CONTEXT(), runner, undefined, resolver.resolve)(makeTask());
+    expect(resolver.calls).toHaveLength(1);
+    expect(resolver.calls[0]).toMatchObject({ issueNumber: 77, branch: 'ai/issue-77', baseRef: 'origin/main' });
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('-b'))).toBe(false);
   });
 
   test('uses session.baseBranch when set instead of main', async () => {
     const runner = happyRunner(undefined, undefined, 'develop');
     await createImplementationHandler(CONTEXT({ session: SESSION({ baseBranch: 'develop' }) }), runner)(makeTask());
-    expect(runner.calls[1]).toMatchObject({ cmd: 'git', args: ['checkout', 'develop'] });
+    expect(runner.calls[0]).toMatchObject({ cmd: 'git', args: ['fetch', 'origin', '+develop:refs/remotes/origin/develop'] });
   });
 
   test('defaults to main when session.baseBranch is not set', async () => {
     const runner = happyRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    expect(runner.calls[1]).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
+    expect(runner.calls[0]).toMatchObject({ cmd: 'git', args: ['fetch', 'origin', '+main:refs/remotes/origin/main'] });
   });
 
   test('gh pr create includes --base with session.baseBranch', async () => {
@@ -617,9 +764,14 @@ describe('implementation handler — command execution', () => {
     expect(title).toContain('77');
   });
 
-  test('git add uses explicit paths and excludes artifact dir when artifactRoot is inside repoRoot', async () => {
-    const inRepoArtifactRoot = join(repoRoot, '.n8n-artifacts');
-    const session = SESSION({ artifactRoot: inRepoArtifactRoot });
+  // Issue #732: the artifact-exclusion check is relative to `cwd` (the
+  // worktree), not `repoRoot` — an artifact root configured "inside repoRoot"
+  // is no longer "inside cwd" once every working-tree command runs in a
+  // separate per-issue worktree. To exercise the exclusion, the artifact root
+  // must live inside the (stubbed) WORKTREE path instead.
+  test('git add uses explicit paths and excludes artifact dir when artifactRoot is inside the worktree', async () => {
+    const inWorktreeArtifactRoot = join(defaultWorktreePath(), '.n8n-artifacts');
+    const session = SESSION({ artifactRoot: inWorktreeArtifactRoot });
     const runner = happyRunner('https://github.com/m2dw/test-repo/pull/99', 'src/foo.ts\0.n8n-artifacts/runs/1/output.md\0');
     await createImplementationHandler(CONTEXT({ session }), runner)(makeTask());
     const addCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'add');
@@ -627,8 +779,8 @@ describe('implementation handler — command execution', () => {
     expect(addCall.args).toEqual(['add', '--', 'src/foo.ts']);
   });
 
-  test('git add uses explicit paths when artifactRoot is outside repoRoot', async () => {
-    // Default SESSION has artifactRoot = join(tmpDir, 'artifacts'), outside repoRoot
+  test('git add uses explicit paths when artifactRoot is outside both repoRoot and the worktree', async () => {
+    // Default SESSION has artifactRoot = join(tmpDir, 'artifacts'), outside both.
     const runner = happyRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeTask());
     const addCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'add');
@@ -657,7 +809,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     const wt = worktreePath();
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -699,7 +851,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     const wt = worktreePath();
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true, root: '/abs/worktrees' } });
+    const session = SESSION({ worktrees: { root: '/abs/worktrees' } });
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -719,7 +871,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     const wt = worktreePath();
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -749,7 +901,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: ' M README.md', stderr: '', exitCode: 0 },  // git status --porcelain (canonical — DIRTY)
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -774,7 +926,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status --porcelain (DIRTY) — in the worktree
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -788,7 +940,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
 
   test('a worktree resolution failure fails the phase without running the agent', async () => {
     const runner = worktreeHappyRunner();
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const failingResolver = () => ({ ok: false, error: 'branch ai/issue-77 diverged from origin' });
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, failingResolver,
@@ -798,36 +950,26 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     expect(result.error).toMatch(/Failed to prepare issue #77 worktree/);
     expect(result.error).toMatch(/diverged from origin/);
     expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
+    // Issue #732 review, P2: the artifact dir is not created until AFTER
+    // materialization succeeds, so this pre-mkdir failure must mark it pending —
+    // otherwise SQLite restore-artifact validation treats the never-created path
+    // as required and missing.
+    expect(result.context?.artifactDirPending).toBe(true);
   });
 
-  test('worktrees disabled keeps the shared canonical checkout and never resolves a worktree', async () => {
-    const runner = happyRunner();
-    const resolver = fakeWorktreeResolver(worktreePath());
-    // No worktrees block at all (default SESSION) -> shared checkout behavior.
+  test('worktree materialization happens even with no worktrees config block at all', async () => {
+    const wt = worktreePath();
+    const runner = worktreeHappyRunner();
+    const resolver = fakeWorktreeResolver(wt);
+    // No worktrees block at all (default SESSION) -> materialization is still
+    // unconditional; there is no shared-checkout fallback left to select (issue #732).
     const result = await createImplementationHandler(
       CONTEXT(), runner, undefined, resolver.resolve,
     )(makeTask());
 
     expect(result.result).toBe('success');
-    expect(resolver.calls).toHaveLength(0);
-    // Shared-checkout choreography is intact and runs in the canonical checkout.
-    expect(runner.calls[1]).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
-    for (const call of runner.calls) {
-      expect(call.opts.cwd).toBe(repoRoot);
-    }
-  });
-
-  test('worktrees enabled: false keeps the shared canonical checkout', async () => {
-    const runner = happyRunner();
-    const resolver = fakeWorktreeResolver(worktreePath());
-    const session = SESSION({ worktrees: { enabled: false } });
-    const result = await createImplementationHandler(
-      CONTEXT({ session }), runner, undefined, resolver.resolve,
-    )(makeTask());
-
-    expect(result.result).toBe('success');
-    expect(resolver.calls).toHaveLength(0);
-    expect(runner.calls[1]).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
+    expect(resolver.calls).toHaveLength(1);
+    expect(runner.calls.find((c) => c.cmd === 'claude').opts.cwd).toBe(wt);
   });
 
   // Issue #454 review (P1): a worktree-originated implementation leaves
@@ -862,7 +1004,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove --force --force <wt> (free branch) — canonical repo
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -919,6 +1061,61 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     expect(runner.calls.find((c) => c.cmd === 'claude').opts.cwd).toBe(wt);
   });
 
+  // Issue #667 review (P1): a needs_fix followup never re-resolves a dependency
+  // plan (Step 0.5 only runs for a new, non-fix implementation), so `depBase` is
+  // always undefined here. Before this fix, the success path wrote
+  // `dependencyBase: depBase` unconditionally and erased the predecessor head
+  // recorded by the ORIGINAL dependency-started implementation, so the next
+  // review would fall back to the session base and re-review the predecessor's
+  // unmerged commits as part of this issue's PR.
+  test('fix mode on a dependency-started PR preserves the recorded dependencyBase (issue #667 review, P1)', async () => {
+    const wt = worktreePath();
+    const recordedDependencyBase = {
+      baseIssueNumber: 50,
+      basePrNumber: 55,
+      baseHeadRefName: 'ai/issue-50',
+      basePrUrl: 'https://github.com/m2dw/test-repo/pull/55',
+      baseHeadSha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+    };
+    const runner = sequenceRunner([
+      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },              // gh pr list (early fix-mode PR lookup)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },             // git rev-parse --verify refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (clean) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                        // git pull origin ai/issue-77 --ff-only — worktree
+      { stdout: 'Applied review feedback.', stderr: '', exitCode: 0 },// claude
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },          // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                    // verification (npm test)
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },            // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                        // git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                        // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                        // git push
+      { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove --force --force <wt> (free branch) — canonical repo
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+    const task = makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        labels: ['agent:claude', 'status:needs-fix'],
+        reviewFeedback: 'Please add a unit test for the limiter.',
+        dependencyBase: recordedDependencyBase,
+      },
+    });
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(task);
+
+    expect(result.result).toBe('success');
+    expect(result.context?.dependencyBase).toEqual(recordedDependencyBase);
+    const patched = applyTaskPatch(task, { context: result.context });
+    expect(patched.context.dependencyBase).toEqual(recordedDependencyBase);
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-result.json'), 'utf8'),
+    );
+    expect(artifact.dependencyBase).toEqual(recordedDependencyBase);
+  });
+
   test('a dirty issue worktree still blocks a fix-mode followup', async () => {
     const wt = worktreePath();
     const runner = sequenceRunner([
@@ -928,7 +1125,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },  // git status --porcelain (DIRTY) — worktree
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -978,7 +1175,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove --force --force <wt> (free branch) — canonical repo
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1014,7 +1211,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: 'fatal: couldn\'t find remote ref', exitCode: 1 }, // git fetch origin ai/issue-77:... — FAILS
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1031,6 +1228,8 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     // Failing before materializing leaves the worktree untouched — no resolver call,
     // no working-tree side effects.
     expect(resolver.calls).toHaveLength(0);
+    // Issue #732 review, P2: this exits before the artifact dir is created.
+    expect(result.context?.artifactDirPending).toBe(true);
   });
 
   // Issue #455: a fix followup on a NON-CONVENTIONAL PR head (an externally-created
@@ -1066,7 +1265,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove --force --force <wt> — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1133,7 +1332,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: closedPrView, stderr: '', exitCode: 0 },             // gh pr view <pr#> (recorded PR) — found, but CLOSED
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1180,7 +1379,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove --force --force <wt> — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1227,7 +1426,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: forkedPrView, stderr: '', exitCode: 0 },             // gh pr view 44 (recorded forked PR) — found, open
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1283,7 +1482,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove --force --force <wt> — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1312,7 +1511,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     const wt = worktreePath();
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1327,7 +1526,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: 'fatal: unable to access origin', exitCode: 1 }, // git fetch origin main:refs/remotes/origin/main — fails
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1337,6 +1536,8 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     // Fail closed before materializing the worktree or running the agent.
     expect(resolver.calls).toHaveLength(0);
     expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
+    // Issue #732 review, P2: this exits before the artifact dir is created.
+    expect(result.context?.artifactDirPending).toBe(true);
   });
 
   // Issue #454 review (P1): a quota/rate-limit delay in worktree mode must NOT reach
@@ -1356,12 +1557,14 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                     // git clean -fd
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
 
     expect(result.result).toBe('delayed');
+    // Category and retry metadata survive onto the handler result (issue #672).
+    expect(result.category).toBe('rate_limit');
     // Worktree-native reset, not a base checkout, and the durable branch is kept.
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'reset' && c.args.includes('--hard'))).toBe(true);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('-f'))).toBe(false);
@@ -1399,7 +1602,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                      // git worktree remove --force --force <wt> (free branch) — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1444,7 +1647,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     // created: true (worktree PATH recreated after prune) BUT branchReused: true (the
     // empty ai/issue-77 branch survived the prune and was checked back out).
     const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: true });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1480,7 +1683,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                      // git worktree remove --force --force <wt> (free branch) — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1498,7 +1701,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     const wt = worktreePath();
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt); // created: true (fresh)
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1530,7 +1733,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                     // git push origin ai/issue-77
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1584,7 +1787,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                        // git push origin feature/custom
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1636,7 +1839,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                      // 16 git worktree remove --force --force <wt> (free branch) — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1704,7 +1907,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                      // 18 git worktree remove --force --force <wt> (free branch) — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1747,7 +1950,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: 'fatal: couldn\'t find remote ref', exitCode: 1 }, // git fetch origin ai/issue-77:refs/... — fails
     ]);
     const resolver = fakeWorktreeResolver(worktreePath());
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1794,7 +1997,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: '', exitCode: 0 },                      // 17 git worktree remove --force --force <wt> (free branch) — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         title: 'Add login rate limiting',
@@ -1851,7 +2054,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
       { stdout: '', stderr: 'fatal: cannot remove a locked working tree', exitCode: 1 }, // git worktree remove — FAILS
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1872,7 +2075,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
     const wt = worktreePath();
     const runner = worktreeHappyRunner();
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -1895,6 +2098,7 @@ describe('implementation handler — per-issue worktree execution (issue #454)',
 describe('implementation handler — per-issue worktree branch-start parity (issue #455)', () => {
   const worktreePath = () => join(tmpDir, 'wt', 'addon-dev', 'issue-77', 'repo');
   const BLOCKER_HEAD = 'ai/issue-50';
+  const BLOCKER_HEAD_SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
   const BLOCKER_PR_URL = 'https://github.com/m2dw/test-repo/pull/55';
   const BLOCKER_PR = {
     number: 55, url: BLOCKER_PR_URL, headRefName: BLOCKER_HEAD,
@@ -1915,6 +2119,7 @@ describe('implementation handler — per-issue worktree branch-start parity (iss
       { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check — first)
       { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
       { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:refs/remotes/origin/ai/issue-50 — canonical (blocker start point)
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
       { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — CLEAN)
       { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (clean) — worktree
       { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },              // claude
@@ -1928,7 +2133,7 @@ describe('implementation handler — per-issue worktree branch-start parity (iss
       { stdout: '', stderr: '', exitCode: 0 },                                  // git worktree remove --force --force <wt> — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, oneOpenBlockerDepChecker, resolver.resolve,
     )(makeTask());
@@ -1980,10 +2185,12 @@ describe('implementation handler — per-issue worktree branch-start parity (iss
       { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
       { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
       { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
       { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — CLEAN)
       { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (clean) — worktree
       { stdout: '0', stderr: '', exitCode: 0 },                                 // git rev-list --count --right-only --cherry-pick origin/ai/issue-50...ai/issue-77 (empty)
       { stdout: '', stderr: '', exitCode: 0 },                                  // git reset --hard origin/ai/issue-50 (worktree)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD (reused-worktree ancestry check, issue #667 review P1)
       { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },              // claude
       { stdout: '2 files changed', stderr: '', exitCode: 0 },                   // git diff --stat HEAD
       { stdout: 'PASS', stderr: '', exitCode: 0 },                              // verification
@@ -1995,7 +2202,7 @@ describe('implementation handler — per-issue worktree branch-start parity (iss
       { stdout: '', stderr: '', exitCode: 0 },                                  // git worktree remove --force --force <wt> — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, oneOpenBlockerDepChecker, resolver.resolve,
     )(makeTask());
@@ -2028,12 +2235,14 @@ describe('implementation handler — per-issue worktree branch-start parity (iss
       { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
       { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
       { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... (force-updating refspec) — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
       { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — CLEAN)
       { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (clean) — worktree
       // The placeholder still holds the OLD blocker commits, but they are patch-equivalent
       // to the rebased blocker head, so the cherry-pick probe reports 0 issue commits.
       { stdout: '0', stderr: '', exitCode: 0 },                                 // git rev-list --count --right-only --cherry-pick origin/ai/issue-50...ai/issue-77
       { stdout: '', stderr: '', exitCode: 0 },                                  // git reset --hard origin/ai/issue-50 (worktree)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD (reused-worktree ancestry check, issue #667 review P1)
       { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },              // claude
       { stdout: '2 files changed', stderr: '', exitCode: 0 },                   // git diff --stat HEAD
       { stdout: 'PASS', stderr: '', exitCode: 0 },                              // verification
@@ -2045,7 +2254,7 @@ describe('implementation handler — per-issue worktree branch-start parity (iss
       { stdout: '', stderr: '', exitCode: 0 },                                  // git worktree remove --force --force <wt> — canonical
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, oneOpenBlockerDepChecker, resolver.resolve,
     )(makeTask());
@@ -2061,6 +2270,118 @@ describe('implementation handler — per-issue worktree branch-start parity (iss
     const reset = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'reset');
     expect(reset.args).toEqual(['reset', '--hard', `origin/${BLOCKER_HEAD}`]);
     expect(reset.opts.cwd).toBe(wt);
+  });
+
+  // Issue #667 review (P1): a reused worktree branch that already carries real
+  // (non-empty) issue-specific commits is NOT reset by the delayed-retry
+  // empty-placeholder refresh above — that refresh only fires for a true empty
+  // placeholder. resolveWorktree ignores `worktreeBaseRef` for a branch that
+  // already exists, so the SHA captured while fetching the CURRENT blocker head
+  // in Step 0.6 does not necessarily describe this branch's real start point:
+  // if the blocker has since advanced (or been force-pushed) past what this
+  // branch was actually built on, the branch's history will not contain it.
+  // Trusting that SHA anyway would let review's later ancestry check fail only
+  // AFTER the agent has already run and pushed more commits. The fix validates
+  // ancestry before the agent runs and fails closed instead.
+  test('reused stacked worktree branch with real commits fails closed when the blocker head is not an ancestor', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (clean) — worktree
+      // Non-zero: the branch already carries real issue-specific work, so the
+      // empty-placeholder reset above is skipped entirely.
+      { stdout: '3', stderr: '', exitCode: 0 },                                 // git rev-list --count --right-only --cherry-pick origin/ai/issue-50...ai/issue-77
+      // The freshly-fetched blocker head is NOT an ancestor of this branch's
+      // real (stale) history — the blocker advanced/force-pushed since this
+      // branch was actually built.
+      { stdout: '', stderr: '', exitCode: 1 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD (reused-worktree ancestry check, issue #667 review P1)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: false });
+    const session = SESSION({});
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, oneOpenBlockerDepChecker, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('does not contain the current blocker head');
+    // The agent must never run against unvalidated ancestry.
+    expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
+  });
+
+  // Issue #667 review (P1, follow-up): a worker with NO local `ai/issue-77` but an
+  // existing `origin/ai/issue-77` (e.g. a prior PR head from before the blocker
+  // advanced) has resolveWorktree recover that remote head instead of creating the
+  // branch fresh from the just-fetched blocker head. `branchReused` is false in this
+  // case (no local branch existed to reuse), so the earlier fix — gated on
+  // `worktreeBranchReused` alone — skipped ancestry validation entirely and let the
+  // agent commit/push onto a branch that does not contain the current blocker head,
+  // only failing later in review. This must be validated BEFORE the agent runs, same
+  // as the reused-local-branch case above.
+  test('remote-recovered stacked worktree branch fails closed when the blocker head is not an ancestor (issue #667 review, P1 follow-up)', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (clean) — worktree
+      // No local branch existed, so the delayed-retry empty-placeholder probe/reset
+      // never fires and there is no recorded Tool Request resume — the very next git
+      // call is the ancestry check against the recovered branch's actual HEAD.
+      { stdout: '', stderr: '', exitCode: 1 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD — NOT an ancestor
+    ]);
+    // `branchReused: false` (no local branch to reuse) but `startedFromRemoteHead: true`
+    // (resolveWorktree recovered an existing origin/ai/issue-77 PR head).
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false, startedFromRemoteHead: true });
+    const session = SESSION({});
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, oneOpenBlockerDepChecker, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('does not contain the current blocker head');
+    // The agent must never run against unvalidated ancestry.
+    expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
+  });
+
+  test('remote-recovered stacked worktree branch proceeds when the blocker head IS an ancestor', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (clean) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD — IS an ancestor
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },              // claude
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },                   // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                              // verification
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },                      // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git add
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git worktree remove --force --force <wt> — canonical
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: true, branchReused: false, startedFromRemoteHead: true });
+    const session = SESSION({});
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, oneOpenBlockerDepChecker, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('success');
+    expect(runner.calls.some(
+      (c) => c.cmd === 'git' && c.args[0] === 'merge-base' && c.args.includes('--is-ancestor'),
+    )).toBe(true);
+    expect(result.context?.dependencyBase?.baseHeadSha).toBe(BLOCKER_HEAD_SHA);
   });
 });
 
@@ -2108,7 +2429,7 @@ describe('implementation handler — worktree-native cleanup continuation preser
       { stdout: '', stderr: '', exitCode: 0 },                     // git push origin ai/issue-77
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -2136,12 +2457,14 @@ describe('implementation handler — worktree-native cleanup continuation preser
       { stdout: '', stderr: '', exitCode: 0 },                     // git clean -fd
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
 
     expect(result.result).toBe('delayed');
+    // Category and retry metadata survive onto the handler result (issue #672).
+    expect(result.category).toBe('rate_limit');
     // The delayed retry re-queues the SAME implementation run, which re-enters
     // this durable worktree — so the branch-freeing `git worktree remove` must
     // NOT run here, and neither must the shared destructive cleanup ops.
@@ -2170,7 +2493,7 @@ describe('implementation handler — worktree-native cleanup continuation preser
       { stdout: '', stderr: 'gh: could not create pull request', exitCode: 1 }, // gh pr create — FAILS
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -2195,7 +2518,7 @@ describe('implementation handler — worktree-native cleanup continuation preser
 // records a structured dirtyContinuation marker in the returned context so that
 // the next phase attempt can distinguish "dirty from a known prior failure" from
 // "dirty for an unknown reason".  A patch artifact is also written for operator
-// inspection.  The canonical/shared-checkout path must remain unaffected.
+// inspection.  A dirty canonical checkout is always fatal regardless (issue #571).
 // ---------------------------------------------------------------------------
 describe('implementation handler — verification-failure dirty state recording (issue #568)', () => {
   const worktreePath = () => join(tmpDir, 'wt', 'addon-dev', 'issue-77', 'repo');
@@ -2227,7 +2550,7 @@ describe('implementation handler — verification-failure dirty state recording 
       { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+added\n', stderr: '', exitCode: 0 }, // git diff HEAD
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -2261,7 +2584,7 @@ describe('implementation handler — verification-failure dirty state recording 
       { stdout: patchContent, stderr: '', exitCode: 0 },      // git diff HEAD (patch)
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -2282,7 +2605,7 @@ describe('implementation handler — verification-failure dirty state recording 
       { stdout: '', stderr: '', exitCode: 0 }, // git diff HEAD
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -2321,7 +2644,7 @@ describe('implementation handler — verification-failure dirty state recording 
       { stdout: '', stderr: '', exitCode: 0 },                         // git diff HEAD (empty — no tracked changes)
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -2351,7 +2674,7 @@ describe('implementation handler — verification-failure dirty state recording 
       { stdout: '', stderr: '', exitCode: 0 },                           // git diff HEAD (empty)
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
@@ -2362,30 +2685,497 @@ describe('implementation handler — verification-failure dirty state recording 
     expect(patchContent).toContain('diff --git a/src/generated/foo.ts b/src/generated/foo.ts');
     expect(patchContent).toContain('+export const foo = 42;');
   });
+});
 
-  test('dirtyContinuation is absent from context when verification fails in shared-checkout mode', async () => {
-    // Non-worktree (shared checkout) verification failure — existing behavior must be
-    // byte-for-byte unchanged: no extra git calls and no dirtyContinuation in context.
+// ---------------------------------------------------------------------------
+// Dirty continuation on abnormal agent exit (issue #727)
+//
+// Issue #699 exposed a gap: when the implementation agent itself exits nonzero
+// (or is interrupted) after modifying the managed worktree, the handler
+// returned a generic failure WITHOUT recording/refreshing a dirtyContinuation
+// marker. The next attempt then either failed the dirty preflight outright (no
+// marker) or, if a stale marker from an earlier attempt was still recorded,
+// failed the content-drift guard forever. The handler must capture a fresh
+// snapshot of the CURRENT worktree state before returning the agent-exit
+// failure, reusing the same bounded patch-capture contract as the
+// verification-failure path above.
+// ---------------------------------------------------------------------------
+describe('implementation handler — dirty continuation on abnormal agent exit (issue #727)', () => {
+  const worktreePath = () => join(tmpDir, 'wt', 'addon-dev', 'issue-77', 'repo');
+
+  const PRIOR_PATCH = [
+    'diff --git a/src/foo.ts b/src/foo.ts',
+    '--- a/src/foo.ts',
+    '+++ b/src/foo.ts',
+    '@@ -1,3 +1,4 @@',
+    ' export function foo() {',
+    '+  // prior unfinished edit',
+    '   return 42;',
+    ' }',
+    '',
+  ].join('\n');
+
+  function makeDirtyTask(dirtyCtxOverrides = {}) {
+    return makeTask({
+      context: {
+        ...makeTask().context,
+        dirtyContinuation: {
+          issueNumber: 77,
+          phase: 'implementation',
+          runId: 'run-prev-1',
+          branch: 'ai/issue-77',
+          worktreeId: 'addon-dev/issue-77',
+          agentExitCode: 1,
+          dirtyFiles: ['src/foo.ts'],
+          patchArtifactFile: 'implementation-dirty-patch.patch',
+          timestamp: '2026-01-01T00:00:00.000Z',
+          commitSkipped: true,
+          ...dirtyCtxOverrides,
+        },
+      },
+    });
+  }
+
+  test('clean worktree: agent edits files then exits nonzero records a dirtyContinuation marker and patch', async () => {
+    const wt = worktreePath();
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },          // git rev-parse HEAD
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout -b
-      { stdout: 'done', stderr: '', exitCode: 0 },          // claude
-      { stdout: '1 file changed', stderr: '', exitCode: 0 }, // git diff --stat HEAD
-      { stdout: 'FAIL', stderr: '', exitCode: 1 },          // npm test (first verification fails)
-      { stdout: 'repair', stderr: '', exitCode: 0 },        // repair claude
-      { stdout: 'FAIL', stderr: '', exitCode: 1 },          // npm test (second verification fails)
+      { stdout: '', stderr: '', exitCode: 0 },                          // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                          // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                          // git status --porcelain (worktree — CLEAN preflight)
+      { stdout: '', stderr: 'claude crashed mid-run', exitCode: 1 },    // claude — edited files, then exited nonzero
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },           // git status --porcelain -z --untracked-files=all (post-exit capture)
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+added\n', stderr: '', exitCode: 0 }, // git diff HEAD (patch)
     ]);
-    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/claude crashed mid-run/);
+    expect(result.context?.dirtyContinuation).toMatchObject({
+      issueNumber: 77,
+      phase: 'implementation',
+      runId: 'run-impl-1',
+      branch: 'ai/issue-77',
+      worktreeId: 'addon-dev/issue-77',
+      agentExitCode: 1,
+      commitSkipped: true,
+    });
+    expect(result.context.dirtyContinuation.dirtyFiles).toContain('src/foo.ts');
+    expect(result.context.dirtyContinuation.patchArtifactFile).toBe('implementation-dirty-patch.patch');
+    expect(typeof result.context.dirtyContinuation.timestamp).toBe('string');
+
+    const patchPath = join(artifactRoot, 'runs', 'run-impl-1', 'implementation-dirty-patch.patch');
+    expect(existsSync(patchPath)).toBe(true);
+    expect(readFileSync(patchPath, 'utf8')).toContain('+added');
+  });
+
+  test('initial preflight ignores artifact-root-only dirt and lets the run proceed (issue #727 review)', async () => {
+    // When `session.artifactRoot` lives inside the worktree and is not
+    // gitignored, a prior run's own artifact files are the only dirt left
+    // behind after a nonzero agent exit with no source changes (the
+    // `captureDirtyContinuationOnAgentExit` path correctly records no
+    // marker for that case). Before this fix, the NEXT attempt's initial
+    // `git status --porcelain` preflight was unfiltered and rejected those
+    // artifact files as unrelated changes before ever reaching claude.
+    const wt = worktreePath();
+    const inWorktreeArtifactRoot = join(wt, '.n8n-artifacts');
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                     // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                     // git status --porcelain (canonical — CLEAN)
+      { stdout: '?? .n8n-artifacts/runs/run-prev-1/implementation-output.md\n', stderr: '', exitCode: 0 }, // git status --porcelain (worktree — artifact-only dirt)
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 }, // claude — preflight let the run proceed
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },       // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                 // verification (npm test)
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },         // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                     // git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                     // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                     // git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                     // git worktree remove --force --force <wt> (canonical)
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({ artifactRoot: inWorktreeArtifactRoot });
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('success');
+    expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(true);
+  });
+
+  test('untracked binary file left after abnormal agent exit fails closed instead of recording an unverifiable marker', async () => {
+    // A marker built from a placeholder patch (name + size only) is rejected by
+    // the recovery-time drift check the next attempt runs (see the #571 "skipped
+    // untracked binary file" test above), so recording one here would only
+    // guarantee the next retry fails on drift — the exit capture must refuse to
+    // record it at all and surface manual-recovery guidance instead (issue #727 review).
+    const wt = worktreePath();
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, 'artifact.bin'), Buffer.from([0x00, 0x01, 0x02, 0xff]));
+
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                       // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (worktree — CLEAN preflight)
+      { stdout: '', stderr: 'claude crashed mid-run', exitCode: 1 }, // claude — created an untracked binary, then exited nonzero
+      { stdout: '?? artifact.bin\0', stderr: '', exitCode: 0 },      // git status -z (post-exit capture)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git diff HEAD (tracked diff — empty; only the untracked file changed)
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/claude crashed mid-run/);
+    expect(result.error).toMatch(/cannot be content-verified/);
+    expect(result.error).toMatch(/Manually inspect/);
+    expect(result.context?.dirtyContinuation).toBeUndefined();
+    expect(existsSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-dirty-patch.patch'))).toBe(false);
+  });
+
+  test('a nonzero agent exit with no file changes does not create a misleading marker', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                       // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (worktree — CLEAN preflight)
+      { stdout: '', stderr: 'claude: auth error', exitCode: 1 },     // claude — exits nonzero, no edits made
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain -z --untracked-files=all (post-exit — still clean)
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
     expect(result.result).toBe('failed');
     expect(result.context?.dirtyContinuation).toBeUndefined();
-    // No git status or diff HEAD called beyond the initial preflight
-    const statusCalls = runner.calls.filter(
-      (c) => c.cmd === 'git' && c.args[0] === 'status' && c.args.includes('--porcelain'),
+  });
+
+  test('failure to inspect post-exit worktree state fails closed with operator guidance and clears any stale marker', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                       // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (worktree — CLEAN preflight)
+      { stdout: '', stderr: 'claude crashed', exitCode: 1 },         // claude — exits nonzero
+      { stdout: '', stderr: 'fatal: git error', exitCode: 128 },     // git status -z --untracked-files=all FAILS
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/claude crashed/);
+    expect(result.error).toMatch(/failed to capture/i);
+    expect(result.error).toMatch(/Manually inspect/);
+    // No marker is trusted when the current state could not itself be verified.
+    expect(result.context?.dirtyContinuation).toBeUndefined();
+  });
+
+  test('agent exit diagnostics (exit code, artifactDir, resolvedProfile) remain available alongside the marker', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'claude crashed mid-run', exitCode: 7 },
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+added\n', stderr: '', exitCode: 0 },
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(result.error).toMatch(/exited 7/);
+    expect(result.context?.artifactDir).toBe(join(artifactRoot, 'runs', 'run-impl-1'));
+    expect(result.context?.resolvedProfile).toMatchObject({ phase: 'implementation', agentId: 'claude' });
+    expect(result.context?.dirtyContinuation).toMatchObject({ agentExitCode: 7 });
+  });
+
+  test('a run continuing from a valid dirtyContinuation that exits nonzero refreshes the marker to the new content', async () => {
+    const wt = worktreePath();
+    // Prior run's patch artifact, referenced by the incoming dirtyContinuation marker.
+    const priorDir = join(artifactRoot, 'runs', 'run-prev-1');
+    mkdirSync(priorDir, { recursive: true });
+    writeFileSync(join(priorDir, 'implementation-dirty-patch.patch'), PRIOR_PATCH, 'utf8');
+
+    const NEW_PATCH = 'diff --git a/src/foo.ts b/src/foo.ts\n+  // further unfinished edit\n';
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                                    // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                    // git status --porcelain (canonical — CLEAN)
+      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },                       // git status --porcelain (worktree DIRTY — allowed via continuation)
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },                     // git status -z (file-set drift check — unchanged)
+      { stdout: PRIOR_PATCH, stderr: '', exitCode: 0 },                           // git diff HEAD (content-drift check — matches stored patch)
+      { stdout: '', stderr: 'claude crashed again', exitCode: 1 },                // claude — further edits, then exits nonzero
+      { stdout: ' M src/foo.ts\0 M src/bar.ts\0', stderr: '', exitCode: 0 },      // git status -z (NEW post-exit capture — refreshed)
+      { stdout: NEW_PATCH, stderr: '', exitCode: 0 },                            // git diff HEAD (NEW patch)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: false });
+    const session = SESSION({});
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeDirtyTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/claude crashed again/);
+    // The marker is refreshed to THIS run, not the stale prior one.
+    expect(result.context.dirtyContinuation.runId).toBe('run-impl-1');
+    expect(result.context.dirtyContinuation.dirtyFiles).toEqual(
+      expect.arrayContaining(['src/foo.ts', 'src/bar.ts']),
     );
-    expect(statusCalls).toHaveLength(1);
+
+    const newPatchPath = join(artifactRoot, 'runs', 'run-impl-1', 'implementation-dirty-patch.patch');
+    expect(existsSync(newPatchPath)).toBe(true);
+    expect(readFileSync(newPatchPath, 'utf8')).toBe(NEW_PATCH);
+  });
+
+  test('the following recovery attempt accepts the refreshed snapshot instead of reporting patch drift', async () => {
+    const wt = worktreePath();
+    const priorDir = join(artifactRoot, 'runs', 'run-prev-1');
+    mkdirSync(priorDir, { recursive: true });
+    writeFileSync(join(priorDir, 'implementation-dirty-patch.patch'), PRIOR_PATCH, 'utf8');
+
+    const NEW_PATCH = 'diff --git a/src/foo.ts b/src/foo.ts\n+  // further unfinished edit\n';
+    const firstRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },
+      { stdout: PRIOR_PATCH, stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'claude crashed again', exitCode: 1 },
+      { stdout: ' M src/foo.ts\0 M src/bar.ts\0', stderr: '', exitCode: 0 },
+      { stdout: NEW_PATCH, stderr: '', exitCode: 0 },
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: false });
+    const session = SESSION({});
+
+    const firstResult = await createImplementationHandler(
+      CONTEXT({ session }), firstRunner, undefined, resolver.resolve,
+    )(makeDirtyTask());
+    const refreshedMarker = firstResult.context.dirtyContinuation;
+
+    // Next attempt (a new run) starts from the refreshed marker; the worktree
+    // still holds exactly the content captured above, so the drift checks pass
+    // and the agent is allowed to run again — no "drifted" failure.
+    const secondRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                                    // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                    // git status --porcelain (canonical — CLEAN)
+      { stdout: ' M src/foo.ts\n M src/bar.ts', stderr: '', exitCode: 0 },        // git status --porcelain (worktree DIRTY)
+      { stdout: ' M src/foo.ts\0 M src/bar.ts\0', stderr: '', exitCode: 0 },      // git status -z (file-set drift check — unchanged)
+      { stdout: NEW_PATCH, stderr: '', exitCode: 0 },                            // git diff HEAD (content-drift check — matches refreshed patch)
+      { stdout: 'recovered', stderr: '', exitCode: 0 },                          // claude — runs successfully this time
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },                    // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                               // npm test
+      { stdout: 'src/foo.ts\0src/bar.ts\0', stderr: '', exitCode: 0 },           // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                                    // git add
+      { stdout: '', stderr: '', exitCode: 0 },                                    // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                                    // git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/100', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                    // git worktree remove (canonical)
+    ]);
+    const nextTask = makeTask({
+      context: {
+        ...makeTask().context,
+        dirtyContinuation: refreshedMarker,
+      },
+    });
+    const secondResult = await createImplementationHandler(
+      CONTEXT({ session, runId: 'run-impl-2' }), secondRunner, undefined, resolver.resolve,
+    )(nextTask);
+
+    expect(secondResult.result).toBe('success');
+    expect(secondResult.error).toBeUndefined();
+  });
+
+  test('continuation prompt renders the agent-exit diagnostic instead of assuming a verification failure occurred', async () => {
+    // The marker recorded by captureDirtyContinuationOnAgentExit has no
+    // verificationFailure — the phase runner persists agentExitFailure alongside
+    // it instead. The next attempt's continuation prompt must render THAT
+    // diagnostic rather than unconditionally instructing the agent to "fix the
+    // verification failure described below" with nothing describing one
+    // (issue #727 review).
+    const wt = worktreePath();
+    const priorDir = join(artifactRoot, 'runs', 'run-prev-1');
+    mkdirSync(priorDir, { recursive: true });
+    writeFileSync(join(priorDir, 'implementation-dirty-patch.patch'), PRIOR_PATCH, 'utf8');
+
+    const NEW_PATCH = 'diff --git a/src/foo.ts b/src/foo.ts\n+  // further unfinished edit\n';
+    const firstRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },
+      { stdout: PRIOR_PATCH, stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'claude crashed again', exitCode: 1 },
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },
+      { stdout: NEW_PATCH, stderr: '', exitCode: 0 },
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { created: false });
+    const session = SESSION({});
+
+    const firstResult = await createImplementationHandler(
+      CONTEXT({ session }), firstRunner, undefined, resolver.resolve,
+    )(makeDirtyTask());
+
+    // Simulate the phase runner persisting the returned context patch (the
+    // refreshed dirtyContinuation plus the agentExitFailure diagnostic) onto
+    // the task for the next attempt.
+    const nextTask = makeTask({
+      context: {
+        ...makeTask().context,
+        dirtyContinuation: firstResult.context.dirtyContinuation,
+        agentExitFailure: firstResult.context.agentExitFailure,
+      },
+    });
+
+    const secondRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },
+      { stdout: NEW_PATCH, stderr: '', exitCode: 0 },
+      { stdout: 'recovered', stderr: '', exitCode: 0 },
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },
+      { stdout: 'PASS', stderr: '', exitCode: 0 },
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'https://github.com/m2dw/test-repo/pull/100', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+    ]);
+
+    await createImplementationHandler(
+      CONTEXT({ session, runId: 'run-impl-2' }), secondRunner, undefined, resolver.resolve,
+    )(nextTask);
+
+    const prompt = readFileSync(
+      join(artifactRoot, 'runs', 'run-impl-2', 'implementation-prompt.md'), 'utf8',
+    );
+    expect(prompt).toContain('## Continuation Context');
+    expect(prompt).toContain('Prior Agent Exit (code 1)');
+    expect(prompt).toContain('claude crashed again');
+    expect(prompt).not.toContain('Fix the verification failure');
+  });
+
+  test('abnormal repair-agent exit after modifying the worktree records a fresh dirtyContinuation marker', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                          // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                          // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                          // git status --porcelain (worktree — CLEAN preflight)
+      { stdout: 'done', stderr: '', exitCode: 0 },                      // claude (initial agent)
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },            // git diff --stat HEAD
+      { stdout: 'FAIL: 1 test failed', stderr: '', exitCode: 1 },       // npm test — verification fails
+      { stdout: '', stderr: 'repair agent crashed', exitCode: 1 },      // claude (repair agent) — exits nonzero after further edits
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },           // git status -z (post-exit capture)
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+fix\n', stderr: '', exitCode: 0 }, // git diff HEAD
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/repair agent crashed/);
+    expect(result.context?.dirtyContinuation).toMatchObject({
+      issueNumber: 77,
+      phase: 'implementation',
+      runId: 'run-impl-1',
+      branch: 'ai/issue-77',
+      agentExitCode: 1,
+      commitSkipped: true,
+    });
+    expect(result.context.dirtyContinuation.dirtyFiles).toContain('src/foo.ts');
+  });
+
+  test('a repair-agent crash retains the verification failure that triggered the repair (issue #727 review)', async () => {
+    // Losing verificationFailure/verificationFeedback here would make the next
+    // continuation prompt claim "no verification failure is available" even
+    // though the repair agent was reacting to a real one — retain both
+    // diagnostics so the next agent still knows what to fix.
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                          // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                          // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                          // git status --porcelain (worktree — CLEAN preflight)
+      { stdout: 'done', stderr: '', exitCode: 0 },                      // claude (initial agent)
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },            // git diff --stat HEAD
+      { stdout: 'FAIL: 1 test failed', stderr: '', exitCode: 1 },       // npm test — verification fails
+      { stdout: '', stderr: 'repair agent crashed', exitCode: 1 },      // claude (repair agent) — exits nonzero after further edits
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },           // git status -z (post-exit capture)
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+fix\n', stderr: '', exitCode: 0 }, // git diff HEAD
+    ]);
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+
+    const firstResult = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(firstResult.result).toBe('failed');
+    expect(firstResult.context?.verificationFailure).toEqual({ name: 'test', exitCode: 1 });
+    expect(firstResult.context?.verificationFeedback).toMatch(/FAIL: 1 test failed/);
+    expect(firstResult.context?.agentExitFailure).toMatchObject({ exitCode: 1 });
+    expect(firstResult.context?.agentExitFailure?.message).toMatch(/repair agent crashed/);
+
+    const nextTask = makeTask({
+      context: {
+        ...makeTask().context,
+        dirtyContinuation: firstResult.context.dirtyContinuation,
+        verificationFailure: firstResult.context.verificationFailure,
+        verificationFeedback: firstResult.context.verificationFeedback,
+        agentExitFailure: firstResult.context.agentExitFailure,
+      },
+    });
+    const secondRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+fix\n', stderr: '', exitCode: 0 },
+      { stdout: 'recovered', stderr: '', exitCode: 0 },
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },
+      { stdout: 'PASS', stderr: '', exitCode: 0 },
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'https://github.com/m2dw/test-repo/pull/100', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+    ]);
+
+    await createImplementationHandler(
+      CONTEXT({ session, runId: 'run-impl-2' }), secondRunner, undefined, resolver.resolve,
+    )(nextTask);
+
+    const prompt = readFileSync(
+      join(artifactRoot, 'runs', 'run-impl-2', 'implementation-prompt.md'), 'utf8',
+    );
+    expect(prompt).toContain('## Continuation Context');
+    expect(prompt).toContain('Prior Verification Failure: test (exit 1)');
+    expect(prompt).toContain('FAIL: 1 test failed');
+    expect(prompt).toContain('Prior Repair Agent Exit (code 1)');
+    expect(prompt).toContain('repair agent crashed');
   });
 });
 
@@ -2483,7 +3273,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
     const runner = dirtyContinuationRunner();
     // branchReused: true because the prior run left the branch in place
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
@@ -2502,7 +3292,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
     const wt = worktreePath();
     const runner = dirtyContinuationRunner();
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
@@ -2520,7 +3310,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
     const wt = worktreePath();
     const runner = dirtyContinuationRunner();
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
@@ -2542,7 +3332,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status --porcelain (DIRTY, no marker)
     ]);
     const resolver = fakeWorktreeResolver(wt);
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
@@ -2561,7 +3351,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status --porcelain (DIRTY)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     // dirtyContinuation for a DIFFERENT issue
     const task = makeDirtyTask({ issueNumber: 999 });
 
@@ -2582,7 +3372,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status --porcelain (DIRTY)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     // dirtyContinuation for a different branch name
     const task = makeDirtyTask({ branch: 'ai/issue-999' });
 
@@ -2603,7 +3393,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status --porcelain (DIRTY)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     // dirtyContinuation without patchArtifactFile (capture failed)
     const task = makeTask({
       context: {
@@ -2638,7 +3428,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 }, // git status -z (file set drift check — matches)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     // patchArtifactFile is present (so isValidDirtyContinuation passes) but runId is absent
     const task = makeDirtyTask({ runId: undefined });
 
@@ -2659,7 +3449,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status --porcelain (DIRTY)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeDirtyTask({ commitSkipped: false });
 
     const result = await createImplementationHandler(
@@ -2678,7 +3468,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status --porcelain (DIRTY)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     // dirtyContinuation with a different worktreeId
     const task = makeDirtyTask({ worktreeId: 'other-session/issue-77' });
 
@@ -2704,7 +3494,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts\0?? src/extra.ts\0', stderr: '', exitCode: 0 },
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
@@ -2729,7 +3519,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: DIFFERENT_PATCH, stderr: '', exitCode: 0 },           // git diff HEAD (content DRIFTED from stored patch)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
@@ -2749,7 +3539,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status --porcelain (DIRTY)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         ...makeTask().context,
@@ -2794,7 +3584,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: DIRTY_CONTINUATION_PATCH, stderr: '', exitCode: 0 },
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     // Marker lists both files so the path-set check passes; the content check must block.
     const task = makeDirtyTask({ dirtyFiles: ['artifact.bin', 'src/foo.ts'] });
 
@@ -2808,18 +3598,22 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
     expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
   });
 
-  test('shared-checkout (non-worktree) dirty state still aborts even with dirtyContinuation', async () => {
-    // canonical checkout dirty — shared mode must always fail regardless of any marker.
+  test('dirty canonical checkout still aborts even with dirtyContinuation in the task context', async () => {
+    // A dirtyContinuation marker only ever excuses a dirty ISSUE worktree; a dirty
+    // canonical checkout must always fail regardless of any marker (issue #571).
+    const wt = worktreePath();
     const runner = sequenceRunner([
-      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 }, // git status (DIRTY — no fetch in shared mode)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin main (canonical)
+      { stdout: ' M README.md', stderr: '', exitCode: 0 }, // git status --porcelain (canonical — DIRTY)
     ]);
-    // session with worktrees DISABLED
+    const resolver = fakeWorktreeResolver(wt, { created: false });
+    const session = SESSION({});
     const result = await createImplementationHandler(
-      CONTEXT(), runner,
+      CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeDirtyTask());
 
     expect(result.result).toBe('failed');
-    expect(result.error).toMatch(/Working tree is dirty before implementation/);
+    expect(result.error).toMatch(/Canonical checkout is dirty/);
     expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
   });
 
@@ -2832,7 +3626,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       // worktree status never reached
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
 
     const result = await createImplementationHandler(
       CONTEXT({ session }), runner, undefined, resolver.resolve,
@@ -2862,7 +3656,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: 'dddcccbbbfff5678', stderr: '', exitCode: 0 },       // git rev-parse refs/remotes/origin/ai/issue-77 (remote AHEAD)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         ...makeTask().context,
@@ -2909,7 +3703,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: '', stderr: '', exitCode: 0 },                       // git worktree remove (canonical)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         ...makeTask().context,
@@ -2952,7 +3746,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: '', stderr: 'fatal: unable to access remote', exitCode: 128 }, // git fetch origin ai/issue-77 FAILS
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         ...makeTask().context,
@@ -3001,7 +3795,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: '', stderr: '', exitCode: 0 },                       // git worktree remove (canonical)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         ...makeTask().context,
@@ -3045,7 +3839,7 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
       { stdout: '', stderr: 'fatal: unknown revision', exitCode: 128 }, // git rev-parse FETCH_HEAD (ABSENT — both unresolvable)
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
-    const session = SESSION({ worktrees: { enabled: true } });
+    const session = SESSION({});
     const task = makeTask({
       context: {
         ...makeTask().context,
@@ -3112,7 +3906,6 @@ describe('implementation handler — dirty continuation in per-issue worktrees (
     ]);
     const resolver = fakeWorktreeResolver(wt, { created: false });
     const session = SESSION({
-      worktrees: { enabled: true },
       environmentPrepare: { enabled: true, command: 'make install' },
     });
     // dirtyContinuation marker for an untracked file; override default dirtyFiles
@@ -3231,19 +4024,21 @@ describe('implementation handler — PR body', () => {
   });
 
   test('PR body omits verification section when no verification commands are configured', async () => {
+    // No verification configured, so the verification-command step is skipped
+    // entirely from the runner sequence (issue #732: worktree fetch/status
+    // replace the old checkout/pull/rev-parse/checkout-b preflight).
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },  // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'done', stderr: '', exitCode: 0 },
-      { stdout: '1 file changed', stderr: '', exitCode: 0 },
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'https://github.com/m2dw/test-repo/pull/7', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (worktree — clean)
+      { stdout: 'done', stderr: '', exitCode: 0 },                  // claude
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },        // git diff --stat HEAD
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },          // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                      // git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                      // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                      // git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/7', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                      // git worktree remove (canonical)
     ]);
     const ctx = CONTEXT({ session: SESSION({ verification: {} }) });
     await createImplementationHandler(ctx, runner)(makeTask());
@@ -3267,6 +4062,27 @@ describe('implementation handler — failure cases', () => {
     expect(runner.calls).toHaveLength(0);
   });
 
+  // Issue #732 review, P2: an unsupported agent is rejected before Step 0.6
+  // materializes the issue worktree. When `artifactRoot` is configured INSIDE
+  // that future worktree path (issue #629), the best-effort assignment-failure
+  // artifact must not pre-create a non-empty directory tree there — that would
+  // make a later `git worktree add` (once the operator fixes the agent
+  // assignment) fail because its target is non-empty.
+  test('unsupported agent does not pre-create the future worktree directory when artifactRoot lives inside it', async () => {
+    const inWorktreeArtifactRoot = join(defaultWorktreePath(), '.n8n-artifacts');
+    const session = SESSION({ artifactRoot: inWorktreeArtifactRoot, worktrees: { root: join(tmpDir, 'wt') } });
+    const runner = happyRunner();
+    const result = await createImplementationHandler(CONTEXT({ session }), runner)(makeTask({ implementationAgent: 'gpt4' }));
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/Unsupported implementation agent/);
+    expect(runner.calls).toHaveLength(0);
+    // Nothing was written under the future worktree path — the failure is
+    // reported purely through the returned `error` and the pending-artifact
+    // context flag.
+    expect(existsSync(defaultWorktreePath())).toBe(false);
+    expect(result.context?.artifactDirPending).toBe(true);
+  });
+
   test('returns failed when claude exits non-zero', async () => {
     const r = await createImplementationHandler(CONTEXT(), fakeFail('compile error'))(makeTask());
     expect(r.result).toBe('failed');
@@ -3275,22 +4091,23 @@ describe('implementation handler — failure cases', () => {
 
   test('returns failed when working tree is dirty before starting', async () => {
     const runner = sequenceRunner([
-      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // git status — dirty
+      { stdout: '', stderr: '', exitCode: 0 },                 // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                 // git status --porcelain (canonical — clean)
+      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 },  // git status --porcelain (worktree — DIRTY)
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(r.result).toBe('failed');
     expect(r.error).toMatch(/dirty/);
     // Claude must NOT have been called
-    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls).toHaveLength(3);
+    expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
   });
 
   test('returns failed when claude produces no diff', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },          // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (worktree — clean)
       { stdout: '', stderr: '', exitCode: 0 },              // claude — succeeds
       { stdout: '', stderr: '', exitCode: 0 },              // git diff — empty
       { stdout: '', stderr: '', exitCode: 0 },              // git ls-files --others (untracked check)
@@ -3300,13 +4117,16 @@ describe('implementation handler — failure cases', () => {
     expect(r.error).toMatch(/no file changes/);
   });
 
-  test('returns failed when git push fails, then restores HEAD to base', async () => {
+  // Issue #732: `failAfterBranch` (the late-failure surface point) is now a
+  // plain passthrough — worktree mode never restores/checks-out the base branch
+  // or quarantines after a late failure (the durable issue worktree IS the
+  // continuation point; see the #470 "late failure" test for the equivalent gh
+  // pr create scenario).
+  test('returns failed when git push fails, and does not touch the worktree', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },          // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (worktree — clean)
       { stdout: 'done', stderr: '', exitCode: 0 },          // claude
       { stdout: '1 file changed', stderr: '', exitCode: 0 }, // git diff
       { stdout: 'PASS', stderr: '', exitCode: 0 },          // verification (npm test)
@@ -3314,25 +4134,22 @@ describe('implementation handler — failure cases', () => {
       { stdout: '', stderr: '', exitCode: 0 },              // git add -- <paths>
       { stdout: '', stderr: '', exitCode: 0 },              // git commit
       { stdout: '', stderr: 'push rejected', exitCode: 1 }, // git push — fails
-      { stdout: '', stderr: '', exitCode: 0 },              // cleanup: git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },              // cleanup: git checkout main
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(r.result).toBe('failed');
     expect(r.error).toMatch(/push rejected/);
-    // Cleanup returns the checkout to the base branch (no quarantine note)
-    const lastCheckout = [...runner.calls].reverse().find((c) => c.cmd === 'git' && c.args[0] === 'checkout');
-    expect(lastCheckout).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
+    // No shared-checkout-style restore and no quarantine note; the worktree is
+    // simply left as-is for a later retry to resume.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
     expect(r.error).not.toMatch(/quarantined/);
   });
 
-  test('returns failed when gh pr create fails, then restores HEAD to base', async () => {
+  test('returns failed when gh pr create fails, and does not touch the worktree', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },          // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (worktree — clean)
       { stdout: 'done', stderr: '', exitCode: 0 },
       { stdout: '1 file changed', stderr: '', exitCode: 0 },
       { stdout: 'PASS', stderr: '', exitCode: 0 },          // verification (npm test)
@@ -3341,12 +4158,11 @@ describe('implementation handler — failure cases', () => {
       { stdout: '', stderr: '', exitCode: 0 },
       { stdout: '', stderr: '', exitCode: 0 },
       { stdout: '', stderr: 'gh: auth error', exitCode: 1 }, // gh pr create — fails
-      { stdout: '', stderr: '', exitCode: 0 },              // cleanup: git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },              // cleanup: git checkout main
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(r.result).toBe('failed');
     expect(r.error).toMatch(/gh: auth error/);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
   });
 });
 
@@ -3355,15 +4171,14 @@ describe('implementation handler — failure cases', () => {
 // ---------------------------------------------------------------------------
 
 describe('implementation handler — pre-push verification', () => {
-  // Order through the diff check: status(0) checkout-main(1) pull(2) rev-parse(3)
-  // checkout-b(4) claude(5) diff(6) then verification(7) ...
+  // Order through the diff check: fetch-base(0) status-canonical(1) status-worktree(2)
+  // claude(3) diff(4) then verification(5) ... (issue #732: worktree
+  // materialization is unconditional, replacing the old checkout/pull/rev-parse/checkout-b preflight).
   function upToVerification(verificationResult) {
     return [
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },          // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (worktree — clean)
       { stdout: 'done', stderr: '', exitCode: 0 },          // claude
       { stdout: '1 file changed', stderr: '', exitCode: 0 }, // git diff --stat HEAD
       verificationResult,                                    // verification (npm test)
@@ -3431,6 +4246,7 @@ describe('implementation handler — pre-push verification', () => {
       { stdout: '', stderr: '', exitCode: 0 },              // git commit
       { stdout: '', stderr: '', exitCode: 0 },              // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/5', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove (canonical)
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(r.result).toBe('success');
@@ -3474,6 +4290,7 @@ describe('implementation handler — pre-push verification', () => {
       { stdout: '', stderr: '', exitCode: 0 },                // git commit
       { stdout: '', stderr: '', exitCode: 0 },                // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/9', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                // git worktree remove (canonical)
     ]);
     await createImplementationHandler(CONTEXT(), runner)(makeTask());
     const repairClaude = runner.calls.filter((c) => c.cmd === 'claude')[1];
@@ -3491,11 +4308,8 @@ describe('implementation handler — pre-push verification', () => {
     const runner = sequenceRunner([
       ...upToVerification({ stdout: 'FAIL: cannot find module left-pad', stderr: '', exitCode: 1 }),
       { stdout: block, stderr: '', exitCode: 0 },  // repair claude emits a Tool Request
-      { stdout: '', stderr: '', exitCode: 0 },     // git add -A (capture partial diff, issue #379)
-      { stdout: '', stderr: '', exitCode: 0 },     // git diff --cached --binary HEAD (no partial work)
-      { stdout: '', stderr: '', exitCode: 0 },     // git checkout -f main (handoff cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },     // git clean -fd
-      { stdout: '', stderr: '', exitCode: 0 },     // git branch -D <branch>
+      { stdout: '', stderr: '', exitCode: 0 },     // git add -A -- . (capture partial diff, issue #379)
+      { stdout: '', stderr: '', exitCode: 0 },     // git diff --cached --binary HEAD (empty — no partial work; handoffCleanup returns immediately)
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(r.result).toBe('tool_request');
@@ -3505,14 +4319,13 @@ describe('implementation handler — pre-push verification', () => {
       mode: 'new',
       resolved: false,
     });
-    // Issue #472 review (P1): a shared-checkout new implementation that hands off a
-    // Tool Request BEFORE any PR exists must NOT persist the conventional
-    // `ai/issue-<n>` name as `context.branch`. handoffCleanup just deleted that branch
-    // (`git branch -D <branch>` above), and recording it would make
-    // `admin tool-request grant` treat it as a recorded PR head (`fromRecordedPr`),
-    // so moveToToolRequestBranch would refuse to recreate it from base and the grant
-    // could never run. resolveToolRequestWorkBranch derives the same name via its
-    // fallback, so omitting the key keeps `fromRecordedPr` false.
+    // Issue #472 review (P1): a new implementation that hands off a Tool Request
+    // BEFORE any PR exists must NOT persist the conventional `ai/issue-<n>` name
+    // as `context.branch` — recording it would make `admin tool-request grant`
+    // treat it as a recorded PR head (`fromRecordedPr`), so moveToToolRequestBranch
+    // would refuse to recreate it from base and the grant could never run.
+    // resolveToolRequestWorkBranch derives the same name via its fallback, so
+    // omitting the key keeps `fromRecordedPr` false.
     expect(r.context.branch).toBeUndefined();
     // The requested command is never run, and nothing is committed/pushed.
     expect(runner.calls.some((c) => c.cmd === 'npm' && c.args.includes('install'))).toBe(false);
@@ -3535,11 +4348,8 @@ describe('implementation handler — pre-push verification', () => {
       // Repair agent emits a valid Tool Request but exits nonzero — must be
       // detected before the nonzero-exit failure branch.
       { stdout: block, stderr: 'blocked: disallowed command', exitCode: 1 },
-      { stdout: '', stderr: '', exitCode: 0 },     // git add -A (capture partial diff, issue #379)
-      { stdout: '', stderr: '', exitCode: 0 },     // git diff --cached --binary HEAD (no partial work)
-      { stdout: '', stderr: '', exitCode: 0 },     // git checkout -f main (handoff cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },     // git clean -fd
-      { stdout: '', stderr: '', exitCode: 0 },     // git branch -D <branch>
+      { stdout: '', stderr: '', exitCode: 0 },     // git add -A -- . (capture partial diff, issue #379)
+      { stdout: '', stderr: '', exitCode: 0 },     // git diff --cached --binary HEAD (empty — no partial work; handoffCleanup returns immediately)
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(r.result).toBe('tool_request');
@@ -3549,60 +4359,61 @@ describe('implementation handler — pre-push verification', () => {
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('push'))).toBe(false);
   });
 
-  test('initial-agent quota exhaustion delays the retry and restores the checkout (issue #25 review)', async () => {
-    // The agent exits nonzero with a quota message after the issue branch was
-    // created. The task must be re-queued as `delayed`, but only after the
-    // checkout is restored to base and the freshly-created branch is dropped —
-    // otherwise the delayed retry's preflight hard-fails on a dirty worktree or
-    // a `checkout -b` collision with the existing branch.
+  // Issue #732: worktree mode's `discardEditsToBase` never drops the durable
+  // `ai/issue-<n>` worktree branch (the delayed retry re-enters the SAME
+  // worktree), and it restores the worktree with `git reset --hard HEAD`
+  // instead of a shared-checkout `git checkout -f <base>` (mirrors the #470
+  // "quota/rate-limit delayed retry" test).
+  test('initial-agent quota exhaustion delays the retry and resets the worktree (issue #25 review)', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                     // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                     // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                     // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                 // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },                     // git checkout -b <branch>
+      { stdout: '', stderr: '', exitCode: 0 },                     // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                     // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                     // git status --porcelain (worktree — clean)
       { stdout: '', stderr: 'Error: HTTP 429 rate limit exceeded, try again later', exitCode: 1 }, // claude — quota
-      { stdout: '', stderr: '', exitCode: 0 },                     // git add -A (capture partial diff, issue #379)
-      { stdout: '', stderr: '', exitCode: 0 },                     // git diff --cached --binary HEAD (no partial work)
-      { stdout: '', stderr: '', exitCode: 0 },                     // git checkout -f main (restore)
+      { stdout: '', stderr: '', exitCode: 0 },                     // git add -A -- . (capture partial diff, issue #379)
+      { stdout: '', stderr: '', exitCode: 0 },                     // git diff --cached --binary HEAD (empty — no partial work)
+      { stdout: '', stderr: '', exitCode: 0 },                     // git reset --hard HEAD (restoreWorktreeToBase, worktree-native)
       { stdout: '', stderr: '', exitCode: 0 },                     // git clean -fd
-      { stdout: '', stderr: '', exitCode: 0 },                     // git branch -D <branch>
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(r.result).toBe('delayed');
-    // Checkout restored to base and the new-impl branch dropped before re-queueing.
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('-f'))).toBe(true);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(true);
+    // Category and retry metadata survive onto the handler result (issue #672).
+    expect(r.category).toBe('rate_limit');
+    expect(r.context.category).toBe('rate_limit');
+    // The durable worktree branch is reset, never dropped or checked out to base.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'reset' && c.args.includes('--hard'))).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('-f'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
     // Nothing committed or pushed.
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'commit')).toBe(false);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('push'))).toBe(false);
   });
 
-  test('repair-agent quota exhaustion delays the retry and restores the checkout (issue #25 review)', async () => {
+  test('repair-agent quota exhaustion delays the retry and resets the worktree (issue #25 review)', async () => {
     const runner = sequenceRunner([
       ...upToVerification({ stdout: 'FAIL: 1 test failed', stderr: '', exitCode: 1 }), // verification fails
       { stdout: '', stderr: 'usage limit reached. Your limit will reset at 5pm.', exitCode: 1 }, // repair claude — quota
-      { stdout: '', stderr: '', exitCode: 0 },     // git add -A (capture partial diff, issue #379)
-      { stdout: '', stderr: '', exitCode: 0 },     // git diff --cached --binary HEAD (no partial work)
-      { stdout: '', stderr: '', exitCode: 0 },     // git checkout -f main (restore)
+      { stdout: '', stderr: '', exitCode: 0 },     // git add -A -- . (capture partial diff, issue #379)
+      { stdout: '', stderr: '', exitCode: 0 },     // git diff --cached --binary HEAD (empty — no partial work)
+      { stdout: '', stderr: '', exitCode: 0 },     // git reset --hard HEAD (restoreWorktreeToBase, worktree-native)
       { stdout: '', stderr: '', exitCode: 0 },     // git clean -fd
-      { stdout: '', stderr: '', exitCode: 0 },     // git branch -D <branch>
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(r.result).toBe('delayed');
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('-f'))).toBe(true);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(true);
+    // Category and retry metadata survive onto the handler result (issue #672).
+    expect(r.category).toBe('usage_quota');
+    expect(r.context.category).toBe('usage_quota');
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'reset' && c.args.includes('--hard'))).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('push'))).toBe(false);
   });
 
   test('empty verification config skips verification and commits normally', async () => {
     // No verification command is run, so the sequence has no npm step.
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },          // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (worktree — clean)
       { stdout: 'done', stderr: '', exitCode: 0 },          // claude
       { stdout: '1 file changed', stderr: '', exitCode: 0 }, // git diff
       { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },  // git ls-files -z
@@ -3610,6 +4421,7 @@ describe('implementation handler — pre-push verification', () => {
       { stdout: '', stderr: '', exitCode: 0 },              // git commit
       { stdout: '', stderr: '', exitCode: 0 },              // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/7', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },              // git worktree remove (canonical)
     ]);
     const ctx = CONTEXT({ session: SESSION({ verification: {} }) });
     const r = await createImplementationHandler(ctx, runner)(makeTask());
@@ -3619,13 +4431,11 @@ describe('implementation handler — pre-push verification', () => {
 
   test('verification also runs in fix mode before pushing to the existing PR', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                 // git status
-      { stdout: '', stderr: '', exitCode: 0 },                 // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                 // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },             // rev-parse — HEAD at base
-      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },       // gh pr list
-      { stdout: '', stderr: '', exitCode: 0 },                 // git checkout <branch>
-      { stdout: '', stderr: '', exitCode: 0 },                 // git pull origin <branch>
+      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },       // gh pr list (early fix-mode PR lookup)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 },      // git rev-parse --verify refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                 // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                 // git status --porcelain (worktree — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                 // git pull origin ai/issue-77 --ff-only — worktree
       { stdout: 'done', stderr: '', exitCode: 0 },             // claude
       { stdout: '1 file changed', stderr: '', exitCode: 0 },   // git diff
       { stdout: 'FAIL', stderr: '', exitCode: 1 },             // verification fails
@@ -3655,11 +4465,9 @@ describe('implementation handler — dependency sync', () => {
 
   test('runs the configured sync command when package.json changed, before verification and commit', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                                      // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (worktree — clean)
       { stdout: 'edited package.json', stderr: '', exitCode: 0 },                       // claude
       { stdout: ' M package.json', stderr: '', exitCode: 0 },                           // git diff --stat HEAD
       { stdout: ' M package.json\n', stderr: '', exitCode: 0 },                         // dep-sync git status (before)
@@ -3671,6 +4479,7 @@ describe('implementation handler — dependency sync', () => {
       { stdout: '', stderr: '', exitCode: 0 },                                          // git commit
       { stdout: '', stderr: '', exitCode: 0 },                                          // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/3', stderr: '', exitCode: 0 },  // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git worktree remove (canonical)
     ]);
     const r = await createImplementationHandler(CONTEXT({ session: depSession() }), runner)(makeTask());
     expect(r.result).toBe('success');
@@ -3702,11 +4511,9 @@ describe('implementation handler — dependency sync', () => {
 
   test('does not run the sync command when no trigger path changed', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                                      // rev-parse
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (worktree — clean)
       { stdout: 'edited source', stderr: '', exitCode: 0 },                             // claude
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },                             // git diff --stat HEAD
       { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 },                           // dep-sync git status (before) — no trigger
@@ -3716,6 +4523,7 @@ describe('implementation handler — dependency sync', () => {
       { stdout: '', stderr: '', exitCode: 0 },                                          // git commit
       { stdout: '', stderr: '', exitCode: 0 },                                          // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/4', stderr: '', exitCode: 0 },  // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git worktree remove (canonical)
     ]);
     const r = await createImplementationHandler(CONTEXT({ session: depSession() }), runner)(makeTask());
     expect(r.result).toBe('success');
@@ -3734,11 +4542,9 @@ describe('implementation handler — dependency sync', () => {
 
   test('sync failure stops with actionable feedback and does not commit or push', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                              // rev-parse
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (worktree — clean)
       { stdout: 'edited package.json', stderr: '', exitCode: 0 },               // claude
       { stdout: ' M package.json', stderr: '', exitCode: 0 },                   // git diff --stat HEAD
       { stdout: ' M package.json\n', stderr: '', exitCode: 0 },                 // dep-sync git status (before)
@@ -3774,11 +4580,9 @@ describe('implementation handler — dependency sync', () => {
 
   test('refuses a lifecycle-running command in safe mode without committing or pushing', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                    // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                    // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                    // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                // rev-parse
-      { stdout: '', stderr: '', exitCode: 0 },                    // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                    // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                    // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                    // git status --porcelain (worktree — clean)
       { stdout: 'edited package.json', stderr: '', exitCode: 0 }, // claude
       { stdout: ' M package.json', stderr: '', exitCode: 0 },     // git diff --stat HEAD
       { stdout: ' M package.json\n', stderr: '', exitCode: 0 },   // dep-sync git status (before)
@@ -3802,11 +4606,9 @@ describe('implementation handler — dependency sync', () => {
 
   test('re-runs dependency sync after a verification repair changes the manifest', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                                      // rev-parse
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (worktree — clean)
       { stdout: 'edited package.json', stderr: '', exitCode: 0 },                       // claude (initial)
       { stdout: ' M package.json', stderr: '', exitCode: 0 },                           // git diff --stat HEAD
       { stdout: ' M package.json\n', stderr: '', exitCode: 0 },                         // dep-sync status (initial, before)
@@ -3823,6 +4625,7 @@ describe('implementation handler — dependency sync', () => {
       { stdout: '', stderr: '', exitCode: 0 },                                          // git commit
       { stdout: '', stderr: '', exitCode: 0 },                                          // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/9', stderr: '', exitCode: 0 },  // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git worktree remove (canonical)
     ]);
     const r = await createImplementationHandler(CONTEXT({ session: depSession() }), runner)(makeTask());
     expect(r.result).toBe('success');
@@ -3849,13 +4652,13 @@ describe('implementation handler — agent selection', () => {
   test('uses task.implementationAgent over session default', async () => {
     const runner = happyRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeTask({ implementationAgent: 'claude' }));
-    expect(runner.calls[5].cmd).toBe('claude');
+    expect(runner.calls[3].cmd).toBe('claude');
   });
 
   test('falls back to session.defaults.implementationAgent when task has none', async () => {
     const runner = happyRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeTask({ implementationAgent: undefined }));
-    expect(runner.calls[5].cmd).toBe('claude');
+    expect(runner.calls[3].cmd).toBe('claude');
   });
 });
 
@@ -3976,11 +4779,9 @@ describe('implementation handler — phase transition', () => {
     });
 
     const noDiffRunner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },      // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },      // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },      // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },  // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },      // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },      // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },      // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },      // git status --porcelain (worktree — clean)
       { stdout: '', stderr: '', exitCode: 0 },      // claude
       { stdout: '', stderr: '', exitCode: 0 },      // git diff — empty
       { stdout: '', stderr: '', exitCode: 0 },      // git ls-files --others (untracked check)
@@ -4014,9 +4815,15 @@ describe('run-one-phase CLI — implementation gating', () => {
     defaults: { implementationAgent: 'claude', reviewAgent: 'codex', researchAgent: 'gemini' },
     verification: { test: 'npm test' },
     labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
+    // Worktree materialization is unconditional (issue #732: there is no
+    // shared-checkout mode left to opt out of). `root` is filled in per-test
+    // (in beforeEach, once `tmpDir` exists) so the real `git worktree add` the
+    // CLI drives lands inside the test's own tmpDir and is cleaned up with it.
   };
 
   function runCli(...args) {
+    const envOverride =
+      args.length > 0 && typeof args[args.length - 1] === 'object' ? args.pop() : {};
     try {
       const stdout = execFileSync(process.execPath, [CLI, ...args], {
         encoding: 'utf8',
@@ -4024,6 +4831,7 @@ describe('run-one-phase CLI — implementation gating', () => {
           ...process.env,
           ANTIGRAVITY_BIN: join(tmpDir, 'fake-agy'),
           PATH: `${join(tmpDir, 'bin')}:${process.env.PATH}`,
+          ...envOverride,
         },
       });
       return { code: 0, stdout };
@@ -4037,6 +4845,11 @@ describe('run-one-phase CLI — implementation gating', () => {
     dbPath = join(tmpDir, 'cli.db');
     const binDir = join(tmpDir, 'bin');
     mkdirSync(binDir, { recursive: true });
+    // The canonical checkout must exist on disk before the CLI runs: every
+    // subprocess spawned against `cwd: repoRoot` (git, gh) fails with a
+    // (confusingly-worded) ENOENT if the directory itself is missing, even
+    // though `git`/`gh` are faked and never read real repo state.
+    mkdirSync(repoRoot, { recursive: true });
 
     // Fake claude: reads stdin, exits 0, prints stub output
     const fakeClaude = join(binDir, 'claude');
@@ -4048,12 +4861,37 @@ describe('run-one-phase CLI — implementation gating', () => {
     writeFileSync(fakeNpm, '#!/bin/sh\necho "npm test PASS"\nexit 0\n', 'utf8');
     chmodSync(fakeNpm, 0o755);
 
-    // Fake git: clean status, succeeds on all subcommands, stubs diff output
+    // Fake git: clean status, succeeds on all subcommands, stubs diff output.
+    // Issue #732: worktree materialization is unconditional and real here (the
+    // CLI drives this shim end-to-end, not the mocked command runner), so the
+    // shim must behave plausibly enough for `resolveIssueWorktree` to succeed:
+    //   - `git worktree add ... <path> ...` must actually create the worktree
+    //     directory, or the next subprocess spawned with that `cwd` fails with
+    //     ENOENT before it even runs.
+    //   - `git rev-parse --verify --quiet refs/heads/<branch>` and
+    //     `refs/remotes/origin/<branch>` must report "not found" (nonzero) so a
+    //     fresh task always takes the create-from-baseRef path, matching these
+    //     fixtures' fresh (never-before-run) issue numbers.
     const fakeGit = join(binDir, 'git');
     writeFileSync(fakeGit,
       '#!/bin/sh\n' +
       'if [ "$1" = "status" ]; then exit 0; fi\n' +         // clean working tree
-      'if [ "$1" = "rev-parse" ]; then echo "main"; exit 0; fi\n' + // HEAD is at base
+      'if [ "$1" = "worktree" ] && [ "$2" = "add" ]; then\n' +
+      '  shift 2\n' +
+      '  for a in "$@"; do\n' +
+      '    case "$a" in\n' +
+      '      /*) mkdir -p "$a" ;;\n' +
+      '    esac\n' +
+      '  done\n' +
+      '  exit 0\n' +
+      'fi\n' +
+      'if [ "$1" = "rev-parse" ]; then\n' +
+      '  case "$*" in\n' +
+      '    *"refs/heads/"*|*"refs/remotes/"*) exit 1 ;;\n' +
+      '  esac\n' +
+      '  echo "main"\n' +
+      '  exit 0\n' +
+      'fi\n' +
       'if [ "$1" = "diff" ]; then echo "1 file changed"; fi\n' +
       'if [ "$1" = "ls-files" ]; then printf "src/foo.ts\\0"; fi\n' +
       'exit 0\n',
@@ -4078,7 +4916,12 @@ describe('run-one-phase CLI — implementation gating', () => {
     writeFileSync(fakeAgy, '#!/bin/sh\necho "agy done"\nexit 0\n', 'utf8');
     chmodSync(fakeAgy, 0o755);
 
-    const session = { ...SESSION_OBJ, repoRoot, artifactDir: '.n8n-artifacts' };
+    const session = {
+      ...SESSION_OBJ,
+      repoRoot,
+      artifactDir: '.n8n-artifacts',
+      worktrees: { root: join(tmpDir, 'wt') },
+    };
     writeFileSync(sessionsPath, JSON.stringify({ sessions: [session] }), 'utf8');
   });
 
@@ -4108,6 +4951,13 @@ describe('run-one-phase CLI — implementation gating', () => {
     });
     store.close();
 
+    // This CLI run acquires the SAME default (production) issue worktree lock
+    // used outside this test's tmpDir (see the "serializes the SAME issue"
+    // test below for why). Force-clear any lock a prior crashed run left
+    // behind on this scope so a fresh acquire here is not spuriously
+    // contended.
+    new IssueWorktreeLock().forceRelease('addon-dev', 101);
+
     const r = runCli(
       '--session-id', 'addon-dev', '--run-id', 'r2',
       '--sessions-path', sessionsPath, '--db-path', dbPath,
@@ -4123,6 +4973,67 @@ describe('run-one-phase CLI — implementation gating', () => {
     // PR was "created" by fake gh; task should now be queued for review
     expect(task).toMatchObject({ status: 'queued', phase: 'review' });
   });
+
+  // Issue #732 review, P1: the implementation handler materializes and mutates
+  // the per-issue worktree unconditionally. The dispatcher's issue-scoped lock
+  // (run-one-phase's `acquireIssuePhaseLock`) must still serialize the SAME
+  // issue, or two concurrent executions could race on the same branch/worktree.
+  test('serializes the SAME issue via the worktree lock', async () => {
+    const session = {
+      ...SESSION_OBJ,
+      repoRoot,
+      artifactDir: '.n8n-artifacts',
+      worktrees: { root: join(tmpDir, 'wt') },
+    };
+    writeFileSync(sessionsPath, JSON.stringify({ sessions: [session] }), 'utf8');
+
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({
+      sessionId: 'addon-dev', issueNumber: 103, phase: 'implementation',
+      implementationAgent: 'claude', now: '2026-06-07T00:00:00.000Z',
+    });
+    store.close();
+
+    // A concurrent run already owns this issue's worktree lock — the same
+    // *default* lock store `run-one-phase.ts` uses in production (no
+    // `--lock-dir` override is exercised here or below). That default
+    // resolves under `~/.local/state/...`, which is unwritable in
+    // restricted/hermetic test environments (issue #732 review, P1), so
+    // point `HOME` at a writable directory inside this test's own tmpDir for
+    // both this process's lock object and the CLI child process below —
+    // both then resolve `DEFAULT_WORKTREE_LOCK_DIR` to the SAME isolated
+    // directory, still exercising the real default-wiring code path. Force-
+    // clear any lock a prior crashed run left behind on this scope before
+    // asserting a fresh acquire succeeds — and do the acquire itself inside
+    // the try so a failed assertion still runs the `finally` release below
+    // instead of leaking the lock for the 24h TTL.
+    const isolatedHome = join(tmpDir, 'home');
+    mkdirSync(isolatedHome, { recursive: true });
+    const isolatedLockDir = join(isolatedHome, '.local', 'state', 'n8n-ai-cli-loop', 'worktree-locks');
+    const lock = new IssueWorktreeLock(isolatedLockDir);
+    lock.forceRelease('addon-dev', 103);
+    try {
+      expect(lock.acquire('other-run', 'addon-dev', 103).locked).toBe(true);
+      const r = runCli(
+        '--session-id', 'addon-dev', '--run-id', 'r3',
+        '--sessions-path', sessionsPath, '--db-path', dbPath,
+        '--supported-phases', 'implementation',
+        { HOME: isolatedHome },
+      );
+      expect(r.code).toBe(0);
+      const out = JSON.parse(r.stdout.trim());
+      // Contended, not completed — the handler must never have run (and so
+      // never touched claude/git for this task).
+      expect(out).toMatchObject({ ok: true, outcome: 'lock_contended', task: { issueNumber: 103 } });
+
+      const store2 = new SqliteTaskStore(dbPath);
+      const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 103 });
+      store2.close();
+      expect(task?.status).toBe('queued');
+    } finally {
+      lock.release('other-run', 'addon-dev', 103);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4130,10 +5041,20 @@ describe('run-one-phase CLI — implementation gating', () => {
 // ---------------------------------------------------------------------------
 
 // Helpers for fix-mode runners.
-// Fix orchestration order:
-//   status(0) checkout-main(1) pull-main(2) gh-pr-list(3) git-checkout-branch(4)
-//   git-pull-branch(5) claude(6) diff(7) verification(8) ls-files(9) add(10) commit(11) push(12)
-//   (no gh pr create)
+// Fix orchestration order (worktree-only, issue #732): the PR lookup
+// (`resolveFixPr`, backed by `gh pr list`) runs FIRST — before any worktree
+// materialization — because the discovered PR head decides which branch the
+// worktree checks out (issue #454, #455). With the local `ai/issue-<n>` branch
+// already present in the canonical repo, there is no pre-materialization fetch
+// (issue #454 review). The worktree is then materialized (stubbed here) already
+// checked out on that branch, so there is no `git checkout <branch>` — Git
+// refuses to check out a branch already checked out in this worktree's own tree.
+// Reconciliation with origin is a `git pull --ff-only` inside the worktree
+// instead:
+//   gh-pr-list(0) rev-parse-verify(1, canonical) status(2, canonical)
+//   status(3, worktree) pull-ff-only(4, worktree) claude(5) diff(6)
+//   verification(7) ls-files(8) add(9) commit(10) push(11)
+//   worktree-remove(12, canonical) (no gh pr create)
 
 const EXISTING_PR_URL = 'https://github.com/m2dw/test-repo/pull/44';
 const EXISTING_BRANCH = 'ai/issue-77';
@@ -4143,20 +5064,19 @@ const PR_LIST_JSON = JSON.stringify([
 
 function happyFixRunner() {
   return sequenceRunner([
-    { stdout: '', stderr: '', exitCode: 0 },                 // git status — clean
-    { stdout: '', stderr: '', exitCode: 0 },                 // git checkout main
-    { stdout: '', stderr: '', exitCode: 0 },                 // git pull --ff-only
-    { stdout: 'main', stderr: '', exitCode: 0 },             // rev-parse — HEAD at base
-    { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },       // gh pr list
-    { stdout: '', stderr: '', exitCode: 0 },                 // git checkout <branch>
-    { stdout: '', stderr: '', exitCode: 0 },                 // git pull origin <branch>
-    { stdout: 'Applied review feedback.', stderr: '', exitCode: 0 }, // claude
-    { stdout: '1 file changed', stderr: '', exitCode: 0 },  // git diff --stat HEAD
-    { stdout: 'PASS', stderr: '', exitCode: 0 },            // verification (npm test)
-    { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },    // git ls-files -z
-    { stdout: '', stderr: '', exitCode: 0 },                 // git add -- <paths>
-    { stdout: '', stderr: '', exitCode: 0 },                 // git commit
-    { stdout: '', stderr: '', exitCode: 0 },                 // git push
+    { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },              // gh pr list (early fix-mode PR lookup)
+    { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },  // git rev-parse --verify refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS) — canonical
+    { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (canonical — CLEAN)
+    { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (clean) — worktree
+    { stdout: '', stderr: '', exitCode: 0 },                        // git pull origin ai/issue-77 --ff-only — worktree
+    { stdout: 'Applied review feedback.', stderr: '', exitCode: 0 },// claude
+    { stdout: '1 file changed', stderr: '', exitCode: 0 },          // git diff --stat HEAD
+    { stdout: 'PASS', stderr: '', exitCode: 0 },                    // verification (npm test)
+    { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },            // git ls-files -z
+    { stdout: '', stderr: '', exitCode: 0 },                        // git add -- <paths>
+    { stdout: '', stderr: '', exitCode: 0 },                        // git commit
+    { stdout: '', stderr: '', exitCode: 0 },                        // git push
+    { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove --force --force <wt> (free branch) — canonical
   ]);
 }
 
@@ -4192,29 +5112,40 @@ describe('implementation handler — Tool Request grant resume branch (issue #31
   // A Tool Request grant during initial implementation can land dependency/Tool
   // Request changes on `ai/issue-<n>` before the run is requeued. manual-done records
   // that branch as `toolRequestResumeBranch`; the requeued NEW-impl run must check it
-  // out and continue from there instead of `git checkout -b` (which would collide).
-  function happyResumeRunner(branchExists, baseBranch = 'main') {
+  // out and continue from there instead of creating it fresh.
+  //
+  // Worktree-only orchestration (issue #732): there is no shared-checkout base
+  // reset/branch-creation dance left — the worktree manager already materialized
+  // (and checked out) the recorded branch by the time the resume reconciliation
+  // below runs. The command sequence for the common "branch already exists in the
+  // canonical repo" case is:
+  //   fetch-base(0, canonical) rev-parse-verify(1, canonical: local branch present)
+  //   status(2, canonical) status(3, worktree)
+  //   rev-parse-verify(4, worktree: resume probe) checkout(5, worktree, no-op)
+  //   ls-remote(6, worktree) fetch(7, worktree) merge-ff-only(8, worktree)
+  //   rev-list-count(9, worktree) claude(10) diff(11) verification(12) ls-files(13)
+  //   add(14) commit(15) push(16) gh-pr-create(17) worktree-remove(18, canonical)
+  function happyResumeRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout <base>
-      { stdout: '', stderr: '', exitCode: 0 },                      // git pull --ff-only
-      { stdout: baseBranch, stderr: '', exitCode: 0 },              // git rev-parse --abbrev-ref HEAD (== base)
-      branchExists
-        ? { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 } // git rev-parse --verify (exists)
-        : { stdout: '', stderr: '', exitCode: 1 },                      // git rev-parse --verify (absent)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout (<branch> resume) OR (-b <branch> <base>)
-      { stdout: 'origin/ai/issue-77', stderr: '', exitCode: 0 },    // git ls-remote --exit-code (origin has it)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin <branch>
-      { stdout: '', stderr: '', exitCode: 0 },                      // git merge --ff-only FETCH_HEAD
-      { stdout: '0', stderr: '', exitCode: 0 },                     // git rev-list --count FETCH_HEAD..HEAD (not ahead)
-      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // claude
-      { stdout: '2 files changed', stderr: '', exitCode: 0 },       // git diff --stat HEAD
-      { stdout: 'PASS', stderr: '', exitCode: 0 },                  // verification
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },          // git ls-files -z
-      { stdout: '', stderr: '', exitCode: 0 },                      // git add -- <paths>
-      { stdout: '', stderr: '', exitCode: 0 },                      // git commit
-      { stdout: '', stderr: '', exitCode: 0 },                      // git push
-      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                      // 0  git fetch origin main:refs/remotes/origin/main (refresh base) — canonical
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// 1  git rev-parse --verify --quiet refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                      // 2  git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                      // 3  git status --porcelain (clean) — worktree
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// 4  git rev-parse --verify --quiet refs/heads/ai/issue-77 (resume probe) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                      // 5  git checkout ai/issue-77 (no-op; already the worktree HEAD)
+      { stdout: 'origin/ai/issue-77', stderr: '', exitCode: 0 },    // 6  git ls-remote --exit-code --heads origin ai/issue-77 (origin has it)
+      { stdout: '', stderr: '', exitCode: 0 },                      // 7  git fetch origin ai/issue-77
+      { stdout: '', stderr: '', exitCode: 0 },                      // 8  git merge --ff-only FETCH_HEAD
+      { stdout: '0', stderr: '', exitCode: 0 },                     // 9  git rev-list --count FETCH_HEAD..HEAD (not ahead)
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // 10 claude
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },       // 11 git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                  // 12 verification
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },          // 13 git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                      // 14 git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                      // 15 git commit
+      { stdout: '', stderr: '', exitCode: 0 },                      // 16 git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // 17 gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                      // 18 git worktree remove --force --force <wt> (free branch) — canonical
     ]);
   }
 
@@ -4230,12 +5161,13 @@ describe('implementation handler — Tool Request grant resume branch (issue #31
   }
 
   test('resumes the recorded issue branch instead of recreating it when it exists', async () => {
-    const runner = happyResumeRunner(true);
+    const runner = happyResumeRunner();
     const result = await createImplementationHandler(CONTEXT(), runner)(makeResumeTask());
     expect(result.result).toBe('success');
 
-    // The branch existence was probed, then the existing branch was checked out
-    // WITHOUT -b (no collision). No `git checkout -b` anywhere in the run.
+    // The branch existence was probed inside the worktree, then the existing
+    // branch was checked out WITHOUT -b (no collision). No `git checkout -b`
+    // anywhere in the run — branch creation is the worktree manager's job.
     const verifyCall = runner.calls[4];
     expect(verifyCall.cmd).toBe('git');
     expect(verifyCall.args).toEqual(['rev-parse', '--verify', '--quiet', 'refs/heads/ai/issue-77']);
@@ -4263,14 +5195,14 @@ describe('implementation handler — Tool Request grant resume branch (issue #31
   // delete — commits that were never confirmed pushed (issue #316 review).
   test('fails closed when the local resume branch is ahead of origin', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout <base>
-      { stdout: '', stderr: '', exitCode: 0 },                      // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                  // git rev-parse --abbrev-ref HEAD (== base)
-      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (exists)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout ai/issue-77
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin main:refs/remotes/origin/main — canonical
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean) — worktree
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (resume probe) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout ai/issue-77 (no-op) — worktree
       { stdout: 'origin/ai/issue-77', stderr: '', exitCode: 0 },    // git ls-remote --exit-code (origin has it)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin <branch>
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin ai/issue-77
       { stdout: '', stderr: '', exitCode: 0 },                      // git merge --ff-only FETCH_HEAD (no-op: local ahead)
       { stdout: '2', stderr: '', exitCode: 0 },                     // git rev-list --count FETCH_HEAD..HEAD (ahead by 2)
     ]);
@@ -4286,12 +5218,12 @@ describe('implementation handler — Tool Request grant resume branch (issue #31
   // ls-remote exits 2 → keep the local branch as-is, no fetch/merge.
   test('keeps the local resume branch when origin lacks it (ls-remote exit 2)', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout <base>
-      { stdout: '', stderr: '', exitCode: 0 },                      // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                  // git rev-parse --abbrev-ref HEAD (== base)
-      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (exists)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout ai/issue-77
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin main:refs/remotes/origin/main — canonical
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean) — worktree
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (resume probe) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout ai/issue-77 (no-op) — worktree
       { stdout: '', stderr: '', exitCode: 2 },                      // git ls-remote --exit-code (no match)
       { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // claude
       { stdout: '2 files changed', stderr: '', exitCode: 0 },       // git diff --stat HEAD
@@ -4301,11 +5233,15 @@ describe('implementation handler — Tool Request grant resume branch (issue #31
       { stdout: '', stderr: '', exitCode: 0 },                      // git commit
       { stdout: '', stderr: '', exitCode: 0 },                      // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                      // git worktree remove --force --force <wt> — canonical
     ]);
     const result = await createImplementationHandler(CONTEXT(), runner)(makeResumeTask());
     expect(result.result).toBe('success');
-    // No fetch/merge after the ls-remote no-match — the local branch is the source.
-    const fetchCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    // No resume-branch fetch/merge after the ls-remote no-match — the local branch
+    // is the source. (The canonical base-refresh fetch at call[0] is unrelated.)
+    const fetchCall = runner.calls.find(
+      (c) => c.cmd === 'git' && c.args[0] === 'fetch' && c.args.includes('ai/issue-77'),
+    );
     expect(fetchCall).toBeUndefined();
     const mergeCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'merge');
     expect(mergeCall).toBeUndefined();
@@ -4316,12 +5252,12 @@ describe('implementation handler — Tool Request grant resume branch (issue #31
   // it never continues on a possibly-stale local branch (issue #316 review).
   test('fails closed when the resume branch origin lookup is inconclusive', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout <base>
-      { stdout: '', stderr: '', exitCode: 0 },                      // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                  // git rev-parse --abbrev-ref HEAD (== base)
-      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (exists)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout ai/issue-77
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin main:refs/remotes/origin/main — canonical
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean) — worktree
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// git rev-parse --verify (resume probe) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout ai/issue-77 (no-op) — worktree
       { stdout: '', stderr: 'could not read from remote', exitCode: 128 }, // git ls-remote (transient failure)
     ]);
     const result = await createImplementationHandler(CONTEXT(), runner)(makeResumeTask());
@@ -4332,78 +5268,36 @@ describe('implementation handler — Tool Request grant resume branch (issue #31
     expect(claudeCall).toBeUndefined();
   });
 
-  // The recorded resume branch is absent locally because the operator committed and
-  // pushed the Tool Request side effects from another clone — it lives only on
-  // origin (manual-done records the branch when origin has it; issue #316 review).
-  // The requeued run must fetch and continue from origin, NOT branch fresh from base
-  // (which would silently discard the pushed dependency/Tool Request changes).
-  function originResumeRunner(fetchOk) {
-    return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout <base>
-      { stdout: '', stderr: '', exitCode: 0 },                      // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                  // git rev-parse --abbrev-ref HEAD (== base)
-      { stdout: '', stderr: '', exitCode: 1 },                      // git rev-parse --verify (absent locally)
-      fetchOk
-        ? { stdout: '', stderr: '', exitCode: 0 }                   // git fetch origin <branch>
-        : { stdout: '', stderr: 'could not read from remote', exitCode: 1 },
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout -B <branch> FETCH_HEAD
-      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // claude
-      { stdout: '2 files changed', stderr: '', exitCode: 0 },       // git diff --stat HEAD
-      { stdout: 'PASS', stderr: '', exitCode: 0 },                  // verification
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },          // git ls-files -z
-      { stdout: '', stderr: '', exitCode: 0 },                      // git add -- <paths>
-      { stdout: '', stderr: '', exitCode: 0 },                      // git commit
-      { stdout: '', stderr: '', exitCode: 0 },                      // git push
-      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
-    ]);
-  }
-
-  test('fetches the recorded branch from origin when it is absent locally', async () => {
-    const runner = originResumeRunner(true);
-    const result = await createImplementationHandler(CONTEXT(), runner)(makeResumeTask());
-    expect(result.result).toBe('success');
-
-    // Branch absent locally → fetch it from origin and check it out, NEVER branch
-    // fresh from base. No `git checkout -b <branch> <base>` anywhere.
-    const fetchCall = runner.calls[5];
-    expect(fetchCall.cmd).toBe('git');
-    expect(fetchCall.args).toEqual(['fetch', 'origin', 'ai/issue-77']);
-    const checkoutCall = runner.calls[6];
-    expect(checkoutCall.args).toContain('checkout');
-    expect(checkoutCall.args).toContain('-B');
-    expect(checkoutCall.args).toContain('ai/issue-77');
-    expect(checkoutCall.args).toContain('FETCH_HEAD');
-    const checkoutBCall = runner.calls.find(
-      (c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('-b'),
-    );
-    expect(checkoutBCall).toBeUndefined();
-  });
-
-  test('fails closed when the recorded branch cannot be fetched from origin', async () => {
-    const runner = originResumeRunner(false);
-    const result = await createImplementationHandler(CONTEXT(), runner)(makeResumeTask());
-    // A transient origin fetch failure must NOT fall through to branching from base
-    // and discarding the pushed side effects — the run fails closed instead.
-    expect(result.result).toBe('failed');
-    expect(result.error).toContain('git fetch origin ai/issue-77');
-    const checkoutBCall = runner.calls.find(
-      (c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('-b'),
-    );
-    expect(checkoutBCall).toBeUndefined();
-  });
+  // Issue #732 note: the "recorded resume branch absent locally, recover it from
+  // origin" scenario that `resumeFromToolRequestBranch`'s own fetch+`checkout -B
+  // FETCH_HEAD` fallback used to cover in shared-checkout mode is now handled
+  // entirely BEFORE worktree materialization (Step 0.6's `hasRecordedResumeBranch`
+  // origin-recovery fetch, covered by the "origin-only resume branch becomes the
+  // worktree start point" test in the per-issue-worktree-execution describe block
+  // above). By the time this resume reconciliation runs, the worktree has already
+  // been checked out ON the recorded branch, so `refs/heads/<branch>` always
+  // exists in the worktree — the "absent locally" branch inside
+  // `resumeFromToolRequestBranch` can no longer be reached from a real worktree
+  // materialization, so the two tests that exercised it directly (fetch-and-adopt
+  // from origin, and fail-closed on that fetch failing) were deleted rather than
+  // rewritten onto an unreachable state.
 
   test('a normal new-impl task never probes for a resume branch', async () => {
     const runner = happyRunner();
-    await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    // No `toolRequestResumeBranch` in context → the rev-parse --verify probe is
-    // never issued, so the command sequence matches the original new-impl path.
+    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('success');
+    // No `toolRequestResumeBranch` in context → the rev-parse --verify resume probe
+    // is never issued, so the command sequence matches the plain worktree happy
+    // path (issue #732: worktree materialization itself — including any branch
+    // creation — is owned by the resolver and stubbed out here, so there is no
+    // observable `git checkout -b` to assert on for either a resumed or a normal
+    // run).
     const verifyCall = runner.calls.find(
       (c) => c.cmd === 'git' && c.args.includes('--verify'),
     );
     expect(verifyCall).toBeUndefined();
-    const checkoutBCall = runner.calls.find((c) => c.cmd === 'git' && c.args.includes('-b'));
-    expect(checkoutBCall).toBeDefined();
+    const pullCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'pull');
+    expect(pullCall).toBeUndefined();
   });
 });
 
@@ -4419,27 +5313,33 @@ describe('implementation handler — Tool Request grant resume branch (issue #31
 
 describe('implementation handler — resumed-branch no-op success (issue #404)', () => {
   // Resume an existing local `ai/issue-77` that is reconciled with origin, then the
-  // agent makes no new edits. `diffQuietExit` models `git diff --quiet base...HEAD`:
-  // exit 1 = the branch already has committed changes; exit 0 = the branch is empty.
+  // agent makes no new edits. `diffQuietExit` models `git diff --quiet
+  // origin/<base>...HEAD`: exit 1 = the branch already has committed changes;
+  // exit 0 = the branch is empty. Worktree mode compares against the FETCHED
+  // `origin/<base>` rather than the local `baseBranch` ref (issue #454 review):
+  // worktree mode skips the shared checkout's `git checkout <base> && git pull`,
+  // so a stale local `main` could make a branch with only upstream base commits
+  // look non-empty and wrongly pass the no-op check.
   function resumedNoopRunner(diffQuietExit) {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                      // 0  git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 1  git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                      // 2  git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                  // 3  git rev-parse --abbrev-ref HEAD (== base)
-      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// 4  git rev-parse --verify (exists)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 5  git checkout ai/issue-77 (resume)
+      { stdout: '', stderr: '', exitCode: 0 },                      // 0  git fetch origin main:refs/remotes/origin/main — canonical
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// 1  git rev-parse --verify (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                      // 2  git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                      // 3  git status --porcelain (clean) — worktree
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// 4  git rev-parse --verify (resume probe) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                      // 5  git checkout ai/issue-77 (no-op) — worktree
       { stdout: 'origin/ai/issue-77', stderr: '', exitCode: 0 },    // 6  git ls-remote --exit-code (origin has it)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 7  git fetch origin <branch>
+      { stdout: '', stderr: '', exitCode: 0 },                      // 7  git fetch origin ai/issue-77
       { stdout: '', stderr: '', exitCode: 0 },                      // 8  git merge --ff-only FETCH_HEAD
       { stdout: '0', stderr: '', exitCode: 0 },                     // 9  git rev-list --count FETCH_HEAD..HEAD (not ahead)
       { stdout: '', stderr: '', exitCode: 0 },                      // 10 claude — no new changes
       { stdout: '', stderr: '', exitCode: 0 },                      // 11 git diff --stat HEAD (empty)
       { stdout: '', stderr: '', exitCode: 0 },                      // 12 git ls-files --others (no untracked)
-      { stdout: '', stderr: '', exitCode: diffQuietExit },          // 13 git diff --quiet base...HEAD
+      { stdout: '', stderr: '', exitCode: diffQuietExit },          // 13 git diff --quiet origin/main...HEAD
       { stdout: 'PASS', stderr: '', exitCode: 0 },                  // 14 verification (npm test)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 15 git ls-files -z (nothing stageable)
+      { stdout: '', stderr: '', exitCode: 0 },                      // 15 git ls-files --modified... -z (nothing stageable)
       { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },            // 16 gh pr list (reuse existing PR)
+      { stdout: '', stderr: '', exitCode: 0 },                      // 17 git worktree remove --force --force <wt> — canonical
     ]);
   }
 
@@ -4455,16 +5355,16 @@ describe('implementation handler — resumed-branch no-op success (issue #404)',
   }
 
   test('existing issue branch has committed changes + agent no-op -> success', async () => {
-    const runner = resumedNoopRunner(1); // base...HEAD has committed changes
+    const runner = resumedNoopRunner(1); // origin/main...HEAD has committed changes
     const result = await createImplementationHandler(CONTEXT(), runner)(makeResumeTask());
     expect(result.result).toBe('success');
 
-    // The committed-changes probe was issued against the base branch.
+    // The committed-changes probe was issued against the fetched origin/<base>.
     const diffQuietCall = runner.calls.find(
       (c) => c.cmd === 'git' && c.args[0] === 'diff' && c.args.includes('--quiet'),
     );
     expect(diffQuietCall).toBeDefined();
-    expect(diffQuietCall.args).toEqual(['diff', '--quiet', 'main...HEAD']);
+    expect(diffQuietCall.args).toEqual(['diff', '--quiet', 'origin/main...HEAD']);
 
     // No new commit/push: the branch is already committed and pushed.
     const commitCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'commit');
@@ -4479,7 +5379,7 @@ describe('implementation handler — resumed-branch no-op success (issue #404)',
   });
 
   test('existing issue branch has no committed changes + agent no-op -> failure', async () => {
-    const runner = resumedNoopRunner(0); // base...HEAD is empty
+    const runner = resumedNoopRunner(0); // origin/main...HEAD is empty
     const result = await createImplementationHandler(CONTEXT(), runner)(makeResumeTask());
     expect(result.result).toBe('failed');
     expect(result.error).toMatch(/no file changes/);
@@ -4498,31 +5398,36 @@ describe('implementation handler — resumed-branch no-op success (issue #404)',
   const depResumeChecker = {
     async getBlockedBy() { return [{ issueNumber: 50, state: 'open' }]; },
   };
+  const DEP_BLOCKER_HEAD_SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
 
   // Resume an existing `ai/issue-77` stacked on the blocker head, then the agent
   // makes no new edits. `blockerDiffQuietExit` models
   // `git diff --quiet FETCH_HEAD...HEAD` (FETCH_HEAD = blocker head): exit 1 = the
   // branch has issue-specific commits beyond the blocker; exit 0 = it carries only
-  // the blocker's commits.
+  // the blocker's commits. Uses the DEFAULT worktree resolver (not reused, not
+  // remote-recovered), so the reused-branch ancestry check (issue #667 review, P1)
+  // does not fire here — `depBase` resolves straight from the SHA already captured
+  // while fetching the blocker head in Step 0.6, with no extra runner calls.
   function depResumedNoopRunner(blockerDiffQuietExit, extraSteps = []) {
     return sequenceRunner([
       { stdout: JSON.stringify([DEP_BLOCKER_PR]), stderr: '', exitCode: 0 },         // 0  gh pr list (dep check)
       { stdout: JSON.stringify({ labels: [{ name: 'status:stack-ready' }] }), stderr: '', exitCode: 0 }, // 1  gh issue view (dep check)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 2  git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 3  git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                      // 4  git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                  // 5  git rev-parse --abbrev-ref HEAD (== base)
-      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },// 6  git rev-parse --verify (resume branch exists)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 7  git checkout ai/issue-77 (resume)
-      { stdout: 'origin/ai/issue-77', stderr: '', exitCode: 0 },    // 8  git ls-remote --exit-code (origin has it)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 9  git fetch origin <branch>
-      { stdout: '', stderr: '', exitCode: 0 },                      // 10 git merge --ff-only FETCH_HEAD
-      { stdout: '0', stderr: '', exitCode: 0 },                     // 11 git rev-list --count FETCH_HEAD..HEAD (not ahead)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 12 claude — no new changes
-      { stdout: '', stderr: '', exitCode: 0 },                      // 13 git diff --stat HEAD (empty)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 14 git ls-files --others (no untracked)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 15 git fetch origin <blocker head>
-      { stdout: '', stderr: '', exitCode: blockerDiffQuietExit },   // 16 git diff --quiet FETCH_HEAD...HEAD
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 2  git fetch origin +ai/issue-50:refs/remotes/origin/ai/issue-50 — canonical (blocker start point)
+      { stdout: DEP_BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                       // 3  git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },                   // 4  git rev-parse --verify --quiet refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 5  git status --porcelain (canonical — CLEAN)
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 6  git status --porcelain (clean) — worktree
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },                   // 7  git rev-parse --verify --quiet refs/heads/ai/issue-77 (resume probe) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 8  git checkout ai/issue-77 (no-op) — worktree
+      { stdout: 'origin/ai/issue-77', stderr: '', exitCode: 0 },                       // 9  git ls-remote --exit-code (origin has it)
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 10 git fetch origin ai/issue-77
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 11 git merge --ff-only FETCH_HEAD
+      { stdout: '0', stderr: '', exitCode: 0 },                                       // 12 git rev-list --count FETCH_HEAD..HEAD (not ahead)
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 13 claude — no new changes
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 14 git diff --stat HEAD (empty)
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 15 git ls-files --others (no untracked)
+      { stdout: '', stderr: '', exitCode: 0 },                                        // 16 git fetch origin ai/issue-50 (branchHasCommittedChanges dep fetch) — worktree
+      { stdout: '', stderr: '', exitCode: blockerDiffQuietExit },                      // 17 git diff --quiet FETCH_HEAD...HEAD
       ...extraSteps,
     ]);
   }
@@ -4550,9 +5455,10 @@ describe('implementation handler — resumed-branch no-op success (issue #404)',
     // The branch has issue-specific commits ON TOP OF the blocker head (diff
     // beyond the blocker head is non-empty), so the no-op resume succeeds.
     const runner = depResumedNoopRunner(1, [
-      { stdout: 'PASS', stderr: '', exitCode: 0 },                  // 17 verification (npm test)
-      { stdout: '', stderr: '', exitCode: 0 },                      // 18 git ls-files -z (nothing stageable)
-      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },            // 19 gh pr list (reuse existing PR)
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                  // 18 verification (npm test)
+      { stdout: '', stderr: '', exitCode: 0 },                      // 19 git ls-files --modified... -z (nothing stageable)
+      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },            // 20 gh pr list (reuse existing PR)
+      { stdout: '', stderr: '', exitCode: 0 },                      // 21 git worktree remove --force --force <wt> — canonical
     ]);
     const result = await createImplementationHandler(CONTEXT(), runner, depResumeChecker)(makeResumeTask());
     expect(result.result).toBe('success');
@@ -4564,15 +5470,13 @@ describe('implementation handler — resumed-branch no-op success (issue #404)',
     expect(result.context.resumedNoChanges).toBe(true);
   });
 
-  test('fresh new-impl no-op remains a failure and never probes base...HEAD', async () => {
+  test('fresh new-impl no-op remains a failure and never probes committed changes', async () => {
     // No toolRequestResumeBranch → the fresh branch path. A no-op must still fail,
     // and the committed-changes probe must never run for a fresh implementation.
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },              // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },          // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },              // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin main:refs/remotes/origin/main — canonical
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (clean) — worktree
       { stdout: '', stderr: '', exitCode: 0 },              // claude — succeeds, no edits
       { stdout: '', stderr: '', exitCode: 0 },              // git diff --stat HEAD (empty)
       { stdout: '', stderr: '', exitCode: 0 },              // git ls-files --others (no untracked)
@@ -4588,15 +5492,18 @@ describe('implementation handler — resumed-branch no-op success (issue #404)',
 });
 
 describe('implementation handler — fix mode (status:needs-fix)', () => {
-  test('checks out existing branch instead of creating a new one', async () => {
+  test('reconciles the existing branch via fast-forward pull instead of creating a new one', async () => {
     const runner = happyFixRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeFixTask());
-    // calls[4] = gh pr list, calls[5] = git checkout <existing branch> (no -b flag)
-    const checkoutCall = runner.calls[5];
-    expect(checkoutCall.cmd).toBe('git');
-    expect(checkoutCall.args).toContain('checkout');
-    expect(checkoutCall.args).not.toContain('-b');
-    expect(checkoutCall.args).toContain(EXISTING_BRANCH);
+    // The worktree is already checked out on the existing PR branch (materialized
+    // by resolveWorktree before this point), so there is no `git checkout` at all —
+    // Git refuses to check out a branch already checked out in this worktree's own
+    // tree. Reconciliation with origin is the `git pull --ff-only` inside the
+    // worktree instead (issue #454 review).
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout')).toBe(false);
+    const pullCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'pull');
+    expect(pullCall).toBeDefined();
+    expect(pullCall.args).toEqual(['pull', 'origin', EXISTING_BRANCH, '--ff-only']);
   });
 
   test('does not call gh pr create', async () => {
@@ -4628,35 +5535,32 @@ describe('implementation handler — fix mode (status:needs-fix)', () => {
 
   test('dirty worktree guard still applies in fix mode', async () => {
     const runner = sequenceRunner([
-      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 }, // dirty
+      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },              // gh pr list (early fix-mode PR lookup)
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },  // git rev-parse --verify (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (canonical — CLEAN)
+      { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 },         // git status --porcelain (DIRTY) — worktree
     ]);
     const result = await createImplementationHandler(CONTEXT(), runner)(makeFixTask());
     expect(result.result).toBe('failed');
     expect(result.error).toMatch(/dirty/);
-    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls).toHaveLength(4);
   });
 
   test('fails clearly when no open PR exists for the issue', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },          // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },          // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },          // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },      // rev-parse — HEAD at base
-      { stdout: '[]', stderr: '', exitCode: 0 },        // gh pr list — empty
+      { stdout: '[]', stderr: '', exitCode: 0 },        // gh pr list — empty (early fix-mode PR lookup)
     ]);
     const result = await createImplementationHandler(CONTEXT(), runner)(makeFixTask());
     expect(result.result).toBe('failed');
     expect(result.error).toMatch(/No open PR found/);
     expect(result.error).toMatch(/77/);
+    // The lookup runs before any worktree materialization or git preflight.
+    expect(runner.calls).toHaveLength(1);
   });
 
   test('fails when gh pr list itself errors', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },           // rev-parse — HEAD at base
-      { stdout: '', stderr: 'gh: auth error', exitCode: 1 }, // gh pr list fails
+      { stdout: '', stderr: 'gh: auth error', exitCode: 1 }, // gh pr list fails (early fix-mode PR lookup)
     ]);
     const result = await createImplementationHandler(CONTEXT(), runner)(makeFixTask());
     expect(result.result).toBe('failed');
@@ -4664,14 +5568,16 @@ describe('implementation handler — fix mode (status:needs-fix)', () => {
   });
 
   test('fix mode: new impl task (needs-implementation) still creates branch and PR', async () => {
-    // Confirm normal task (not fix) still goes through the original path
+    // Confirm normal task (not fix) still goes through the original path. Worktree
+    // materialization (including any branch creation) is stubbed/owned by the
+    // resolver, so there is no observable `git checkout -b` to assert on here —
+    // the meaningful fix-vs-new distinction is that a normal task never runs the
+    // fix-mode `git pull --ff-only` reconciliation, and it does create a PR.
     const runner = happyRunner();
     const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('success');
-    const checkoutBCall = runner.calls.find(
-      (c) => c.cmd === 'git' && c.args.includes('-b'),
-    );
-    expect(checkoutBCall).toBeDefined();
+    const pullCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'pull');
+    expect(pullCall).toBeUndefined();
     const ghCreateCall = runner.calls.find(
       (c) => c.cmd === 'gh' && c.args.includes('create'),
     );
@@ -4796,6 +5702,9 @@ describe('implementation handler — dependency recheck gate', () => {
       blockedBy: [{ issueNumber: 50, state: 'open' }],
     });
     expect(typeof result.context?.dependencyRecheck?.checkedAt).toBe('string');
+    // Issue #732 review, P2: a blocked task returns before the artifact dir is
+    // created (Step 0.6 never runs), so the context must mark it pending.
+    expect(result.context?.artifactDirPending).toBe(true);
   });
 
   test('blocked recheck snapshot records the full relationship list (open + closed)', async () => {
@@ -4901,6 +5810,7 @@ describe('implementation handler — dependency recheck gate', () => {
 
 describe('implementation handler — dependency-aware start point (issue #208, #242)', () => {
   const BLOCKER_HEAD = 'ai/issue-50';
+  const BLOCKER_HEAD_SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
   const BLOCKER_PR_URL = 'https://github.com/m2dw/test-repo/pull/55';
   const BLOCKER_PR = {
     number: 55, url: BLOCKER_PR_URL, headRefName: BLOCKER_HEAD,
@@ -4926,72 +5836,121 @@ describe('implementation handler — dependency-aware start point (issue #208, #
     return JSON.stringify({ labels: labels.map((name) => ({ name })) });
   }
 
-  // Full happy stacked sequence. Dep check runs FIRST (before any git ops) per
-  // issue #224. Calls:
-  // gh-pr-list(0) gh-issue-view(1)           ← dep check (no git needed)
-  // status(2) checkout-main(3) pull(4) rev-parse(5)   ← git preflight
-  // git-fetch(6) checkout-b-FETCH_HEAD(7) claude(8) diff(9) verification(10)
-  // ls-files(11) add(12) commit(13) push(14) gh-pr-create(15)
+  // Full happy stacked sequence (issue #732: worktree-only orchestration). Dep
+  // check runs FIRST (before any git op) per issue #224. The blocker head is then
+  // fetched into its remote-tracking ref IN THE CANONICAL REPO, before the
+  // per-issue worktree is ever materialized (issue #454, #455): resolveWorktree
+  // itself is stubbed by the `createImplementationHandler` test wrapper, so branch
+  // creation is not an observable git call here.
+  // Calls:
+  // gh-pr-list(0) gh-issue-view(1)                          ← dep check
+  // git-fetch-blocker(2, canonical) rev-parse-blocker-sha(3, canonical)
+  //   ← blocker-head start point + dependency review base (issue #667 review, P2)
+  // status(4, canonical) status(5, worktree)                ← preflight
+  // claude(6) diff(7) verification(8)
+  // ls-files(9) add(10) commit(11) push(12) gh-pr-create(13)
+  // worktree-remove(14, canonical)                          ← frees the branch (issue #454 review)
   function stackedHappyRunner(prUrl = 'https://github.com/m2dw/test-repo/pull/99') {
     return sequenceRunner([
-      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 }, // gh pr list (dep check — first!)
-      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 }, // gh issue view (dep check)
-      { stdout: '', stderr: '', exitCode: 0 },                          // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                          // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                          // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                      // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },                          // git fetch origin <head>
-      { stdout: '', stderr: '', exitCode: 0 },                          // git checkout -b <branch> FETCH_HEAD
-      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },      // claude
-      { stdout: '2 files changed', stderr: '', exitCode: 0 },           // git diff --stat HEAD
-      { stdout: 'PASS', stderr: '', exitCode: 0 },                      // verification (npm test)
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },              // git ls-files -z
-      { stdout: '', stderr: '', exitCode: 0 },                          // git add -- <paths>
-      { stdout: '', stderr: '', exitCode: 0 },                          // git commit
-      { stdout: '', stderr: '', exitCode: 0 },                          // git push
-      { stdout: prUrl, stderr: '', exitCode: 0 },                       // gh pr create
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },       // 0  gh pr list (dep check — first!)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 }, // 1  gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                 // 2  git fetch origin +ai/issue-50:refs/remotes/origin/ai/issue-50 — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                   // 3  git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667 review P2) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                 // 4  git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                 // 5  git status --porcelain (worktree — clean)
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },             // 6  claude
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },                  // 7  git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                             // 8  verification (npm test)
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },                     // 9  git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                                 // 10 git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                                 // 11 git commit
+      { stdout: '', stderr: '', exitCode: 0 },                                 // 12 git push
+      { stdout: prUrl, stderr: '', exitCode: 0 },                              // 13 gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                 // 14 git worktree remove --force --force <wt> (free branch) — canonical
     ]);
   }
 
   test('no dependency: branches from the base branch and targets the base in the PR', async () => {
     const runner = happyRunner();
-    const result = await createImplementationHandler(CONTEXT(), runner, noBlockerDepChecker)(makeTask());
+    const resolver = fakeWorktreeResolver(defaultWorktreePath());
+    const result = await createImplementationHandler(CONTEXT(), runner, noBlockerDepChecker, resolver.resolve)(makeTask());
     expect(result.result).toBe('success');
-    // Branch created explicitly from main, not via fetch/FETCH_HEAD
-    const checkoutB = runner.calls.find((c) => c.cmd === 'git' && c.args.includes('-b'));
-    expect(checkoutB.args).toEqual(['checkout', '-b', 'ai/issue-77', 'main']);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'fetch')).toBe(false);
+    // With no dependency, resolveWorktree receives the plain refreshed base as
+    // the start point — never a blocker head.
+    expect(resolver.calls[0]).toMatchObject({ branch: 'ai/issue-77', baseRef: 'origin/main' });
+    // The base is refreshed in the canonical repo before the worktree materializes
+    // (issue #454 review); no blocker-head fetch occurs for a non-stacked task.
+    const fetchCalls = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0].args).toEqual(['fetch', 'origin', '+main:refs/remotes/origin/main']);
     const ghCreate = runner.calls.find((c) => c.cmd === 'gh' && c.args.includes('create'));
     expect(ghCreate.args[ghCreate.args.indexOf('--base') + 1]).toBe('main');
-    // No dependency base metadata recorded for the no-dependency case
+    // No dependency base metadata recorded for the no-dependency case. The key
+    // must still be written explicitly as undefined (not omitted) so applyTaskPatch's
+    // context merge clears any stale dependencyBase left over from an earlier
+    // dependency-started run of this issue (issue #667 review, P2) — same guarantee
+    // already covered for the Tool Request handoff path above.
+    expect('dependencyBase' in result.context).toBe(true);
     expect(result.context?.dependencyBase).toBeUndefined();
   });
 
-  test('one usable blocker PR: command order fetches blocker head then branches from FETCH_HEAD', async () => {
+  test('no dependency: clears a stale dependencyBase left over from an earlier dependency-started run (issue #667 review, P2)', async () => {
+    // Simulates a task that was previously dependency-started (blocker head recorded),
+    // then reimplemented after the blocker resolved and its issue branch was recreated
+    // from main — the incoming task context still carries the old dependencyBase.
+    const runner = happyRunner();
+    const staleTask = makeTask({
+      context: { ...makeTask().context, dependencyBase: { baseHeadSha: 'deadbeef', baseHeadRefName: 'ai/issue-11' } },
+    });
+    const result = await createImplementationHandler(CONTEXT(), runner, noBlockerDepChecker)(staleTask);
+    expect(result.result).toBe('success');
+    expect('dependencyBase' in result.context).toBe(true);
+    expect(result.context?.dependencyBase).toBeUndefined();
+    // The phase runner's context merge must actually drop the stale value, not just
+    // the raw handler result — this is what review.ts reads at the next phase.
+    const patched = applyTaskPatch(staleTask, { context: result.context });
+    expect(patched.context.dependencyBase).toBeUndefined();
+  });
+
+  test('one usable blocker PR: command order fetches the blocker head into the canonical repo before the worktree is ever materialized', async () => {
     const runner = stackedHappyRunner();
     const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker)(makeTask());
     expect(result.result).toBe('success');
     const calls = runner.calls;
-    // Dep check (gh pr list + gh issue view) now runs BEFORE any git preflight
+    // Dep check (gh pr list + gh issue view) runs BEFORE any git op.
     expect(calls[0]).toMatchObject({ cmd: 'gh', args: expect.arrayContaining(['pr', 'list']) });
-    expect(calls[6]).toMatchObject({ cmd: 'git', args: ['fetch', 'origin', BLOCKER_HEAD] });
-    expect(calls[7]).toMatchObject({ cmd: 'git', args: ['checkout', '-b', 'ai/issue-77', 'FETCH_HEAD'] });
-    expect(calls[8].cmd).toBe('claude');
+    expect(calls[1]).toMatchObject({ cmd: 'gh', args: expect.arrayContaining(['issue', 'view']) });
+    // The blocker head is fetched into its remote-tracking ref, in the canonical
+    // repo, before resolveWorktree is ever called (issue #454, #455).
+    expect(calls[2]).toMatchObject({
+      cmd: 'git', args: ['fetch', 'origin', `+${BLOCKER_HEAD}:refs/remotes/origin/${BLOCKER_HEAD}`],
+    });
+    expect(calls[2].opts.cwd).toBe(repoRoot);
+    // The dependency review base (issue #667) is captured right here, from the
+    // fetch that just landed — not re-fetched later (issue #667 review, P2).
+    expect(calls[3]).toMatchObject({ cmd: 'git', args: ['rev-parse', `refs/remotes/origin/${BLOCKER_HEAD}`] });
+    expect(calls[4]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
+    expect(calls[5]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
+    expect(calls[6].cmd).toBe('claude');
   });
 
-  test('one usable blocker PR: dependent branch is not created from stale main', async () => {
+  test('one usable blocker PR: the worktree resolver receives the blocker head as the branch start point, never the base', async () => {
+    // Branch creation itself is resolveWorktree's job (issue #454, #732), so the
+    // dependency-stacked start point is verified through the resolver's own input
+    // rather than an observable `git checkout -b`.
+    const resolver = fakeWorktreeResolver(defaultWorktreePath());
     const runner = stackedHappyRunner();
-    await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker)(makeTask());
-    // The branch-creating checkout -b must use FETCH_HEAD, never the base branch.
-    const checkoutB = runner.calls.find((c) => c.cmd === 'git' && c.args.includes('-b'));
-    expect(checkoutB.args).toEqual(['checkout', '-b', 'ai/issue-77', 'FETCH_HEAD']);
-    expect(checkoutB.args).not.toContain('main');
+    await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, resolver.resolve)(makeTask());
+    expect(resolver.calls[0]).toMatchObject({ branch: 'ai/issue-77', baseRef: `origin/${BLOCKER_HEAD}` });
+    expect(runner.calls.some(
+      (c) => c.cmd === 'git' && c.args[0] === 'fetch' && c.args.some((a) => typeof a === 'string' && a.includes('main')),
+    )).toBe(false);
   });
 
   test('one usable blocker PR: dependent PR targets the session base branch, NOT the blocker head (issue #242)', async () => {
-    // The branch START POINT is the blocker head (FETCH_HEAD), but the PR must
-    // still target the session base branch (`main`) so the dependent issue's
-    // mainline delivery stays visible. There is no retargeting step.
+    // The branch START POINT is the blocker head, but the PR must still target
+    // the session base branch (`main`) so the dependent issue's mainline delivery
+    // stays visible. There is no retargeting step.
     const runner = stackedHappyRunner();
     await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker)(makeTask());
     const ghCreate = runner.calls.find((c) => c.cmd === 'gh' && c.args.includes('create'));
@@ -5008,6 +5967,9 @@ describe('implementation handler — dependency-aware start point (issue #208, #
       basePrNumber: 55,
       baseHeadRefName: BLOCKER_HEAD,
       basePrUrl: BLOCKER_PR_URL,
+      // The exact predecessor commit the branch was built on (issue #667), so
+      // review can diff against it instead of the session base.
+      baseHeadSha: BLOCKER_HEAD_SHA,
     });
   });
 
@@ -5022,67 +5984,113 @@ describe('implementation handler — dependency-aware start point (issue #208, #
       basePrNumber: 55,
       baseHeadRefName: BLOCKER_HEAD,
       basePrUrl: BLOCKER_PR_URL,
+      baseHeadSha: BLOCKER_HEAD_SHA,
     });
   });
 
-  test('fresh/single-branch clone: uses git fetch + FETCH_HEAD and never a remote-tracking ref', async () => {
+  test('canonical fetch of the blocker head uses an explicit force-updating remote-tracking refspec, never FETCH_HEAD (issue #458 review, #732)', async () => {
     const runner = stackedHappyRunner();
     await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker)(makeTask());
-    // The head is fetched explicitly so a missing origin/<head> ref is irrelevant.
+    // The blocker head is fetched straight into its remote-tracking ref with a
+    // force-updating (`+`) refspec, deterministically regardless of the clone's
+    // configured fetch refspec, and even when the blocker head was force-pushed.
     const fetchCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'fetch');
-    expect(fetchCall.args).toEqual(['fetch', 'origin', BLOCKER_HEAD]);
-    // Nothing references a remote-tracking ref like origin/ai/issue-50.
-    for (const call of runner.calls) {
-      expect(call.args).not.toContain(`origin/${BLOCKER_HEAD}`);
-    }
+    expect(fetchCall.args).toEqual(['fetch', 'origin', `+${BLOCKER_HEAD}:refs/remotes/origin/${BLOCKER_HEAD}`]);
+    // The dependency-review-base SHA (issue #667) is captured from that same
+    // remote-tracking ref (issue #667 review, P2) — the worktree manager, not this
+    // fetch, is what materializes the branch (issue #732), so there is no
+    // FETCH_HEAD-based capture left.
+    const revParseCall = runner.calls.find(
+      (c) => c.cmd === 'git' && c.args[0] === 'rev-parse' && !c.args.includes('--verify'),
+    );
+    expect(revParseCall.args).toEqual(['rev-parse', `refs/remotes/origin/${BLOCKER_HEAD}`]);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('FETCH_HEAD'))).toBe(false);
   });
 
   test('one usable blocker PR + recorded resume branch: resumes the issue branch, never recreates from the blocker head (issue #316 review)', async () => {
     // A Tool Request grant raised during dependency-start-point implementation
     // landed the side effects on `ai/issue-77` (created from the blocker head) and
     // manual-done recorded it as the resume branch. The next run still sees the
-    // dependency as ready (depBase set), but it must resume from `ai/issue-77`
-    // rather than fetch the blocker head and `git checkout -b` (which would collide
-    // with the existing branch or discard the granted changes).
+    // dependency as ready (depBase set) — the blocker head is still fetched in the
+    // canonical repo (issue #732: it always is, whenever depBase is set) — but the
+    // resolved worktree branch must be RESUMED, never recreated from that head.
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // 0  gh pr list (dep check)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // 1  gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 2  git fetch origin +ai/issue-50:refs/remotes/origin/ai/issue-50 — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // 3  git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667 review P2) — canonical
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },            // 4  git rev-parse --verify --quiet refs/heads/ai/issue-77 (hasRecordedResumeBranch: local branch present) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 5  git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 6  git status --porcelain (worktree — clean)
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },            // 7  git rev-parse --verify --quiet refs/heads/ai/issue-77 (resume probe) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 8  git checkout ai/issue-77 (resume, no -b) — worktree
+      { stdout: '', stderr: '', exitCode: 2 },                                  // 9  git ls-remote --exit-code --heads origin ai/issue-77 (origin lacks it; keep local) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 10 git merge-base --is-ancestor <blocker SHA> HEAD (issue #667 review, P1) — worktree
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },              // 11 claude
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },                   // 12 git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                              // 13 verification
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },                      // 14 git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 15 git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 16 git commit
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 17 git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // 18 gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                  // 19 git worktree remove --force --force <wt> — canonical
+    ]);
+    const resolver = fakeWorktreeResolver(defaultWorktreePath(), { created: false }); // reused branch
+    const task = makeTask({ context: { ...makeTask().context, toolRequestResumeBranch: 'ai/issue-77' } });
+    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, resolver.resolve)(task);
+    expect(result.result).toBe('success');
+
+    // The worktree-side resume probe checked out the recorded branch WITHOUT -b.
+    const verifyCall = runner.calls[7];
+    expect(verifyCall).toMatchObject({ cmd: 'git', args: ['rev-parse', '--verify', '--quiet', 'refs/heads/ai/issue-77'] });
+    const checkoutResume = runner.calls[8];
+    expect(checkoutResume).toMatchObject({ cmd: 'git', args: ['checkout', 'ai/issue-77'] });
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('-b'))).toBe(false);
+    // The blocker head is fetched exactly once — the canonical Step 0.6 fetch that
+    // always runs whenever depBase is set (issue #732) — never a second time to
+    // recreate the branch.
+    const fetchCalls = runner.calls.filter((c) => c.cmd === 'git' && c.args[0] === 'fetch');
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0].args).toEqual(['fetch', 'origin', `+${BLOCKER_HEAD}:refs/remotes/origin/${BLOCKER_HEAD}`]);
+    expect(result.context?.dependencyBase?.baseHeadSha).toBe(BLOCKER_HEAD_SHA);
+  });
+
+  test('resumed Tool Request branch: rewritten blocker ref fails closed instead of resolving a stale merge-base (issue #667 review, P2)', async () => {
+    // Same resume scaffolding as above, but the blocker PR was force-pushed/rebased
+    // after 'ai/issue-77' was created, so the current blocker head is no longer an
+    // ancestor of the resumed branch. The ancestry check runs BEFORE the agent, using
+    // the SHA already captured while fetching the blocker head in Step 0.6 — it must
+    // fail closed rather than silently accept a stale predecessor.
     const runner = sequenceRunner([
       { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
       { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                              // rev-parse — HEAD at base
-      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },            // rev-parse --verify (resume branch exists locally)
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git checkout ai/issue-77 (resume)
-      { stdout: '', stderr: '', exitCode: 2 },                                  // ls-remote --exit-code (origin lacks it; keep local)
-      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },              // claude
-      { stdout: '2 files changed', stderr: '', exitCode: 0 },                   // git diff --stat HEAD
-      { stdout: 'PASS', stderr: '', exitCode: 0 },                              // verification
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },                      // git ls-files -z
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git add -- <paths>
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git commit
-      { stdout: '', stderr: '', exitCode: 0 },                                  // git push
-      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },            // git rev-parse --verify --quiet (hasRecordedResumeBranch: local branch present) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (worktree — clean)
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },            // git rev-parse --verify --quiet (resume probe) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git checkout ai/issue-77 (resume, no -b) — worktree
+      { stdout: '', stderr: '', exitCode: 2 },                                  // git ls-remote --exit-code (origin lacks it; keep local) — worktree
+      { stdout: '', stderr: '', exitCode: 1 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD -> NOT an ancestor (rewritten blocker)
     ]);
+    const resolver = fakeWorktreeResolver(defaultWorktreePath(), { created: false });
     const task = makeTask({ context: { ...makeTask().context, toolRequestResumeBranch: 'ai/issue-77' } });
-    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker)(task);
-    expect(result.result).toBe('success');
-
-    // The recorded resume branch was checked out WITHOUT -b, and the blocker head
-    // was never fetched or used as a branch start point.
-    const verifyCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'rev-parse' && c.args.includes('--verify'));
-    expect(verifyCall.args).toEqual(['rev-parse', '--verify', '--quiet', 'refs/heads/ai/issue-77']);
-    const checkoutB = runner.calls.find((c) => c.cmd === 'git' && c.args.includes('-b'));
-    expect(checkoutB).toBeUndefined();
-    const fetchCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'fetch');
-    expect(fetchCall).toBeUndefined();
-    const checkoutResume = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('ai/issue-77'));
-    expect(checkoutResume.args).toEqual(['checkout', 'ai/issue-77']);
+    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, resolver.resolve)(task);
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/does not contain the current blocker head/);
+    expect(result.error).toMatch(/force-pushed or rebased/);
+    // No commit/push/PR calls: the run must stop before it ever resolves a stale base.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args.includes('create'))).toBe(false);
   });
 
   test('unsupported multiple open blockers: returns blocked without any runner calls', async () => {
     // Two open blockers — dep check short-circuits before the resolver issues any
     // runner call (no gh pr list needed). Since dep check now runs BEFORE git
-    // preflight, zero commands are issued (issue #224).
+    // preflight AND before worktree materialization, zero commands are issued
+    // (issue #224, #732).
     const runner = sequenceRunner([]);
     const result = await createImplementationHandler(CONTEXT(), runner, twoOpenBlockersDepChecker)(makeTask());
     expect(result.result).toBe('blocked');
@@ -5092,7 +6100,7 @@ describe('implementation handler — dependency-aware start point (issue #208, #
 
   test('blocker PR missing: returns blocked — dep check fires before any git op', async () => {
     // Dep check runs first: gh pr list returns no open PR → blocked. No git
-    // commands run (issue #224).
+    // commands run, and the worktree is never materialized (issue #224, #732).
     const runner = sequenceRunner([
       { stdout: '[]', stderr: '', exitCode: 0 },  // gh pr list (dep check) — no open PR
     ]);
@@ -5100,7 +6108,6 @@ describe('implementation handler — dependency-aware start point (issue #208, #
     expect(result.result).toBe('blocked');
     expect(result.message).toMatch(/no open PR/i);
     expect(runner.calls.some((c) => c.cmd === 'git')).toBe(false);
-    expect(runner.calls.some((c) => c.args.includes('-b'))).toBe(false);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'fetch')).toBe(false);
   });
 
@@ -5113,26 +6120,191 @@ describe('implementation handler — dependency-aware start point (issue #208, #
     expect(result.result).toBe('blocked');
     expect(result.message).toMatch(/CONFLICTING|DIRTY/);
     expect(runner.calls.some((c) => c.cmd === 'git')).toBe(false);
-    expect(runner.calls.some((c) => c.args.includes('-b'))).toBe(false);
   });
 
-  test('failed git fetch of blocker head returns failed without creating a PR', async () => {
-    // Dep check succeeds (blocker PR is usable), then git preflight runs, then
-    // git fetch of the blocker head fails.
+  test('failed git fetch of blocker head returns failed without creating a PR or ever materializing the worktree', async () => {
+    // Dep check succeeds (blocker PR is usable), then the canonical fetch of the
+    // blocker head — the very first git op, run BEFORE resolveWorktree — fails.
     const runner = sequenceRunner([
       { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },  // gh pr list (dep check)
       { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
-      { stdout: '', stderr: '', exitCode: 0 },                            // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                            // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                            // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                        // rev-parse — HEAD at base
       { stdout: '', stderr: 'fatal: couldn\'t find remote ref', exitCode: 1 }, // git fetch — fails
     ]);
     const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker)(makeTask());
     expect(result.result).toBe('failed');
     expect(result.error).toMatch(/git fetch origin/);
-    expect(runner.calls.some((c) => c.args.includes('-b'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('-b'))).toBe(false);
     expect(runner.calls.some((c) => c.cmd === 'gh' && c.args.includes('create'))).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Existing-branch guard for stacked recovery (issue #659)
+  //
+  // Pre-#732 regression coverage for m2dw/yoda_form_js#237: a dependency-stacked
+  // task whose recorded resume context was lost must never blindly recreate
+  // `ai/issue-<n>` from the blocker head when that branch already exists —
+  // locally (collision) or on origin only (later non-fast-forward push).
+  //
+  // Issue #732 moved that branch-existence detection (rev-parse --verify,
+  // ls-remote, checkout -B, merge --ff-only, rev-list --count) entirely INTO
+  // resolveIssueWorktree — it is no longer observable through this handler's
+  // mock command runner. What implementation.ts still owns, and what remains
+  // testable here, is (a) the resolver always receives the blocker head as the
+  // start point regardless of what it decides to do with it, (b) the
+  // delayed-retry empty-placeholder reset and the pre-agent ancestry validation
+  // that key off the resolver's `branchReused` / `startedFromRemoteHead` flags,
+  // and (c) that a resolveWorktree failure (e.g. a diverged or unpushed-ahead
+  // local branch) fails the run closed before any worktree-side git op.
+  // ---------------------------------------------------------------------------
+
+  test('existing LOCAL issue branch (no recorded resume marker) is reused: the resolver still receives the blocker head as the start point, and real committed work is preserved untouched (issue #237 local-collision regression)', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 (capture dependency review base, issue #667) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (worktree — clean)
+      // Non-zero: the reused branch already carries real issue-specific commits,
+      // so the delayed-retry empty-placeholder reset is skipped entirely.
+      { stdout: '3', stderr: '', exitCode: 0 },                                 // git rev-list --count --right-only --cherry-pick origin/ai/issue-50...ai/issue-77
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD (issue #667 review, P1)
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },              // claude
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },                   // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                              // verification
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },                      // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git worktree remove --force --force <wt> — canonical
+    ]);
+    const resolver = fakeWorktreeResolver(defaultWorktreePath(), { created: false }); // reused branch, no resume marker
+    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, resolver.resolve)(makeTask());
+    expect(result.result).toBe('success');
+    expect(resolver.calls[0]).toMatchObject({ branch: 'ai/issue-77', baseRef: `origin/${BLOCKER_HEAD}` });
+    // The real committed work is preserved: no reset onto the blocker head, and
+    // ancestry against the current blocker head was still validated up front.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'reset')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'merge-base' && c.args.includes('--is-ancestor'))).toBe(true);
+  });
+
+  test('existing LOCAL issue branch whose ancestry is incompatible with a rewritten blocker head fails closed (issue #659 review, P2)', async () => {
+    // The reused `ai/issue-77` was built on an OLDER blocker head that was later
+    // force-pushed/rebased. Reusing it must NOT silently succeed — the branch's
+    // start point no longer shares history with the current blocker head.
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (worktree — clean)
+      { stdout: '3', stderr: '', exitCode: 0 },                                 // git rev-list --count --right-only --cherry-pick (real work — reset skipped)
+      { stdout: '', stderr: '', exitCode: 1 },                                  // git merge-base --is-ancestor — NOT an ancestor
+    ]);
+    const resolver = fakeWorktreeResolver(defaultWorktreePath(), { created: false });
+    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, resolver.resolve)(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/does not contain the current blocker head/);
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args.includes('create'))).toBe(false);
+  });
+
+  test('existing ORIGIN-ONLY issue branch is recovered by the resolver and still validated against the current blocker head (issue #237 non-fast-forward regression)', async () => {
+    // No local branch existed, but resolveWorktree recovered one from an existing
+    // `origin/ai/issue-77` (a prior PR head). `branchReused` is false (no local
+    // branch to reuse), but `startedFromRemoteHead` is true — the ancestry check
+    // is gated on EITHER flag (issue #667 review, P1 follow-up).
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (worktree — clean)
+      // No local branch existed, so the delayed-retry probe never fires; the very
+      // next call is the ancestry check against the recovered branch's HEAD.
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD — IS an ancestor
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },              // claude
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },                   // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                              // verification
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },                      // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git worktree remove --force --force <wt> — canonical
+    ]);
+    const resolver = fakeWorktreeResolver(defaultWorktreePath(), { created: true, branchReused: false, startedFromRemoteHead: true });
+    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, resolver.resolve)(makeTask());
+    expect(result.result).toBe('success');
+    expect(resolver.calls[0]).toMatchObject({ branch: 'ai/issue-77', baseRef: `origin/${BLOCKER_HEAD}` });
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'merge-base' && c.args.includes('--is-ancestor'))).toBe(true);
+    expect(result.context?.branch).toBe('ai/issue-77');
+  });
+
+  // A worktree resolution failure — e.g. a local branch that diverged from
+  // origin, or carries unpushed commits the resolver refuses to silently
+  // discard/resume from — now surfaces as `resolveWorktree` returning `{ ok:
+  // false }` (issue #732: that reconciliation moved entirely into
+  // resolveIssueWorktree). The handler's only remaining responsibility is to
+  // fail the run closed, before any worktree-side git op, on that failure.
+  test('a worktree resolution failure (e.g. a diverged local issue branch) fails closed before any worktree-side git op or PR creation', async () => {
+    const runner = stackedHappyRunner(); // only the dep-check + canonical fetch/rev-parse calls are consumed
+    const failingResolve = (input) => ({
+      ok: false,
+      error: `local '${input.branch}' diverged from origin/${input.branch}; refusing to fast-forward`,
+    });
+    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, failingResolve)(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('diverged from origin');
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args.includes('create'))).toBe(false);
+  });
+
+  test('a worktree resolution failure for a local branch ahead of origin (unpushed commits) fails closed instead of silently resuming (issue #659 review, P1 semantics, moved into resolveWorktree)', async () => {
+    const runner = stackedHappyRunner();
+    const failingResolve = (input) => ({
+      ok: false,
+      error: `local '${input.branch}' is ahead of origin/${input.branch} by 3 commit(s); refusing to resume from unpushed local commits`,
+    });
+    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, failingResolve)(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('ahead of origin');
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args.includes('create'))).toBe(false);
+  });
+
+  test('quota exhaustion during dependency-stacked implementation preserves the issue worktree branch (issue #659 review, P1 corollary in worktree mode)', async () => {
+    // A prior run reused a local-only `ai/issue-77` (possibly with committed work
+    // this run's agent never touched) and this run's agent then hits a
+    // quota/rate-limit failure. In worktree mode the delayed cleanup NEVER drops
+    // the issue branch regardless of reuse (issue #454, #470) — capturePartialDiff
+    // only snapshots UNCOMMITTED changes, so deleting a reused branch here would
+    // silently destroy any already-committed work a prior run left on it.
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify([BLOCKER_PR]), stderr: '', exitCode: 0 },        // gh pr list (dep check)
+      { stdout: issueViewJson([STACK_READY_LABEL]), stderr: '', exitCode: 0 },  // gh issue view (dep check)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git fetch origin +ai/issue-50:... — canonical
+      { stdout: BLOCKER_HEAD_SHA, stderr: '', exitCode: 0 },                    // git rev-parse refs/remotes/origin/ai/issue-50 — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git status --porcelain (worktree — clean)
+      { stdout: '3', stderr: '', exitCode: 0 },                                 // git rev-list --count --right-only --cherry-pick (real work — reset skipped)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git merge-base --is-ancestor <blocker SHA> HEAD — IS an ancestor
+      { stdout: '', stderr: 'Error: HTTP 429 rate limit exceeded, try again later', exitCode: 1 }, // claude — quota
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git add -A (capture partial diff, issue #379)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git diff --cached --binary HEAD (no NEW uncommitted work)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git reset --hard HEAD (worktree-native restore, issue #454 review)
+      { stdout: '', stderr: '', exitCode: 0 },                                  // git clean -fd
+    ]);
+    const resolver = fakeWorktreeResolver(defaultWorktreePath(), { created: false }); // reused branch
+    const result = await createImplementationHandler(CONTEXT(), runner, oneOpenBlockerDepChecker, resolver.resolve)(makeTask());
+    expect(result.result).toBe('delayed');
+    // Restored to a clean worktree HEAD, but the reused issue branch is NEVER
+    // dropped — worktree mode never `git branch -D`s the durable issue branch.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'reset' && c.args.includes('--hard') && c.args.includes('HEAD'))).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
   });
 });
 
@@ -5191,15 +6363,52 @@ describe('implementation handler — resolved profile metadata', () => {
     });
   });
 
-  test('complexity:xhigh label records label-sourced profile (effort=xhigh, $20)', async () => {
+  test('complexity:xhigh label records label-sourced profile (model=fable, effort=high, $20)', async () => {
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:claude', 'status:needs-implementation', 'complexity:xhigh'] } });
     await createImplementationHandler(CONTEXT(), happyRunner())(task);
     const ctx = JSON.parse(readFileSync(join(dir(), 'implementation-context.json'), 'utf8'));
     expect(ctx.resolvedProfile).toMatchObject({
-      model: 'opus', modelSource: 'label',
-      effort: 'xhigh', effortSource: 'label',
+      model: 'fable', modelSource: 'label',
+      effort: 'high', effortSource: 'label',
       maxBudgetUsd: '20', budgetSource: 'label',
     });
+  });
+
+  test('session claude.complexityProfiles override on complexity:xhigh records source=session-config', async () => {
+    const task = makeTask({ context: { ...makeTask().context, labels: ['agent:claude', 'status:needs-implementation', 'complexity:xhigh'] } });
+    const context = CONTEXT({ session: SESSION({ claude: { complexityProfiles: { xhigh: { model: 'claude-fable-5' } } } }) });
+    await createImplementationHandler(context, happyRunner())(task);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'implementation-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({
+      model: 'claude-fable-5', modelSource: 'session-config',
+      effort: 'high', effortSource: 'label',
+      maxBudgetUsd: '20', budgetSource: 'label',
+    });
+  });
+
+  test('session claude.complexityProfiles override on the default tier (no complexity label) records source=session-config', async () => {
+    const context = CONTEXT({ session: SESSION({ claude: { complexityProfiles: { default: { model: 'opus', effort: 'low', budget: '3' } } } }) });
+    await createImplementationHandler(context, happyRunner())(makeTask());
+    const ctx = JSON.parse(readFileSync(join(dir(), 'implementation-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({
+      model: 'opus', modelSource: 'session-config',
+      effort: 'low', effortSource: 'session-config',
+      maxBudgetUsd: '3', budgetSource: 'session-config',
+    });
+  });
+
+  test('escalatedEffort still wins over a session-config effort override (source=escalation)', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        labels: ['agent:claude', 'status:needs-implementation', 'complexity:low'],
+        escalatedEffort: 'high',
+      },
+    });
+    const context = CONTEXT({ session: SESSION({ claude: { complexityProfiles: { low: { effort: 'low' } } } }) });
+    await createImplementationHandler(context, happyRunner())(task);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'implementation-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ effort: 'high', effortSource: 'escalation' });
   });
 
   test('env vars record source=env in resolved profile', async () => {
@@ -5292,130 +6501,19 @@ describe('implementation handler — resolved profile metadata', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Contamination guard (issue #211)
-//
-// Regression coverage for the superseded PR #207 incident: issue #202 committed
-// but failed at gh pr create, then issue #199's branch picked up #202's commit.
-// ---------------------------------------------------------------------------
-
-describe('implementation handler — contamination guard (issue #211)', () => {
-  const QUARANTINE = () => join(artifactRoot, 'implementation-quarantine.json');
-
-  // status, checkout base, pull, rev-parse(main), checkout -b, claude, diff,
-  // verification, ls-files, add, commit, push, gh pr create (fails), then
-  // cleanup status (clean) + checkout base.
-  function commitThenPrCreateFails() {
-    return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },           // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'done', stderr: '', exitCode: 0 },
-      { stdout: '1 file changed', stderr: '', exitCode: 0 },
-      { stdout: 'PASS', stderr: '', exitCode: 0 },
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },               // add
-      { stdout: '', stderr: '', exitCode: 0 },               // commit
-      { stdout: '', stderr: '', exitCode: 0 },               // push
-      { stdout: '', stderr: 'gh: rate limited', exitCode: 1 }, // gh pr create — fails
-      { stdout: '', stderr: '', exitCode: 0 },               // cleanup status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },               // cleanup checkout base
-    ]);
-  }
-
-  test('issue A late PR-create failure does not leak its commit into issue B branch base', async () => {
-    // Run A: issue #202 commits, then gh pr create fails. Cleanup restores HEAD
-    // to the base branch and does NOT quarantine (worktree was clean).
-    const runnerA = commitThenPrCreateFails();
-    const rA = await createImplementationHandler(CONTEXT(), runnerA)(makeTask({ issueNumber: 202 }));
-    expect(rA.result).toBe('failed');
-    expect(rA.error).toMatch(/gh: rate limited/);
-    expect(rA.error).not.toMatch(/quarantined/);
-    expect(existsSync(QUARANTINE())).toBe(false);
-    const restoreCheckout = [...runnerA.calls].reverse().find((c) => c.cmd === 'git' && c.args[0] === 'checkout');
-    expect(restoreCheckout).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
-
-    // Run B: issue #199 starts later. HEAD is verified to be at base and the new
-    // branch is created explicitly from base — never from ai/issue-202.
-    const runnerB = happyRunner();
-    const rB = await createImplementationHandler(CONTEXT(), runnerB)(makeTask({ issueNumber: 199 }));
-    expect(rB.result).toBe('success');
-    const checkoutB = runnerB.calls.find((c) => c.cmd === 'git' && c.args.includes('-b'));
-    expect(checkoutB.args).toEqual(['checkout', '-b', 'ai/issue-199', 'main']);
-  });
-
-  test('late failure that cannot be safely restored quarantines and blocks the next run', async () => {
-    // Run A: commit fails leaving a dirty worktree, so cleanup cannot return to
-    // the base branch and must quarantine.
-    const runnerA = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                // status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                // checkout base
-      { stdout: '', stderr: '', exitCode: 0 },                // pull
-      { stdout: 'main', stderr: '', exitCode: 0 },            // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },                // checkout -b
-      { stdout: 'done', stderr: '', exitCode: 0 },            // claude
-      { stdout: '1 file changed', stderr: '', exitCode: 0 },  // diff
-      { stdout: 'PASS', stderr: '', exitCode: 0 },            // verification
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },    // ls-files
-      { stdout: '', stderr: '', exitCode: 0 },                // add
-      { stdout: '', stderr: 'commit failed', exitCode: 1 },   // commit fails
-      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },   // cleanup status — DIRTY
-    ]);
-    const rA = await createImplementationHandler(CONTEXT(), runnerA)(makeTask({ issueNumber: 202 }));
-    expect(rA.result).toBe('failed');
-    expect(rA.error).toMatch(/quarantined/);
-    // The public-facing error must not embed the local artifact root path.
-    expect(rA.error).not.toContain(artifactRoot);
-    expect(existsSync(QUARANTINE())).toBe(true);
-
-    // Run B: must fail closed in preflight because the quarantine marker exists.
-    const runnerB = happyRunner();
-    const rB = await createImplementationHandler(CONTEXT(), runnerB)(makeTask({ issueNumber: 199 }));
-    expect(rB.result).toBe('failed');
-    expect(rB.error).toMatch(/quarantined/);
-    expect(rB.error).not.toContain(artifactRoot);
-    // Refused before running any git command (not even the dirty check).
-    expect(runnerB.calls).toHaveLength(0);
-  });
-
-  test('quarantine marker records diagnostic context without public artifact paths', async () => {
-    const runnerA = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'done', stderr: '', exitCode: 0 },
-      { stdout: '1 file changed', stderr: '', exitCode: 0 },
-      { stdout: 'PASS', stderr: '', exitCode: 0 },
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },               // add
-      { stdout: '', stderr: '', exitCode: 0 },               // commit
-      { stdout: '', stderr: 'push rejected', exitCode: 1 },  // push fails
-      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },  // cleanup status — DIRTY
-    ]);
-    await createImplementationHandler(CONTEXT(), runnerA)(makeTask({ issueNumber: 202 }));
-    const marker = JSON.parse(readFileSync(QUARANTINE(), 'utf8'));
-    expect(marker).toMatchObject({ issueNumber: 202, branch: 'ai/issue-202', runId: 'run-impl-1' });
-    expect(typeof marker.quarantinedAt).toBe('string');
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Gemini/Antigravity implementation agent
 // ---------------------------------------------------------------------------
 
-// Gemini happy path: same orchestration order as Claude but using agy/ANTIGRAVITY_BIN.
-// status(0) checkout-main(1) pull(2) rev-parse(3) checkout-b(4) agy(5) diff(6)
-// verification(7) ls-files(8) add(9) commit(10) push(11) gh-pr-create(12)
+// Gemini happy path: same worktree-only orchestration as Claude's
+// worktreeHappyRunner but using agy/ANTIGRAVITY_BIN in agy's place (issue #732).
+// fetch-base(0, canonical) status(1, canonical) status(2, worktree) agy(3) diff(4)
+// verification(5) ls-files(6) add(7) commit(8) push(9) gh-pr-create(10)
+// worktree-remove(11, canonical)
 function happyGeminiRunner(prUrl = 'https://github.com/m2dw/test-repo/pull/99') {
   return sequenceRunner([
-    { stdout: '', stderr: '', exitCode: 0 },                                      // git status — clean
-    { stdout: '', stderr: '', exitCode: 0 },                                      // git checkout main
-    { stdout: '', stderr: '', exitCode: 0 },                                      // git pull --ff-only
-    { stdout: 'main', stderr: '', exitCode: 0 },                                  // git rev-parse — HEAD at base
-    { stdout: '', stderr: '', exitCode: 0 },                                      // git checkout -b
+    { stdout: '', stderr: '', exitCode: 0 },                                      // git fetch origin main:refs/remotes/origin/main (canonical)
+    { stdout: '', stderr: '', exitCode: 0 },                                      // git status --porcelain (canonical — clean)
+    { stdout: '', stderr: '', exitCode: 0 },                                      // git status --porcelain (worktree — clean)
     { stdout: 'Implemented changes via Gemini.', stderr: '', exitCode: 0 },       // agy
     { stdout: '2 files changed', stderr: '', exitCode: 0 },                       // git diff --stat HEAD
     { stdout: 'PASS', stderr: '', exitCode: 0 },                                  // verification (npm test)
@@ -5424,29 +6522,30 @@ function happyGeminiRunner(prUrl = 'https://github.com/m2dw/test-repo/pull/99') 
     { stdout: '', stderr: '', exitCode: 0 },                                      // git commit
     { stdout: '', stderr: '', exitCode: 0 },                                      // git push
     { stdout: prUrl, stderr: '', exitCode: 0 },                                   // gh pr create
+    { stdout: '', stderr: '', exitCode: 0 },                                      // git worktree remove --force --force <wt> (canonical)
   ]);
 }
 
-// Fix mode with Gemini: same as happyFixRunner but agy at calls[7].
-// status(0) checkout-main(1) pull-main(2) rev-parse(3) gh-pr-list(4)
-// git-checkout-branch(5) git-pull-branch(6) agy(7) diff(8) verification(9)
-// ls-files(10) add(11) commit(12) push(13)
+// Fix mode with Gemini: same worktree-only orchestration as happyFixRunner but
+// agy replaces claude at calls[5] (issue #732).
+// gh-pr-list(0) rev-parse-verify(1, canonical) status(2, canonical)
+// status(3, worktree) pull-ff-only(4, worktree) agy(5) diff(6) verification(7)
+// ls-files(8) add(9) commit(10) push(11) worktree-remove(12, canonical)
 function happyGeminiFixRunner() {
   return sequenceRunner([
-    { stdout: '', stderr: '', exitCode: 0 },                                   // git status — clean
-    { stdout: '', stderr: '', exitCode: 0 },                                   // git checkout main
-    { stdout: '', stderr: '', exitCode: 0 },                                   // git pull --ff-only
-    { stdout: 'main', stderr: '', exitCode: 0 },                               // rev-parse — HEAD at base
-    { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },                         // gh pr list
-    { stdout: '', stderr: '', exitCode: 0 },                                   // git checkout <branch>
-    { stdout: '', stderr: '', exitCode: 0 },                                   // git pull origin <branch>
+    { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },                          // gh pr list (early fix-mode PR lookup)
+    { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },              // git rev-parse --verify (LOCAL BRANCH EXISTS) — canonical
+    { stdout: '', stderr: '', exitCode: 0 },                                    // git status --porcelain (canonical — clean)
+    { stdout: '', stderr: '', exitCode: 0 },                                    // git status --porcelain (clean) — worktree
+    { stdout: '', stderr: '', exitCode: 0 },                                    // git pull origin ai/issue-77 --ff-only — worktree
     { stdout: 'Applied review feedback via Gemini.', stderr: '', exitCode: 0 }, // agy
-    { stdout: '1 file changed', stderr: '', exitCode: 0 },                    // git diff --stat HEAD
-    { stdout: 'PASS', stderr: '', exitCode: 0 },                              // verification (npm test)
-    { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },                      // git ls-files -z
-    { stdout: '', stderr: '', exitCode: 0 },                                   // git add -- <paths>
-    { stdout: '', stderr: '', exitCode: 0 },                                   // git commit
-    { stdout: '', stderr: '', exitCode: 0 },                                   // git push
+    { stdout: '1 file changed', stderr: '', exitCode: 0 },                     // git diff --stat HEAD
+    { stdout: 'PASS', stderr: '', exitCode: 0 },                               // verification (npm test)
+    { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },                       // git ls-files -z
+    { stdout: '', stderr: '', exitCode: 0 },                                    // git add -- <paths>
+    { stdout: '', stderr: '', exitCode: 0 },                                    // git commit
+    { stdout: '', stderr: '', exitCode: 0 },                                    // git push
+    { stdout: '', stderr: '', exitCode: 0 },                                    // git worktree remove --force --force <wt> (canonical)
   ]);
 }
 
@@ -5475,8 +6574,10 @@ function makeGeminiFixTask(overrides = {}) {
 }
 
 describe('implementation handler — Gemini/Antigravity agent', () => {
-  // agy is at calls[5] in the new-impl happy path (same index as claude)
-  const AGY_IDX = 5;
+  // agy is at calls[3] in the new-impl worktree happy path (fetch-base,
+  // canonical-status, worktree-status, agent — same slot as claude in
+  // worktreeHappyRunner; issue #732).
+  const AGY_IDX = 3;
 
   beforeEach(() => { delete process.env['ANTIGRAVITY_BIN']; });
   afterEach(() => { delete process.env['ANTIGRAVITY_BIN']; });
@@ -5522,10 +6623,10 @@ describe('implementation handler — Gemini/Antigravity agent', () => {
     expect(agyCall.args).toEqual(['--print', agyCall.opts.stdin]);
   });
 
-  test('uses session.repoRoot as cwd', async () => {
+  test('uses the issue worktree as cwd', async () => {
     const runner = happyGeminiRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeGeminiTask());
-    expect(runner.calls[AGY_IDX].opts.cwd).toBe(repoRoot);
+    expect(runner.calls[AGY_IDX].opts.cwd).toBe(defaultWorktreePath());
   });
 
   test('fix mode with Gemini checks out existing branch and does not create a new PR', async () => {
@@ -5540,18 +6641,16 @@ describe('implementation handler — Gemini/Antigravity agent', () => {
   test('fix mode prompt includes Review Feedback section', async () => {
     const runner = happyGeminiFixRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeGeminiFixTask());
-    const agyCall = runner.calls[7]; // agy is at index 7 in fix mode
+    const agyCall = runner.calls[5]; // agy is at index 5 in fix mode
     expect(agyCall.opts.stdin).toContain('Review Feedback To Address');
     expect(agyCall.opts.stdin).toContain(REVIEW_FEEDBACK);
   });
 
   test('fails when Gemini exits non-zero', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                        // git status — clean
-      { stdout: '', stderr: '', exitCode: 0 },                        // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                        // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                    // rev-parse — HEAD at base
-      { stdout: '', stderr: '', exitCode: 0 },                        // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                        // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (worktree — clean)
       { stdout: '', stderr: 'agy: auth error', exitCode: 1 },         // agy — fails
     ]);
     const result = await createImplementationHandler(CONTEXT(), runner)(makeGeminiTask());
@@ -5595,26 +6694,24 @@ describe('implementation handler — Gemini/Antigravity agent', () => {
     expect(argvStr).not.toContain('77');
   });
 
-  test('follows the same branch and commit orchestration order as Claude', async () => {
+  test('follows the same worktree orchestration order as Claude', async () => {
     const runner = happyGeminiRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeGeminiTask());
     const calls = runner.calls;
-    expect(calls[0]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
-    expect(calls[1]).toMatchObject({ cmd: 'git', args: ['checkout', 'main'] });
-    expect(calls[4]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['checkout', '-b']) });
+    expect(calls[0]).toMatchObject({ cmd: 'git', args: ['fetch', 'origin', '+main:refs/remotes/origin/main'] });
+    expect(calls[1]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
+    expect(calls[2]).toMatchObject({ cmd: 'git', args: ['status', '--porcelain'] });
     expect(calls[AGY_IDX].cmd).toBe('agy');
-    expect(calls[6]).toMatchObject({ cmd: 'git', args: ['diff', '--stat', 'HEAD'] });
-    expect(calls[7]).toMatchObject({ cmd: 'npm', args: ['test'] });   // verification
-    expect(calls[11]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['push']) });
-    expect(calls[12].cmd).toBe('gh');                                  // gh pr create
+    expect(calls[4]).toMatchObject({ cmd: 'git', args: ['diff', '--stat', 'HEAD'] });
+    expect(calls[5]).toMatchObject({ cmd: 'npm', args: ['test'] });   // verification
+    expect(calls[9]).toMatchObject({ cmd: 'git', args: expect.arrayContaining(['push']) });
+    expect(calls[10].cmd).toBe('gh');                                  // gh pr create
   });
 
   test('implementation-context.json exists even on Gemini failure (pre-run audit)', async () => {
     const runner = sequenceRunner([
       { stdout: '', stderr: '', exitCode: 0 },
       { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },
       { stdout: '', stderr: '', exitCode: 0 },
       { stdout: '', stderr: 'agy: command not found', exitCode: 127 },
     ]);
@@ -5629,10 +6726,11 @@ describe('implementation handler — Gemini/Antigravity agent', () => {
 // ---------------------------------------------------------------------------
 
 describe('implementation handler — codex agent', () => {
-  // Codex new-implementation sequence mirrors Claude's at the same indexes:
-  // status(0) checkout-main(1) pull(2) rev-parse(3) checkout-b(4) codex(5)
-  // diff(6) verification(7) ls-files(8) add(9) commit(10) push(11) gh-pr-create(12)
-  const CODEX_AGENT_IDX = 5;
+  // Codex new-implementation sequence mirrors Claude's worktreeHappyRunner at
+  // the same indexes (issue #732): fetch-base(0, canonical) status(1, canonical)
+  // status(2, worktree) codex(3) diff(4) verification(5) ls-files(6) add(7)
+  // commit(8) push(9) gh-pr-create(10) worktree-remove(11, canonical)
+  const CODEX_AGENT_IDX = 3;
 
   function makeCodexTask(overrides = {}) {
     return makeTask({
@@ -5648,11 +6746,9 @@ describe('implementation handler — codex agent', () => {
 
   function happyCodexRunner(prUrl = 'https://github.com/m2dw/test-repo/pull/99') {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                      // git status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                      // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                  // git rev-parse --abbrev-ref HEAD
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout -b <branch>
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (worktree — clean)
       { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // codex
       { stdout: '2 files changed', stderr: '', exitCode: 0 },       // git diff --stat HEAD
       { stdout: 'PASS', stderr: '', exitCode: 0 },                  // verification (npm test)
@@ -5661,6 +6757,7 @@ describe('implementation handler — codex agent', () => {
       { stdout: '', stderr: '', exitCode: 0 },                      // git commit
       { stdout: '', stderr: '', exitCode: 0 },                      // git push
       { stdout: prUrl, stderr: '', exitCode: 0 },                   // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                      // git worktree remove --force --force <wt> (canonical)
     ]);
   }
 
@@ -5783,12 +6880,10 @@ describe('implementation handler — codex agent', () => {
 
   test('codex exit non-zero returns failed with agent output in error', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: 'codex: not authenticated', exitCode: 1 },
+      { stdout: '', stderr: '', exitCode: 0 },                       // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (worktree — clean)
+      { stdout: '', stderr: 'codex: not authenticated', exitCode: 1 }, // codex — fails
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeCodexTask());
     expect(r.result).toBe('failed');
@@ -5797,12 +6892,10 @@ describe('implementation handler — codex agent', () => {
 
   test('missing codex CLI (exit 127) returns failed without dirty worktree', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: 'codex: command not found', exitCode: 127 },
+      { stdout: '', stderr: '', exitCode: 0 },                       // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                       // git status --porcelain (worktree — clean)
+      { stdout: '', stderr: 'codex: command not found', exitCode: 127 }, // codex — fails
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeCodexTask());
     expect(r.result).toBe('failed');
@@ -5869,26 +6962,27 @@ describe('implementation handler — codex agent', () => {
     expect(ctx.resolvedProfile).toMatchObject({ effort: 'high', effortSource: 'escalation' });
   });
 
-  // Fix-mode sequence for codex:
-  // status(0) checkout-main(1) pull(2) rev-parse(3) gh-pr-list(4)
-  // git-checkout-branch(5) git-pull-branch(6) codex(7) diff(8)
-  // verification(9) ls-files(10) add(11) commit(12) push(13)
+  // Fix-mode sequence for codex mirrors happyFixRunner with codex replacing
+  // claude at calls[5] (issue #732):
+  // gh-pr-list(0) rev-parse-verify(1, canonical) status(2, canonical)
+  // status(3, worktree) pull-ff-only(4, worktree) codex(5) diff(6)
+  // verification(7) ls-files(8) add(9) commit(10) push(11)
+  // worktree-remove(12, canonical)
   test('fix mode: codex checks out existing branch and does not create a new PR', async () => {
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'main', stderr: '', exitCode: 0 },
-      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: 'Applied review feedback.', stderr: '', exitCode: 0 },
-      { stdout: '1 file changed', stderr: '', exitCode: 0 },
-      { stdout: 'PASS', stderr: '', exitCode: 0 },
-      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
-      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },              // gh pr list (early fix-mode PR lookup)
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },  // git rev-parse --verify (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (clean) — worktree
+      { stdout: '', stderr: '', exitCode: 0 },                        // git pull origin ai/issue-77 --ff-only — worktree
+      { stdout: 'Applied review feedback.', stderr: '', exitCode: 0 },// codex
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },          // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                    // verification (npm test)
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },            // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                        // git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                        // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                        // git push
+      { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove --force --force <wt> (canonical)
     ]);
     const fixTask = makeCodexTask({
       context: {
@@ -5928,21 +7022,19 @@ function toolRequestBlock(lines) {
   return [TOOL_REQUEST_OPEN, ...lines, TOOL_REQUEST_CLOSE].join('\n');
 }
 
-// new-impl sequence up to the agent, agent emits a Tool Request block (exit 0),
-// then the handler cleans up: git checkout -f <base>, git clean -fd, git branch -D <branch>.
+// new-impl worktree sequence up to the agent; the agent emits a Tool Request
+// block (exit 0) with NO partial work (`git diff --cached` is empty), so
+// `handoffCleanup` short-circuits with `{ noPriorDiff: true }` immediately —
+// worktree mode never runs a base-restore/branch-drop for an empty capture
+// (issue #732: there is no shared-checkout cleanup left to fall back to).
 function toolRequestRunner(blockText) {
   return sequenceRunner([
-    { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (clean)
-    { stdout: '', stderr: '', exitCode: 0 },         // git checkout main
-    { stdout: '', stderr: '', exitCode: 0 },         // git pull --ff-only
-    { stdout: 'main', stderr: '', exitCode: 0 },     // git rev-parse --abbrev-ref HEAD
-    { stdout: '', stderr: '', exitCode: 0 },         // git checkout -b <branch>
+    { stdout: '', stderr: '', exitCode: 0 },         // git fetch origin main:refs/remotes/origin/main (canonical)
+    { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (canonical — clean)
+    { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (worktree — clean)
     { stdout: blockText, stderr: '', exitCode: 0 },  // claude — emits Tool Request
-    { stdout: '', stderr: '', exitCode: 0 },         // git add -A (capture partial diff, issue #379)
-    { stdout: '', stderr: '', exitCode: 0 },         // git diff --cached --binary HEAD (no partial work)
-    { stdout: '', stderr: '', exitCode: 0 },         // git checkout -f main (cleanup)
-    { stdout: '', stderr: '', exitCode: 0 },         // git clean -fd (cleanup, removes untracked edits)
-    { stdout: '', stderr: '', exitCode: 0 },         // git branch -D <branch> (cleanup)
+    { stdout: '', stderr: '', exitCode: 0 },         // git add -A -- . (capture partial diff, issue #379)
+    { stdout: '', stderr: '', exitCode: 0 },         // git diff --cached --binary HEAD (empty — no partial work)
   ]);
 }
 
@@ -6018,26 +7110,21 @@ describe('implementation handler — tool request handoff', () => {
     expect(runner.calls.some((c) => c.cmd === 'gh' && c.args.includes('create'))).toBe(false);
   });
 
-  test('restores the checkout to base and drops the issue branch', async () => {
+  // Issue #732: worktree materialization is unconditional, so the old
+  // shared-checkout cleanup (`git checkout -f <base>`, `git clean -fd`, `git
+  // branch -D <branch>`) never runs anymore — not even for a Tool Request
+  // handoff. With no partial work to preserve (`git diff --cached` is empty),
+  // `handoffCleanup` returns immediately: the durable issue worktree and its
+  // branch are left exactly as they were, ready for a later grant to resume in
+  // the SAME worktree (mirrors the #470 preservation tests).
+  test('leaves the issue worktree and branch untouched when there is no partial diff to preserve', async () => {
     const runner = toolRequestRunner(BLOCK);
     await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('-f') && c.args.includes('main'))).toBe(true);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(true);
-  });
-
-  test('cleans untracked edits so the shared checkout returns to a safe base', async () => {
-    const runner = toolRequestRunner(BLOCK);
-    await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    // git clean removes untracked files git checkout -f leaves behind, which
-    // would otherwise trip the next run's dirty-tree preflight.
-    const cleanCall = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'clean');
-    expect(cleanCall).toBeDefined();
-    expect(cleanCall.args).toEqual(expect.arrayContaining(['-fd']));
-    // The artifact dir (untracked but holding this run's audit records) is excluded.
-    if (cleanCall.args.includes('-e')) {
-      const excluded = cleanCall.args[cleanCall.args.indexOf('-e') + 1];
-      expect(excluded.startsWith('..')).toBe(false);
-    }
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'checkout' && c.args.includes('-f'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'reset' && c.args.includes('--hard'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'clean')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove')).toBe(false);
   });
 
   test('records the tool request in implementation-result.json', async () => {
@@ -6059,17 +7146,12 @@ describe('implementation handler — tool request handoff', () => {
   // so the run becomes a clean tool_request handoff rather than a generic failure.
   function toolRequestRunnerNonzero(stdout, stderr) {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },     // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },     // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },     // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 }, // git rev-parse --abbrev-ref HEAD
-      { stdout: '', stderr: '', exitCode: 0 },     // git checkout -b <branch>
+      { stdout: '', stderr: '', exitCode: 0 },     // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },     // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },     // git status --porcelain (worktree — clean)
       { stdout, stderr, exitCode: 1 },             // claude — emits Tool Request but exits nonzero
-      { stdout: '', stderr: '', exitCode: 0 },     // git add -A (capture partial diff, issue #379)
-      { stdout: '', stderr: '', exitCode: 0 },     // git diff --cached --binary HEAD (no partial work)
-      { stdout: '', stderr: '', exitCode: 0 },     // git checkout -f main (cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },     // git clean -fd (cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },     // git branch -D <branch> (cleanup)
+      { stdout: '', stderr: '', exitCode: 0 },     // git add -A -- . (capture partial diff, issue #379)
+      { stdout: '', stderr: '', exitCode: 0 },     // git diff --cached --binary HEAD (empty — no partial work)
     ]);
   }
 
@@ -6098,11 +7180,16 @@ describe('implementation handler — tool request handoff', () => {
 
   // Regression (issue #379): a new-implementation agent that produced real partial
   // work (new files, edits) before emitting a Tool Request must NOT have that work
-  // silently discarded by the handoff cleanup. The cleanup still returns the
-  // checkout to a safe base, but the partial diff is first captured into a patch
-  // artifact so it is recoverable. Uses a real git checkout (with a bare origin so
-  // the `git pull --ff-only` preflight succeeds) and intercepts only the agent
-  // command — the agent writes a new file, then emits the Tool Request block.
+  // silently discarded by the handoff cleanup — the partial diff is captured (and,
+  // in worktree mode, committed + pushed) so it is recoverable. Uses a real git
+  // checkout (with a bare origin) and intercepts only the agent command — the
+  // agent writes a new file, then emits the Tool Request block.
+  // Issue #732: worktree materialization is unconditional, so this end-to-end
+  // test now drives the REAL `resolveIssueWorktree` (passed explicitly as the
+  // 4th arg — the `createImplementationHandler` test wrapper's fake-resolver
+  // default only applies when the caller omits it) against a real git repo, and
+  // the agent's writes must target the REAL worktree cwd, not the canonical
+  // `repoRoot`, or `git add -A` in the worktree would see nothing to capture.
   test('preserves the agent partial diff as a patch artifact instead of discarding it silently', async () => {
     mkdirSync(repoRoot, { recursive: true });
     const git = (...a) => execFileSync('git', a, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -6119,14 +7206,15 @@ describe('implementation handler — tool request handoff', () => {
     git('push', '-q', '-u', 'origin', 'main');
 
     // Hybrid runner: real git, but the agent step writes a partial implementation
-    // file (src/psl.ts) and then emits the Tool Request block.
+    // file (src/psl.ts) INTO THE WORKTREE (`opts.cwd`, not `repoRoot`) and then
+    // emits the Tool Request block.
     const runner = {
       calls: [],
       run(cmd, args, opts) {
         this.calls.push({ cmd, args, opts });
         if (cmd === 'claude') {
-          mkdirSync(join(repoRoot, 'src'), { recursive: true });
-          writeFileSync(join(repoRoot, 'src', 'psl.ts'), 'export const PSL_MARKER = "partial-work";\n', 'utf8');
+          mkdirSync(join(opts.cwd, 'src'), { recursive: true });
+          writeFileSync(join(opts.cwd, 'src', 'psl.ts'), 'export const PSL_MARKER = "partial-work";\n', 'utf8');
           return { stdout: BLOCK, stderr: '', exitCode: 0 };
         }
         try {
@@ -6141,31 +7229,41 @@ describe('implementation handler — tool request handoff', () => {
       },
     };
 
-    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    const worktreeRoot = join(tmpDir, 'wt');
+    const session = SESSION({ worktrees: { root: worktreeRoot } });
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolveIssueWorktree,
+    )(makeTask());
     expect(result.result).toBe('tool_request');
 
-    // The partial work is recorded on the stored request as a relative artifact
-    // name (never an absolute path) and the patch file exists with the new file.
+    // Capture succeeds (real `git diff --cached --binary HEAD` in the worktree
+    // sees the new file): the patch artifact is still recorded AND, because
+    // worktree mode's handoff cleanup goes on to commit + push the staged work
+    // unconditionally (issue #454, #732), the branch is also advertised as the
+    // preserved continuation point — both survive together here, unlike the
+    // shared-checkout path this test predates.
     expect(result.context.toolRequest.partialDiffArtifact).toBe('partial-implementation.patch');
     const patchPath = join(artifactRoot, 'runs', 'run-impl-1', 'partial-implementation.patch');
     expect(existsSync(patchPath)).toBe(true);
     const patch = readFileSync(patchPath, 'utf8');
     expect(patch).toContain('src/psl.ts');
     expect(patch).toContain('PSL_MARKER');
+    expect(result.context.toolRequest.preservedBranch).toBe('ai/issue-77');
+    expect(result.context.toolRequest.preservedBranchPushed).toBe(true);
 
-    // The checkout is still returned to a safe base: the partial file is gone from
-    // the worktree (so the next run starts clean) and the issue branch is dropped —
-    // but the work is recoverable from the captured patch, not lost.
-    expect(existsSync(join(repoRoot, 'src', 'psl.ts'))).toBe(false);
-    const branches = execFileSync('git', ['branch', '--list', 'ai/issue-77'], { cwd: repoRoot, encoding: 'utf8' });
-    expect(branches.trim()).toBe('');
+    // The issue branch exists on origin and its tip contains the partial work —
+    // the continuation point is real, not discarded.
+    const lsRemote = execFileSync('git', ['ls-remote', '--heads', 'origin', 'ai/issue-77'], { cwd: repoRoot, encoding: 'utf8' });
+    expect(lsRemote).toContain('refs/heads/ai/issue-77');
+    const showFile = execFileSync('git', ['show', 'ai/issue-77:src/psl.ts'], { cwd: repoRoot, encoding: 'utf8' });
+    expect(showFile).toContain('PSL_MARKER');
+
+    // The canonical checkout was never touched by the worktree-issue's cleanup.
     const status = execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8' });
     expect(status.trim()).toBe('');
 
-    // The handoff never ran the requested command, committed, or pushed.
+    // The handoff never ran the requested command.
     expect(runner.calls.some((c) => c.cmd === 'npm' && c.args.includes('install'))).toBe(false);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'commit')).toBe(false);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
   });
 
   // -------------------------------------------------------------------------
@@ -6180,18 +7278,14 @@ describe('implementation handler — tool request handoff', () => {
   // --binary HEAD) fails, so the handler preserves the branch via commit (+push).
   function captureFailureRunner({ pushExitCode = 0 } = {}) {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },         // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },     // git rev-parse --abbrev-ref HEAD
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout -b <branch>
+      { stdout: '', stderr: '', exitCode: 0 },         // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (worktree — clean)
       { stdout: BLOCK, stderr: '', exitCode: 0 },      // claude — emits Tool Request
-      { stdout: '', stderr: '', exitCode: 0 },         // git add -A (stages partial work)
+      { stdout: '', stderr: '', exitCode: 0 },         // git add -A -- . (stages partial work)
       { stdout: '', stderr: 'fatal: simulated capture failure', exitCode: 128 }, // git diff --cached --binary HEAD (FAILS)
-      { stdout: '', stderr: '', exitCode: 0 },         // git commit --no-verify (preserve partial work)
+      { stdout: '', stderr: '', exitCode: 0 },         // git commit --no-verify (preserve partial work onto the issue branch)
       { stdout: '', stderr: '', exitCode: pushExitCode }, // git push origin <branch>
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout -f main (restore worktree)
-      { stdout: '', stderr: '', exitCode: 0 },         // git clean -fd
     ]);
   }
 
@@ -6228,33 +7322,34 @@ describe('implementation handler — tool request handoff', () => {
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
   });
 
-  // new-impl sequence where BOTH the partial-diff capture AND the preservation
-  // commit fail. The branch's state after the worktree restore is decided by the
-  // `git rev-list --count <base>..<branch>` probe: `aheadStdout`/`aheadExitCode`
-  // drive whether the handler proves the branch empty (delete) or keeps it.
-  function commitFailureRunner({ aheadStdout = '0', aheadExitCode = 0, pushExitCode = 0 } = {}) {
+  // new-impl worktree sequence where BOTH the partial-diff capture AND the
+  // preservation commit fail. Worktree mode's `handoffCleanup` (issue #454)
+  // NEVER deletes or pushes the durable issue branch on this path — it just
+  // resets the worktree to a clean tree (`git reset --hard HEAD` + `git clean
+  // -fd`) and decides whether to ADVERTISE the branch as a preserved
+  // continuation point from `git rev-list --count <base>..<branch>`:
+  // `aheadStdout`/`aheadExitCode` drive that probe.
+  function commitFailureRunner({ aheadStdout = '0', aheadExitCode = 0 } = {}) {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },         // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },     // git rev-parse --abbrev-ref HEAD
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout -b <branch>
+      { stdout: '', stderr: '', exitCode: 0 },         // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (worktree — clean)
       { stdout: BLOCK, stderr: '', exitCode: 0 },      // claude — emits Tool Request
-      { stdout: '', stderr: '', exitCode: 0 },         // git add -A (stages partial work)
+      { stdout: '', stderr: '', exitCode: 0 },         // git add -A -- . (stages partial work)
       { stdout: '', stderr: 'fatal: simulated capture failure', exitCode: 128 }, // git diff --cached --binary HEAD (FAILS)
       { stdout: '', stderr: 'nothing to commit', exitCode: 1 }, // git commit --no-verify (FAILS)
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout -f main (restore worktree)
+      { stdout: '', stderr: '', exitCode: 0 },         // git reset --hard HEAD (restoreWorktreeToBase, worktree-native)
       { stdout: '', stderr: '', exitCode: 0 },         // git clean -fd
       { stdout: aheadStdout, stderr: '', exitCode: aheadExitCode }, // git rev-list --count main..<branch>
-      { stdout: '', stderr: '', exitCode: pushExitCode }, // git branch -D OR git push origin <branch>
     ]);
   }
 
-  test('capture+commit failure on an empty branch deletes it and does NOT advertise it as preserved (issue #390 review)', async () => {
-    // The dangerous case the review flags: capture failed, the preservation commit
-    // also failed (nothing was committed), and the worktree restore discarded the
-    // index. The branch now only points at base, so it preserves nothing — it must
-    // be dropped, never advertised as a continuation point.
+  test('capture+commit failure on an empty branch is never deleted but is not advertised as preserved (issue #390 review)', async () => {
+    // Capture failed, the preservation commit also failed (nothing was
+    // committed), and the worktree restore discarded the index. The branch now
+    // only points at base, so there is nothing to advertise as a continuation
+    // point — but worktree mode's durable `ai/issue-<n>` is never deleted
+    // either way (issue #454, #732).
     const runner = commitFailureRunner({ aheadStdout: '0' });
     const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('tool_request');
@@ -6268,45 +7363,52 @@ describe('implementation handler — tool request handoff', () => {
     expect(result.context.toolRequest.partialDiffArtifact).toBeUndefined();
     expect(result.context.toolRequest.noPriorDiff).toBeUndefined();
 
-    // The empty branch is deleted, and it is NEVER pushed (pushing an empty ref
-    // would let admin resolve falsely resume from it and lose the work).
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(true);
+    // The durable worktree branch is never deleted or pushed on this path.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
   });
 
-  test('capture+commit failure keeps a branch that already carries committed work (issue #390 review)', async () => {
-    // A resumed `ai/issue-<n>` already holds earlier commits. Even when this run's
-    // capture and preservation commit both fail, that branch is a real continuation
-    // point and must be kept + advertised (and pushed best-effort), never deleted.
+  test('capture+commit failure advertises a branch that already carries committed work, but never pushes it here (issue #390 review)', async () => {
+    // A resumed `ai/issue-<n>` already holds earlier commits. Even when this
+    // run's capture and preservation commit both fail, that branch is a real
+    // continuation point and is advertised — but worktree mode's commit-failure
+    // path never itself pushes (it only resets the worktree to a clean tree),
+    // so `preservedBranchPushed` is always `false` here; a later grant/resolve
+    // pushes it best-effort. Never deleted either way (issue #454, #732).
     const runner = commitFailureRunner({ aheadStdout: '2' });
     const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('tool_request');
 
     expect(result.context.toolRequest.preservedBranch).toBe('ai/issue-77');
-    expect(result.context.toolRequest.preservedBranchPushed).toBe(true);
+    expect(result.context.toolRequest.preservedBranchPushed).toBe(false);
     expect(typeof result.context.toolRequest.partialDiffCaptureFailed).toBe('string');
 
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push' && c.args.includes('ai/issue-77'))).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
   });
 
-  test('capture+commit failure with an unprovable branch state fails closed and keeps the branch (issue #390 review)', async () => {
-    // If the `git rev-list` probe itself fails we cannot prove the branch is empty,
-    // so the handler must NOT delete it — fail closed and keep the only potential
-    // continuation point.
+  test('capture+commit failure with an unprovable branch state does not advertise the branch, but never deletes it either (issue #390 review)', async () => {
+    // If the `git rev-list` probe itself fails, worktree mode's `hasCommits`
+    // check (which requires `exitCode === 0`) treats it the same as "no
+    // commits": the branch is not advertised as `preservedBranch`. Unlike the
+    // old shared-checkout path this is still safe — the durable `ai/issue-<n>`
+    // worktree branch is NEVER deleted regardless of this probe's outcome
+    // (issue #454, #732), so a failed probe cannot lose the work.
     const runner = commitFailureRunner({ aheadStdout: '', aheadExitCode: 1 });
     const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('tool_request');
 
-    expect(result.context.toolRequest.preservedBranch).toBe('ai/issue-77');
+    expect(result.context.toolRequest.preservedBranch).toBeUndefined();
+    expect(result.context.toolRequest.preservedBranchPushed).toBeUndefined();
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
   });
 
-  test('no implementation diff drops the branch and records noPriorDiff with no patch (issue #390)', async () => {
+  test('no implementation diff records noPriorDiff with no patch and leaves the worktree branch untouched (issue #390)', async () => {
     // The #365-shaped case where the agent emitted its Tool Request without
     // producing any file changes: the empty-diff capture proves there is nothing
-    // to preserve, so the branch is safely dropped — but the handoff records that
-    // explicitly so operators are not told to look for a nonexistent patch.
+    // to preserve, so the handoff records that explicitly so operators are not
+    // told to look for a nonexistent patch. Worktree mode never deletes the
+    // durable issue branch either way (issue #454, #732).
     const runner = toolRequestRunner(BLOCK); // add=0, diff=0 (empty) → proven no diff
     const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
     expect(result.result).toBe('tool_request');
@@ -6314,35 +7416,33 @@ describe('implementation handler — tool request handoff', () => {
     expect(result.context.toolRequest.partialDiffArtifact).toBeUndefined();
     expect(result.context.toolRequest.preservedBranch).toBeUndefined();
     expect(result.context.toolRequest.partialDiffCaptureFailed).toBeUndefined();
-    // No diff means the branch is genuinely safe to drop.
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'commit')).toBe(false);
   });
 
-  // Fix mode reaches the Tool Request handoff with an EXISTING PR branch already
-  // checked out. When partial-diff capture fails there, the repair edits are
-  // discarded with no patch written — the existing branch is kept regardless, so
-  // there is no continuation point to protect, but the stored request must still
-  // record WHY there is no patch (partialDiffCaptureFailed) rather than looking
-  // like it simply had no diff (issue #390 review).
+  // Fix mode reaches the Tool Request handoff on its EXISTING PR branch, already
+  // checked out in the issue worktree. `handoffCleanup`'s worktree-mode branch
+  // (issue #454) does NOT special-case fix mode: when partial-diff capture fails
+  // but the preservation commit succeeds, it commits the repair edits onto the
+  // existing PR branch and pushes them — same as a new-implementation handoff —
+  // recording WHY there is no patch (partialDiffCaptureFailed) alongside the
+  // preserved branch (issue #390 review, issue #732).
   function fixCaptureFailureRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },           // git status --porcelain (clean)
-      { stdout: '', stderr: '', exitCode: 0 },           // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },           // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },       // git rev-parse --abbrev-ref HEAD
-      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 }, // gh pr list
-      { stdout: '', stderr: '', exitCode: 0 },           // git checkout <existing branch>
-      { stdout: '', stderr: '', exitCode: 0 },           // git pull origin <branch>
+      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 }, // gh pr list (early fix-mode PR lookup)
+      { stdout: 'ai/issue-77', stderr: '', exitCode: 0 }, // git rev-parse --verify refs/heads/ai/issue-77 (LOCAL BRANCH EXISTS) — canonical
+      { stdout: '', stderr: '', exitCode: 0 },           // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },           // git status --porcelain (worktree — clean)
+      { stdout: '', stderr: '', exitCode: 0 },           // git pull origin ai/issue-77 --ff-only — worktree
       { stdout: BLOCK, stderr: '', exitCode: 0 },        // claude — emits Tool Request
-      { stdout: '', stderr: '', exitCode: 0 },           // git add -A (stages partial work)
+      { stdout: '', stderr: '', exitCode: 0 },           // git add -A -- . (stages partial repair edits)
       { stdout: '', stderr: 'fatal: simulated capture failure', exitCode: 128 }, // git diff --cached --binary HEAD (FAILS)
-      { stdout: '', stderr: '', exitCode: 0 },           // git checkout -f main (restore worktree)
-      { stdout: '', stderr: '', exitCode: 0 },           // git clean -fd
+      { stdout: '', stderr: '', exitCode: 0 },           // git commit --no-verify (preserve repair edits onto the existing PR branch)
+      { stdout: '', stderr: '', exitCode: 0 },           // git push origin ai/issue-77
     ]);
   }
 
-  test('fix mode capture failure records the failure reason (issue #390 review)', async () => {
+  test('fix mode capture failure commits and pushes the repair edits onto the existing PR branch (issue #390 review)', async () => {
     const runner = fixCaptureFailureRunner();
     const result = await createImplementationHandler(CONTEXT(), runner)(makeFixTask());
     expect(result.result).toBe('tool_request');
@@ -6355,10 +7455,13 @@ describe('implementation handler — tool request handoff', () => {
     expect(result.context.toolRequest.partialDiffArtifact).toBeUndefined();
     expect(result.context.toolRequest.noPriorDiff).toBeUndefined();
 
-    // Fix mode keeps the existing PR branch (its work is already there), so the
-    // handler neither commits a preservation WIP nor deletes the branch.
-    expect(result.context.toolRequest.preservedBranch).toBeUndefined();
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'commit')).toBe(false);
+    // Worktree mode's handoff cleanup does not special-case fix mode: the repair
+    // edits are committed onto the existing PR branch and pushed, and the branch
+    // is (as always) never deleted.
+    expect(result.context.toolRequest.preservedBranch).toBe('ai/issue-77');
+    expect(result.context.toolRequest.preservedBranchPushed).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'commit' && c.args.includes('--no-verify'))).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'push' && c.args.includes('ai/issue-77'))).toBe(true);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
     // The requested command is still never run.
     expect(runner.calls.some((c) => c.cmd === 'npm' && c.args.includes('install'))).toBe(false);
@@ -6367,6 +7470,9 @@ describe('implementation handler — tool request handoff', () => {
   // End-to-end with a real git checkout: capture is forced to fail, and the real
   // commit + push to a bare origin proves the agent's partial work survives on the
   // issue branch (recoverable) rather than being discarded (issue #390).
+  // Issue #732: real `resolveIssueWorktree` (explicit 4th arg) against a real
+  // repo; the agent writes into the real worktree cwd (`opts.cwd`), not the
+  // canonical `repoRoot`.
   test('capture failure preserves the agent partial work on origin (real git, issue #390)', async () => {
     mkdirSync(repoRoot, { recursive: true });
     const git = (...a) => execFileSync('git', a, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -6382,15 +7488,16 @@ describe('implementation handler — tool request handoff', () => {
     git('remote', 'add', 'origin', remotePath);
     git('push', '-q', '-u', 'origin', 'main');
 
-    // Hybrid runner: real git, but the agent writes a partial file and the
-    // partial-diff capture (git diff --cached --binary HEAD) is forced to fail.
+    // Hybrid runner: real git, but the agent writes a partial file INTO THE
+    // WORKTREE (`opts.cwd`) and the partial-diff capture (git diff --cached
+    // --binary HEAD) is forced to fail.
     const runner = {
       calls: [],
       run(cmd, args, opts) {
         this.calls.push({ cmd, args, opts });
         if (cmd === 'claude') {
-          mkdirSync(join(repoRoot, 'src'), { recursive: true });
-          writeFileSync(join(repoRoot, 'src', 'psl.ts'), 'export const PSL_MARKER = "partial-work";\n', 'utf8');
+          mkdirSync(join(opts.cwd, 'src'), { recursive: true });
+          writeFileSync(join(opts.cwd, 'src', 'psl.ts'), 'export const PSL_MARKER = "partial-work";\n', 'utf8');
           return { stdout: BLOCK, stderr: '', exitCode: 0 };
         }
         if (cmd === 'git' && args[0] === 'diff' && args.includes('--cached') && args.includes('--binary')) {
@@ -6408,7 +7515,11 @@ describe('implementation handler — tool request handoff', () => {
       },
     };
 
-    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    const worktreeRoot = join(tmpDir, 'wt');
+    const session = SESSION({ worktrees: { root: worktreeRoot } });
+    const result = await createImplementationHandler(
+      CONTEXT({ session }), runner, undefined, resolveIssueWorktree,
+    )(makeTask());
     expect(result.result).toBe('tool_request');
     expect(result.context.toolRequest.preservedBranch).toBe('ai/issue-77');
     expect(result.context.toolRequest.preservedBranchPushed).toBe(true);
@@ -6420,10 +7531,107 @@ describe('implementation handler — tool request handoff', () => {
     const showFile = execFileSync('git', ['show', 'ai/issue-77:src/psl.ts'], { cwd: repoRoot, encoding: 'utf8' });
     expect(showFile).toContain('PSL_MARKER');
 
-    // The shared checkout is returned to a clean base, and the command was never run.
+    // The canonical checkout is untouched, and the requested command was never run.
     const status = execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8' });
     expect(status.trim()).toBe('');
     expect(runner.calls.some((c) => c.cmd === 'npm' && c.args.includes('install'))).toBe(false);
+  });
+
+  // Issue #629: when the session artifact dir lives INSIDE the target repo and
+  // is gitignored (.n8n-artifacts), the old `:(exclude)` magic pathspec caused
+  // `git add -A` to fail with a fatal "paths are ignored by .gitignore" error,
+  // which turned into a partialDiffCaptureFailed on the stored Tool Request.
+  // The fix uses a plain `git add -A -- .` (gitignored files are already
+  // skipped by git) followed by `git reset -q -- <artifactRoot>` to unstage
+  // non-ignored artifact dirs — so gitignored artifact roots never fail capture.
+  // Issue #732: the artifact root that used to live "inside repoRoot" now must
+  // live inside the WORKTREE (`cwd`) for the #629 gitignore/`git add -A`
+  // interaction to be reachable at all — `capturePartialDiff`'s `relative(cwd,
+  // artifactRoot)` check is worktree-relative, and `repoRoot` itself is a
+  // different git worktree of the same repo. The worktree path is deterministic
+  // (`issueWorktreePath` + `canonicalizePath`, the same composition
+  // `resolveIssueWorktree` uses internally), so it can be precomputed and used
+  // to configure `session.artifactRoot` before the handler runs.
+  test('capture succeeds when the session artifact dir is gitignored inside the worktree (real git, issue #629)', async () => {
+    mkdirSync(repoRoot, { recursive: true });
+    const git = (...a) => execFileSync('git', a, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    git('init', '-q');
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'Test');
+    writeFileSync(join(repoRoot, 'package.json'), '{"name":"x"}\n', 'utf8');
+    // .n8n-artifacts is gitignored — this is the scenario that broke the old
+    // `:(exclude)` pathspec. Committed so the worktree checkout inherits it too.
+    writeFileSync(join(repoRoot, '.gitignore'), '.n8n-artifacts/\n', 'utf8');
+    git('add', '-A');
+    git('commit', '-q', '-m', 'init');
+    git('branch', '-M', 'main');
+    const remotePath = join(tmpDir, 'origin.git');
+    execFileSync('git', ['init', '-q', '--bare', remotePath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    git('remote', 'add', 'origin', remotePath);
+    git('push', '-q', '-u', 'origin', 'main');
+
+    const worktreeRoot = join(tmpDir, 'wt');
+    const expectedWorktreePath = canonicalizePath(issueWorktreePath(worktreeRoot, 'addon-dev', 77));
+    // Use an artifact root INSIDE the worktree (the gitignored .n8n-artifacts
+    // dir), matching the scenario the #629 regression covers.
+    const inWorktreeArtifactRoot = join(expectedWorktreePath, '.n8n-artifacts');
+
+    const BLOCK = toolRequestBlock([
+      'command: node internal/qa/gen-workbook.mjs',
+      'reason: Needs the generator to run.',
+      'expected_files: output.xlsx',
+      'suggested_action: guided-run',
+    ]);
+
+    const runner = {
+      calls: [],
+      run(cmd, args, opts) {
+        this.calls.push({ cmd, args, opts });
+        if (cmd === 'claude') {
+          // Agent edits a source file and emits a Tool Request, both inside the
+          // real worktree (`opts.cwd`).
+          mkdirSync(join(opts.cwd, 'internal', 'qa'), { recursive: true });
+          writeFileSync(join(opts.cwd, 'internal', 'qa', 'gen-workbook.mjs'), '// EDITED_MARKER\n', 'utf8');
+          // Write an ignored artifact to verify it is not captured in the patch.
+          mkdirSync(join(opts.cwd, '.n8n-artifacts'), { recursive: true });
+          writeFileSync(join(opts.cwd, '.n8n-artifacts', 'run.json'), '{}', 'utf8');
+          return { stdout: BLOCK, stderr: '', exitCode: 0 };
+        }
+        try {
+          const stdout = execFileSync(cmd, args, {
+            cwd: opts.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+            ...(opts.stdin !== undefined ? { input: opts.stdin } : {}),
+          });
+          return { stdout, stderr: '', exitCode: 0 };
+        } catch (e) {
+          return { stdout: e.stdout?.toString() ?? '', stderr: e.stderr?.toString() ?? String(e), exitCode: e.status ?? 1 };
+        }
+      },
+    };
+
+    const session = SESSION({
+      artifactDir: '.n8n-artifacts',
+      artifactRoot: inWorktreeArtifactRoot,
+      worktrees: { root: worktreeRoot },
+    });
+    const ctx = CONTEXT({ session });
+    const result = await createImplementationHandler(
+      ctx, runner, undefined, resolveIssueWorktree,
+    )(makeTask());
+    expect(result.result).toBe('tool_request');
+
+    // Capture must succeed (no partialDiffCaptureFailed).
+    expect(result.context.toolRequest.partialDiffCaptureFailed).toBeUndefined();
+    expect(result.context.toolRequest.partialDiffArtifact).toBe('partial-implementation.patch');
+
+    // The patch must contain the agent's source edit, not the ignored artifact.
+    const patchPath = join(inWorktreeArtifactRoot, 'runs', 'run-impl-1', 'partial-implementation.patch');
+    expect(existsSync(patchPath)).toBe(true);
+    const patch = readFileSync(patchPath, 'utf8');
+    expect(patch).toContain('gen-workbook.mjs');
+    expect(patch).toContain('EDITED_MARKER');
+    // The gitignored artifact file must NOT appear in the patch.
+    expect(patch).not.toContain('run.json');
   });
 });
 
@@ -6453,23 +7661,27 @@ describe('implementation handler — dependency-update routing (issue #302)', ()
     'suggested_action: dependencySync',
   ]);
 
+  // The manifest edit runs against the handler's cwd, which — worktree
+  // materialization now being unconditional (issue #732) — is the per-issue
+  // worktree path (`defaultWorktreePath()`), not the canonical `repoRoot`.
   function writeRepoManifest(manifest) {
-    mkdirSync(repoRoot, { recursive: true });
-    writeFileSync(join(repoRoot, 'package.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+    mkdirSync(defaultWorktreePath(), { recursive: true });
+    writeFileSync(join(defaultWorktreePath(), 'package.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8');
   }
   function readRepoManifest() {
-    return JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
+    return JSON.parse(readFileSync(join(defaultWorktreePath(), 'package.json'), 'utf8'));
   }
 
-  // new-impl preflight → claude emits dep-install request → dep-sync (status,
-  // npm, status) → diff → verification → ls-files → add → commit → push → gh pr.
+  // Worktree-only preflight (issue #732: fetch base (canonical) → status
+  // (canonical) → status (worktree)) → claude emits dep-install request →
+  // dep-sync (status, npm, status) → diff → verification → ls-files → add →
+  // commit → push → gh pr → worktree remove (canonical, frees the branch for
+  // the downstream review checkout).
   function depUpdateSuccessRunner(prUrl = 'https://github.com/m2dw/test-repo/pull/99') {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                                      // git rev-parse HEAD
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (worktree — clean)
       { stdout: DEP_BLOCK, stderr: '', exitCode: 0 },                                   // claude — dep-install request
       { stdout: ' M package.json\n', stderr: '', exitCode: 0 },                         // dep-sync git status (before)
       { stdout: 'updated lockfile', stderr: '', exitCode: 0 },                          // npm install --package-lock-only
@@ -6481,6 +7693,7 @@ describe('implementation handler — dependency-update routing (issue #302)', ()
       { stdout: '', stderr: '', exitCode: 0 },                                          // git commit
       { stdout: '', stderr: '', exitCode: 0 },                                          // git push
       { stdout: prUrl, stderr: '', exitCode: 0 },                                       // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git worktree remove --force --force <wt> (canonical)
     ]);
   }
 
@@ -6603,20 +7816,21 @@ describe('implementation handler — dependency-update routing (issue #302)', ()
     expect(r.dependencyUpdate.packages[0]).toMatchObject({ name: 'left-pad', version: '^1.3.0' });
   });
 
-  // new-impl preflight → claude emits request → unchanged (no sync) → handoff cleanup.
+  // Worktree-only preflight → claude emits request → dep-sync status shows the
+  // manifest is not dirty (already satisfied, no sync command runs) → handoff
+  // cleanup. In worktree mode `ai/issue-<n>` is the durable per-issue worktree
+  // branch, so an empty-capture handoff (no partial work) never restores to
+  // base or drops the branch (issue #732) — capturePartialDiff's `git add -A`
+  // + `git diff --cached` are the only calls after the dep-sync status probe.
   function depUpdateUnchangedRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },         // git status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },         // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },     // git rev-parse HEAD
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },         // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (worktree — clean)
       { stdout: DEP_BLOCK, stderr: '', exitCode: 0 },  // claude — dep-install request (already satisfied)
+      { stdout: '', stderr: '', exitCode: 0 },         // dep-sync git status (before — package.json NOT dirty)
       { stdout: '', stderr: '', exitCode: 0 },         // git add -A (capture partial diff, issue #379)
       { stdout: '', stderr: '', exitCode: 0 },         // git diff --cached --binary HEAD (no partial work)
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout -f main (cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },         // git clean -fd (cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },         // git branch -D (cleanup)
     ]);
   }
 
@@ -6679,19 +7893,16 @@ describe('implementation handler — dependency-update routing (issue #302)', ()
       'reason: needs left-pad',
       'suggested_action: dependencySync',
     ]);
-    // Generic handoff cleanup is identical to toolRequestRunner.
+    // Generic handoff cleanup is identical to toolRequestRunner: worktree mode
+    // never restores to base or drops the branch for an empty-capture handoff
+    // (issue #732).
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },         // git status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },         // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },     // git rev-parse HEAD
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },         // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },         // git status --porcelain (worktree — clean)
       { stdout: block, stderr: '', exitCode: 0 },      // claude — versionless request
       { stdout: '', stderr: '', exitCode: 0 },         // git add -A (capture partial diff, issue #379)
       { stdout: '', stderr: '', exitCode: 0 },         // git diff --cached --binary HEAD (no partial work)
-      { stdout: '', stderr: '', exitCode: 0 },         // git checkout -f main (cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },         // git clean -fd (cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },         // git branch -D (cleanup)
     ]);
     const result = await createImplementationHandler(depContext(), runner)(makeTask());
     expect(result.result).toBe('tool_request');
@@ -6702,22 +7913,21 @@ describe('implementation handler — dependency-update routing (issue #302)', ()
     expect(r.step).toBe('tool-request');
   });
 
-  // new-impl preflight → claude emits request → manifest edit + sync fails → handoff.
+  // Worktree-only preflight → claude emits request → manifest edit + sync
+  // fails → handoff. The failed sync leaves no staged diff for the mock to
+  // report (canned empty), so worktree mode's empty-capture handoff never
+  // restores to base or drops the branch (issue #732) — it stays the durable
+  // per-issue worktree continuation point.
   function depUpdateSyncFailRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                       // git status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                                       // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                       // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                                   // git rev-parse HEAD
-      { stdout: '', stderr: '', exitCode: 0 },                                       // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                                       // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                       // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                       // git status --porcelain (worktree — clean)
       { stdout: DEP_BLOCK, stderr: '', exitCode: 0 },                                // claude — dep-install request
       { stdout: ' M package.json\n', stderr: '', exitCode: 0 },                      // dep-sync git status (before)
       { stdout: '', stderr: 'npm ERR! 404 Not Found', exitCode: 1 },                 // npm install — fails
       { stdout: '', stderr: '', exitCode: 0 },                                       // git add -A (capture partial diff, issue #379)
       { stdout: '', stderr: '', exitCode: 0 },                                       // git diff --cached --binary HEAD (no partial work)
-      { stdout: '', stderr: '', exitCode: 0 },                                       // git checkout -f main (cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },                                       // git clean -fd (cleanup)
-      { stdout: '', stderr: '', exitCode: 0 },                                       // git branch -D (cleanup)
     ]);
   }
 
@@ -6729,9 +7939,13 @@ describe('implementation handler — dependency-update routing (issue #302)', ()
     expect(result.result).toBe('tool_request');
     expect(result.context.dependencyUpdate.failure.kind).toBe('sync-failed');
     expect(result.context.dependencyUpdate.failure.message).toContain('404 Not Found');
-    // Nothing committed; the branch is cleaned up.
+    // Nothing committed, and — unlike the old shared-checkout cleanup — the
+    // issue branch is NEVER dropped in worktree mode: it is the durable
+    // per-issue worktree continuation point, so an empty-capture handoff
+    // leaves it intact for a later grant/resume (issue #732).
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'commit')).toBe(false);
-    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'branch' && c.args.includes('-D'))).toBe(false);
+    expect(result.context.toolRequest.noPriorDiff).toBe(true);
   });
 
   // A verification-repair agent emits a dep-install request and exits NONZERO to
@@ -6740,11 +7954,9 @@ describe('implementation handler — dependency-update routing (issue #302)', ()
   test('satisfies a repair-agent dependency request that exits nonzero, then commits', async () => {
     writeRepoManifest({ name: 'p' });
     const runner = sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git status (clean)
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git pull --ff-only
-      { stdout: 'main', stderr: '', exitCode: 0 },                                      // git rev-parse HEAD
-      { stdout: '', stderr: '', exitCode: 0 },                                          // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git status --porcelain (worktree — clean)
       { stdout: 'edited source', stderr: '', exitCode: 0 },                             // claude (initial) — no dep request
       { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },                             // git diff --stat HEAD
       { stdout: ' M src/foo.ts\n', stderr: '', exitCode: 0 },                           // dep-sync status (initial, no trigger → no-op)
@@ -6760,6 +7972,7 @@ describe('implementation handler — dependency-update routing (issue #302)', ()
       { stdout: '', stderr: '', exitCode: 0 },                                          // git commit
       { stdout: '', stderr: '', exitCode: 0 },                                          // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/12', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                                          // git worktree remove --force --force <wt> (canonical)
     ]);
     const result = await createImplementationHandler(depContext(), runner)(makeTask());
 
@@ -6841,7 +8054,12 @@ describe('implementation handler — gitea-issues work-item auth', () => {
 // ---------------------------------------------------------------------------
 
 describe('implementation handler — codex context-mode', () => {
-  const CODEX_IDX = 5; // status checkout pull rev-parse checkout-b codex(5)
+  // Worktree-only sequence mirrors the `codex agent` describe block's
+  // happyCodexRunner at the same indexes (issue #732): fetch-base(0,
+  // canonical) status(1, canonical) status(2, worktree) codex(3) diff(4)
+  // verification(5) ls-files(6) add(7) commit(8) push(9) gh-pr-create(10)
+  // worktree-remove(11, canonical).
+  const CODEX_IDX = 3;
   const dir = () => join(artifactRoot, 'runs', 'run-impl-1');
 
   function codexSession(overrides = {}) {
@@ -6861,11 +8079,9 @@ describe('implementation handler — codex context-mode', () => {
 
   function happyCodexRunner() {
     return sequenceRunner([
-      { stdout: '', stderr: '', exitCode: 0 },                      // git status
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout main
-      { stdout: '', stderr: '', exitCode: 0 },                      // git pull
-      { stdout: 'main', stderr: '', exitCode: 0 },                  // git rev-parse
-      { stdout: '', stderr: '', exitCode: 0 },                      // git checkout -b
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (worktree — clean)
       { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // codex
       { stdout: '2 files changed', stderr: '', exitCode: 0 },       // git diff --stat
       { stdout: 'PASS', stderr: '', exitCode: 0 },                  // verification
@@ -6874,6 +8090,7 @@ describe('implementation handler — codex context-mode', () => {
       { stdout: '', stderr: '', exitCode: 0 },                      // git commit
       { stdout: '', stderr: '', exitCode: 0 },                      // git push
       { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                      // git worktree remove --force --force <wt> (canonical)
     ]);
   }
 
@@ -6956,10 +8173,109 @@ describe('implementation handler — codex context-mode', () => {
     const session = SESSION({ codex: { contextMode: { enabled: true, config: ['context_mode=on'] } } });
     const runner = happyRunner();
     await createImplementationHandler(CONTEXT({ session }), runner)(makeTask());
-    const claudeCall = runner.calls[5];
+    // Agent call is index 3 in the worktree-only sequence: fetch-base(0,
+    // canonical) status(1, canonical) status(2, worktree) claude(3) (issue #732).
+    const claudeCall = runner.calls[3];
     expect(claudeCall.cmd).toBe('claude');
     expect(claudeCall.args).not.toContain('context_mode=on');
     expect(readProfile()).toMatchObject({ agentId: 'claude', provider: 'anthropic', contextMode: 'n/a' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex model selection (issue #609)
+// ---------------------------------------------------------------------------
+
+describe('implementation handler — codex model selection', () => {
+  // Worktree-only sequence mirrors the `codex agent` describe block's
+  // happyCodexRunner at the same indexes (issue #732): fetch-base(0,
+  // canonical) status(1, canonical) status(2, worktree) codex(3) diff(4)
+  // verification(5) ls-files(6) add(7) commit(8) push(9) gh-pr-create(10)
+  // worktree-remove(11, canonical).
+  const CODEX_IDX = 3;
+  const dir = () => join(artifactRoot, 'runs', 'run-impl-1');
+
+  function codexSession(overrides = {}) {
+    return SESSION({ defaults: { implementationAgent: 'codex', reviewAgent: 'codex' }, ...overrides });
+  }
+
+  function makeCodexTask() {
+    return makeTask({
+      implementationAgent: 'codex',
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        labels: ['agent:codex', 'status:needs-implementation'],
+      },
+    });
+  }
+
+  function happyCodexRunner() {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin main:refs/remotes/origin/main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (worktree — clean)
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // codex
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },       // git diff --stat
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                  // verification
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },          // git ls-files
+      { stdout: '', stderr: '', exitCode: 0 },                      // git add
+      { stdout: '', stderr: '', exitCode: 0 },                      // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                      // git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/99', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                      // git worktree remove --force --force <wt> (canonical)
+    ]);
+  }
+
+  function readProfile() {
+    return JSON.parse(readFileSync(join(dir(), 'implementation-context.json'), 'utf8')).resolvedProfile;
+  }
+
+  test('no session.codex.model or CODEX_MODEL: no --model flag, compatibility mode metadata', async () => {
+    const runner = happyCodexRunner();
+    await createImplementationHandler(CONTEXT({ session: codexSession() }), runner)(makeCodexTask());
+    const { args } = runner.calls[CODEX_IDX];
+    expect(args).not.toContain('--model');
+    expect(readProfile()).toMatchObject({ model: 'cli-default', modelSource: 'default' });
+  });
+
+  test('session.codex.model: --model precedes the exec subcommand, metadata records session-config', async () => {
+    const session = codexSession({ codex: { model: 'gpt-5-codex' } });
+    const runner = happyCodexRunner();
+    await createImplementationHandler(CONTEXT({ session }), runner)(makeCodexTask());
+    const { args } = runner.calls[CODEX_IDX];
+    const mIdx = args.indexOf('--model');
+    const execIdx = args.indexOf('exec');
+    expect(mIdx).toBeGreaterThanOrEqual(0);
+    expect(args[mIdx + 1]).toBe('gpt-5-codex');
+    expect(mIdx).toBeLessThan(execIdx);
+    expect(readProfile()).toMatchObject({ model: 'gpt-5-codex', modelSource: 'session-config' });
+  });
+
+  test('CODEX_MODEL env var overrides session.codex.model', async () => {
+    process.env['CODEX_MODEL'] = 'o1-preview';
+    const session = codexSession({ codex: { model: 'gpt-5-codex' } });
+    const runner = happyCodexRunner();
+    try {
+      await createImplementationHandler(CONTEXT({ session }), runner)(makeCodexTask());
+    } finally {
+      delete process.env['CODEX_MODEL'];
+    }
+    const { args } = runner.calls[CODEX_IDX];
+    const mIdx = args.indexOf('--model');
+    expect(args[mIdx + 1]).toBe('o1-preview');
+    expect(readProfile()).toMatchObject({ model: 'o1-preview', modelSource: 'env' });
+  });
+
+  test('claude implementation is unaffected by codex model config', async () => {
+    const session = SESSION({ codex: { model: 'gpt-5-codex' } });
+    const runner = happyRunner();
+    await createImplementationHandler(CONTEXT({ session }), runner)(makeTask());
+    // Agent call is index 3 in the worktree-only sequence (issue #732).
+    const claudeCall = runner.calls[3];
+    expect(claudeCall.cmd).toBe('claude');
+    expect(claudeCall.args).not.toContain('gpt-5-codex');
+    expect(readProfile()).toMatchObject({ agentId: 'claude' });
   });
 });
 
@@ -6975,7 +8291,6 @@ describe('implementation handler — environmentPrepare baseline exclusion (issu
   const worktreePath = () => join(tmpDir, 'wt', 'addon-dev', 'issue-77', 'repo');
   const PREPARE_SESSION = (extra = {}) =>
     SESSION({
-      worktrees: { enabled: true },
       environmentPrepare: { enabled: true, command: 'echo ok' },
       ...extra,
     });

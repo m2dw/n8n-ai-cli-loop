@@ -122,3 +122,120 @@ describe('outbox migration via SqliteTaskStore', () => {
     outboxStore.close();
   });
 });
+
+describe('outbox retry-column migration (issue #606)', () => {
+  function createPreRetryOutbox(db) {
+    // The idempotency_key-era schema (#506), before attempt_count/last_error/
+    // next_attempt_at/dead_letter_at existed.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS outbox (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        idempotency_key   TEXT NOT NULL UNIQUE,
+        topic             TEXT NOT NULL,
+        payload           TEXT NOT NULL,
+        created_at        TEXT NOT NULL,
+        sent_at           TEXT
+      );
+    `);
+  }
+
+  test('adds retry columns to a pre-#606 DB (idempotency_key present, retry columns absent)', async () => {
+    const raw = new Database(dbPath);
+    createPreRetryOutbox(raw);
+    raw.prepare(
+      `INSERT INTO outbox (idempotency_key, topic, payload, created_at) VALUES (?, ?, ?, ?)`,
+    ).run('pre-retry-1', 'gh:comment', JSON.stringify({ topic: 'gh:comment', owner: 'o', repo: 'r', issueNumber: 1, body: 'old' }), '2026-01-01T00:00:00.000Z');
+    raw.close();
+
+    const store = new SqliteOutboxStore(dbPath);
+    const [entry] = await store.listPending();
+    expect(entry.idempotencyKey).toBe('pre-retry-1');
+    expect(entry.attemptCount).toBe(0);
+    expect(entry.lastError).toBeUndefined();
+    expect(entry.nextAttemptAt).toBeUndefined();
+    expect(entry.deadLetterAt).toBeUndefined();
+
+    // markFailed works against the migrated row
+    const result = await store.markFailed(entry.id, 'boom', '2026-01-01T00:00:00.000Z');
+    expect(result).toEqual({ deadLettered: false });
+    store.close();
+  });
+
+  test('adds retry columns even on a fully-legacy DB (neither idempotency_key nor retry columns)', async () => {
+    const raw = new Database(dbPath);
+    createLegacyOutbox(raw);
+    insertLegacyRow(raw, 'gh:comment', { topic: 'gh:comment', owner: 'o', repo: 'r', issueNumber: 1, body: 'old' });
+    raw.close();
+
+    const store = new SqliteOutboxStore(dbPath);
+    const [entry] = await store.listPending();
+    expect(entry.idempotencyKey).toMatch(/^legacy-/);
+    expect(entry.attemptCount).toBe(0);
+    store.close();
+  });
+
+  test('migration is idempotent: opening an already-migrated retry-column DB is a no-op', async () => {
+    const s1 = new SqliteOutboxStore(dbPath);
+    const payload = { topic: 'gh:comment', owner: 'o', repo: 'r', issueNumber: 2, body: 'b' };
+    await s1.enqueue({ idempotencyKey: 'idem-retry-1', topic: 'gh:comment', payload });
+    const [entry] = await s1.listPending();
+    await s1.markFailed(entry.id, 'transient', '2026-01-01T00:00:00.000Z');
+    s1.close();
+
+    const s2 = new SqliteOutboxStore(dbPath);
+    const [reopened] = await s2.listPending();
+    expect(reopened.attemptCount).toBe(1);
+    expect(reopened.lastError).toBe('transient');
+    s2.close();
+  });
+});
+
+describe('outbox claim-column migration (issue #607 review follow-up)', () => {
+  function createPreClaimOutbox(db) {
+    // The #607-era schema (cancelled_at present, before claimed_at existed).
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS outbox (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        idempotency_key   TEXT NOT NULL UNIQUE,
+        topic             TEXT NOT NULL,
+        payload           TEXT NOT NULL,
+        created_at        TEXT NOT NULL,
+        sent_at           TEXT,
+        attempt_count     INTEGER NOT NULL DEFAULT 0,
+        last_error        TEXT,
+        next_attempt_at   TEXT,
+        dead_letter_at    TEXT,
+        cancelled_at      TEXT
+      );
+    `);
+  }
+
+  test('adds the claimed_at column to a pre-claim-column DB', async () => {
+    const raw = new Database(dbPath);
+    createPreClaimOutbox(raw);
+    raw.prepare(
+      `INSERT INTO outbox (idempotency_key, topic, payload, created_at) VALUES (?, ?, ?, ?)`,
+    ).run('pre-claim-1', 'gh:comment', JSON.stringify({ topic: 'gh:comment', owner: 'o', repo: 'r', issueNumber: 1, body: 'old' }), '2026-01-01T00:00:00.000Z');
+    raw.close();
+
+    const store = new SqliteOutboxStore(dbPath);
+    const [entry] = await store.listPending();
+    expect(entry.claimedAt).toBeUndefined();
+    expect(await store.claimForDispatch(entry.id, '2026-01-01T00:00:00.000Z')).toBe(true);
+    store.close();
+  });
+
+  test('migration is idempotent: opening an already-migrated claim-column DB is a no-op', async () => {
+    const s1 = new SqliteOutboxStore(dbPath);
+    const payload = { topic: 'gh:comment', owner: 'o', repo: 'r', issueNumber: 4, body: 'b' };
+    await s1.enqueue({ idempotencyKey: 'idem-claim-1', topic: 'gh:comment', payload });
+    const [entry] = await s1.listPending();
+    await s1.claimForDispatch(entry.id, '2026-01-01T00:00:00.000Z');
+    s1.close();
+
+    const s2 = new SqliteOutboxStore(dbPath);
+    const [reopened] = await s2.listPending();
+    expect(reopened.claimedAt).toBe('2026-01-01T00:00:00.000Z');
+    s2.close();
+  });
+});

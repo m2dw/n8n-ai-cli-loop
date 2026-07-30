@@ -13,7 +13,11 @@
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "package": "npm run build",
     "build:parent-child-workflow": "node scripts/build-parent-child-workflow.mjs",
-    "metrics": "npm run build && node scripts/metrics.mjs"
+    "metrics": "npm run build && node scripts/metrics.mjs",
+    "copybara:export": "node scripts/copybara-export.mjs",
+    "copybara:validate": "node scripts/copybara-validate.mjs",
+    "public:export": "node scripts/public-export.mjs",
+    "public:publish": "node scripts/public-export.mjs --publish"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

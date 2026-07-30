@@ -352,6 +352,109 @@ describe('runNextPhase — quota/rate-limit delay comment (issue #352)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// runNextPhase — category-appropriate delay wording (issue #672)
+//
+// A handler that has classified a normalized failure category must have that
+// category survive through runNextPhase into both the phase.delayed task
+// event and the public GitHub/outbox comment, and the wording must not claim
+// usage-quota exhaustion for a rate_limit/provider_capacity failure.
+// ---------------------------------------------------------------------------
+
+describe('runNextPhase — category-appropriate delay wording (issue #672)', () => {
+  let store;
+  let cleanup;
+
+  beforeEach(() => {
+    ({ store, cleanup } = makeSqlite());
+  });
+  afterEach(() => cleanup());
+
+  const SESSION = {
+    sessionId: 's', repoRoot: '/srv/work/repo', artifactRoot: '/srv/work/repo/.artifacts',
+    githubRepo: 'o/r', githubOwner: 'o', githubName: 'r',
+    defaults: { implementationAgent: 'claude', reviewAgent: 'codex', researchAgent: 'gemini' },
+    workItemProvider: { provider: 'github-issues', auth: { mode: 'gh' } },
+    labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:rfh' },
+  };
+  const request = { sessionId: 's', workerId: 'w', runId: 'run-1', now: NOW };
+
+  async function enqueueImpl() {
+    await store.enqueueTask({ sessionId: 's', issueNumber: 7, phase: 'implementation', now: NOW });
+  }
+
+  function makeOutbox() {
+    const enqueued = [];
+    return { enqueued, store: { enqueue: async (e) => { enqueued.push(e); return { enqueued: true }; } } };
+  }
+
+  test('category survives onto the phase.delayed task event', async () => {
+    await enqueueImpl();
+    const handler = async () => ({ result: 'delayed', context: {}, category: 'provider_capacity' });
+    await runNextPhase({ store, request, handlers: { implementation: handler } });
+
+    const events = await store.listEvents({ sessionId: 's', issueNumber: 7 });
+    const delayed = events.find((e) => e.type === 'phase.delayed');
+    expect(delayed.data).toMatchObject({ category: 'provider_capacity' });
+  });
+
+  test('a handler that does not classify a category omits it from the event (no false category)', async () => {
+    await enqueueImpl();
+    const handler = async () => ({ result: 'delayed', context: {} });
+    await runNextPhase({ store, request, handlers: { implementation: handler } });
+
+    const events = await store.listEvents({ sessionId: 's', issueNumber: 7 });
+    const delayed = events.find((e) => e.type === 'phase.delayed');
+    expect(delayed.data.category).toBeUndefined();
+  });
+
+  test('usage_quota renders as an explicit usage-quota comment', async () => {
+    await enqueueImpl();
+    const { enqueued, store: outboxStore } = makeOutbox();
+    const handler = async () => ({ result: 'delayed', context: {}, category: 'usage_quota' });
+    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+
+    const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
+    expect(body).toContain('Agent usage quota delay');
+    expect(body).toMatch(/exhausted its usage quota/);
+  });
+
+  test('rate_limit renders without claiming usage-quota exhaustion', async () => {
+    await enqueueImpl();
+    const { enqueued, store: outboxStore } = makeOutbox();
+    const handler = async () => ({ result: 'delayed', context: {}, category: 'rate_limit' });
+    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+
+    const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
+    expect(body).toContain('Agent rate-limit delay');
+    expect(body).not.toMatch(/quota/i);
+  });
+
+  test('provider_capacity renders without claiming usage-quota exhaustion (issue #672 acceptance criterion)', async () => {
+    await enqueueImpl();
+    const { enqueued, store: outboxStore } = makeOutbox();
+    const handler = async () => ({ result: 'delayed', context: {}, category: 'provider_capacity' });
+    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+
+    const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
+    expect(body).toContain('Provider capacity delay');
+    expect(body).toMatch(/provider is at capacity/);
+    // The whole point of this acceptance criterion: never claim quota exhaustion
+    // for a capacity condition.
+    expect(body).not.toMatch(/quota/i);
+  });
+
+  test('an uncategorized delay keeps the original generic quota/rate-limit wording (backward compatible)', async () => {
+    await enqueueImpl();
+    const { enqueued, store: outboxStore } = makeOutbox();
+    const handler = async () => ({ result: 'delayed', context: {} });
+    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+
+    const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
+    expect(body).toContain('Agent quota/rate-limit delay');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 

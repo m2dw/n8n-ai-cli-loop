@@ -580,7 +580,7 @@ describe('admin ui — collectActiveTasks', () => {
     await store.enqueueTask({ sessionId: 'session-b', issueNumber: 2, phase: 'implementation', now: '2026-06-20T03:00:00.000Z' });
     await store.enqueueTask({ sessionId: 'session-a', issueNumber: 3, phase: 'review', now: '2026-06-20T02:00:00.000Z' });
 
-    const tasks = collectActiveTasks(store, ['session-a', 'session-b']);
+    const tasks = await collectActiveTasks(store, ['session-a', 'session-b']);
     store.close();
 
     expect(tasks).toHaveLength(3);
@@ -600,7 +600,7 @@ describe('admin ui — collectActiveTasks', () => {
       { status: 'done' },
     );
 
-    const tasks = collectActiveTasks(store, ['session-a']);
+    const tasks = await collectActiveTasks(store, ['session-a']);
     store.close();
     expect(tasks).toHaveLength(0);
   });
@@ -1213,7 +1213,7 @@ describe('admin ui — session scope helpers', () => {
     await store.enqueueTask({ sessionId: 'session-b', issueNumber: 2, phase: 'implementation' });
 
     const scopedIds = sessionIdsForScope({ kind: 'one', sessionId: 'session-a' }, ['session-a', 'session-b']);
-    const tasks = collectActiveTasks(store, scopedIds);
+    const tasks = await collectActiveTasks(store, scopedIds);
     store.close();
 
     expect(tasks).toHaveLength(1);
@@ -1226,7 +1226,7 @@ describe('admin ui — session scope helpers', () => {
     await store.enqueueTask({ sessionId: 'session-b', issueNumber: 2, phase: 'implementation' });
 
     const scopedIds = sessionIdsForScope({ kind: 'all' }, ['session-a', 'session-b']);
-    const tasks = collectActiveTasks(store, scopedIds);
+    const tasks = await collectActiveTasks(store, scopedIds);
     store.close();
 
     expect(tasks).toHaveLength(2);
@@ -1239,11 +1239,11 @@ describe('admin ui — session scope helpers', () => {
     await store.enqueueTask({ sessionId: 'session-b', issueNumber: 2, phase: 'implementation' });
 
     const allScope = { kind: 'all' };
-    const allTasks = collectActiveTasks(store, sessionIdsForScope(allScope, ['session-a', 'session-b']));
+    const allTasks = await collectActiveTasks(store, sessionIdsForScope(allScope, ['session-a', 'session-b']));
     expect(allTasks).toHaveLength(2);
 
     const oneScope = { kind: 'one', sessionId: 'session-b' };
-    const scopedTasks = collectActiveTasks(store, sessionIdsForScope(oneScope, ['session-a', 'session-b']));
+    const scopedTasks = await collectActiveTasks(store, sessionIdsForScope(oneScope, ['session-a', 'session-b']));
     store.close();
     expect(scopedTasks).toHaveLength(1);
     expect(scopedTasks[0].sessionId).toBe('session-b');

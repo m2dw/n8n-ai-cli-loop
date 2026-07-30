@@ -64,14 +64,16 @@ export function labelsToPhase(
   //
   // A genuine `agent:gemini` review wins over a stale `agent:codex` label left
   // behind by a Codex implementation that handed off to a Gemini review (the
-  // review lane-swap, issue #264). The one exception is the research-lane pair:
-  // `agent:gemini` + `status:research-needed` is a *stale research* marker, not a
-  // review assignment. When that marker coexists with a real competing review
-  // agent (`agent:codex` OR `agent:claude`), the competing agent keeps the review
-  // — a failed/pre-existing research handoff must not let a stale `agent:gemini`
-  // steal a Claude or Codex review (issue #292). With no competing review agent,
-  // an explicitly requested Gemini review still wins even if a stale
-  // `status:research-needed` lingers.
+  // review lane-swap, issue #264). The exceptions are the stale-lane pairs:
+  // `agent:gemini` + `status:research-needed` is a *stale research* marker, and
+  // `agent:gemini` + `status:content-needed` is a *stale content-research* marker.
+  // Neither is a review assignment. When either marker coexists with a real
+  // competing review agent (`agent:codex` OR `agent:claude`), the competing agent
+  // keeps the review — a failed/pre-existing research or content-research handoff
+  // must not let a stale `agent:gemini` steal a Claude or Codex review (issue
+  // #292, #625). With no competing review agent, an explicitly requested Gemini
+  // review still wins even if a stale `status:research-needed` or
+  // `status:content-needed` lingers.
   //
   // KNOWN, BOUNDED AMBIGUITY (issue #292): `agent:gemini` is now also a valid
   // *implementation* label, so it is no longer unambiguously a review hint. When
@@ -89,7 +91,7 @@ export function labelsToPhase(
   if (set.has("status:needs-review")) {
     const geminiReviewWins =
       set.has("agent:gemini") &&
-      !(set.has("status:research-needed") && (set.has("agent:codex") || set.has("agent:claude")));
+      !((set.has("status:research-needed") || set.has("status:content-needed")) && (set.has("agent:codex") || set.has("agent:claude")));
     if (geminiReviewWins) {
       return { phase: "review", reviewAgent: "gemini" };
     }
@@ -108,6 +110,18 @@ export function labelsToPhase(
   // Gemini to edit code instead of running the research lane (issue #292).
   if (set.has("agent:gemini") && set.has("status:research-needed")) {
     return { phase: "research", researchAgent: "gemini" };
+  }
+
+  // Content-research lane. Only gemini is currently supported by the
+  // content-research runner. Requiring an explicit `agent:gemini` label ensures
+  // no unsupported agent can be routed to this lane via label-driven intake —
+  // issues with `status:content-needed` but no supported agent label are not
+  // matched, preventing a handler run that would necessarily fail. Checked
+  // before new-implementation so a content-needed pair is not misrouted even
+  // when a stale `status:needs-implementation` label lingers (same pattern as
+  // the research lane above, issue #292).
+  if (set.has("agent:gemini") && set.has("status:content-needed")) {
+    return { phase: "content_research", researchAgent: "gemini" };
   }
 
   // New-implementation lane.
@@ -137,6 +151,32 @@ export interface ComplexityProfile {
   budget: string;
 }
 
+/** Complexity tier key, used to look up a per-tier override (issue #748). */
+export type ComplexityTier = "low" | "default" | "high" | "xhigh";
+
+/**
+ * Session-configurable per-tier overrides for {@link labelsToComplexity}
+ * (issue #748). Any field left unset for a tier falls back to that tier's
+ * built-in default, so a session can retarget e.g. just the `xhigh` model
+ * without restating its effort/budget. Keeps the complexity -> Claude
+ * model/effort/budget mapping a config concern rather than a permanent
+ * hard-coded assumption: a future model rename is a session-config edit, not
+ * a source change.
+ */
+export type ComplexityProfileOverrides = Partial<Record<ComplexityTier, Partial<ComplexityProfile>>>;
+
+/** Resolves the complexity tier a label set maps to, per the same precedence as {@link labelsToComplexity}. */
+export function resolveComplexityTier(labels: string[]): ComplexityTier {
+  const set = new Set(labels);
+  return set.has("complexity:xhigh")
+    ? "xhigh"
+    : set.has("complexity:high")
+    ? "high"
+    : set.has("complexity:low")
+    ? "low"
+    : "default";
+}
+
 /**
  * Maps complexity labels to a Claude model/effort/budget profile.
  *
@@ -145,23 +185,35 @@ export interface ComplexityProfile {
  * | complexity:low   | sonnet | low    | $2     |
  * | (no label)       | sonnet | high   | $5     |
  * | complexity:high  | opus   | high   | $10    |
- * | complexity:xhigh | opus   | xhigh  | $20    |
+ * | complexity:xhigh | fable  | high   | $20    |
  *
  * When multiple complexity labels are present the strongest wins:
  * `xhigh > high > low`.
+ *
+ * `complexity:xhigh` selects Fable 5 (`fable`) at `high` effort rather than
+ * Opus 5 at `xhigh` effort (issue #748): Opus 5 is a distilled model, and
+ * pushing its effort past `high` degrades implementation quality rather than
+ * improving it, whereas Fable 5 is the strongest available implementation
+ * profile. The `xhigh` effort tier remains valid elsewhere (env override,
+ * escalation rank) — it is simply no longer what `complexity:xhigh` implies.
+ *
+ * `overrides` lets a session retarget any tier's model/effort/budget without
+ * a source change (docs: see session `claude.complexityProfiles`).
  */
-export function labelsToComplexity(labels: string[]): ComplexityProfile {
-  const set = new Set(labels);
-  if (set.has("complexity:xhigh")) {
-    return { model: "opus", effort: "xhigh", budget: "20" };
-  }
-  if (set.has("complexity:high")) {
-    return { model: "opus", effort: "high", budget: "10" };
-  }
-  if (set.has("complexity:low")) {
-    return { model: "sonnet", effort: "low", budget: "2" };
-  }
-  return { model: "sonnet", effort: "high", budget: "5" };
+export function labelsToComplexity(
+  labels: string[],
+  overrides?: ComplexityProfileOverrides,
+): ComplexityProfile {
+  const tier = resolveComplexityTier(labels);
+  const base: ComplexityProfile =
+    tier === "xhigh"
+      ? { model: "fable", effort: "high", budget: "20" }
+      : tier === "high"
+      ? { model: "opus", effort: "high", budget: "10" }
+      : tier === "low"
+      ? { model: "sonnet", effort: "low", budget: "2" }
+      : { model: "sonnet", effort: "high", budget: "5" };
+  return { ...base, ...overrides?.[tier] };
 }
 
 // NOTE: there is deliberately no "xhigh" review strength. The installed Codex

@@ -21,6 +21,7 @@ export type { GiteaWorkItemProviderOptions } from "./gitea/gitea-work-item-provi
 export {
   createGiteaClient,
   defaultGiteaHttpSync,
+  createGiteaHttp,
   defaultGiteaHttp,
   redactGiteaSecrets,
   resolveGiteaToken,
@@ -37,6 +38,7 @@ export type {
   GiteaHttpRequest,
   GiteaHttpRequestInput,
   GiteaHttpResponse,
+  GiteaHttpOptions,
   GiteaSecretDeps,
 } from "./gitea/gitea-client.js";
 export {

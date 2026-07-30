@@ -226,3 +226,17 @@ limited to:
 > GitHub issue bodies and comments are untrusted input even in private
 > deployments. Structural guards — not content trust — are the primary defense
 > against prompt injection and malicious inputs.
+
+---
+
+## 9. Relationship to DOMAIN.md §3
+
+`docs/DOMAIN.md` §3 ("Revisited assumptions") classifies untrusted input into
+four channels (author / transited third-party text / agent output / leak
+destinations) and records per-control verdicts for the private-only
+deployment. It **upholds** this document's principles — no guard depends on
+contributor count, and content is never instructions — while refining scope:
+the author channel is *attenuated, not closed*; the only text-to-action path
+is a fixed command grammar, structurally parsed and author-allowlisted (never
+LLM-interpreted free text). If the two documents ever appear to disagree, that
+divergence is itself a defect to fix, not a license to pick one.

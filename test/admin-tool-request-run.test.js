@@ -485,3 +485,168 @@ describe('admin CLI — tool-request run: --disposition keep (default)', () => {
     expect(existsSync(join(repoRoot, 'generated.txt'))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Execution failure (issue #678): a non-zero exit is diagnostic information for
+// the implementation agent, not by itself a reason to stop at a human handoff.
+// ---------------------------------------------------------------------------
+
+describe('admin CLI — tool-request run: execution failure', () => {
+  test('a non-zero exit that leaves the tree clean requeues automatically with the failure delivered to the agent', async () => {
+    writeSession();
+    initRepo();
+    await seedToolRequestTask(123, { command: 'false' });
+    const r = run('tool-request', 'run', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    expect(parse(r)).toMatchObject({
+      ok: true,
+      action: 'guided-run',
+      executed: true,
+      success: false,
+      requeued: true,
+      status: 'queued',
+      phase: 'implementation',
+    });
+
+    const task = await getTask(123);
+    expect(task.status).toBe('queued');
+    expect(task.context.toolRequest.resolved).toBe(true);
+    const resolution = task.context.toolRequest.resolution;
+    expect(resolution.action).toBe('guided-run');
+    expect(resolution.disposition).toBe('failed');
+    expect(resolution.capturedResult.exitCode).not.toBe(0);
+  });
+
+  test('a non-zero exit that leaves changes behind stays a human handoff', async () => {
+    writeSession();
+    initRepo();
+    await seedToolRequestTask(123, { command: 'sh -c "echo dirty > leftover.txt; exit 1"' });
+    const r = run('tool-request', 'run', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    expect(parse(r)).toMatchObject({
+      ok: true,
+      executed: true,
+      success: false,
+      requeued: false,
+      status: 'ready_for_human',
+    });
+
+    const task = await getTask(123);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.toolRequest.resolved).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #629 — ignored .n8n-artifacts/** must not break pre-request capture;
+// capture failure must be fail-closed; disposition commit must restore source
+// edits from the captured patch before running the command.
+// ---------------------------------------------------------------------------
+
+describe('admin CLI — tool-request run: issue #629 pre-request capture and fail-closed', () => {
+  test('refuses to execute when partialDiffCaptureFailed is set (fail-closed, issue #629)', async () => {
+    // Scenario: the implementation handoff could not capture the source edits as
+    // a patch (e.g. because git add -A failed on a gitignored artifact path).
+    // Running the command now would execute against old source and requeueing
+    // would restart implementation from the pre-edit state, causing an infinite
+    // loop. The guided run must refuse instead.
+    writeSession();
+    initRepo();
+    await seedToolRequestTask(123, {
+      command: 'node internal/qa/gen-workbook.mjs',
+      partialDiffCaptureFailed: 'git add -A -- . :(exclude).n8n-artifacts failed (exit 128): The following paths are ignored by one of your .gitignore files:\n.n8n-artifacts',
+    });
+    const r = run('tool-request', 'run', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+
+    // Must refuse — non-zero exit and the error explains the capture failure.
+    expect(r.code).not.toBe(0);
+    const out = parse(r);
+    expect(out.error).toContain('partial-diff capture failed');
+    expect(out.error).toContain('.n8n-artifacts');
+
+    // The task is unchanged: unresolved, not requeued.
+    const task = await getTask(123);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.toolRequest.resolved).toBe(false);
+    // No grant was issued (command was never run).
+    expect(task.context.toolRequestGrant).toBeUndefined();
+  });
+
+  test('--disposition commit applies the captured source-edit patch before running the command, then commits both (issue #629)', async () => {
+    // Scenario: the implementation handler captured source edits in a partial-diff
+    // patch (shared-checkout mode). The guided run must apply that patch before
+    // running the command so the command sees the edited source; with
+    // --disposition commit both the restored edits and the command output must
+    // land on the issue branch in a single commit.
+    writeSession();
+    initRepo({ withRemote: true });
+
+    // Simulate a handoff artifact dir containing the captured partial-diff patch.
+    // The patch adds a new source file 'src/gen.mjs' that the generator command
+    // relies on (it's the output of the agent's source edits).
+    const handoffRunId = 'run-impl-629';
+    const handoffArtifactDir = join(repoRoot, '.n8n-artifacts', 'runs', handoffRunId);
+    mkdirSync(handoffArtifactDir, { recursive: true });
+
+    // Create the patch: adds src/gen.mjs with a known marker.
+    // We build a real git patch so `git apply` accepts it.
+    const git = (...a) => execFileSync('git', a, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    // Stage a file, diff it, then unstage — purely to build a valid patch string.
+    mkdirSync(join(repoRoot, 'src'), { recursive: true });
+    writeFileSync(join(repoRoot, 'src', 'gen.mjs'), '// GEN_MARKER\n', 'utf8');
+    git('add', 'src/gen.mjs');
+    const patchContent = execFileSync('git', ['diff', '--cached', '--binary', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' });
+    git('reset', '-q', '--', 'src/gen.mjs');
+    // Clean up the file so the repo is back to the original state for the grant.
+    rmSync(join(repoRoot, 'src', 'gen.mjs'));
+
+    writeFileSync(join(handoffArtifactDir, 'partial-implementation.patch'), patchContent, 'utf8');
+
+    // The generator command reads the source file and produces an output.
+    const generatorCommand = 'cat src/gen.mjs > generated-output.txt';
+
+    await seedToolRequestTask(123, {
+      command: generatorCommand,
+      partialDiffArtifact: 'partial-implementation.patch',
+      // No preservedBranch: shared-checkout mode, patch is the only copy of the edits.
+    });
+
+    // Store the handoff artifactDir on the task context so the guided run can
+    // locate the patch (mirrors what the implementation handler records).
+    const store = new SqliteTaskStore(dbPath);
+    const tasks = store.listTasks('addon-dev', 123);
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 123 },
+      { status: tasks[0].status },
+      { status: tasks[0].status, phase: tasks[0].phase, context: { ...tasks[0].context, artifactDir: handoffArtifactDir } },
+    );
+    store.close();
+
+    const r = run('tool-request', 'run', '--session-id', 'addon-dev', '--issue-number', '123', '--disposition', 'commit', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    expect(r.code).toBe(0);
+    expect(parse(r)).toMatchObject({
+      ok: true,
+      executed: true,
+      success: true,
+      requeued: true,
+      disposition: 'committed',
+      branch: 'ai/issue-123',
+    });
+
+    // Both the source edit (from the patch) and the command output must be on
+    // the issue branch — the next implementation run must see both.
+    expect(gitOut('rev-parse', '--abbrev-ref', 'HEAD')).toBe('ai/issue-123');
+    // The source file restored from the patch is on the branch.
+    expect(gitOut('ls-files', 'src/gen.mjs')).toBe('src/gen.mjs');
+    // The command produced output using that source file.
+    expect(gitOut('ls-files', 'generated-output.txt')).toBe('generated-output.txt');
+    // The output contains the content from the restored source file.
+    const outputContent = readFileSync(join(repoRoot, 'generated-output.txt'), 'utf8');
+    expect(outputContent).toContain('GEN_MARKER');
+
+    const task = await getTask(123);
+    expect(task.status).toBe('queued');
+    expect(task.context.toolRequest.resolution.disposition).toBe('committed');
+    expect(task.context.toolRequestResumeBranch).toBe('ai/issue-123');
+  });
+});

@@ -98,6 +98,32 @@ describe('JsonSessionRegistry', () => {
     });
   });
 
+  test('a session that omits the worktrees block resolves worktrees to undefined', async () => {
+    writeSessions(SESSION_A);
+    const registry = new JsonSessionRegistry(jsonPath);
+    const session = await registry.getSessionById('addon-dev');
+
+    expect(session.worktrees).toBeUndefined();
+  });
+
+  test('a session with an explicit worktrees.root override is unchanged', async () => {
+    writeSessions({ ...SESSION_A, worktrees: { root: '/custom/worktree/root' } });
+    const registry = new JsonSessionRegistry(jsonPath);
+    const session = await registry.getSessionById('addon-dev');
+
+    expect(session.worktrees).toEqual({ root: '/custom/worktree/root' });
+  });
+
+  test('rejects legacy worktrees.enabled with an actionable error (issue #731)', () => {
+    writeSessions({ ...SESSION_A, worktrees: { enabled: false } });
+    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/worktrees\.enabled is no longer supported/);
+  });
+
+  test('rejects legacy worktrees.enabled: true too', () => {
+    writeSessions({ ...SESSION_A, worktrees: { enabled: true, root: '/custom/worktree/root' } });
+    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/worktrees\.enabled is no longer supported/);
+  });
+
   test('rejects relative repoRoot', () => {
     writeSessions({ ...SESSION_A, repoRoot: 'relative/path' });
     expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/absolute/);
@@ -389,6 +415,42 @@ describe('JsonSessionRegistry', () => {
     });
   });
 
+  describe('codex model configuration (issue #609)', () => {
+    test('codex.model is undefined when not configured', async () => {
+      writeSessions(SESSION_A);
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.codex).toBeUndefined();
+    });
+
+    test('accepts an explicit model string', async () => {
+      writeSessions({ ...SESSION_A, codex: { model: 'gpt-5-codex' } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.codex.model).toBe('gpt-5-codex');
+    });
+
+    test('rejects a non-string model', () => {
+      writeSessions({ ...SESSION_A, codex: { model: 42 } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/model must be a non-empty string/);
+    });
+
+    test('rejects an empty-string model', () => {
+      writeSessions({ ...SESSION_A, codex: { model: '   ' } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/model must be a non-empty string/);
+    });
+
+    test('coexists with contextMode in the same block', async () => {
+      writeSessions({
+        ...SESSION_A,
+        codex: { model: 'gpt-5-codex', contextMode: { enabled: true, profile: 'ctx' } },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.codex).toEqual({ model: 'gpt-5-codex', contextMode: { enabled: true, profile: 'ctx' } });
+    });
+  });
+
   describe('research configuration (issue #493)', () => {
     test('research is undefined when not configured', async () => {
       writeSessions(SESSION_A);
@@ -445,6 +507,139 @@ describe('JsonSessionRegistry', () => {
       s1.research.antigravity.model = 'mutated';
       const s2 = await registry.getSessionById('addon-dev');
       expect(s2.research.antigravity.model).toBe('Gemini 3.1 Pro (Low)');
+    });
+  });
+
+  describe('research evidence configuration (issue #806)', () => {
+    test('preserves a full research.evidence block', async () => {
+      writeSessions({
+        ...SESSION_A,
+        research: {
+          evidence: {
+            enabled: true,
+            denyGlobs: ['secrets/**'],
+            generatedGlobs: ['dist/**'],
+            maxTurns: 3,
+          },
+        },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research).toEqual({
+        evidence: {
+          enabled: true,
+          denyGlobs: ['secrets/**'],
+          generatedGlobs: ['dist/**'],
+          maxTurns: 3,
+        },
+      });
+    });
+
+    test('accepts an empty research.evidence block', async () => {
+      writeSessions({ ...SESSION_A, research: { evidence: {} } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research).toEqual({ evidence: {} });
+    });
+
+    test('rejects research.evidence that is not an object', () => {
+      writeSessions({ ...SESSION_A, research: { evidence: true } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence must be an object/);
+    });
+
+    test('rejects research.evidence.enabled that is not a boolean', () => {
+      writeSessions({ ...SESSION_A, research: { evidence: { enabled: 'yes' } } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence\.enabled must be a boolean/);
+    });
+
+    test('rejects research.evidence.denyGlobs that is not an array of strings', () => {
+      writeSessions({ ...SESSION_A, research: { evidence: { denyGlobs: 'secrets/**' } } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence\.denyGlobs must be an array of strings/);
+    });
+
+    test('rejects research.evidence.generatedGlobs entries that are not strings', () => {
+      writeSessions({ ...SESSION_A, research: { evidence: { generatedGlobs: [42] } } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence\.generatedGlobs\[0\] must be a non-empty string/);
+    });
+
+    test('rejects research.evidence.maxTurns that is not a positive integer', () => {
+      writeSessions({ ...SESSION_A, research: { evidence: { maxTurns: 0 } } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence\.maxTurns must be a positive integer/);
+    });
+
+    test('resolved evidence config is an independent copy (no aliasing)', async () => {
+      writeSessions({ ...SESSION_A, research: { evidence: { enabled: true, denyGlobs: ['secrets/**'] } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const s1 = await registry.getSessionById('addon-dev');
+      s1.research.evidence.enabled = false;
+      s1.research.evidence.denyGlobs.push('mutated/**');
+      const s2 = await registry.getSessionById('addon-dev');
+      expect(s2.research.evidence).toEqual({ enabled: true, denyGlobs: ['secrets/**'] });
+    });
+  });
+
+  describe('claude complexity-profile overrides (issue #748)', () => {
+    test('claude is undefined when not configured', async () => {
+      writeSessions(SESSION_A);
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.claude).toBeUndefined();
+    });
+
+    test('accepts a claude.complexityProfiles.xhigh model override', async () => {
+      writeSessions({ ...SESSION_A, claude: { complexityProfiles: { xhigh: { model: 'claude-fable-5' } } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.claude).toEqual({ complexityProfiles: { xhigh: { model: 'claude-fable-5' } } });
+    });
+
+    test('accepts overrides for multiple tiers and fields', async () => {
+      writeSessions({
+        ...SESSION_A,
+        claude: {
+          complexityProfiles: {
+            xhigh: { model: 'claude-fable-5', effort: 'high', budget: '25' },
+            low: { model: 'haiku' },
+          },
+        },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.claude.complexityProfiles).toEqual({
+        xhigh: { model: 'claude-fable-5', effort: 'high', budget: '25' },
+        low: { model: 'haiku' },
+      });
+    });
+
+    test('accepts claude block with no complexityProfiles key', async () => {
+      writeSessions({ ...SESSION_A, claude: {} });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.claude).toEqual({});
+    });
+
+    test('rejects claude.complexityProfiles.xhigh.model that is an empty string', () => {
+      writeSessions({ ...SESSION_A, claude: { complexityProfiles: { xhigh: { model: '' } } } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/claude\.complexityProfiles\.xhigh\.model must be a non-empty string/);
+    });
+
+    test('rejects claude.complexityProfiles.xhigh that is not an object', () => {
+      writeSessions({ ...SESSION_A, claude: { complexityProfiles: { xhigh: 'fable' } } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/claude\.complexityProfiles\.xhigh must be an object/);
+    });
+
+    test('rejects claude that is not an object', () => {
+      writeSessions({ ...SESSION_A, claude: 'fable' });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/claude must be an object/);
+    });
+
+    test('resolved claude config is an independent copy (no aliasing)', async () => {
+      writeSessions({ ...SESSION_A, claude: { complexityProfiles: { xhigh: { model: 'claude-fable-5' } } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const s1 = await registry.getSessionById('addon-dev');
+      s1.claude.complexityProfiles.xhigh.model = 'mutated';
+      const s2 = await registry.getSessionById('addon-dev');
+      expect(s2.claude.complexityProfiles.xhigh.model).toBe('claude-fable-5');
     });
   });
 
@@ -1139,6 +1334,92 @@ describe('JsonSessionRegistry', () => {
       s1.aliases.push('mutated');
       const s2 = await registry.getSessionById('thunderbird-auth-results');
       expect(s2.aliases).toEqual(['addon', 'tar']);
+    });
+  });
+
+  describe('reportOnly configuration (issue #532)', () => {
+    test('accepts { enabled: true } and exposes it on the resolved session', async () => {
+      writeSessions({ ...SESSION_A, reportOnly: { enabled: true } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.reportOnly).toEqual({ enabled: true });
+    });
+
+    test('accepts { enabled: false } (master switch off)', async () => {
+      writeSessions({ ...SESSION_A, reportOnly: { enabled: false } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.reportOnly).toEqual({ enabled: false });
+    });
+
+    test('reportOnly is undefined when not configured', async () => {
+      writeSessions(SESSION_A);
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.reportOnly).toBeUndefined();
+    });
+
+    test('rejects a missing enabled field', () => {
+      writeSessions({ ...SESSION_A, reportOnly: {} });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/reportOnly.enabled must be a boolean/);
+    });
+
+    test('rejects non-boolean enabled', () => {
+      writeSessions({ ...SESSION_A, reportOnly: { enabled: 'yes' } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/reportOnly.enabled must be a boolean/);
+    });
+
+    test('resolved reportOnly is an independent copy (no aliasing)', async () => {
+      writeSessions({ ...SESSION_A, reportOnly: { enabled: true } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const s1 = await registry.getSessionById('addon-dev');
+      s1.reportOnly.enabled = false;
+      const s2 = await registry.getSessionById('addon-dev');
+      expect(s2.reportOnly).toEqual({ enabled: true });
+    });
+  });
+
+  describe('audit configuration (issue #533)', () => {
+    test('accepts acknowledge entries and exposes them on the resolved session', async () => {
+      writeSessions({
+        ...SESSION_A,
+        audit: { acknowledge: { 'verification-commands': 'docs-only repo' } },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.audit).toEqual({ acknowledge: { 'verification-commands': 'docs-only repo' } });
+    });
+
+    test('audit is undefined when not configured', async () => {
+      writeSessions(SESSION_A);
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.audit).toBeUndefined();
+    });
+
+    test('rejects a blank acknowledgement reason', () => {
+      // An acknowledgement exists to record WHY a finding is accepted; a blank
+      // one would silently suppress the finding with no rationale.
+      writeSessions({ ...SESSION_A, audit: { acknowledge: { 'verification-commands': '' } } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
+        /audit\.acknowledge\.verification-commands must be a non-empty string/,
+      );
+    });
+
+    test('rejects a non-string acknowledgement reason', () => {
+      writeSessions({ ...SESSION_A, audit: { acknowledge: { 'verification-commands': true } } });
+      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
+        /audit\.acknowledge\.verification-commands must be a non-empty string/,
+      );
+    });
+
+    test('resolved audit block is an independent copy (no aliasing)', async () => {
+      writeSessions({ ...SESSION_A, audit: { acknowledge: { 'verification-commands': 'why' } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const s1 = await registry.getSessionById('addon-dev');
+      s1.audit.acknowledge['verification-commands'] = 'mutated';
+      const s2 = await registry.getSessionById('addon-dev');
+      expect(s2.audit.acknowledge).toEqual({ 'verification-commands': 'why' });
     });
   });
 });

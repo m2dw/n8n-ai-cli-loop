@@ -1,16 +1,17 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, relative, resolve } from "path";
 import type { AiTask, ImplementationMode } from "../core/task.js";
 import type { PhaseHandler, PhaseHandlerContext, PhaseHandlerResult } from "../core/phase-runner.js";
 import { defaultCommandRunner } from "./command-runner.js";
 import type { CommandRunner } from "./command-runner.js";
 import type { DependencyChecker, DependencyDecision } from "../core/github-intake.js";
-import { labelsToComplexity } from "../core/github-intake.js";
-import { runArtifactDir, writeAssignmentFailureArtifact } from "./artifact-dir.js";
+import { labelsToComplexity, resolveComplexityTier } from "../core/github-intake.js";
+import { runArtifactDir, writeAssignmentFailureArtifact, ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "./artifact-dir.js";
 import { agentForPhase, readResolvedAssignment } from "../core/assignment.js";
 import { branchName, findOpenPr, resolveFixPr, extractPrNumber } from "./pr-helpers.js";
 import type { PrInfo } from "./pr-helpers.js";
-import { resolveIssueWorktree, removeWorktree } from "./worktree.js";
+import { resolveIssueWorktree, removeWorktree, canonicalizePath, isPathInside } from "./worktree.js";
+import { resolveWorktreeRoot, issueWorktreePath } from "../core/worktree-paths.js";
 import { ghRunnerFromCommandRunner } from "../providers/github/gh-runner.js";
 import type { GhRunner } from "../providers/github/gh-runner.js";
 import { resolveGhRunner } from "../providers/github/github-app-auth.js";
@@ -25,11 +26,12 @@ import type { DependencySyncOutcome } from "./dependency-sync.js";
 import { ensureEnvironmentPrepared } from "./environment-prepare.js";
 import { runDependencyUpdate } from "./dependency-update.js";
 import type { DependencyUpdateApplied, DependencyUpdateFailed } from "./dependency-update.js";
-import { classifyQuotaExhaustion } from "../core/quota-classifier.js";
+import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory } from "../core/quota-classifier.js";
+import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
 import { parseToolRequest, toolRequestPromptSection, toolRequestResolutionPromptSection, normalizeToolRequestCommand } from "../core/tool-request.js";
 import type { StoredToolRequest, ToolRequest } from "../core/tool-request.js";
-import type { CodexConfig } from "../core/session.js";
-import { resolveCodexContextMode, providerForAgent } from "./codex-context-mode.js";
+import type { ClaudeConfig, CodexConfig } from "../core/session.js";
+import { resolveCodexContextMode, resolveCodexModel, providerForAgent } from "./codex-context-mode.js";
 
 // ---------------------------------------------------------------------------
 // Mode detection
@@ -241,6 +243,236 @@ function isValidDirtyContinuation(
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Artifact-root exclusion for dirty-file sets (issue #727 review)
+//
+// `session.artifactRoot` may be configured INSIDE the managed worktree but NOT
+// gitignored — a configuration capturePartialDiff's staging logic (below)
+// explicitly supports. In that configuration every implementation run's own
+// artifact files (this run's AND every prior run's, since each lives under
+// `<artifactRoot>/runs/<run-id>/`) show up as untracked noise in `git status`.
+// Left unfiltered, that noise (a) pollutes a recorded dirtyContinuation
+// marker's dirtyFiles/patch and (b) keeps growing on every later attempt as
+// each run writes its own new artifacts, so a path-set or content comparison
+// against an earlier snapshot would never stabilize — the drift guard would
+// reject an otherwise-unchanged continuation forever. Excluding artifact-root
+// paths applies uniformly at every place a git-status snapshot feeds such a
+// comparison, so capture and validation stay consistent with each other.
+// ---------------------------------------------------------------------------
+
+function isUnderRelativeRoot(relPath: string, relRoot: string): boolean {
+  return relRoot !== "" && !relRoot.startsWith("..") &&
+    (relPath === relRoot || relPath.startsWith(relRoot + "/"));
+}
+
+function excludeArtifactRootPaths(paths: string[], relArtifactRoot: string): string[] {
+  return paths.filter((p) => !isUnderRelativeRoot(p, relArtifactRoot));
+}
+
+// `git status --porcelain` (v1, no `-z`) C-quotes any path containing a
+// double quote, backslash, or non-ASCII byte — wrapping it in `"..."` with
+// `\\`, `\"`, and `\NNN` octal-byte escapes. Without unquoting, an
+// artifactRoot whose name needs quoting would never match `relArtifactRoot`
+// and every retry would reject its own artifact files as unrelated dirt
+// (issue #727 review, follow-up P2).
+function unquotePorcelainPath(raw: string): string {
+  if (raw.length < 2 || raw[0] !== '"' || raw[raw.length - 1] !== '"') return raw;
+  const inner = raw.slice(1, -1);
+  const bytes: number[] = [];
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === "\\" && i + 1 < inner.length) {
+      const next = inner[i + 1];
+      if (next >= "0" && next <= "7") {
+        let oct = next;
+        i++;
+        for (let k = 0; k < 2 && i + 1 < inner.length && inner[i + 1] >= "0" && inner[i + 1] <= "7"; k++) {
+          oct += inner[++i];
+        }
+        bytes.push(parseInt(oct, 8) & 0xff);
+        continue;
+      }
+      const named: Record<string, string> = {
+        a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", '"': '"', "\\": "\\",
+      };
+      if (next in named) {
+        bytes.push(named[next].charCodeAt(0));
+        i++;
+        continue;
+      }
+    }
+    bytes.push(c.charCodeAt(0));
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+// Parses `git status --porcelain` (v1, line-based) output into the paths that
+// should count as dirty for the preflight check, excluding paths confined to
+// the artifact root. A rename/copy line ("XY from -> to") is treated as dirty
+// unless BOTH sides resolve under the artifact root: selecting only the
+// destination (the prior implementation) let an agent rename a tracked file
+// INTO the artifact root and have the whole entry filtered out as
+// artifact-only dirt, so the next attempt passed preflight with no
+// dirtyContinuation marker and later staged the source-path deletion as if it
+// were unrelated committed history (issue #727 review, follow-up P1).
+function parsePorcelainDirtyPaths(stdout: string, relArtifactRoot: string): string[] {
+  const result: string[] = [];
+  for (const line of stdout.split("\n")) {
+    if (line.length < 3) continue;
+    const rest = line.slice(3);
+    const arrowIdx = rest.indexOf(" -> ");
+    if (arrowIdx === -1) {
+      const path = unquotePorcelainPath(rest);
+      if (!isUnderRelativeRoot(path, relArtifactRoot)) result.push(path);
+      continue;
+    }
+    const fromPath = unquotePorcelainPath(rest.slice(0, arrowIdx));
+    const toPath = unquotePorcelainPath(rest.slice(arrowIdx + 4));
+    const fromUnderRoot = isUnderRelativeRoot(fromPath, relArtifactRoot);
+    const toUnderRoot = isUnderRelativeRoot(toPath, relArtifactRoot);
+    if (fromUnderRoot && toUnderRoot) continue;
+    result.push(fromPath, toPath);
+  }
+  return result;
+}
+
+// Parses `git status --porcelain -z --untracked-files=all` output (already
+// split on NUL into `statusEntries`) into the raw path list every -z capture/
+// drift-check site below builds `dirtyFiles`/`currentFiles` from. A rename/copy
+// entry emits "XY new-path" followed by a second NUL-terminated "old-path"
+// token; unconditionally consuming-and-discarding that old-path token (as an
+// earlier revision of this capture did) lets a rename INTO the artifact root
+// have its destination filtered as artifact noise with the source silently
+// dropped — producing an empty dirty-file set (no marker saved) even though
+// the source path is real dirt outside the root. Mirrors
+// `parsePorcelainDirtyPaths`': keep both sides unless BOTH resolve under the
+// artifact root (issue #727 review, follow-up P2).
+function parseZPorcelainDirtyPaths(statusEntries: string[], relArtifactRoot: string): string[] {
+  const result: string[] = [];
+  let idx = 0;
+  while (idx < statusEntries.length) {
+    const entry = statusEntries[idx++];
+    if (entry.length < 3) continue;
+    const xy = entry.slice(0, 2);
+    const path = entry.slice(3);
+    if (xy[0] === "R" || xy[0] === "C" || xy[1] === "R" || xy[1] === "C") {
+      const oldPath = statusEntries[idx++] ?? "";
+      const newUnderRoot = isUnderRelativeRoot(path, relArtifactRoot);
+      const oldUnderRoot = isUnderRelativeRoot(oldPath, relArtifactRoot);
+      if (newUnderRoot && oldUnderRoot) continue;
+      result.push(path, oldPath);
+      continue;
+    }
+    result.push(path);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Dirty continuation capture on abnormal agent exit (issue #727)
+//
+// The verification-failure path above (isValidDirtyContinuation) already lets a
+// later run continue from unfinished edits left by a prior attempt. Issue #699
+// exposed the gap: when the implementation agent itself exits nonzero (or is
+// interrupted) after modifying the managed worktree, the handler returned a
+// generic failure WITHOUT refreshing/creating a dirtyContinuation marker. The
+// next run then either failed the dirty preflight outright (no marker) or, if a
+// stale marker from an earlier attempt was still recorded, failed the drift
+// guard against content the marker no longer describes.
+//
+// This helper captures the SAME bounded, NUL-delimited status + `git diff HEAD`
+// + untracked-file patch used by the verification-failure capture, so a fresh
+// snapshot tied to the current run is available before the handler returns
+// `failed`. Returns `dirtyContinuation: undefined` when the worktree has no
+// changes (no marker should be created), and fails closed (`ok: false`) when
+// the dirty state itself cannot be safely captured — the caller must surface
+// an explicit error rather than silently leaving a stale or absent marker.
+// ---------------------------------------------------------------------------
+
+function captureDirtyContinuationOnAgentExit(
+  runner: CommandRunner,
+  cwd: string,
+  artifactDir: string,
+  artifactRoot: string,
+  task: AiTask,
+  runId: string,
+  worktreeBranch: string,
+  resolvedWorktreeId: string | undefined,
+  extra: Record<string, unknown>,
+): { ok: true; dirtyContinuation?: Record<string, unknown> } | { ok: false; error: string } {
+  const relArtifactRoot = relative(cwd, artifactRoot);
+  const dirtyStatus = runner.run("git", ["status", "--porcelain", "-z", "--untracked-files=all"], { cwd });
+  if (dirtyStatus.exitCode !== 0) {
+    return {
+      ok: false,
+      error: `git status failed while capturing post-exit worktree state (exit ${dirtyStatus.exitCode}): ${(dirtyStatus.stderr || dirtyStatus.stdout).slice(0, 300)}`,
+    };
+  }
+  const statusEntries = dirtyStatus.stdout.split("\0").filter(Boolean);
+  const dirtyFilesRaw = parseZPorcelainDirtyPaths(statusEntries, relArtifactRoot);
+  const dirtyFiles = excludeArtifactRootPaths(dirtyFilesRaw, relArtifactRoot);
+  // No file changes (excluding artifact-root noise): do not create a
+  // misleading continuation marker.
+  if (dirtyFiles.length === 0) {
+    return { ok: true, dirtyContinuation: undefined };
+  }
+  const patchResult = runner.run("git", ["diff", "HEAD"], { cwd, maxBuffer: 64 * 1024 * 1024 });
+  if (patchResult.exitCode !== 0) {
+    return {
+      ok: false,
+      error: `git diff failed while capturing post-exit worktree state (exit ${patchResult.exitCode}): ${(patchResult.stderr || patchResult.stdout).slice(0, 300)}`,
+    };
+  }
+  // Also include untracked files (git diff HEAD omits them).
+  const untrackedFiles = excludeArtifactRootPaths(
+    statusEntries.filter((entry) => entry.startsWith("?? ")).map((entry) => entry.slice(3)),
+    relArtifactRoot,
+  );
+  const { patch: untrackedPatch, skipped: skippedUntracked } = buildUntrackedPatch(cwd, untrackedFiles);
+  // Fail closed when any untracked file could not be content-verified (binary,
+  // oversized, non-regular, or inaccessible). The recovery-time drift check
+  // (isValidDirtyContinuation's caller, below) rejects any marker whose
+  // untracked patch contains such a placeholder, so recording one here would
+  // only guarantee the next retry fails on drift instead of recovering —
+  // surface the manual-recovery guidance now instead.
+  if (skippedUntracked.length > 0) {
+    return {
+      ok: false,
+      error:
+        "Worktree has untracked files that cannot be content-verified " +
+        "(binary, oversized, non-regular, or inaccessible); " +
+        `refusing to record a dirtyContinuation marker for them. Skipped: ${skippedUntracked.join(", ")}`,
+    };
+  }
+  const patchFile = "implementation-dirty-patch.patch";
+  try {
+    writeFileSync(join(artifactDir, patchFile), patchResult.stdout + untrackedPatch, "utf8");
+  } catch (err) {
+    // Convert a write failure (disk exhaustion, permission change on the
+    // artifact directory, etc.) into the same fail-closed contract as the
+    // git-command failures above, instead of throwing out of this helper and
+    // leaving any prior marker persisted with no refreshed context (issue
+    // #727 review).
+    return {
+      ok: false,
+      error: `Failed to write ${patchFile} while capturing post-exit worktree state: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  const dirtyContinuation: Record<string, unknown> = {
+    issueNumber: task.issueNumber,
+    phase: "implementation",
+    runId,
+    branch: worktreeBranch,
+    worktreeId: resolvedWorktreeId ?? null,
+    dirtyFiles,
+    patchArtifactFile: patchFile,
+    timestamp: new Date().toISOString(),
+    commitSkipped: true,
+    ...extra,
+  };
+  return { ok: true, dirtyContinuation };
+}
+
 // Builds a unified-diff representation of untracked files in `cwd`, using the
 // same format as `git diff HEAD` so both parts can be concatenated and compared
 // as a single patch. Used at both recording and check-time to detect content drift.
@@ -323,23 +555,35 @@ function buildPrompt(
 
   // When the handler detected a valid dirty continuation, include a section that
   // tells the agent its prior edits are still in the tree so it continues from
-  // them rather than starting fresh, and shows the verification failure that
-  // caused the earlier attempt to stop (issue #571).
+  // them rather than starting fresh. The failure that caused the prior attempt
+  // to stop has two distinct origins (issue #727): a verification failure
+  // (issue #571) or an abnormal agent exit with no verification having run —
+  // render whichever one actually produced this marker instead of always
+  // assuming verification ran, which would hand the agent contradictory,
+  // missing failure context.
   const continuationLines: string[] = [];
   if (dirtyContinuation) {
     const verFailure = ctx["verificationFailure"] as { name: string; exitCode: number } | undefined;
     const verFeedback = typeof ctx["verificationFeedback"] === "string"
       ? (ctx["verificationFeedback"] as string)
       : "";
+    const agentExitFailure = ctx["agentExitFailure"] as { message: string; exitCode: number } | undefined;
     continuationLines.push(
       "",
       "## Continuation Context",
       "",
       "This run continues a prior implementation attempt whose edits are already in the working tree.",
       "Review the existing changes and continue from them; do not discard correct work.",
-      "Fix the verification failure described below and the runner will commit and push as normal.",
     );
-    if (verFailure) {
+    if (verFailure && agentExitFailure) {
+      // issue #727 review: a repair agent crashed while reacting to this
+      // verification failure — render both so the next agent knows the
+      // original failure it must fix AND that the previous repair attempt
+      // itself exited abnormally partway through.
+      continuationLines.push(
+        "A repair agent crashed while trying to fix the verification failure described below. " +
+          "Fix the verification failure and the runner will commit and push as normal.",
+      );
       continuationLines.push(
         "",
         `### Prior Verification Failure: ${verFailure.name} (exit ${verFailure.exitCode})`,
@@ -348,6 +592,39 @@ function buildPrompt(
       if (verFeedback.trim()) {
         continuationLines.push("```", verFeedback.slice(0, 4000), "```");
       }
+      continuationLines.push(
+        "",
+        `### Prior Repair Agent Exit (code ${agentExitFailure.exitCode})`,
+        "",
+        "```",
+        agentExitFailure.message.slice(0, 4000),
+        "```",
+      );
+    } else if (verFailure) {
+      continuationLines.push("Fix the verification failure described below and the runner will commit and push as normal.");
+      continuationLines.push(
+        "",
+        `### Prior Verification Failure: ${verFailure.name} (exit ${verFailure.exitCode})`,
+        "",
+      );
+      if (verFeedback.trim()) {
+        continuationLines.push("```", verFeedback.slice(0, 4000), "```");
+      }
+    } else if (agentExitFailure) {
+      continuationLines.push(
+        "The prior attempt's agent process exited abnormally before verification ran, so no verification " +
+          "failure is available. Finish the implementation and the runner will verify, commit, and push as normal.",
+      );
+      continuationLines.push(
+        "",
+        `### Prior Agent Exit (code ${agentExitFailure.exitCode})`,
+        "",
+        "```",
+        agentExitFailure.message.slice(0, 4000),
+        "```",
+      );
+    } else {
+      continuationLines.push("Finish the implementation and the runner will commit and push as normal.");
     }
   }
 
@@ -552,11 +829,11 @@ export interface ResolvedImplementationProfile {
   /** Sanitized argv — no prompt content (prompt is passed via stdin). */
   argv: string[];
   model: string;
-  modelSource: "env" | "label" | "default";
+  modelSource: "env" | "session-config" | "label" | "default";
   effort: string;
-  effortSource: "env" | "escalation" | "label" | "default";
+  effortSource: "env" | "escalation" | "session-config" | "label" | "default";
   maxBudgetUsd: string;
-  budgetSource: "env" | "label" | "default";
+  budgetSource: "env" | "session-config" | "label" | "default";
   /** Binary path source — set for Gemini/Antigravity; absent for Claude. */
   cmdSource?: "env" | "cli-default";
   /** Company/provider backing the agent (e.g. "anthropic", "openai", "google"). */
@@ -574,8 +851,10 @@ export interface ResolvedImplementationProfile {
 
 // Relative ordering of Claude effort tiers, used to ensure review-loop
 // escalation only ever raises effort and never downgrades an already-stronger
-// label profile (e.g. complexity:xhigh must not be knocked down to "high"
-// escalation — issue #243).
+// label/session-derived profile (issue #243). `xhigh`/`max` are no longer
+// produced by the built-in complexity mapping (complexity:xhigh resolves to
+// "high" on Fable 5 — issue #748) but remain valid via `CLAUDE_EFFORT` or a
+// session `claude.complexityProfiles` override, so the guard still applies.
 const EFFORT_RANK: Record<string, number> = {
   low: 1,
   medium: 2,
@@ -591,20 +870,38 @@ function effortRank(effort: string): number {
 function resolveClaudeProfile(
   labels: string[],
   escalatedEffort?: string,
+  claudeConfig?: ClaudeConfig,
 ): ResolvedImplementationProfile {
-  const labelProfile = labelsToComplexity(labels);
+  const labelProfile = labelsToComplexity(labels, claudeConfig?.complexityProfiles);
   const hasComplexityLabel =
     labels.includes("complexity:xhigh") ||
     labels.includes("complexity:high") ||
     labels.includes("complexity:low");
+  // The session-config override for the resolved tier, if any — used below to
+  // report an accurate source per field so GitHub run metadata shows that a
+  // configured session profile (not just the built-in label/default table)
+  // determined what ran (issue #748 review).
+  const tierOverride = claudeConfig?.complexityProfiles?.[resolveComplexityTier(labels)];
 
   const model = process.env["CLAUDE_MODEL"] ?? labelProfile.model;
   const modelSource: ResolvedImplementationProfile["modelSource"] =
-    process.env["CLAUDE_MODEL"] ? "env" : hasComplexityLabel ? "label" : "default";
+    process.env["CLAUDE_MODEL"]
+      ? "env"
+      : tierOverride?.model !== undefined
+      ? "session-config"
+      : hasComplexityLabel
+      ? "label"
+      : "default";
 
   const budget = process.env["CLAUDE_MAX_BUDGET_USD"] ?? labelProfile.budget;
   const budgetSource: ResolvedImplementationProfile["budgetSource"] =
-    process.env["CLAUDE_MAX_BUDGET_USD"] ? "env" : hasComplexityLabel ? "label" : "default";
+    process.env["CLAUDE_MAX_BUDGET_USD"]
+      ? "env"
+      : tierOverride?.budget !== undefined
+      ? "session-config"
+      : hasComplexityLabel
+      ? "label"
+      : "default";
 
   let effort: string;
   let effortSource: ResolvedImplementationProfile["effortSource"];
@@ -619,7 +916,8 @@ function resolveClaudeProfile(
     effortSource = "escalation";
   } else {
     effort = labelProfile.effort;
-    effortSource = hasComplexityLabel ? "label" : "default";
+    effortSource =
+      tierOverride?.effort !== undefined ? "session-config" : hasComplexityLabel ? "label" : "default";
   }
 
   const argv = [
@@ -677,12 +975,16 @@ function resolveGeminiProfile(): ResolvedImplementationProfile {
 // ---------------------------------------------------------------------------
 // Codex flags — implementation lane
 //
-// Codex does not expose model selection or a per-run budget cap via CLI flags.
-// Effort is passed via -c model_reasoning_effort=<value>; the effort tier is
-// resolved from task labels / escalation / env just like Claude, then mapped
-// to the three levels Codex accepts (low / medium / high). xhigh and max (Claude-
-// specific tiers) are mapped to "high" since Codex has no finer tier above it.
-// Prompt is passed via stdin (same contract as Claude).
+// Codex does not expose a per-run budget cap via CLI flags. Model selection is
+// optional: `resolveCodexModel()` (src/handlers/codex-context-mode.ts) resolves
+// an explicit `--model <model>` (a global Codex option, spliced before `exec`)
+// from `CODEX_MODEL` / `session.codex.model`; when neither is set the Codex CLI's
+// own config/default selects the model (compatibility mode, recorded as
+// `model: "cli-default"`). Effort is passed via -c model_reasoning_effort=<value>;
+// the effort tier is resolved from task labels / escalation / env just like
+// Claude, then mapped to the three levels Codex accepts (low / medium / high).
+// xhigh and max (Claude-specific tiers) are mapped to "high" since Codex has no
+// finer tier above it. Prompt is passed via stdin (same contract as Claude).
 // ---------------------------------------------------------------------------
 
 function resolveCodexProfile(
@@ -724,7 +1026,15 @@ function resolveCodexProfile(
     return { error: ctxMode.error };
   }
 
-  const argv: string[] = ["exec"];
+  // Resolved BEFORE argv so the --model flag (a global Codex option) can be
+  // spliced ahead of the `exec` subcommand, same positioning rule as --profile.
+  const modelResolution = resolveCodexModel(codex);
+
+  const argv: string[] = [];
+  if (modelResolution.source !== "unset") {
+    argv.push("--model", modelResolution.model);
+  }
+  argv.push("exec");
   argv.push("-c", `model_reasoning_effort=${codexEffortLevel}`);
   if (ctxMode.status === "enabled") {
     argv.push(...ctxMode.args);
@@ -736,10 +1046,8 @@ function resolveCodexProfile(
       agentId: "codex",
       cmd: "codex",
       argv,
-      // Codex does not expose model selection via CLI flags; model is determined
-      // by the Codex CLI configuration.
-      model: "cli-default",
-      modelSource: "default",
+      model: modelResolution.model,
+      modelSource: modelResolution.source === "unset" ? "default" : modelResolution.source,
       effort,
       effortSource,
       // Codex does not support a per-run budget cap flag.
@@ -764,10 +1072,11 @@ function implementationCommand(
   labels: string[],
   escalatedEffort?: string,
   codex?: CodexConfig,
+  claude?: ClaudeConfig,
 ): { profile: ResolvedImplementationProfile } | { error: string } {
   const agent = agentId ?? "claude";
   if (agent === "claude") {
-    return { profile: resolveClaudeProfile(labels, escalatedEffort) };
+    return { profile: resolveClaudeProfile(labels, escalatedEffort, claude) };
   }
   if (agent === "gemini") {
     return { profile: resolveGeminiProfile() };
@@ -777,24 +1086,6 @@ function implementationCommand(
   }
   return { error: `Unsupported implementation agent: ${agent}. Supported: claude, codex, gemini` };
 }
-
-// ---------------------------------------------------------------------------
-// Contamination guard helpers (issue #211)
-//
-// A previous implementation run that created a branch and committed but then
-// failed at a late step (push / gh pr create) could leave the worker checkout
-// sitting on that failed branch. A later run that assumed a clean base would
-// then branch off the wrong HEAD, pulling one issue's commit into another
-// issue's PR. These helpers harden the run against that:
-//
-//   - currentBranch(): read the checked-out branch so we can assert HEAD is at
-//     the intended base before `git checkout -b`.
-//   - the quarantine marker: a persistent fail-closed signal written to the
-//     shared session artifact root when a late failure cannot be rolled back to
-//     a safe base. While present, every new run aborts in preflight so a
-//     contaminated checkout can never become the base for a later issue branch.
-//     It is cleared by manual recovery (deleting the file).
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Partial-work preservation result types (issue #379, #390)
@@ -826,52 +1117,14 @@ interface HandoffPreservation {
   preservedBranchPushed?: boolean;
 }
 
-const QUARANTINE_FILENAME = "implementation-quarantine.json";
-
-function quarantineMarkerPath(artifactRoot: string): string {
-  return join(artifactRoot, QUARANTINE_FILENAME);
-}
-
-function currentBranch(
-  runner: CommandRunner,
-  cwd: string,
-): { branch: string } | { error: string } {
-  const r = runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
-  if (r.exitCode !== 0) {
-    return {
-      error: `git rev-parse --abbrev-ref HEAD failed (exit ${r.exitCode}): ${(r.stderr || r.stdout).slice(0, 300)}`,
-    };
-  }
-  return { branch: r.stdout.trim() };
-}
-
-interface QuarantineInfo {
-  issueNumber: number;
-  sessionId: string;
-  runId: string;
-  branch: string;
-  step: string;
-}
-
-function writeQuarantineMarker(artifactRoot: string, info: QuarantineInfo): void {
-  try {
-    mkdirSync(artifactRoot, { recursive: true });
-    writeFileSync(
-      quarantineMarkerPath(artifactRoot),
-      JSON.stringify({ ...info, quarantinedAt: new Date().toISOString() }, null, 2),
-      "utf8",
-    );
-  } catch {
-    // Best-effort: if the marker cannot be written the run still reports the
-    // underlying failure. The next run's preflight HEAD check remains a guard.
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Implementation phase handler factory
 //
-// Two orchestration modes share the same dirty-check + base-reset prologue,
-// then diverge on branch setup:
+// Setup always resolves and materializes the managed per-Issue worktree
+// (issue #454, #455, #732) — there is no shared/canonical-checkout mode to
+// select between. Both orchestration modes share the same dirty-check +
+// worktree-materialization prologue, then diverge only on which branch the
+// worktree checks out:
 //
 // NEW IMPLEMENTATION (status:needs-implementation):
 //   0.5. Revalidate dependency execution plan (issue #208, #224, #242):
@@ -880,28 +1133,27 @@ function writeQuarantineMarker(artifactRoot: string, info: QuarantineInfo): void
 //                                     it; the dependent PR still targets the
 //                                     session base branch (`main`), NOT that head
 //        - blocked / unsupported    → return blocked WITHOUT running any git ops
-//   1. git status --porcelain — fail if dirty
-//   2. git checkout main && git pull --ff-only
-//   3. git checkout -b ai/issue-<N> (from the base branch or the blocker head)
-//   4. Run Claude
-//   5. git diff --stat HEAD — fail if no changes
-//   6. Run session.verification (bounded repair loop) — fail if still failing
-//   7. git add -A, git commit, git push
-//   8. gh pr create — capture PR URL
-//   9. Return success with prUrl/branch in context
+//   0.6. Materialize the issue worktree on ai/issue-<N> (from the base branch or
+//        the blocker head) — git status --porcelain fail-closed on the canonical
+//        checkout, then on the worktree itself
+//   1. Run Claude
+//   2. git diff --stat HEAD — fail if no changes
+//   3. Run session.verification (bounded repair loop) — fail if still failing
+//   4. git add -A, git commit, git push
+//   5. gh pr create — capture PR URL
+//   6. Return success with prUrl/branch in context
 //
 // FIX EXISTING PR (status:needs-fix):
-//   1. git status --porcelain — fail if dirty
-//   2. git checkout main && git pull --ff-only
-//   3. gh pr list → find open PR for the branch; fail if none
-//   4. git checkout <headRefName>
-//   5. git pull origin <headRefName> --ff-only
-//   6. Run Claude
-//   7. git diff --stat HEAD — fail if no changes
-//   8. Run session.verification (bounded repair loop) — fail if still failing
-//   9. git add -A, git commit, git push
-//   10. (no gh pr create — existing PR auto-updates)
-//   11. Return success with existing prUrl/branch in context
+//   0.6. Look up the issue's open PR (any head, conventional or not) and
+//        materialize the issue worktree on its LIVE head; git status --porcelain
+//        fail-closed on the canonical checkout, then on the worktree itself;
+//        git pull --ff-only to reconcile with origin
+//   1. Run Claude
+//   2. git diff --stat HEAD — fail if no changes
+//   3. Run session.verification (bounded repair loop) — fail if still failing
+//   4. git add -A, git commit, git push
+//   5. (no gh pr create — existing PR auto-updates)
+//   6. Return success with existing prUrl/branch in context
 // ---------------------------------------------------------------------------
 
 export function createImplementationHandler(
@@ -915,17 +1167,14 @@ export function createImplementationHandler(
 ): PhaseHandler {
   return async (task: AiTask): Promise<PhaseHandlerResult> => {
     const { session, runId } = context;
-    const artifactDir = runArtifactDir(session.artifactRoot, runId);
+    let artifactDir = runArtifactDir(session.artifactRoot, runId);
     const canonicalRoot = session.repoRoot;
-    // Per-issue worktree execution (issue #454). When the session opts into
-    // per-issue worktrees the implementation runs INSIDE this issue's own durable
-    // worktree (resolved in Step 0.6 below) instead of the shared canonical
-    // checkout; until then `cwd` is the canonical checkout so the repo-host auth
-    // and dependency-plan reads target the canonical repository. A
-    // worktree-disabled session keeps `cwd === canonicalRoot` for the whole run,
-    // so its behavior is byte-for-byte unchanged.
+    // Per-issue worktree execution (issue #454, #732). Implementation always runs
+    // INSIDE this issue's own durable worktree (resolved and materialized in Step
+    // 0.6 below) — there is no shared-checkout mode to opt into. Until Step 0.6
+    // materializes it, `cwd` is the canonical checkout so the repo-host auth and
+    // dependency-plan reads target the canonical repository.
     let cwd = canonicalRoot;
-    const worktreesEnabled = session.worktrees?.enabled === true;
     const baseBranch = session.baseBranch ?? "main";
     const fixMode = isNeedsFixTask(task);
 
@@ -936,12 +1185,44 @@ export function createImplementationHandler(
     const taskLabels = Array.isArray(task.context["labels"])
       ? task.context["labels"] as string[]
       : [];
-    const cmdSpec = implementationCommand(agentId, taskLabels, escalatedEffort, session.codex);
+    const cmdSpec = implementationCommand(agentId, taskLabels, escalatedEffort, session.codex, session.claude);
     if ("error" in cmdSpec) {
-      writeAssignmentFailureArtifact(artifactDir, {
-        phase: "implementation", agentId, sessionId: task.sessionId, issueNumber: task.issueNumber, runId, error: cmdSpec.error,
-      });
-      return { result: "failed", error: cmdSpec.error, context: { artifactDir, assignmentError: { phase: "implementation", agent: agentId ?? null } } };
+      // Skip the artifact write when it would land INSIDE the not-yet-materialized
+      // issue worktree (issue #732 review, P2). `writeAssignmentFailureArtifact`
+      // `mkdirSync(artifactDir, { recursive: true })`s eagerly, and this check runs
+      // before Step 0.6 materializes the worktree below. When `session.artifactRoot`
+      // is configured inside that future worktree path (issue #629), the eager
+      // mkdir would leave a non-empty directory tree at the target Step 0.6's `git
+      // worktree add` requires empty — so a later run, after the operator fixes the
+      // agent assignment, would fail to materialize the worktree at all. Computing
+      // the future worktree path is pure (no git side effect), so this check is
+      // safe to run before Step 0.6; a root-resolution failure here just means
+      // Step 0.6 would have failed closed on the same error anyway, so fall back to
+      // the normal write.
+      let artifactDirInsideFutureWorktree = false;
+      try {
+        const futureWorktreeRoot = resolveWorktreeRoot({ sessionRoot: session.worktrees?.root });
+        const futureWorktreePath = canonicalizePath(
+          issueWorktreePath(futureWorktreeRoot, session.sessionId, task.issueNumber),
+        );
+        artifactDirInsideFutureWorktree = isPathInside(canonicalizePath(artifactDir), futureWorktreePath);
+      } catch {
+        artifactDirInsideFutureWorktree = false;
+      }
+      if (!artifactDirInsideFutureWorktree) {
+        writeAssignmentFailureArtifact(artifactDir, {
+          phase: "implementation", agentId, sessionId: task.sessionId, issueNumber: task.issueNumber, runId, error: cmdSpec.error,
+        });
+      }
+      return {
+        result: "failed",
+        error: cmdSpec.error,
+        context: {
+          artifactDir,
+          [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true,
+          assignmentError: { phase: "implementation", agent: agentId ?? null },
+        },
+      };
     }
     const resolvedProfile = cmdSpec.profile;
 
@@ -956,32 +1237,6 @@ export function createImplementationHandler(
           `Expected task.context.reviewFeedback to be a non-empty string, ` +
           `but it was ${JSON.stringify(task.context["reviewFeedback"])}. ` +
           `Re-run the review phase so findings are captured before fix mode runs.`,
-      };
-    }
-
-    try {
-      mkdirSync(artifactDir, { recursive: true });
-    } catch (err) {
-      return {
-        result: "failed",
-        context: { resolvedProfile },
-        error: `Failed to create artifact dir: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-
-    // Step 0: Fail closed if a prior run quarantined the checkout. A quarantine
-    // marker means an earlier late-stage failure left the repository in a state
-    // that could not be safely rolled back to the base branch. Running now risks
-    // branching issue #N off contaminated state, so refuse until manual recovery.
-    if (existsSync(quarantineMarkerPath(session.artifactRoot))) {
-      return {
-        result: "failed",
-        context: { artifactDir, resolvedProfile },
-        error:
-          `Implementation is quarantined after a prior unrecoverable failure left the worker ` +
-          `checkout in an unsafe state. Refusing to run so a contaminated branch cannot become ` +
-          `the base for issue #${task.issueNumber}. Manual recovery required: restore the checkout ` +
-          `to ${baseBranch} and clear the quarantine marker in the session artifact root.`,
       };
     }
 
@@ -1032,7 +1287,7 @@ export function createImplementationHandler(
     } catch (err) {
       return {
         result: "failed",
-        context: { artifactDir, resolvedProfile },
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
         error: `Failed to resolve repo-host provider: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
@@ -1055,8 +1310,32 @@ export function createImplementationHandler(
     //
     // Fix mode never stacks — it operates on the issue's own existing PR branch.
     let depBase:
-      | { baseIssueNumber: number; basePrNumber: number; baseHeadRefName: string; basePrUrl: string }
+      | {
+          baseIssueNumber: number;
+          basePrNumber: number;
+          baseHeadRefName: string;
+          basePrUrl: string;
+          /**
+           * The exact predecessor commit the issue branch was built on, resolved once
+           * the branch/worktree setup below converges (issue #667). Durable enough for
+           * the review phase to diff `<baseHeadSha>...HEAD` instead of the session base
+           * branch, so a dependency-started review excludes the predecessor's
+           * not-yet-merged commits. Absent only if resolution below fails, which fails
+           * the run closed rather than persisting a `dependencyBase` that review cannot
+           * safely use.
+           */
+          baseHeadSha?: string;
+        }
       | undefined;
+    // Captured at the exact moment a branch-setup path below fetches the
+    // blocker head into FETCH_HEAD / its remote-tracking ref (issue #667
+    // review, P2). Recording the SHA there — rather than re-fetching the same
+    // ref later once branch setup has converged — means a blocker PR merged
+    // with branch auto-delete (or force-pushed) between that fetch and the
+    // later resolution point can no longer abort an otherwise-valid
+    // implementation: the predecessor commit is already present in the local
+    // object database and its SHA is already known.
+    let resolvedDepBaseSha: string | undefined;
     if (!fixMode && depChecker) {
       let plan: DependencyExecutionPlan;
       try {
@@ -1083,7 +1362,7 @@ export function createImplementationHandler(
       } catch (err) {
         return {
           result: "blocked",
-          context: { artifactDir, resolvedProfile },
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
           message: `Dependency plan resolution failed (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
         };
       }
@@ -1100,7 +1379,7 @@ export function createImplementationHandler(
         };
         return {
           result: "blocked",
-          context: { artifactDir, dependencyRecheck, resolvedProfile },
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, dependencyRecheck, resolvedProfile },
           message: plan.reason,
         };
       }
@@ -1115,17 +1394,14 @@ export function createImplementationHandler(
       }
     }
 
-    // Look up the issue's existing open PR for fix-mode runs BEFORE deciding
-    // worktree vs shared checkout (issue #454 review). A worktree-enabled session
-    // that first implemented the issue through worktree mode leaves `ai/issue-<n>`
-    // checked out in the per-issue worktree, so the next needs-fix run must reuse
-    // that same worktree — but it can only decide that once it knows the PR head
-    // branch. The lookup is only needed when worktrees are enabled; the shared
-    // fix path below resolves its own PR, so a worktree-disabled session keeps its
-    // single lookup and unchanged behavior. Fail closed on a lookup error exactly
-    // as the shared fix path does.
+    // Look up the issue's existing open PR for fix-mode runs BEFORE materializing
+    // the worktree (issue #454, #455, #732). `ai/issue-<n>` (or a non-conventional
+    // head) may already be checked out in the per-issue worktree from a prior
+    // implementation, so the next needs-fix run must reuse that same worktree —
+    // but it can only decide that once it knows the PR head branch. Fail closed on
+    // a lookup error.
     let fixPr: PrInfo | undefined;
-    if (fixMode && worktreesEnabled) {
+    if (fixMode) {
       // Resolve via `resolveFixPr` (not `findOpenPr`) so a PR whose head is not the
       // conventional `ai/issue-<n>` — e.g. an externally-created `feature/custom`
       // recorded in the task context — is discovered before worktree routing
@@ -1133,48 +1409,29 @@ export function createImplementationHandler(
       // `not-found` here and never reach the worktree fix path below.
       const prInfo = resolveFixPr(sessionRepoHost.provider, task, task.issueNumber);
       if ("error" in prInfo) {
-        return { result: "failed", context: { artifactDir, resolvedProfile }, error: prInfo.error };
+        return { result: "failed", context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile }, error: prInfo.error };
       }
       fixPr = prInfo;
     }
 
-    // Step 0.6: Materialize the per-issue worktree (issue #454, #455). Every
-    // worktree-enabled NEW implementation runs in the per-issue worktree, whether
-    // it branches from the session base or stacks on a dependency blocker PR head
-    // (issue #455): the blocker head is only the branch START POINT, so a stacked
-    // worktree branch keeps the same `ai/issue-<n>` name and the same dependency
-    // semantics the shared checkout has — it just runs in the isolated worktree.
+    // Step 0.6: Materialize the per-issue worktree (issue #454, #455, #732). Every
+    // NEW implementation runs in the per-issue worktree, whether it branches from
+    // the session base or stacks on a dependency blocker PR head (issue #455): the
+    // blocker head is only the branch START POINT, so a stacked worktree branch
+    // keeps the same `ai/issue-<n>` name and the same dependency semantics — it
+    // just runs in the isolated worktree.
     //
     // A fix followup likewise runs in the worktree for ANY open PR head (issue
     // #455), not just the conventional `ai/issue-<n>` branch. The worktree checks
     // out the LIVE PR head discovered from the PR — `ai/issue-<n>` for a
     // worktree-originated PR, or a non-conventional head for an externally-created
     // one — so the agent edits and pushes the real PR branch instead of blindly
-    // `ai/issue-<n>`. Without routing into the worktree, a worktree-originated PR's
-    // followup would fall back to the shared checkout and `git checkout
-    // ai/issue-<n>` would fail because the branch is held by the worktree, breaking
-    // every review/fix cycle.
+    // `ai/issue-<n>`.
     //
     // Deferring materialization to HERE — after the dependency plan above cleared —
     // means a still-blocked task returns `blocked` WITHOUT any worktree side effect,
-    // and a dirty *canonical* checkout can never fail a naturally blocked issue. Once
-    // materialized the worktree is checked out on `ai/issue-<n>` by the worktree
-    // manager, so the shared-checkout base-reset + branch-creation choreography
-    // (Steps 2–3) is skipped below and every downstream git side effect + the agent
-    // run uses the worktree as `cwd`.
+    // and a dirty *canonical* checkout can never fail a naturally blocked issue.
     const conventionalBranch = branchName(task.issueNumber);
-    // New implementation runs in the per-issue worktree whether or not it stacks on
-    // a dependency blocker PR head (issue #455). depBase only changes the branch
-    // START POINT (handled in Step 0.6 / Step 3 below); the worktree branch is still
-    // `ai/issue-<n>`.
-    const worktreeNewMode = worktreesEnabled && !fixMode;
-    // Fix followups run in the per-issue worktree for any open PR head (issue #455),
-    // including a non-conventional one. fixPr is always populated here when fixMode
-    // && worktreesEnabled (the lookup above fails closed otherwise), so its presence
-    // is what gates worktree fix routing; an empty value would mean a
-    // worktree-disabled session, which keeps the shared fix path.
-    const worktreeFixMode = worktreesEnabled && fixMode && fixPr !== undefined;
-    const worktreeMode = worktreeNewMode || worktreeFixMode;
     // The branch the worktree checks out, commits, and pushes: the LIVE PR head in
     // fix mode (which may be a non-conventional name discovered from the PR), and the
     // conventional `ai/issue-<n>` for new implementation — including a
@@ -1200,11 +1457,11 @@ export function createImplementationHandler(
     // — our own `ai/issue-<n>` or a non-conventional head pushed to `origin` — fetch and
     // push by branch name. New implementation never reaches this; it pushes its own
     // `ai/issue-<n>` to origin.)
-    if (worktreeFixMode && fixPr?.isCrossRepository === true) {
+    if (fixMode && fixPr?.isCrossRepository === true) {
       const fixPrNumber = extractPrNumber(fixPr.url);
       return {
         result: "failed",
-        context: { artifactDir, resolvedProfile },
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
         error:
           `Refusing to run a worktree fix for issue #${task.issueNumber}${fixPrNumber !== undefined ? ` on PR #${fixPrNumber}` : ""}: its head is on a fork (a cross-repository PR head lives on the contributor's fork, not origin), so pushing fixes to origin would update an unrelated base-repo branch instead of the PR. Carry the PR head repository/remote through before fixing forked PRs in worktree mode.`,
       };
@@ -1224,8 +1481,15 @@ export function createImplementationHandler(
     // (`created: true`, `branchReused: true`) — the branch is still reused and must still
     // be refreshed (issue #455 review).
     let worktreeBranchReused = false;
+    // True when resolveWorktree recovered the branch from an existing
+    // `origin/<branch>` (a prior PR head) rather than creating it fresh from
+    // `baseRef`. Distinct from `worktreeBranchReused` — no local branch existed to
+    // reuse — but the recovered branch's history still predates this run and may
+    // not descend from the just-fetched dependency start point, so it needs the
+    // same pre-agent ancestry validation as a reused branch (issue #667 review, P1).
+    let worktreeStartedFromRemoteHead = false;
     let resolvedWorktreeId: string | undefined;
-    if (worktreeMode) {
+    {
       const issueBranch = worktreeBranch;
       // A grant / manual-done requeue may record `toolRequestResumeBranch ===
       // ai/issue-<n>` as the resume point for this run. Detect it once up front: it
@@ -1239,7 +1503,7 @@ export function createImplementationHandler(
       // fix-followup case, where `ai/issue-<n>` already carries the PR commits).
       let worktreeBaseRef = `origin/${baseBranch}`;
 
-      // Fix followup (worktreeFixMode): when the issue branch already exists locally
+      // Fix followup (fixMode): when the issue branch already exists locally
       // with the PR commits, do NOT fetch `origin/ai/issue-<n>` here. The worktree
       // reconciliation below (`git pull origin <branch> --ff-only`, Step 3a) fetches
       // and fast-forwards it onto origin — the same reconciliation the shared fix path
@@ -1254,7 +1518,7 @@ export function createImplementationHandler(
       // the fetch keeps this path side-effect-free on the canonical repo (issue #454
       // review). The fresh/single-branch-clone case where the local branch is absent is
       // handled in the `else` branch below.
-      if (!worktreeFixMode) {
+      if (!fixMode) {
         if (depBase) {
           // DEPENDENCY-STACKED NEW IMPLEMENTATION (issue #455): the single open
           // blocker already has a usable PR, so the fresh issue branch must START
@@ -1282,11 +1546,22 @@ export function createImplementationHandler(
           if (fetchBlocker.exitCode !== 0) {
             return {
               result: "failed",
-              context: { artifactDir, resolvedProfile },
+              context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
               error: `git fetch origin ${depBase.baseHeadRefName} (stacked worktree start point) failed (exit ${fetchBlocker.exitCode}): ${(fetchBlocker.stderr || fetchBlocker.stdout).slice(0, 300)}`,
             };
           }
           worktreeBaseRef = `origin/${depBase.baseHeadRefName}`;
+          // Record the SHA this fetch just landed (issue #667 review, P2): this
+          // IS the predecessor head the worktree branch is about to be created
+          // from, so there is nothing left to resolve later.
+          const blockerShaResolved = runner.run(
+            "git",
+            ["rev-parse", `refs/remotes/origin/${depBase.baseHeadRefName}`],
+            { cwd: canonicalRoot },
+          );
+          if (blockerShaResolved.exitCode === 0) {
+            resolvedDepBaseSha = blockerShaResolved.stdout.trim();
+          }
         } else {
           // Refresh the base ref in the canonical repo BEFORE branching from it (issue
           // #454 review). The shared-checkout path lands on an up-to-date base via
@@ -1307,7 +1582,7 @@ export function createImplementationHandler(
           if (fetchBase.exitCode !== 0) {
             return {
               result: "failed",
-              context: { artifactDir, resolvedProfile },
+              context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
               error: `git fetch origin ${baseBranch} (refresh worktree base) failed (exit ${fetchBase.exitCode}): ${(fetchBase.stderr || fetchBase.stdout).slice(0, 300)}`,
             };
           }
@@ -1348,7 +1623,7 @@ export function createImplementationHandler(
             if (fetchResume.exitCode !== 0) {
               return {
                 result: "failed",
-                context: { artifactDir, resolvedProfile },
+                context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
                 error: `git fetch origin ${issueBranch} (recover origin-only Tool Request resume branch as worktree start point) failed (exit ${fetchResume.exitCode}): ${(fetchResume.stderr || fetchResume.stdout).slice(0, 300)}`,
               };
             }
@@ -1357,7 +1632,7 @@ export function createImplementationHandler(
         }
       } else {
         // FIX FOLLOWUP with NO local issue branch (issue #454 review). The common
-        // worktreeFixMode case reuses an `ai/issue-<n>` branch this session's worktree
+        // fix-mode case reuses an `ai/issue-<n>` branch this session's worktree
         // already left checked out, so the skip-the-fetch reasoning above holds. But on
         // a fresh/single-branch clone — a different worker, or after the local ref was
         // pruned — neither `refs/heads/ai/issue-<n>` NOR `refs/remotes/origin/ai/issue-<n>`
@@ -1392,11 +1667,31 @@ export function createImplementationHandler(
           if (fetchPrHead.exitCode !== 0) {
             return {
               result: "failed",
-              context: { artifactDir, resolvedProfile },
+              context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
               error: `git fetch origin ${prHeadFetchSource} (materialize fix worktree from PR head) failed (exit ${fetchPrHead.exitCode}): ${(fetchPrHead.stderr || fetchPrHead.stdout).slice(0, 300)}`,
             };
           }
         }
+      }
+
+      // Canonical dirty preflight — checked BEFORE `resolveWorktree` below, the
+      // first call in this run that can mutate durable state (issue #732 review,
+      // P1). `resolveWorktree` can create and retain a new issue worktree/branch,
+      // and if the canonical checkout currently holds that same branch checked
+      // out it may detach the canonical HEAD to free it up — side effects a
+      // rejected run must not leave behind. The read-only `git fetch`/`rev-parse`
+      // calls above this point only update remote-tracking refs; they touch
+      // neither the canonical working tree nor its checked-out branch, so
+      // running them ahead of this guard is safe and preserves their existing
+      // call order in tests. Checked unconditionally so the guard applies even
+      // when the eventual issue worktree is clean (issue #571).
+      const canonicalStatus = runner.run("git", ["status", "--porcelain"], { cwd: canonicalRoot });
+      if (canonicalStatus.exitCode !== 0 || canonicalStatus.stdout.trim().length > 0) {
+        return {
+          result: "failed",
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
+          error: `Canonical checkout is dirty; aborting to prevent unsafe state:\n${canonicalStatus.stdout.slice(0, 300)}`,
+        };
       }
 
       const materialized = resolveWorktree({
@@ -1428,14 +1723,14 @@ export function createImplementationHandler(
         // implementations (no recorded resume branch) keep the strict guard: a fresh
         // branch starts at the just-fetched base and a leftover diverged ref must
         // still fail closed (issue #454 review).
-        allowFastForward: worktreeFixMode || hasRecordedResumeBranch,
+        allowFastForward: fixMode || hasRecordedResumeBranch,
         ...(session.worktrees?.root ? { worktreeRoot: session.worktrees.root } : {}),
         runner,
       });
       if (!materialized.ok) {
         return {
           result: "failed",
-          context: { artifactDir, resolvedProfile },
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
           error: `Failed to prepare issue #${task.issueNumber} worktree: ${materialized.error}`,
         };
       }
@@ -1449,43 +1744,72 @@ export function createImplementationHandler(
       // Keying off `created` would treat the branch as fresh and skip the refresh below,
       // running the retry from the stale old start point (issue #455 review).
       worktreeBranchReused = materialized.branchReused;
+      worktreeStartedFromRemoteHead = materialized.startedFromRemoteHead;
 
     }
 
-    // Step 1: Preflight — reject dirty working tree.
-    // In worktree mode `cwd` is the issue's own worktree, so this protects that
-    // tree from unrelated changes. A dirty *canonical* checkout is always fatal in
-    // worktree mode (issue #571) — checked unconditionally here so the guard
-    // applies even when the issue worktree itself is clean. In shared mode the
-    // single statusResult check below guards the canonical checkout as before.
-    // Exception (issue #571): in per-issue worktree mode a dirty issue-worktree is
-    // allowed when the task context carries a dirtyContinuation marker whose safety
-    // checks all pass — the dirty state is unfinished work from a prior verification
-    // failure for the same issue/branch/worktree, so continuing is safe.
-    if (worktreeMode) {
-      const canonicalStatus = runner.run("git", ["status", "--porcelain"], { cwd: canonicalRoot });
-      if (canonicalStatus.exitCode !== 0 || canonicalStatus.stdout.trim().length > 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `Canonical checkout is dirty; aborting to prevent unsafe state:\n${canonicalStatus.stdout.slice(0, 300)}`,
-        };
-      }
+    // Create the artifact dir AFTER worktree materialization, not before (issue
+    // #732 review): a session may configure `artifactRoot` to live INSIDE the
+    // managed worktree (issue #629), a path that does not exist until
+    // `resolveWorktree` above runs `git worktree add`. Creating it earlier would
+    // pre-populate that path with an empty directory tree, and `git worktree add`
+    // refuses to materialize a worktree at an already-existing, non-empty target.
+    try {
+      mkdirSync(artifactDir, { recursive: true });
+    } catch (err) {
+      return {
+        result: "failed",
+        context: { resolvedProfile },
+        error: `Failed to create artifact dir: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
+
+    // Every phase below runs inside the managed per-Issue worktree materialized
+    // above — there is no shared-checkout mode left to select between (issue
+    // #732, #733, #734).
+
+    // Step 1: Preflight — reject a dirty issue worktree.
+    // `cwd` is the issue's own worktree, so this protects that tree from
+    // unrelated changes. The *canonical* checkout was already checked above
+    // (Step 0.6, immediately before `resolveWorktree`) and is always fatal if
+    // dirty (issue #571).
+    // Exception (issue #571): a dirty issue-worktree is allowed when the task
+    // context carries a dirtyContinuation marker whose safety checks all pass —
+    // the dirty state is unfinished work from a prior verification failure for
+    // the same issue/branch/worktree, so continuing is safe.
+    // Keep the exact `git status --porcelain` invocation (no `-z`/
+    // `--untracked-files=all`) other call sites and tests key off, but exclude
+    // artifact-root paths from the dirty/clean decision (issue #727 review,
+    // follow-up): when `session.artifactRoot` lives inside the worktree and is
+    // not gitignored, an agent exit that produced no source changes leaves
+    // only this run's own artifact files dirty. Without filtering those out
+    // here, this preflight would reject them as unrelated changes before ever
+    // reaching the marker/drift checks below, even though no dirtyContinuation
+    // marker was created for them. `parsePorcelainDirtyPaths` unquotes
+    // C-quoted paths and keeps a rename dirty unless both sides are under the
+    // artifact root (issue #727 review, follow-up P1/P2).
+    const relArtifactRoot = relative(cwd, session.artifactRoot);
     const statusResult = runner.run("git", ["status", "--porcelain"], { cwd });
+    const statusFiles = parsePorcelainDirtyPaths(statusResult.stdout, relArtifactRoot);
     let activeDirtyContinuation: Record<string, unknown> | undefined;
-    if (statusResult.stdout.trim().length > 0) {
-      const savedDirtyCtx = worktreeMode ? task.context["dirtyContinuation"] : undefined;
+    if (statusFiles.length > 0) {
+      const savedDirtyCtx = task.context["dirtyContinuation"];
       if (
-        worktreeMode &&
         isValidDirtyContinuation(savedDirtyCtx, task.issueNumber, worktreeBranch, resolvedWorktreeId)
       ) {
         // Guard against drift: verify the current dirty file set exactly matches
         // what was recorded in the marker. If any file was added or removed since
         // the marker was written, the worktree is in an unknown state — fail closed.
         const dc = savedDirtyCtx as Record<string, unknown>;
+        // Apply the same artifact-root exclusion to the RECORDED side, not just
+        // the current side below: a marker persisted before this exclusion
+        // existed (or by the older verification-failure capture path) may still
+        // carry artifact-root paths in `dirtyFiles`. Comparing an unfiltered
+        // recorded set against a filtered current set would report drift on
+        // every retry of an otherwise-valid pre-upgrade continuation (issue
+        // #727 review, follow-up P1).
         const recordedFiles = Array.isArray(dc["dirtyFiles"])
-          ? (dc["dirtyFiles"] as string[]).slice().sort()
+          ? excludeArtifactRootPaths((dc["dirtyFiles"] as string[]).slice(), relArtifactRoot).sort()
           : null;
         if (recordedFiles === null) {
           return {
@@ -1498,19 +1822,12 @@ export function createImplementationHandler(
         // encoding (spaces, non-ASCII, renames) is handled consistently.
         const currentDirtyStatus = runner.run("git", ["status", "--porcelain", "-z", "--untracked-files=all"], { cwd });
         const currentEntries = currentDirtyStatus.stdout.split("\0").filter(Boolean);
-        const currentFiles: string[] = [];
-        {
-          let idx = 0;
-          while (idx < currentEntries.length) {
-            const entry = currentEntries[idx++];
-            if (entry.length < 3) continue;
-            const xy = entry.slice(0, 2);
-            currentFiles.push(entry.slice(3));
-            if (xy[0] === "R" || xy[0] === "C" || xy[1] === "R" || xy[1] === "C") {
-              idx++; // skip the old-path token for renames/copies
-            }
-          }
-        }
+        const currentFilesRaw = parseZPorcelainDirtyPaths(currentEntries, relArtifactRoot);
+        // Exclude artifact-root paths (issue #727 review): when `artifactRoot`
+        // lives inside the worktree but is not gitignored, every run's own
+        // artifact files would otherwise show up here as ever-growing noise,
+        // permanently drifting from a marker recorded with the same exclusion.
+        const currentFiles = excludeArtifactRootPaths(currentFilesRaw, relArtifactRoot);
         currentFiles.sort();
         if (
           currentFiles.length !== recordedFiles.length ||
@@ -1565,9 +1882,10 @@ export function createImplementationHandler(
               error: "Failed to compute current git diff for dirtyContinuation content check; failing closed.",
             };
           }
-          const currentUntrackedFiles = currentEntries
-            .filter((e) => e.startsWith("?? "))
-            .map((e) => e.slice(3));
+          const currentUntrackedFiles = excludeArtifactRootPaths(
+            currentEntries.filter((e) => e.startsWith("?? ")).map((e) => e.slice(3)),
+            relArtifactRoot,
+          );
           const { patch: currentUntrackedPatch, skipped: skippedUntracked } = buildUntrackedPatch(cwd, currentUntrackedFiles);
           // Fail closed when any untracked file was skipped (binary, oversized, non-regular,
           // or inaccessible). Placeholder comments for skipped files contain only name and
@@ -1600,63 +1918,29 @@ export function createImplementationHandler(
         return {
           result: "failed",
           context: { artifactDir, resolvedProfile },
-          error: `Working tree is dirty before implementation; aborting to avoid committing unrelated changes:\n${statusResult.stdout.slice(0, 300)}`,
+          error: `Working tree is dirty before implementation; aborting to avoid committing unrelated changes:\n${statusFiles.join("\n").slice(0, 300)}`,
         };
       }
     }
 
-    // Steps 2–2.1 are the shared-checkout base reset + contamination guard. In
-    // worktree mode the issue worktree is already checked out on `ai/issue-<n>` by
-    // the worktree manager, so checking out the base branch here would either fail
-    // (the base is checked out in the canonical tree and cannot be checked out in a
-    // second worktree) or move the worktree off the issue branch. The worktree
-    // manager owns this setup, so both steps are skipped (issue #454).
-    if (!worktreeMode) {
-      // Step 2: Reset to base branch so we start from a clean, up-to-date base
-      for (const [cmd, ...args] of [
-        ["git", "checkout", baseBranch],
-        ["git", "pull", "--ff-only"],
-      ] as [string, ...string[]][]) {
-        const r = runner.run(cmd, args, { cwd });
-        if (r.exitCode !== 0) {
-          return {
-            result: "failed",
-            context: { artifactDir, resolvedProfile },
-            error: `${cmd} ${args.join(" ")} failed (exit ${r.exitCode}): ${(r.stderr || r.stdout).slice(0, 300)}`,
-          };
-        }
-      }
+    // Steps 2–2.1 (shared-checkout base reset + contamination guard) no longer
+    // apply: the issue worktree is already checked out on `ai/issue-<n>` (or the
+    // live PR head) by the worktree manager in Step 0.6, so there is no base
+    // branch to reset to here (issue #454, #732).
 
-      // Step 2.1: Verify HEAD actually landed on the base branch before branching.
-      // Defense-in-depth against a prior failed run leaving the checkout on a
-      // different branch that a silent/no-op checkout did not move. Without this,
-      // `git checkout -b` would branch off the wrong HEAD and one issue's commits
-      // could become the base of another issue's branch (issue #211).
-      const baseHead = currentBranch(runner, cwd);
-      if ("error" in baseHead) {
-        return { result: "failed", context: { artifactDir, resolvedProfile }, error: baseHead.error };
-      }
-      if (baseHead.branch !== baseBranch) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error:
-            `Expected HEAD to be on base branch '${baseBranch}' after checkout/pull, but it is ` +
-            `on '${baseHead.branch}'. Aborting before creating issue #${task.issueNumber}'s branch ` +
-            `to avoid branching off contaminated state.`,
-        };
-      }
-    }
-
-    // Step 3a/b: Branch setup — diverges by mode
+    // Step 3a/b: Branch setup — diverges by fix vs. new implementation
     // (dep plan was resolved in Step 0.5; depBase is set if kind === "ready")
     let branch: string;
     let prUrl: string | undefined;
-    // True when this run resumed an existing `ai/issue-<n>` branch recorded by a
-    // Tool Request grant / manual-done recovery (issue #316). Such a branch may
-    // already contain the issue's committed implementation, so a no-op agent run
-    // is a valid preserved-branch recovery rather than a failed implementation
-    // (issue #404). Fresh runs never set this and keep today's no-diff failure.
+    // True when this run continued on a PRE-EXISTING `ai/issue-<n>` branch rather
+    // than creating one fresh — resumed from a Tool Request grant / manual-done
+    // recovery (issue #316). Such a branch may already carry committed work from
+    // a prior run, so (a) a
+    // no-op agent run is a valid preserved-branch recovery rather than a failed
+    // implementation (issue #404), and (b) a later delayed/quota discard must NOT
+    // `git branch -D` it — that would delete committed work the patch capture
+    // cannot see (issue #659 review, P1). Fresh runs never set this and keep
+    // today's no-diff failure / branch-drop-on-discard behavior.
     let resumedFromToolRequestBranch = false;
 
     // A Tool Request grant (or the operator following manual-done's guidance) may
@@ -1802,17 +2086,17 @@ export function createImplementationHandler(
       return { kind: "resumed" };
     };
 
-    if (worktreeMode) {
-      // WORKTREE MODE (new implementation — plain OR dependency-stacked — or a fix
-      // followup on any open PR head): the worktree manager already checked out the
-      // branch when it materialized the worktree in Step 0.6, so there is no branch
+    {
+      // The worktree manager already checked out the branch (new implementation —
+      // plain OR dependency-stacked — or a fix followup on any open PR head) when
+      // it materialized the worktree in Step 0.6, so there is no branch
       // to create or check out here. Adopt that branch name (`worktreeBranch`): the
       // live PR head in fix mode (possibly non-conventional), the conventional
       // `ai/issue-<n>` for a new implementation. The clean preflight in Step 1 already
       // guarded this tree, and every downstream git op below runs in it.
       branch = worktreeBranch;
 
-      if (worktreeFixMode) {
+      if (fixMode) {
         // FIX FOLLOWUP IN WORKTREE (issue #454, #455): the worktree already holds the
         // live PR head checked out (resolveWorktree reused/recovered it in Step 0.6),
         // whether that is the conventional `ai/issue-<n>` or a non-conventional head
@@ -1820,10 +2104,9 @@ export function createImplementationHandler(
         // fail — the branch is the worktree's own HEAD and Git refuses to check out a
         // branch already checked out in this worktree's tree. Adopt the existing PR
         // url and fast-forward the worktree branch onto origin to pick up any pushed
-        // follow-ups: the same reconciliation the shared fix path performs, just
-        // inside the worktree. `prUrl` is read from the Step 0.6 lookup, which is
-        // always present in this mode (worktreeFixMode requires fixPr); `fixPr?` keeps
-        // the narrowing typed without a non-null assertion.
+        // follow-ups. `prUrl` is read from the Step 0.6 lookup, which is always
+        // present in this mode (fix mode requires fixPr, checked before Step 0.6);
+        // `fixPr?` keeps the narrowing typed without a non-null assertion.
         prUrl = fixPr?.url;
         // Reconcile against `prHeadFetchSource` (the recorded origin head branch) so the
         // followup fast-forwards onto any pushed updates to the real head (issue #456
@@ -1970,138 +2253,147 @@ export function createImplementationHandler(
         if (resumed.kind === "failed") return resumed.result;
         if (resumed.kind === "resumed") resumedFromToolRequestBranch = true;
       }
-    } else if (fixMode) {
-      // FIX MODE (shared checkout): reached only by a worktree-DISABLED session
-      // (issue #455 routes every worktree-enabled fix, including a non-conventional
-      // PR head, into the worktree above). fixPr is therefore undefined here, so
-      // resolve the PR now — unchanged worktree-disabled behavior. Check out its
-      // branch and pull latest.
-      const prInfo = fixPr ?? findOpenPr(sessionRepoHost.provider, task.issueNumber);
-      if ("error" in prInfo) {
-        return { result: "failed", context: { artifactDir, resolvedProfile }, error: prInfo.error };
-      }
-      branch = prInfo.headRefName;
-      prUrl = prInfo.url;
+    }
 
-      const checkoutExisting = runner.run("git", ["checkout", branch], { cwd });
-      if (checkoutExisting.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `git checkout ${branch} failed (exit ${checkoutExisting.exitCode}): ${(checkoutExisting.stderr || checkoutExisting.stdout).slice(0, 300)}`,
-        };
-      }
-
-      const pullBranch = runner.run("git", ["pull", "origin", branch, "--ff-only"], { cwd });
-      if (pullBranch.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `git pull origin ${branch} failed (exit ${pullBranch.exitCode}): ${(pullBranch.stderr || pullBranch.stdout).slice(0, 300)}`,
-        };
-      }
-
-    } else if (depBase) {
-      // DEPENDENCY START-POINT MODE (shared checkout): reached only by a
-      // worktree-DISABLED session (issue #455 runs a worktree-enabled stacked
-      // implementation in the worktree above). The single open blocker already has a
-      // usable PR; build this issue's branch on top of the blocker PR head instead of
-      // the (stale) base branch so the implementation compiles against the blocker's
-      // changes.
-      branch = branchName(task.issueNumber);
-
-      // First honor a Tool Request resume branch: a grant/manual-done may have
-      // already landed the dependency/Tool Request side effects on `ai/issue-<n>`
-      // (created from this same blocker head), so resume from there rather than
-      // recreating the branch and colliding/discarding the changes (issue #316
-      // review).
-      const resumed = resumeFromToolRequestBranch(branch);
-      if (resumed.kind === "failed") return resumed.result;
-      if (resumed.kind === "resumed") resumedFromToolRequestBranch = true;
-      if (resumed.kind === "none") {
-        // No recorded resume point — create the branch from the blocker head.
-        // Fetch the blocker head explicitly and branch directly from the fetched
-        // commit (FETCH_HEAD) so we never depend on a stale local branch or a
-        // remote-tracking ref that may be absent in a fresh/single-branch clone
-        // (issue #208). The PR itself still targets the session base branch
-        // (`main`) — only the branch START POINT is the blocker head (issue #242).
-        const fetchHead = runner.run("git", ["fetch", "origin", depBase.baseHeadRefName], { cwd });
-        if (fetchHead.exitCode !== 0) {
+    // Resolve the dependency review base SHA (issue #667): the exact predecessor
+    // commit this issue branch was actually built on. Computed once here, after
+    // every branch-setup path above (fresh worktree/shared creation, a Tool
+    // Request resume, or a reused pre-existing branch) has converged on a final
+    // `branch`/`cwd`.
+    //
+    // Prefer `resolvedDepBaseSha`, captured at the moment each branch-setup path
+    // above fetched the blocker head (issue #667 review, P2): re-fetching the
+    // same ref here, after branch setup has already completed, races normal
+    // blocker-PR merge-and-auto-delete or force-push — the ref that was valid
+    // moments ago when the branch was created can be gone by the time this
+    // second fetch runs, aborting an otherwise-valid implementation even though
+    // `HEAD` already contains the predecessor commit. Falling back to a fresh
+    // fetch + `merge-base` is needed only for a path that never fetched the
+    // blocker ref itself (a Tool Request resume onto an already-committed
+    // `ai/issue-<n>`, where the predecessor SHA was never observed this run).
+    // Recording the resolved SHA (not just the branch name) lets review diff
+    // against the exact predecessor content even if the blocker branch is later
+    // deleted, force-pushed, or merged. A failure here fails the whole run
+    // closed rather than persisting a `dependencyBase` that review cannot use to
+    // exclude the predecessor's not-yet-merged commits.
+    if (depBase) {
+      // A worktree-mode branch that was materialized from something OTHER than a
+      // fresh checkout of the just-fetched blocker head needs an extra ancestry
+      // check before its captured `resolvedDepBaseSha` is trusted (issue #667
+      // review, P1). `resolveWorktree` takes that "other" path in two cases: an
+      // existing LOCAL branch (`branchReused: true`) is checked out as-is, or —
+      // the gap this review closed — a branch with NO local ref but an existing
+      // `origin/ai/issue-<n>` is recreated by tracking that remote PR head instead
+      // (`branchReused: false`, `startedFromRemoteHead: true`, since no local
+      // branch existed to "reuse"). Both can carry prior work built on an OLDER
+      // blocker head than the one just fetched into `resolvedDepBaseSha`. Only a
+      // genuinely fresh branch created directly from `worktreeBaseRef` (neither a
+      // local nor a remote ref existed) is guaranteed to start exactly at
+      // `resolvedDepBaseSha`, so that case is excluded — it needs no check and
+      // keeps its exact command sequence. The delayed-retry empty-placeholder
+      // reset above already resets a reused branch onto the current blocker head
+      // when it has no issue-specific commits, so this only matters for a branch
+      // that reset skipped or never applied to (a recovered remote branch is never
+      // eligible for that reset — see `worktreeBranchReused` above): one that
+      // already carries real (possibly stale) work. If the blocker has since
+      // advanced or been force-pushed, `resolvedDepBaseSha` is not actually an
+      // ancestor of that work, and trusting it would either let review silently
+      // exclude commits still part of the diff, or fail the later ancestry check
+      // in review only after the agent has already run and pushed (issue #667
+      // review, P1). Validate here — BEFORE the agent runs — using the captured
+      // SHA directly rather than re-fetching, mirroring the no-refetch reasoning
+      // below.
+      if (resolvedDepBaseSha && (worktreeBranchReused || worktreeStartedFromRemoteHead)) {
+        const isAncestor = runner.run(
+          "git",
+          ["merge-base", "--is-ancestor", resolvedDepBaseSha, "HEAD"],
+          { cwd },
+        );
+        if (isAncestor.exitCode === 1) {
           return {
             result: "failed",
             context: { artifactDir, resolvedProfile },
-            error: `git fetch origin ${depBase.baseHeadRefName} failed (exit ${fetchHead.exitCode}): ${(fetchHead.stderr || fetchHead.stdout).slice(0, 300)}`,
+            error: `Worktree issue branch '${branch}' does not contain the current blocker head (origin/${depBase.baseHeadRefName}, ${resolvedDepBaseSha.slice(0, 12)}); its recorded start point is stale, most likely because the blocker PR was force-pushed or rebased after this branch was created, or because this run recovered an existing '${branch}' from an older PR head on origin. Refusing to treat it as a valid implementation of issue #${task.issueNumber} — an incompatible-ancestry branch must be treated as a branch-resolution failure, not silently accepted. Rebase or reset '${branch}' onto the current blocker head, or drop it, before retrying.`,
           };
         }
-        const checkoutStacked = runner.run("git", ["checkout", "-b", branch, "FETCH_HEAD"], { cwd });
-        if (checkoutStacked.exitCode !== 0) {
+        if (isAncestor.exitCode !== 0) {
           return {
             result: "failed",
             context: { artifactDir, resolvedProfile },
-            error: `git checkout -b ${branch} FETCH_HEAD failed (exit ${checkoutStacked.exitCode}): ${(checkoutStacked.stderr || checkoutStacked.stdout).slice(0, 300)}`,
+            error: `git merge-base --is-ancestor ${resolvedDepBaseSha} HEAD (validate worktree issue branch against current blocker head) failed (exit ${isAncestor.exitCode}): ${(isAncestor.stderr || isAncestor.stdout).slice(0, 300)}`,
           };
         }
       }
-    } else {
-      // NEW IMPLEMENTATION MODE: create fresh branch explicitly from the base
-      // branch. Naming the start point makes the base independent of the current
-      // HEAD, so even an unexpected checkout state cannot leak into the new
-      // branch (belt-and-suspenders with the Step 2.1 HEAD verification).
-      branch = branchName(task.issueNumber);
-
-      // A Tool Request grant during initial implementation may have already created
-      // this issue branch and committed the dependency/Tool Request changes onto it
-      // (issue #316). Resume from that recorded branch when present; otherwise create
-      // the branch fresh from the base branch.
-      const resumed = resumeFromToolRequestBranch(branch);
-      if (resumed.kind === "failed") return resumed.result;
-      if (resumed.kind === "resumed") resumedFromToolRequestBranch = true;
-      if (resumed.kind === "none") {
-        const checkoutBranch = runner.run("git", ["checkout", "-b", branch, baseBranch], { cwd });
-        if (checkoutBranch.exitCode !== 0) {
+      if (resolvedDepBaseSha) {
+        depBase = { ...depBase, baseHeadSha: resolvedDepBaseSha };
+      } else {
+        const fetchForSha = runner.run(
+          "git",
+          ["fetch", "origin", `+${depBase.baseHeadRefName}:refs/remotes/origin/${depBase.baseHeadRefName}`],
+          { cwd: canonicalRoot },
+        );
+        if (fetchForSha.exitCode !== 0) {
           return {
             result: "failed",
             context: { artifactDir, resolvedProfile },
-            error: `git checkout -b ${branch} failed (exit ${checkoutBranch.exitCode}): ${(checkoutBranch.stderr || checkoutBranch.stdout).slice(0, 300)}`,
+            error: `git fetch origin ${depBase.baseHeadRefName} (resolve dependency review base for issue #${task.issueNumber}) failed (exit ${fetchForSha.exitCode}): ${(fetchForSha.stderr || fetchForSha.stdout).slice(0, 300)}`,
           };
         }
+        // Reaching this branch means no earlier branch-setup step in this run
+        // fetched the blocker head itself (issue #667 review, P2) — most likely a
+        // Tool Request resume onto a branch that was created before
+        // `resolvedDepBaseSha` capture existed. `git merge-base <blocker> HEAD`
+        // alone is not safe here: it always returns SOME common ancestor even
+        // when the blocker ref has been force-pushed or rebased since this
+        // branch was created, silently resolving to a stale, older ancestor
+        // instead of failing. Require the current blocker head to be an
+        // ancestor of HEAD first — exactly the check the existing-branch reuse
+        // path (`validateAgainstBlockerHead` above) already performs — before
+        // trusting the ref, and then use the blocker head itself (not a
+        // merge-base) as the recorded predecessor SHA.
+        const isAncestor = runner.run(
+          "git",
+          ["merge-base", "--is-ancestor", `origin/${depBase.baseHeadRefName}`, "HEAD"],
+          { cwd },
+        );
+        if (isAncestor.exitCode === 1) {
+          return {
+            result: "failed",
+            context: { artifactDir, resolvedProfile },
+            error: `Resumed issue branch '${branch}' does not contain the current blocker head (origin/${depBase.baseHeadRefName}); its recorded start point is stale, most likely because the blocker PR was force-pushed or rebased after this branch was created. Refusing to resolve the dependency review base from a rewritten blocker ref, since \`git merge-base\` could return a stale common ancestor and cause review to include already-superseded predecessor changes. Rebase or reset '${branch}' onto the current blocker head, or drop it, before retrying.`,
+          };
+        }
+        if (isAncestor.exitCode !== 0) {
+          return {
+            result: "failed",
+            context: { artifactDir, resolvedProfile },
+            error: `git merge-base --is-ancestor origin/${depBase.baseHeadRefName} HEAD (validate dependency review base for issue #${task.issueNumber}) failed (exit ${isAncestor.exitCode}): ${(isAncestor.stderr || isAncestor.stdout).slice(0, 300)}`,
+          };
+        }
+        const blockerShaResolved = runner.run("git", ["rev-parse", `origin/${depBase.baseHeadRefName}`], { cwd });
+        const resolvedSha = blockerShaResolved.stdout.trim();
+        if (blockerShaResolved.exitCode !== 0 || !resolvedSha) {
+          return {
+            result: "failed",
+            context: { artifactDir, resolvedProfile },
+            error: `git rev-parse origin/${depBase.baseHeadRefName} (resolve dependency review base for issue #${task.issueNumber}) failed (exit ${blockerShaResolved.exitCode}): ${(blockerShaResolved.stderr || blockerShaResolved.stdout).slice(0, 300)}`,
+          };
+        }
+        depBase = { ...depBase, baseHeadSha: resolvedSha };
       }
     }
 
     // After this point a branch exists (and, past the commit step, a commit on
-    // it). Any late failure must leave the repository in a predictable safe
-    // state so the next run does not inherit a contaminated checkout. If the
-    // worktree is clean we return to the base branch; if it cannot be safely
-    // restored we quarantine and fail closed (issue #211).
+    // it). A late failure leaves the issue worktree intact: it is an isolated,
+    // durable continuation point, so there is nothing to restore to a base branch
+    // and no quarantine to set (the quarantine marker was a shared-checkout-only
+    // backstop, removed with shared-checkout mode — issue #211, #454, #732).
+    // Surfaces the failure as-is; retained as a named wrapper for call-site
+    // consistency with the out-of-scope handoff/cleanup machinery below.
     const failAfterBranch = (
-      step: string,
+      _step: string,
       failResult: PhaseHandlerResult & { result: "failed" },
-    ): PhaseHandlerResult => {
-      // In worktree mode a late failure leaves the issue worktree intact: it is an
-      // isolated, durable continuation point, so there is no shared checkout to
-      // restore to base and no quarantine to set (the quarantine marker is a
-      // shared-checkout backstop only — issue #454). Surface the failure as-is.
-      if (worktreeMode) return failResult;
-      const status = runner.run("git", ["status", "--porcelain"], { cwd });
-      const clean = status.exitCode === 0 && status.stdout.trim().length === 0;
-      if (clean) {
-        const restore = runner.run("git", ["checkout", baseBranch], { cwd });
-        if (restore.exitCode === 0) return failResult;
-      }
-      writeQuarantineMarker(session.artifactRoot, {
-        issueNumber: task.issueNumber,
-        sessionId: task.sessionId,
-        runId,
-        branch,
-        step,
-      });
-      return {
-        ...failResult,
-        error:
-          `${failResult.error}\n\nThe worker checkout could not be safely restored to '${baseBranch}'; ` +
-          `implementation has been quarantined and later runs will fail closed until manually recovered.`,
-      };
-    };
+    ): PhaseHandlerResult => failResult;
 
     // Tool Request handoff (issue #291). A non-interactive agent that needs a
     // command outside its allowed tool set emits a structured Tool Request block
@@ -2146,18 +2438,29 @@ export function createImplementationHandler(
     //               snapshotted (must NOT silently drop the branch)
     const capturePartialDiff = (): PartialDiffCapture => {
       const relArtifactRoot = relative(cwd, session.artifactRoot);
-      // Stage everything so untracked new files are included in the diff. Exclude
-      // the artifact dir (untracked-but-not-ignored, holding this run's records)
-      // when it lives inside the repo so it is not swept into the patch.
-      const addArgs = ["add", "-A", "--"];
-      if (!relArtifactRoot.startsWith("..")) {
-        addArgs.push(".", `:(exclude)${relArtifactRoot}`, `:(exclude)${relArtifactRoot}/**`);
-      } else {
-        addArgs.push(".");
-      }
-      const added = runner.run("git", addArgs, { cwd });
+      // Stage everything so untracked new files are included in the diff. Use a
+      // plain `git add -A -- .` rather than `:(exclude)` magic pathspecs: newer
+      // git versions reject an `:(exclude)` on a gitignored path (e.g.
+      // `.n8n-artifacts` in `.gitignore`) with a fatal error, even though the
+      // path would never have been staged. Gitignored files are silently skipped
+      // by `git add -A` anyway, so the exclusion is redundant when the dir IS
+      // ignored — and when it is NOT ignored, a `git reset` below removes it from
+      // the index just as effectively (issue #629).
+      const added = runner.run("git", ["add", "-A", "--", "."], { cwd });
       if (added.exitCode !== 0) {
-        return { kind: "failed", reason: `git ${addArgs.join(" ")} failed (exit ${added.exitCode}): ${(added.stderr || added.stdout).slice(0, 200)}` };
+        return { kind: "failed", reason: `git add -A failed (exit ${added.exitCode}): ${(added.stderr || added.stdout).slice(0, 200)}` };
+      }
+      // If the artifact dir lives inside the repo, remove it from the staging
+      // area. When it is gitignored nothing was staged (no-op); when it is not
+      // gitignored this unstages it so the patch reflects only the agent's work.
+      if (!relArtifactRoot.startsWith("..")) {
+        if (relArtifactRoot === "") {
+          return { kind: "failed", reason: `artifact root resolves to the repo working directory (relative path is empty); cannot safely unstage artifacts from the capture` };
+        }
+        const reset = runner.run("git", ["reset", "-q", "--", relArtifactRoot], { cwd });
+        if (reset.exitCode !== 0) {
+          return { kind: "failed", reason: `git reset -- ${relArtifactRoot} failed (exit ${reset.exitCode}): ${(reset.stderr || reset.stdout).slice(0, 200)}` };
+        }
       }
       // Diff the staged tree against HEAD (the issue branch tip — equal to the
       // base for a fresh new-impl branch, or the PR head in fix mode) so the patch
@@ -2182,24 +2485,18 @@ export function createImplementationHandler(
       }
     };
 
-    // Restore the worktree to a clean base branch (shared cleanup). `git checkout
-    // -f` reverts tracked files but leaves untracked files the agent may have
-    // created; those would trip the next phase run's dirty-tree preflight, so
-    // remove them too — but never the artifact dir (untracked-but-not-ignored,
-    // holding this run's audit records) when it lives inside the repo.
+    // Reset the worktree to a clean tree (issue #733). The base branch is checked
+    // out in the canonical repo (git refuses to check it out a second time) and
+    // `ai/issue-<n>` is the durable worktree branch, so this never `git checkout -f
+    // <base>` — it would fail and leave the tree dirty, or move the worktree off its
+    // issue branch. Reset to the worktree's own HEAD (the issue branch tip) so the
+    // next run's preflight sees a clean tree while the worktree stays on the issue
+    // branch (issue #454 review). `git clean -fd` reverts untracked files the agent
+    // may have created; those would trip the next phase run's dirty-tree preflight —
+    // but never the artifact dir (untracked-but-not-ignored, holding this run's audit
+    // records) when it lives inside the repo.
     const restoreWorktreeToBase = (): void => {
-      if (worktreeMode) {
-        // In the per-issue worktree the base branch is checked out by the canonical
-        // repo (git refuses to check it out a second time) and `ai/issue-<n>` is the
-        // durable worktree branch, so never `git checkout -f <base>` — it would fail
-        // and leave the tree dirty, or move the worktree off its issue branch. Reset
-        // the worktree to its own HEAD (the issue branch tip) so the next run's
-        // preflight sees a clean tree while the worktree stays on the issue branch
-        // (issue #454 review).
-        runner.run("git", ["reset", "--hard", "HEAD"], { cwd });
-      } else {
-        runner.run("git", ["checkout", "-f", baseBranch], { cwd });
-      }
+      runner.run("git", ["reset", "--hard", "HEAD"], { cwd });
       const relArtifactRoot = relative(cwd, session.artifactRoot);
       const cleanArgs = ["clean", "-fd"];
       if (!relArtifactRoot.startsWith("..")) {
@@ -2208,159 +2505,66 @@ export function createImplementationHandler(
       runner.run("git", cleanArgs, { cwd });
     };
 
-    // Full discard: capture the partial work, restore the worktree to base, and
-    // drop the freshly-created new-impl issue branch. Used by the quota/rate-limit
-    // delayed path (issue #25), which re-queues the SAME implementation run — that
-    // retry re-creates `ai/issue-<n>` with `git checkout -b`, so the branch MUST
-    // be deleted here or the retry collides. Returns the capture result so callers
-    // can record/inspect what was preserved.
+    // Capture the partial work and reset the worktree to a clean tree. Used by the
+    // quota/rate-limit delayed path (issue #25), which re-queues the SAME
+    // implementation run. `ai/issue-<n>` is the durable per-issue worktree branch, so
+    // the delayed retry re-materializes the SAME worktree on it — there is no `git
+    // checkout -b` to collide with, and `git branch -D` cannot delete a branch
+    // checked out in the current worktree anyway (issue #454 review), so the branch
+    // is never dropped here (issue #733). Returns the capture result so callers can
+    // record/inspect what was preserved.
     const discardEditsToBase = (): PartialDiffCapture => {
       // Preserve the partial work as a patch artifact BEFORE the destructive
       // cleanup below removes it (issue #379).
       const capture = capturePartialDiff();
       restoreWorktreeToBase();
-      // Never delete the issue branch in worktree mode: `ai/issue-<n>` is the durable
-      // per-issue worktree branch, so the delayed retry re-materializes the SAME
-      // worktree on it (there is no `git checkout -b` to collide with), and
-      // `git branch -D` cannot delete a branch checked out in the current worktree
-      // anyway (issue #454 review). In shared mode drop the freshly-created new-impl
-      // branch so the retry's `git checkout -b` does not collide.
-      if (!fixMode && !worktreeMode) {
-        runner.run("git", ["branch", "-D", branch], { cwd });
-      }
       return capture;
     };
 
-    // Tool Request handoff cleanup (issue #379, #390). Like discardEditsToBase,
-    // but a Tool Request leaves the task as a human handoff (ready_for_human) whose
-    // ONLY continuation point, once the patch is absent and no PR exists, is the
-    // issue branch. So in new-impl mode this NEVER deletes the issue branch when
-    // doing so would lose the agent's work irrecoverably:
-    //   - captured / empty: safe to drop the branch — the work is in the patch, or
-    //     there provably was none.
-    //   - failed: a diff may exist but could not be snapshotted. Commit the staged
-    //     partial work onto the issue branch and keep it (pushing best-effort) so
-    //     an operator can resume; never `git branch -D` it.
-    // Fix mode keeps the existing PR branch regardless (its work is already there).
+    // Tool Request handoff cleanup (issue #379, #390, #733). Like
+    // discardEditsToBase, but a Tool Request leaves the task as a human handoff
+    // (ready_for_human) whose ONLY continuation point, once the patch is absent and
+    // no PR exists, is the issue branch. `ai/issue-<n>` is the durable per-issue
+    // worktree branch and the handoff's continuation point, so it is NEVER deleted
+    // and the worktree is NEVER switched to base (issue #454 review): `git checkout
+    // -f <base>` would fail (the base is checked out in the canonical repo) and
+    // `git branch -D` would either fail or drop the only resume point. When the
+    // agent produced work, commit the staged partial implementation
+    // (capturePartialDiff already ran `git add -A`) onto the branch and push
+    // best-effort so a later grant resumes from a real commit (issue #404, #454
+    // review); an empty run leaves the branch at its start point with nothing to
+    // preserve.
     const handoffCleanup = (): HandoffPreservation => {
       const capture = capturePartialDiff();
 
-      // Worktree mode: `ai/issue-<n>` is the durable per-issue worktree branch and the
-      // handoff's continuation point, so it is NEVER deleted and the worktree is NEVER
-      // switched to base (issue #454 review): `git checkout -f <base>` would fail (the
-      // base is checked out in the canonical repo) and `git branch -D` would either
-      // fail or drop the only resume point. When the agent produced work, commit the
-      // staged partial implementation (capturePartialDiff already ran `git add -A`)
-      // onto the branch and push best-effort so a later grant resumes from a real
-      // commit (issue #404, #454 review); an empty run leaves the branch at its start
-      // point with nothing to preserve.
-      if (worktreeMode) {
-        if (capture.kind === "empty") {
-          return { noPriorDiff: true };
-        }
-        const committed = runner.run("git", ["commit", "--no-verify", "-m",
-          `wip: preserve partial implementation for issue #${task.issueNumber} (tool-request handoff)`], { cwd });
-        if (committed.exitCode === 0) {
-          const pushed = runner.run("git", ["push", "origin", branch], { cwd });
-          return {
-            noPriorDiff: false,
-            ...(capture.kind === "captured" ? { partialDiffArtifact: capture.artifact } : {}),
-            ...(capture.kind === "failed" ? { partialDiffCaptureFailed: capture.reason } : {}),
-            preservedBranch: branch,
-            preservedBranchPushed: pushed.exitCode === 0,
-          };
-        }
-        // Commit failed (nothing staged, or a deeper git error). Reset the worktree
-        // to a clean tree — staying on the issue branch — so the next run's preflight
-        // passes; any work still survives in the captured patch. Advertise the branch
-        // as the resume point only when it provably carries committed work beyond base
-        // (a probe failure must not be read as "safe to drop the branch").
-        restoreWorktreeToBase();
-        const ahead = runner.run("git", ["rev-list", "--count", `${baseBranch}..${branch}`], { cwd });
-        const hasCommits = ahead.exitCode === 0 && ahead.stdout.trim() !== "0";
+      if (capture.kind === "empty") {
+        return { noPriorDiff: true };
+      }
+      const committed = runner.run("git", ["commit", "--no-verify", "-m",
+        `wip: preserve partial implementation for issue #${task.issueNumber} (tool-request handoff)`], { cwd });
+      if (committed.exitCode === 0) {
+        const pushed = runner.run("git", ["push", "origin", branch], { cwd });
         return {
           noPriorDiff: false,
           ...(capture.kind === "captured" ? { partialDiffArtifact: capture.artifact } : {}),
           ...(capture.kind === "failed" ? { partialDiffCaptureFailed: capture.reason } : {}),
-          ...(hasCommits ? { preservedBranch: branch, preservedBranchPushed: false } : {}),
-        };
-      }
-
-      if (!fixMode && capture.kind === "failed") {
-        // capturePartialDiff's `git add -A` already staged whatever the agent
-        // produced; the failure was in diffing/writing the patch, not in detecting
-        // changes. Commit that staged work onto the issue branch so the branch is a
-        // real resume point rather than an empty ref. `--no-verify` skips any
-        // pre-commit hooks: this is a best-effort preservation commit, and a hook
-        // failure must not defeat the whole point of not losing the work.
-        const committed = runner.run("git", ["commit", "--no-verify", "-m",
-          `wip: preserve partial implementation for issue #${task.issueNumber} (tool-request handoff; patch capture failed)`], { cwd });
-        if (committed.exitCode === 0) {
-          // Push so the branch is a durable, operator-visible resume point that a
-          // later handoff's `git branch -D` (in another run) cannot lose. Push is
-          // best-effort: if it fails the local branch is still kept and the admin
-          // resolve guidance tells the operator to push it before resolving.
-          const pushed = runner.run("git", ["push", "origin", branch], { cwd });
-          restoreWorktreeToBase();
-          return {
-            noPriorDiff: false,
-            partialDiffCaptureFailed: capture.reason,
-            preservedBranch: branch,
-            preservedBranchPushed: pushed.exitCode === 0,
-          };
-        }
-        // Could not commit (nothing staged, or a deeper git error). Restore the
-        // shared worktree so later runs are not blocked by a dirty tree — but that
-        // restore discards this run's uncommitted/index state, so the branch can
-        // only be a real continuation point if it ALREADY carries committed work
-        // (e.g. a resumed `ai/issue-<n>` with the operator's earlier commits). A
-        // freshly-created new-impl branch that still points at base preserves
-        // NOTHING after the restore: advertising it would send the operator to
-        // resume from base and silently drop the partial work — the exact failure
-        // this review guards against (issue #390 review). So only keep+advertise the
-        // branch when it provably has commits beyond base; when it provably does
-        // not, delete the empty ref so admin resolve cannot mistake it for a resume
-        // point and instead routes to the capture-failure recovery (reconstruct from
-        // the run artifacts) recorded via partialDiffCaptureFailed below.
-        restoreWorktreeToBase();
-        const ahead = runner.run("git", ["rev-list", "--count", `${baseBranch}..${branch}`], { cwd });
-        const provablyEmpty = ahead.exitCode === 0 && ahead.stdout.trim() === "0";
-        if (provablyEmpty) {
-          runner.run("git", ["branch", "-D", branch], { cwd });
-          return {
-            noPriorDiff: false,
-            partialDiffCaptureFailed: capture.reason,
-          };
-        }
-        // The branch carries committed work, or we could not prove it empty (a
-        // probe failure must not be read as "safe to delete" — fail closed and
-        // keep the only potential continuation point). Push best-effort so the ref
-        // is durable; a push failure still leaves the local branch as a resume
-        // point, and the admin guidance tells the operator to push it first.
-        const pushed = runner.run("git", ["push", "origin", branch], { cwd });
-        return {
-          noPriorDiff: false,
-          partialDiffCaptureFailed: capture.reason,
           preservedBranch: branch,
           preservedBranchPushed: pushed.exitCode === 0,
         };
       }
-
-      // captured / empty (or fix mode): safe to fully discard. Captured work lives
-      // in the patch; empty means there is provably no diff to preserve. Fix mode
-      // also reaches here on capture.kind === "failed": its work is already on the
-      // existing PR branch (kept regardless), so there is no continuation point to
-      // protect — but the repair edits made this run were still discarded with no
-      // patch written, so record WHY (issue #390 review) instead of letting the
-      // stored request look like it simply had no diff.
+      // Commit failed (nothing staged, or a deeper git error). Reset the worktree
+      // to a clean tree — staying on the issue branch — so the next run's preflight
+      // passes; any work still survives in the captured patch. Advertise the branch
+      // as the resume point only when it provably carries committed work beyond base
+      // (a probe failure must not be read as "safe to drop the branch").
       restoreWorktreeToBase();
-      if (!fixMode) {
-        runner.run("git", ["branch", "-D", branch], { cwd });
-      }
+      const ahead = runner.run("git", ["rev-list", "--count", `${baseBranch}..${branch}`], { cwd });
+      const hasCommits = ahead.exitCode === 0 && ahead.stdout.trim() !== "0";
       return {
+        noPriorDiff: false,
         ...(capture.kind === "captured" ? { partialDiffArtifact: capture.artifact } : {}),
         ...(capture.kind === "failed" ? { partialDiffCaptureFailed: capture.reason } : {}),
-        noPriorDiff: capture.kind === "empty",
+        ...(hasCommits ? { preservedBranch: branch, preservedBranchPushed: false } : {}),
       };
     };
 
@@ -2442,6 +2646,20 @@ export function createImplementationHandler(
     // `dependencyBase`.
     const recordedWorkBranch = fixMode ? branch : undefined;
 
+    // Fix mode never re-resolves a dependency plan, so `depBase` is always
+    // undefined here for a needs_fix run — even one that is itself a followup to
+    // a dependency-started implementation. A Tool Request handoff mid-fix (a
+    // disallowed command, or a dependency-update the trusted sync path could not
+    // satisfy) must preserve the `dependencyBase` already recorded in the
+    // incoming task context instead of clobbering it with the always-undefined
+    // `depBase`, or the next review (after grant/resume) would hit the missing
+    // `baseHeadSha` guard and block a supported followup flow (issue #667
+    // review, P1). A genuinely new (non-fix) implementation still writes
+    // `depBase` unconditionally — including when it's undefined — to clear a
+    // stale `dependencyBase` left over from a prior dependency-started run of
+    // this issue.
+    const dependencyBaseForHandoff = fixMode ? task.context["dependencyBase"] : depBase;
+
     const toolRequestHandoff = (toolRequest: ToolRequest): PhaseHandlerResult => {
       const preservation = handoffCleanup();
       const storedToolRequest = storeToolRequest(toolRequest, preservation);
@@ -2476,8 +2694,11 @@ export function createImplementationHandler(
           // the phase runner's context merge preserve a stale dependencyBase from a
           // previous handoff, and runToolRequestGrant would rebuild the issue
           // branch from an obsolete blocker head instead of the current base
-          // (issue #316 review).
-          dependencyBase: depBase,
+          // (issue #316 review). In fix mode `depBase` is always undefined (see
+          // dependencyBaseForHandoff above), so use it instead to preserve the
+          // predecessor head already recorded on the incoming task rather than
+          // erasing it (issue #667 review, P1).
+          dependencyBase: dependencyBaseForHandoff,
         },
         message: `Implementation agent requested a disallowed command: ${toolRequest.command}`,
       };
@@ -2531,8 +2752,11 @@ export function createImplementationHandler(
           // the current dependency plan provided no start point — so the phase
           // runner's context merge cannot preserve a stale dependencyBase from a
           // previous handoff and have runToolRequestGrant rebuild the branch from
-          // an obsolete blocker head (issue #316 review).
-          dependencyBase: depBase,
+          // an obsolete blocker head (issue #316 review). In fix mode `depBase` is
+          // always undefined (see dependencyBaseForHandoff above), so use it
+          // instead to preserve the predecessor head already recorded on the
+          // incoming task rather than erasing it (issue #667 review, P1).
+          dependencyBase: dependencyBaseForHandoff,
         },
         message:
           `Dependency update could not be applied through trusted dependency sync ` +
@@ -2570,8 +2794,8 @@ export function createImplementationHandler(
     // reinstalls across retries. A nonzero exit fails closed: the phase stops and
     // no agent execution follows a failed prepare.
     //
-    // `cwd` is the stable identity: the issue worktree path in worktree mode, or
-    // canonicalRoot in shared mode — both are set before this point.
+    // `cwd` is the stable identity: the issue worktree path materialized in Step
+    // 0.6, set before this point.
     const envPrepareIdentity = cwd;
 
     // When a dirty continuation is active and environment preparation is enabled,
@@ -2682,7 +2906,7 @@ export function createImplementationHandler(
       // the combined output and, when it matches, return `delayed` so the task is
       // released back to `queued` with a future notBefore instead of failing. The
       // original output artifact is preserved for diagnosis either way.
-      const quota = classifyQuotaExhaustion(`${agentResult.stdout}\n${agentResult.stderr}`, agentId);
+      const quota = classifyQuotaExhaustion(extractAgentFailureDiagnostic(agentId, agentResult, { cmdSource: resolvedProfile.cmdSource }));
       writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
         issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
         exitCode: agentResult.exitCode, success: false,
@@ -2700,14 +2924,57 @@ export function createImplementationHandler(
         discardEditsToBase();
         return {
           result: "delayed",
-          context: { artifactDir, resolvedProfile, quotaSignal: quota.signal },
-          message: `${resolvedProfile.agentId} hit a quota/rate-limit (signal: "${quota.signal}"); delaying retry`,
+          context: { artifactDir, resolvedProfile, quotaSignal: quota.signal, category: quota.category },
+          message: `${resolvedProfile.agentId} hit a ${describeFailureCategory(quota.category)} condition (signal: "${quota.signal}"); delaying retry`,
+          retryAfterMs: resolveRetryDelayOverrideMsForCategory(quota.category),
+          category: quota.category,
         };
       }
+      // Abnormal agent exit after the worktree was modified (issue #727): capture a
+      // fresh dirtyContinuation snapshot of the CURRENT state before returning the
+      // failure, so the next attempt validates against what the agent actually left
+      // behind instead of an absent or stale marker from an earlier run. Reuses the
+      // same bounded, NUL-delimited status + patch capture as the verification-failure
+      // path below.
+      const agentExitError = `${resolvedProfile.agentId} exited ${agentResult.exitCode}: ${(agentResult.stderr || agentResult.stdout).slice(0, 500)}`;
+      const dirtyCapture = captureDirtyContinuationOnAgentExit(
+        runner, cwd, artifactDir, session.artifactRoot, task, runId, worktreeBranch, resolvedWorktreeId,
+        { agentExitCode: agentResult.exitCode },
+      );
+      if (!dirtyCapture.ok) {
+        return {
+          result: "failed",
+          // Explicitly clear any stale marker rather than silently leaving it: the
+          // current dirty state could not be verified, so it must not be trusted by
+          // the next attempt's drift check.
+          context: { artifactDir, resolvedProfile, dirtyContinuation: undefined },
+          error:
+            `${agentExitError}\n` +
+            `Additionally, failed to capture the post-exit worktree state for continuation: ${dirtyCapture.error} ` +
+            `Manually inspect the worktree and commit or discard its changes before retrying implementation.`,
+        };
+      }
+      // Persist the exit diagnostic so a continuation prompt on the next attempt
+      // can render it (issue #727 review). When this run itself continued edits
+      // from a prior verification failure (activeDirtyContinuation set above),
+      // retain that failure's fields instead of clearing them: the remaining
+      // edits were meant to fix that failure, so the next continuation prompt
+      // must still explain *why*, not just report this crash — mirrors the
+      // repair-agent crash handling below. A fresh (non-continuation) run has no
+      // prior verification failure to retain, so those fields stay cleared.
+      const priorVerificationFailure = task.context["verificationFailure"];
+      const priorVerificationFeedback = task.context["verificationFeedback"];
       return {
         result: "failed",
-        context: { artifactDir, resolvedProfile },
-        error: `${resolvedProfile.agentId} exited ${agentResult.exitCode}: ${(agentResult.stderr || agentResult.stdout).slice(0, 500)}`,
+        context: {
+          artifactDir,
+          resolvedProfile,
+          dirtyContinuation: dirtyCapture.dirtyContinuation,
+          agentExitFailure: { message: agentExitError, exitCode: agentResult.exitCode },
+          verificationFailure: activeDirtyContinuation ? priorVerificationFailure : undefined,
+          verificationFeedback: activeDirtyContinuation ? priorVerificationFeedback : undefined,
+        },
+        error: agentExitError,
       };
     }
 
@@ -2716,7 +2983,6 @@ export function createImplementationHandler(
     // an implementation consisting entirely of new files is not incorrectly rejected.
     const diffResult = runner.run("git", ["diff", "--stat", "HEAD"], { cwd });
     const hasDiff = diffResult.stdout.trim().length > 0;
-    const relArtifactRoot = relative(cwd, session.artifactRoot);
     const isArtifactInRepo = !relArtifactRoot.startsWith("..");
     const untrackedResult = !hasDiff
       ? runner.run("git", ["ls-files", "--others", "--exclude-standard"], { cwd })
@@ -2747,8 +3013,16 @@ export function createImplementationHandler(
         // against `baseBranch` would count the blocker PR's commits as this
         // issue's implementation work and let a no-op resume succeed with only
         // the dependency changes (issue #404 review). Use the blocker head as the
-        // start point in that mode so the probe only sees commits beyond it.
-        let startPoint = baseBranch;
+        // start point in that mode so the probe only sees commits beyond it. The
+        // default (no dependency start point) uses `origin/<base>`: this worktree
+        // deliberately skips the shared checkout's `git checkout <base> && git
+        // pull`, so the local `baseBranch` ref can lag behind `origin/<base>`. The
+        // worktree base was already refreshed via `git fetch origin <base>` above,
+        // so compare against the fetched remote-tracking ref instead — when the
+        // canonical `<base>` is stale, a resumed branch with no issue-specific
+        // commits looks non-empty purely from upstream base commits and would be
+        // wrongly accepted as a no-op success (issue #454 review).
+        let startPoint = `origin/${baseBranch}`;
         if (depBase) {
           // Fetch the blocker head explicitly: a remote-tracking ref may be
           // absent in a fresh/single-branch clone, and the local issue branch was
@@ -2759,16 +3033,6 @@ export function createImplementationHandler(
           const fetchBlocker = runner.run("git", ["fetch", "origin", depBase.baseHeadRefName], { cwd });
           if (fetchBlocker.exitCode !== 0) return false;
           startPoint = "FETCH_HEAD";
-        } else if (worktreeMode) {
-          // Worktree mode deliberately skips the shared checkout's
-          // `git checkout <base> && git pull`, so the local `baseBranch` ref can lag
-          // behind `origin/<base>`. The worktree base was already refreshed via
-          // `git fetch origin <base>` above, so compare against the fetched
-          // remote-tracking ref instead. Otherwise, when the canonical `<base>` is
-          // stale, a resumed branch with no issue-specific commits looks non-empty
-          // purely from upstream base commits and would be wrongly accepted as a
-          // no-op success (issue #454 review).
-          startPoint = `origin/${baseBranch}`;
         }
         const r = runner.run("git", ["diff", "--quiet", `${startPoint}...HEAD`], { cwd });
         // exit 1 = differences present; exit 0 = empty; any other (e.g. 128 for an
@@ -2920,7 +3184,7 @@ export function createImplementationHandler(
         // A quota/rate-limit exhaustion can first surface during the repair
         // attempt; treat it as a delayed retry rather than a repair failure
         // (issue #25).
-        const repairQuota = classifyQuotaExhaustion(`${repairResult.stdout}\n${repairResult.stderr}`, agentId);
+        const repairQuota = classifyQuotaExhaustion(extractAgentFailureDiagnostic(agentId, repairResult, { cmdSource: resolvedProfile.cmdSource }));
         writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
           issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
           exitCode: repairResult.exitCode, success: false,
@@ -2936,14 +3200,46 @@ export function createImplementationHandler(
           discardEditsToBase();
           return {
             result: "delayed",
-            context: { artifactDir, resolvedProfile, quotaSignal: repairQuota.signal },
-            message: `${resolvedProfile.agentId} verification repair hit a quota/rate-limit (signal: "${repairQuota.signal}"); delaying retry`,
+            context: { artifactDir, resolvedProfile, quotaSignal: repairQuota.signal, category: repairQuota.category },
+            message: `${resolvedProfile.agentId} verification repair hit a ${describeFailureCategory(repairQuota.category)} condition (signal: "${repairQuota.signal}"); delaying retry`,
+            retryAfterMs: resolveRetryDelayOverrideMsForCategory(repairQuota.category),
+            category: repairQuota.category,
+          };
+        }
+        // Abnormal repair-agent exit after it modified the worktree (issue #727):
+        // capture a fresh dirtyContinuation snapshot before returning the failure,
+        // mirroring the initial-agent abnormal-exit handling above.
+        const repairExitError = `${resolvedProfile.agentId} verification repair exited ${repairResult.exitCode}: ${(repairResult.stderr || repairResult.stdout).slice(0, 500)}`;
+        const repairDirtyCapture = captureDirtyContinuationOnAgentExit(
+          runner, cwd, artifactDir, session.artifactRoot, task, runId, worktreeBranch, resolvedWorktreeId,
+          { agentExitCode: repairResult.exitCode, step: "verification-repair" },
+        );
+        if (!repairDirtyCapture.ok) {
+          return {
+            result: "failed",
+            context: { artifactDir, resolvedProfile, dirtyContinuation: undefined },
+            error:
+              `${repairExitError}\n` +
+              `Additionally, failed to capture the post-exit worktree state for continuation: ${repairDirtyCapture.error} ` +
+              `Manually inspect the worktree and commit or discard its changes before retrying implementation.`,
           };
         }
         return {
           result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `${resolvedProfile.agentId} verification repair exited ${repairResult.exitCode}: ${(repairResult.stderr || repairResult.stdout).slice(0, 500)}`,
+          context: {
+            artifactDir,
+            resolvedProfile,
+            dirtyContinuation: repairDirtyCapture.dirtyContinuation,
+            // issue #727 review: the repair agent crashed while reacting to
+            // `failure` (the verification failure that triggered this repair
+            // attempt) — retain it alongside the new exit diagnostic so the
+            // next continuation prompt still explains *why* verification was
+            // being repaired, not just that the repair agent crashed.
+            agentExitFailure: { message: repairExitError, exitCode: repairResult.exitCode },
+            verificationFailure: { name: failure.name, exitCode: failure.exitCode },
+            verificationFeedback: failure.output,
+          },
+          error: repairExitError,
         };
       }
       // When the repair request was satisfied through the trusted dependency-update
@@ -3004,58 +3300,50 @@ export function createImplementationHandler(
     }
     if (!verification.passed) {
       const failure = verification.failure!;
-      // In per-issue worktree mode, capture dirty state so the next phase attempt
-      // can distinguish "dirty from a known prior verification failure" from "dirty
-      // for an unknown reason" (docs/per-issue-worktrees.md §Follow-up work, item 1).
-      let dirtyContinuation: Record<string, unknown> | undefined;
-      if (worktreeMode) {
-        // Use -z (NUL-delimited) so paths with spaces, tabs, or non-ASCII are
-        // never quoted by git, avoiding silent path-mismatch on quoted entries.
-        const dirtyStatus = runner.run("git", ["status", "--porcelain", "-z", "--untracked-files=all"], { cwd });
-        const statusEntries = dirtyStatus.stdout.split("\0").filter(Boolean);
-        // Rename/copy entries emit two NUL-terminated tokens: "XY new-path" then "old-path".
-        const dirtyFiles: string[] = [];
-        {
-          let idx = 0;
-          while (idx < statusEntries.length) {
-            const entry = statusEntries[idx++];
-            if (entry.length < 3) continue;
-            const xy = entry.slice(0, 2);
-            dirtyFiles.push(entry.slice(3));
-            if (xy[0] === "R" || xy[0] === "C" || xy[1] === "R" || xy[1] === "C") {
-              idx++; // skip the old-path token
-            }
-          }
-        }
-        const patchResult = runner.run("git", ["diff", "HEAD"], { cwd, maxBuffer: 64 * 1024 * 1024 });
-        // Also include untracked files (git diff HEAD omits them).
-        const untrackedFiles = statusEntries
+      // Capture dirty state so the next phase attempt can distinguish "dirty from
+      // a known prior verification failure" from "dirty for an unknown reason"
+      // (docs/per-issue-worktrees.md §Follow-up work, item 1).
+      // Use -z (NUL-delimited) so paths with spaces, tabs, or non-ASCII are
+      // never quoted by git, avoiding silent path-mismatch on quoted entries.
+      const dirtyStatus = runner.run("git", ["status", "--porcelain", "-z", "--untracked-files=all"], { cwd });
+      const statusEntries = dirtyStatus.stdout.split("\0").filter(Boolean);
+      // Exclude artifact-root paths (issue #727 review) so this marker's dirtyFiles
+      // stays consistent with the drift-check's currentFiles filtering below —
+      // otherwise a supported in-worktree, non-ignored artifactRoot always drifts.
+      const relArtifactRootForCapture = relative(cwd, session.artifactRoot);
+      const dirtyFilesRaw = parseZPorcelainDirtyPaths(statusEntries, relArtifactRootForCapture);
+      const dirtyFiles = excludeArtifactRootPaths(dirtyFilesRaw, relArtifactRootForCapture);
+      const patchResult = runner.run("git", ["diff", "HEAD"], { cwd, maxBuffer: 64 * 1024 * 1024 });
+      // Also include untracked files (git diff HEAD omits them).
+      const untrackedFiles = excludeArtifactRootPaths(
+        statusEntries
           .filter((entry) => entry.startsWith("?? "))
-          .map((entry) => entry.slice(3));
-        const { patch: untrackedPatch } = buildUntrackedPatch(cwd, untrackedFiles);
-        const patchFile = "implementation-dirty-patch.patch";
-        const patchCaptured = dirtyStatus.exitCode === 0 && patchResult.exitCode === 0;
-        if (patchCaptured) {
-          writeFileSync(join(artifactDir, patchFile), patchResult.stdout + untrackedPatch, "utf8");
-        }
-        dirtyContinuation = {
-          issueNumber: task.issueNumber,
-          phase: "implementation",
-          runId,
-          branch: worktreeBranch,
-          worktreeId: resolvedWorktreeId ?? null,
-          verificationName: failure.name,
-          verificationExitCode: failure.exitCode,
-          dirtyFiles,
-          ...(patchCaptured ? { patchArtifactFile: patchFile } : {}),
-          timestamp: new Date().toISOString(),
-          commitSkipped: true,
-        };
+          .map((entry) => entry.slice(3)),
+        relArtifactRootForCapture,
+      );
+      const { patch: untrackedPatch } = buildUntrackedPatch(cwd, untrackedFiles);
+      const patchFile = "implementation-dirty-patch.patch";
+      const patchCaptured = dirtyStatus.exitCode === 0 && patchResult.exitCode === 0;
+      if (patchCaptured) {
+        writeFileSync(join(artifactDir, patchFile), patchResult.stdout + untrackedPatch, "utf8");
       }
+      const dirtyContinuation: Record<string, unknown> = {
+        issueNumber: task.issueNumber,
+        phase: "implementation",
+        runId,
+        branch: worktreeBranch,
+        worktreeId: resolvedWorktreeId ?? null,
+        verificationName: failure.name,
+        verificationExitCode: failure.exitCode,
+        dirtyFiles,
+        ...(patchCaptured ? { patchArtifactFile: patchFile } : {}),
+        timestamp: new Date().toISOString(),
+        commitSkipped: true,
+      };
       writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
         issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
         exitCode: failure.exitCode, success: false, step: `verification:${failure.name}`, artifactDir,
-        ...(dirtyContinuation ? { dirtyContinuation } : {}),
+        dirtyContinuation,
       }, null, 2), "utf8");
       return {
         result: "failed",
@@ -3064,7 +3352,12 @@ export function createImplementationHandler(
           resolvedProfile,
           verificationFailure: { name: failure.name, exitCode: failure.exitCode },
           verificationFeedback: failure.output,
-          ...(dirtyContinuation ? { dirtyContinuation } : {}),
+          dirtyContinuation,
+          // Clear any stale agent-exit diagnostic from an earlier attempt on
+          // this issue (issue #727 review): this failure came from
+          // verification, so the continuation prompt must render the
+          // verification failure above, not a lingering agent-exit message.
+          agentExitFailure: undefined,
         },
         error: `Verification '${failure.name}' failed (exit ${failure.exitCode}) before commit/push:\n${failure.output.slice(0, 500)}`,
       };
@@ -3191,21 +3484,75 @@ export function createImplementationHandler(
       prUrl = prResult.value.url;
     }
 
+    // Summary of a trusted dependency-update application (issue #302), surfaced on
+    // success so it is auditable that the agent's install request was satisfied by
+    // the manifest edit + session sync rather than by the agent running a command.
+    const dependencyUpdateMeta = dependencyUpdate
+      ? { manager: dependencyUpdate.manager, manifestPath: dependencyUpdate.manifestPath, packages: dependencyUpdate.packages }
+      : undefined;
+
+    // Fix mode never re-resolves a dependency plan (Step 0.5 above only runs
+    // `!fixMode`), so `depBase` is always undefined here for a needs_fix run —
+    // even one that is itself a followup to a dependency-started implementation.
+    // Preserve the `dependencyBase` already recorded in the incoming task context
+    // for those runs instead of clobbering it with the always-undefined `depBase`,
+    // or the next review would lose the predecessor start point and fall back to
+    // reviewing the cumulative diff against the session base (issue #667 review,
+    // P1). A genuinely new (non-fix) implementation still writes `depBase`
+    // unconditionally — including when it's undefined — to clear a stale
+    // `dependencyBase` left over from a prior dependency-started run of this issue.
+    const dependencyBaseForContext = fixMode ? task.context["dependencyBase"] : depBase;
+
+    // Write the final success artifact BEFORE freeing the worktree below (issue
+    // #732 review, P1). Same ordering `review.ts` uses around its own
+    // `freeReviewWorktree()` call.
+    writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
+      issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
+      exitCode: 0, success: true, branch, prUrl, artifactDir, resolvedProfile,
+      ...(resumedNoopWithCommits ? { resumedNoChanges: true } : {}),
+      ...(dependencyBaseForContext ? { dependencyBase: dependencyBaseForContext } : {}),
+      ...(dependencySync.ran ? { dependencySync: dependencySyncMeta(dependencySync) } : {}),
+      ...(dependencyUpdateMeta ? { dependencyUpdate: dependencyUpdateMeta } : {}),
+    }, null, 2), "utf8");
+
+    // `session.artifactRoot` may be configured to live INSIDE the managed
+    // worktree (issue #629). Retention/backup-restore validation
+    // (`isSafeArtifactDirAfterRun`, `ARTIFACT_DIR_CONTEXT_FIELDS`) requires the
+    // `artifactDir` this run reports to stay a real subdirectory of that
+    // session-configured root; relocating it to an ad hoc path outside
+    // `artifactRoot` before freeing the worktree (the prior fix here, issue
+    // #732 review P1) satisfies the "artifact survives worktree removal"
+    // requirement but violates that contract instead — a successful run in
+    // this supported configuration then becomes unrestorable from backup, and
+    // retention silently skips its cleanup. There is no relocation target that
+    // is simultaneously durable AND still under `artifactRoot`, since
+    // `artifactRoot`'s own directory is inside the tree `removeWorktree` is
+    // about to delete. Skip freeing the worktree in this case instead — the
+    // artifact tree, and the branch, both stay exactly where they already are
+    // (still valid under `artifactRoot`). The downstream review phase
+    // materializes issue worktrees via the same `resolveIssueWorktree`, which
+    // already tolerates reusing an existing worktree still on the expected
+    // branch (see its `branchReused` reuse path), so a review run right after
+    // this one picks the worktree back up rather than failing on a held branch.
+    const artifactRootInsideWorktree =
+      isPathInside(canonicalizePath(session.artifactRoot), canonicalizePath(cwd));
+
     // Free the issue branch for the downstream review phase (issue #454 review,
     // P1). A successful worktree-mode run leaves `ai/issue-<n>` checked out in the
     // per-issue worktree, but the implementation is now committed AND pushed (and its
-    // PR ensured), so the durable tree has nothing left to preserve. The review phase
-    // runs from the canonical checkout and checks out the PR branch there; Git refuses
-    // to check out a branch already held by another worktree, so every successful
-    // worktree implementation would break review unless the branch is freed. Remove
-    // the per-issue worktree to release the branch ref — the work is safe on origin,
+    // PR ensured), so the durable tree has nothing left to preserve. Review always
+    // runs inside the per-issue worktree too (issue #729) and materializes it via the
+    // same `resolveIssueWorktree`, which tolerates reusing an existing worktree still
+    // on the expected branch (its `branchReused` path) — so a review run right after
+    // this one picks the worktree back up. Remove the per-issue worktree to release
+    // the branch ref — the work is safe on origin,
     // and a later needs-fix run re-materializes the worktree from the existing branch.
     // Force so any residual untracked files in the worktree cannot block the removal
     // (the meaningful work is already committed). Fail closed on a removal error
     // rather than report success and leave review to die on the held branch with a
     // cryptic git error. Failure/handoff paths above keep their worktree on purpose
     // (they have uncommitted state to preserve) and never reach here.
-    if (worktreeMode) {
+    if (!artifactRootInsideWorktree) {
       const freed = removeWorktree(canonicalRoot, cwd, { force: true, runner });
       if (!freed.ok) {
         writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
@@ -3214,32 +3561,23 @@ export function createImplementationHandler(
         }, null, 2), "utf8");
         return {
           result: "failed",
-          context: { artifactDir, resolvedProfile },
+          // Record the already-committed, already-pushed, already-PR'd branch as a
+          // Tool Request resume point (issue #732 review, P1), same as the
+          // artifact-root-conflict failure above: after the operator removes the
+          // worktree manually and requeues, the next new-implementation run must
+          // reconcile the existing branch (`resumeFromToolRequestBranch`) instead of
+          // treating this as a fresh run — a no-op agent on a fresh-branch retry
+          // would fail the stageable-file check instead of reusing the existing PR.
+          context: { artifactDir, resolvedProfile, toolRequestResumeBranch: branch },
           error:
             `Implementation committed, pushed, and its PR is ready, but freeing the issue worktree ` +
             `at ${cwd} failed, leaving '${branch}' checked out there: ${freed.error}\n\n` +
-            `The downstream review phase checks out '${branch}' in the canonical checkout and Git ` +
+            `The downstream review phase materializes its own worktree on '${branch}' and Git ` +
             `refuses a branch already held by another worktree. Remove the worktree manually ` +
             `(e.g. \`git worktree remove --force ${cwd}\`) before the issue can advance to review.`,
         };
       }
     }
-
-    // Summary of a trusted dependency-update application (issue #302), surfaced on
-    // success so it is auditable that the agent's install request was satisfied by
-    // the manifest edit + session sync rather than by the agent running a command.
-    const dependencyUpdateMeta = dependencyUpdate
-      ? { manager: dependencyUpdate.manager, manifestPath: dependencyUpdate.manifestPath, packages: dependencyUpdate.packages }
-      : undefined;
-
-    writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
-      issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
-      exitCode: 0, success: true, branch, prUrl, artifactDir, resolvedProfile,
-      ...(resumedNoopWithCommits ? { resumedNoChanges: true } : {}),
-      ...(depBase ? { dependencyBase: depBase } : {}),
-      ...(dependencySync.ran ? { dependencySync: dependencySyncMeta(dependencySync) } : {}),
-      ...(dependencyUpdateMeta ? { dependencyUpdate: dependencyUpdateMeta } : {}),
-    }, null, 2), "utf8");
 
     return {
       result: "success",
@@ -3251,7 +3589,20 @@ export function createImplementationHandler(
         labels: taskLabels,
         resolvedProfile,
         ...(resumedNoopWithCommits ? { resumedNoChanges: true } : {}),
-        ...(depBase ? { dependencyBase: depBase } : {}),
+        // Write the key unconditionally for a NEW (non-fix) implementation —
+        // clearing it (undefined) when this run's dependency plan provided no
+        // start point. Omitting it when depBase is undefined would let the phase
+        // runner's context merge preserve a stale dependencyBase from a prior
+        // dependency-started run of this issue, and the review phase would then
+        // treat that stale predecessor SHA as the current review base for what is
+        // now a non-dependent reimplementation (issue #667 review, P2). Fix mode
+        // never re-resolves depBase (see dependencyBaseForContext above), so a
+        // fix-mode success instead preserves whatever dependencyBase the task
+        // context already carried — otherwise a needs_fix followup to a
+        // dependency-started PR would erase the recorded predecessor head and the
+        // next review would revert to the cumulative main-based diff (issue #667
+        // review, P1).
+        dependencyBase: dependencyBaseForContext,
         ...(dependencySync.ran ? { dependencySync: dependencySyncMeta(dependencySync) } : {}),
         ...(dependencyUpdateMeta ? { dependencyUpdate: dependencyUpdateMeta } : {}),
         // Explicitly clear any consumed dirtyContinuation marker so a later

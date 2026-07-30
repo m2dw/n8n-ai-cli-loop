@@ -1,6 +1,10 @@
 # Per-Issue Worktrees
 
-Status: design + foundation slice (issue #400)
+Status: design + foundation slice (issue #400). Worktree-only operation is
+now unconditional across all repo-working phases (issue #731) — see
+[docs/worktree-only-migration-contract.md](worktree-only-migration-contract.md)
+for the migration history; the "Scope of the first slice" and "Deferred"
+sections below describe the original 2024 landing and are historical.
 
 This document defines the per-issue git worktree model: the lifecycle, lock
 model, recovery model, and cleanup model. It also records what the first
@@ -336,8 +340,11 @@ sanitized summaries are posted.
 
 ## Compatibility
 
-- **Opt-in**: `session.worktrees.enabled` (default off). A session without the
-  block keeps today's shared-`repoRoot` behavior byte-for-byte.
+- **Unconditional** (issue #731): every session runs every repo-working phase
+  in its per-issue worktree. There is no `worktrees.enabled` config, and no
+  shared-checkout execution mode to opt into; see
+  [docs/worktree-only-migration-contract.md](worktree-only-migration-contract.md)
+  for the migration history.
 - **Task context** records `worktreeId` / `worktreePath`.
 - **PR/branch naming** is unchanged (`ai/issue-<n>`, PRs target the session base).
 - **Artifacts** stay under the configured artifact root, never inside the
@@ -345,14 +352,6 @@ sanitized summaries are posted.
 - **Public comments** never include local worktree paths: the outbox visibility
   layer redacts the worktree state root (in addition to `repoRoot` /
   `artifactRoot`) via `sessionRedactionPaths(session)`.
-
-## Migration
-
-Existing active issues that currently use the shared checkout keep using it until
-their next phase under a worktree-enabled session, at which point
-`resolveIssueWorktree` creates the worktree on first use. No DB migration is
-required: `worktreeId` is recomputable from session + issue, and absence of a
-recorded path simply triggers first-use creation.
 
 Cross-issue dependency stacking reads the blocker's **pushed branch** (fetched
 into the canonical repo), not another issue's worktree, so stacking does not need

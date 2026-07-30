@@ -7,7 +7,38 @@ import type {
   TaskExpected,
   TaskKey,
   TaskPatch,
+  TaskPhase,
+  TaskStatus,
 } from "./task.js";
+import type { OutboxEnqueueInput } from "./outbox.js";
+
+/** Enqueue a fresh outbox row (mirrors {@link OutboxStore.enqueue}). */
+export interface OutboxEffectEnqueue {
+  kind: "enqueue";
+  input: OutboxEnqueueInput;
+}
+
+/** Supersede pending PR-summary rows and insert (mirrors {@link OutboxStore.replacePendingPrSummary}). */
+export interface OutboxEffectReplacePendingPrSummary {
+  kind: "replacePendingPrSummary";
+  input: OutboxEnqueueInput;
+  key: { owner: string; repo: string; prNumber: number; marker: string };
+}
+
+/**
+ * A single outbox write produced by a phase completion, queued for
+ * {@link TaskStore.completePhaseWithEffects} to commit alongside the task
+ * transition (issue #701).
+ */
+export type OutboxEffect = OutboxEffectEnqueue | OutboxEffectReplacePendingPrSummary;
+
+/** The task-store half of a phase completion: the CAS transition plus its event. */
+export interface PhaseCompletionTransition {
+  key: TaskKey;
+  expected: TaskExpected;
+  patch: TaskPatch;
+  event: TaskEvent;
+}
 
 export interface TaskStore {
   enqueueTask(input: EnqueueTaskInput): Promise<StoreResult<AiTask>>;
@@ -21,4 +52,118 @@ export interface TaskStore {
   releaseClaim(key: TaskKey, ownerRunId: string, now?: string): Promise<StoreResult<AiTask>>;
   appendEvent(event: TaskEvent): Promise<void>;
   listEvents(key: TaskKey): Promise<TaskEvent[]>;
+  /**
+   * Atomically commit a phase completion: the task transition, its
+   * `phase.completed` event, and every outbox effect the completion produced,
+   * in one transaction (DOMAIN.md §2.3 Orchestration — transactional-outbox
+   * guarantee, issue #701). A failure here must fail the whole completion —
+   * no transition without its effects, and no effect without its transition —
+   * rather than transitioning the task and separately, best-effort, enqueueing
+   * its side effects.
+   */
+  completePhaseWithEffects(
+    transition: PhaseCompletionTransition,
+    effects: OutboxEffect[],
+  ): Promise<StoreResult<AiTask>>;
+
+  /**
+   * List every task row for a session. Ordering is not guaranteed by the
+   * store; callers that need a specific order (e.g. admin ui's
+   * most-recently-updated-first) sort client-side.
+   */
+  listSessionTasks(sessionId: string): Promise<AiTask[]>;
+
+  /**
+   * Recover a task stuck in `failed`, or in `claimed`/`running` with an
+   * expired lease, back to `queued`. Refuses (returns `conflict`) any other
+   * status, or a `claimed`/`running` task whose lease has not yet expired —
+   * an active task is never touched. `options.phase` overrides the task's
+   * current phase (operator-directed re-route); omitted, the phase is
+   * unchanged.
+   */
+  recoverTask(
+    key: TaskKey,
+    options?: { phase?: TaskPhase; now?: string },
+  ): Promise<StoreResult<AiTask>>;
+
+  /**
+   * Recover a task parked in a specific human-handoff status
+   * (`options.fromStatus`) back to `queued` at `options.phase`. Refuses
+   * (returns `conflict`) if the task's current status does not exactly match
+   * `fromStatus`. Refuses (returns `tool_request_unresolved`) if the task
+   * carries a live, unresolved implementation Tool Request: that handoff must
+   * close through `tool-request resolve`/`tool-request run`, never through a
+   * generic requeue.
+   */
+  recoverHandoff(
+    key: TaskKey,
+    options: { fromStatus: TaskStatus; phase: TaskPhase; now?: string },
+  ): Promise<StoreResult<AiTask>>;
+
+  /**
+   * Recover a task held at `ready_for_human` by a review-loop cap
+   * (`context.reviewLoopCapReached` truthy) back to `queued` at
+   * `options.phase` (default `"review"`), clearing `reviewLoopCapReached`,
+   * `escalatedEffort`, and resetting `reviewCycles` to 0. Refuses (returns
+   * `conflict`) if the task is not `ready_for_human`, or is
+   * `ready_for_human` but the cap flag is not set.
+   */
+  recoverCapHandoff(
+    key: TaskKey,
+    options?: { phase?: TaskPhase; now?: string },
+  ): Promise<StoreResult<AiTask>>;
+
+  /**
+   * Clear the `notBefore` delay on a `queued` task so it becomes immediately
+   * claimable. Refuses (returns `conflict`) any non-`queued` status.
+   */
+  clearTaskDelay(
+    key: TaskKey,
+    options?: { now?: string },
+  ): Promise<StoreResult<AiTask>>;
+
+  /**
+   * Cancel a task (issue #608): a terminal, race-safe transition available
+   * from any non-terminal status (`queued`, `claimed`, `running`, `blocked`,
+   * `ready_for_human`). Implementations must perform the read-check-write
+   * atomically (mirroring `claimNextTask`/`transitionTask`'s CAS discipline)
+   * so a cancellation racing a concurrent claim/requeue has deterministic
+   * behavior: whichever transition's transaction commits first wins, and the
+   * loser observes the fully-applied result of the winner rather than a torn
+   * write.
+   *
+   * A `claimed`/`running` task is NOT force-stopped — there is no live signal
+   * into an in-flight phase handler's subprocess. Instead, cancelling it here
+   * flips `status` to `cancelled` immediately; the active run's own eventual
+   * `transitionTask`/`completePhaseWithEffects` call then loses its CAS (its
+   * `expected.status` no longer matches) and safely no-ops as `claim_lost` —
+   * cancellation therefore takes effect at the run's next safe phase boundary
+   * rather than corrupting an active subprocess or worktree.
+   *
+   * Refuses (`already_cancelled`) a task that is already `cancelled` — a
+   * repeated cancellation is a clean, informative no-op, not an error.
+   * Refuses (`conflict`) a task that already reached a different terminal
+   * status (`done`/`failed`): finished work is not retroactively cancellable.
+   */
+  cancelTask(
+    key: TaskKey,
+    options?: { reason?: string; now?: string },
+  ): Promise<StoreResult<AiTask>>;
+
+  /**
+   * Atomically commit a cancellation (issue #608 review): the same
+   * `cancelTask` transition, plus its `task.cancelled` event and every
+   * outbox effect the cancellation produced (the operator-visible comment),
+   * in one transaction — mirroring `completePhaseWithEffects` (issue #701).
+   * Without this, a crash or a failed event/outbox write after the
+   * transition commits leaves the task permanently `cancelled` with no
+   * event or comment, and retrying cannot repair the gap because a repeat
+   * call observes `already_cancelled` and no-ops.
+   */
+  cancelTaskWithEffects(
+    key: TaskKey,
+    options: { reason?: string; now?: string } | undefined,
+    event: TaskEvent,
+    effects: OutboxEffect[],
+  ): Promise<StoreResult<AiTask>>;
 }

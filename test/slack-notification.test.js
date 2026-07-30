@@ -492,14 +492,21 @@ describe('phase-runner integration — Slack notification on ready_for_human', (
     expect(pending.filter((e) => e.topic === 'slack:notification')).toHaveLength(0);
   });
 
-  test('Slack enqueue failure does not corrupt task state', async () => {
-    // Use a broken outbox store that throws on enqueue
+  test('a broken outboxStore no longer blocks or drops the transactional outbox write (issue #701)', async () => {
+    // Before #701, every effect was written directly through the `outboxStore`
+    // instance passed into runNextPhase, so a throwing sink was silently
+    // swallowed — the task still completed with the notification dropped. Now
+    // the task transition and every outbox effect commit atomically through
+    // the task store's own SQLite connection (completePhaseWithEffects), so a
+    // broken `outboxStore` object passed in has no bearing on the actual
+    // write: it is never called to perform it.
     const brokenOutbox = {
-      enqueue: async (input) => {
-        if (input.topic === 'slack:notification') throw new Error('injected outbox failure');
-        return outboxStore.enqueue(input);
+      enqueue: async () => {
+        throw new Error('injected outbox failure');
       },
-      replacePendingPrSummary: (input, key) => outboxStore.replacePendingPrSummary(input, key),
+      replacePendingPrSummary: async () => {
+        throw new Error('injected outbox failure');
+      },
       listPending: (limit) => outboxStore.listPending(limit),
       markSent: (id, sentAt) => outboxStore.markSent(id, sentAt),
     };
@@ -516,10 +523,15 @@ describe('phase-runner integration — Slack notification on ready_for_human', (
       now: NOW,
     });
 
-    // Task still transitions to ready_for_human even though the Slack enqueue failed
     expect(outcome.status).toBe('completed');
-    const task = outcome.task;
-    expect(task.status).toBe('ready_for_human');
+    expect(outcome.task.status).toBe('ready_for_human');
+
+    // The Slack notification was actually enqueued — via taskStore's own SQLite
+    // connection, not the broken outboxStore's enqueue() — so a real
+    // SqliteOutboxStore opened on the same dbPath sees it.
+    const pending = await outboxStore.listPending();
+    const slack = pending.find((e) => e.topic === 'slack:notification');
+    expect(slack).toBeDefined();
   });
 
   test('conflict_resolution failed → failed status → Slack entry enqueued (slack configured)', async () => {

@@ -159,7 +159,7 @@ export class AiCliLoop implements INodeType {
         name: 'supportedPhases',
         type: 'string',
         required: true,
-        default: 'implementation,review,conflict_resolution,research',
+        default: 'implementation,review,conflict_resolution,research,content_research,content_draft,content_review',
         displayOptions: {
           show: {
             operation: ['githubIntake', 'runOnePhase'],

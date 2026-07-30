@@ -5,8 +5,9 @@ import type { PhaseHandler, PhaseHandlerContext, PhaseHandlerResult } from "../c
 import { defaultCommandRunner } from "./command-runner.js";
 import type { CommandRunner } from "./command-runner.js";
 import { classifyReviewOutput, BLOCKING_PATTERNS } from "../core/review-classifier.js";
-import { classifyQuotaExhaustion } from "../core/quota-classifier.js";
-import { runArtifactDir, writeAssignmentFailureArtifact } from "./artifact-dir.js";
+import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory } from "../core/quota-classifier.js";
+import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
+import { runArtifactDir, writeAssignmentFailureArtifact, ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "./artifact-dir.js";
 import { agentForPhase, readResolvedAssignment } from "../core/assignment.js";
 import { resolvePrContext, branchName } from "./pr-helpers.js";
 import { ghRunnerFromCommandRunner } from "../providers/github/gh-runner.js";
@@ -17,8 +18,10 @@ import { extractIssueVerificationCommands } from "./issue-verification-extractor
 import { clearPrepareSentinel, ensureEnvironmentPrepared } from "./environment-prepare.js";
 import { labelsToReviewStrength, type ReviewStrength } from "../core/github-intake.js";
 import type { CodexConfig } from "../core/session.js";
-import { resolveCodexContextMode, providerForAgent } from "./codex-context-mode.js";
-import { resolveIssueWorktree, removeWorktree, IssueWorktreeLock, issueLockScope } from "./worktree.js";
+import { resolveCodexContextMode, resolveCodexModel, providerForAgent } from "./codex-context-mode.js";
+import { resolveIssueWorktree, removeWorktree, IssueWorktreeLock, issueLockScope, canonicalizePath, isPathInside } from "./worktree.js";
+import { resolveWorktreeRoot, issueWorktreePath } from "../core/worktree-paths.js";
+import { checkReviewAdmission } from "./review-admission.js";
 import { type DiffClassification, classifyDiffFromUnified } from "../core/review-diff-context.js";
 
 // ---------------------------------------------------------------------------
@@ -33,16 +36,19 @@ export interface ResolvedReviewProfile {
   argv: string[];
   /**
    * Source of the model selection.
-   * `cli-default` — Codex (model resolved by the Codex CLI, not reported here).
-   * `env` | `label` | `default` — Claude (model explicitly selected by this handler).
+   * `cli-default` — Codex, unset (compatibility mode: the Codex CLI's own
+   *   config/default selects the model; not explicitly passed by this handler).
+   * `session-config` — Codex, resolved from `session.codex.model`.
+   * `env` — Codex (`CODEX_MODEL`) or Claude (`CLAUDE_MODEL`).
+   * `label` | `default` — Claude (model explicitly selected by this handler).
    */
-  modelSource: "cli-default" | "env" | "label" | "default";
-  /** Claude only: resolved model name. */
+  modelSource: "cli-default" | "session-config" | "env" | "label" | "default";
+  /** Resolved model name — the literal "cli-default" for Codex compatibility mode. */
   model?: string;
-  /** Claude only: resolved effort tier. */
+  /** Resolved effort/reasoning-strength tier passed to the agent. */
   effort?: string;
-  /** Claude only: source of the effort selection. */
-  effortSource?: "env" | "label" | "default";
+  /** Source of the effort selection. */
+  effortSource?: "env" | "label" | "complexity" | "default";
   reviewStrength: ReviewStrength;
   reviewStrengthSource: "label" | "complexity" | "default";
   /**
@@ -101,6 +107,36 @@ function resolveClaudeReviewProfile(
   return { cmd: "claude", baseArgs: argv, resolvedProfile };
 }
 
+// Resolve the explicit Codex `model_reasoning_effort` level for the review lane.
+// `CODEX_EFFORT` (when set) wins outright, mirroring the implementation lane's
+// `CODEX_EFFORT` precedence. Otherwise the resolved `reviewStrength` maps to an
+// explicit level for ALL three cases — this is the issue #609 fix: previously
+// the "default" tier (both a genuine `review:medium` label and the no-label
+// case) passed no `-c model_reasoning_effort` flag at all, silently inheriting
+// whatever the operator's global Codex CLI config happened to default to.
+// A "default" tier now resolves deterministically:
+//   - an explicit `review:medium` label -> "medium" (the label's own request)
+//   - no relevant label (or an unrecognized one, e.g. `review:xhigh` alone)
+//     -> "high", mirroring Claude's own review default
+//     (`resolveClaudeReviewProfile` below: `reviewStrengthSource === "label" ?
+//     "medium" : "high"`), so an unlabeled review is not left to chance either.
+function resolveCodexReviewEffort(
+  reviewStrength: ReviewStrength,
+  reviewStrengthSource: "label" | "complexity" | "default",
+  env: NodeJS.ProcessEnv = process.env,
+): { effort: "low" | "medium" | "high"; source: "env" | "label" | "complexity" | "default" } {
+  const envEffort = env["CODEX_EFFORT"];
+  if (envEffort) {
+    const level = envEffort === "low" ? "low" : envEffort === "medium" ? "medium" : "high";
+    return { effort: level, source: "env" };
+  }
+  if (reviewStrength === "high") return { effort: "high", source: reviewStrengthSource };
+  if (reviewStrength === "low") return { effort: "low", source: reviewStrengthSource };
+  return reviewStrengthSource === "label"
+    ? { effort: "medium", source: "label" }
+    : { effort: "high", source: reviewStrengthSource };
+}
+
 function reviewCommand(
   agentId: string | undefined,
   baseBranch: string,
@@ -117,26 +153,33 @@ function reviewCommand(
     if (ctxMode.status === "error") {
       return { error: ctxMode.error };
     }
-    // `--profile` is a GLOBAL Codex option, not a `codex review` option, so it
-    // must precede the `review` subcommand (`codex --profile ctx review …`).
-    // Splicing it after `review` makes Codex fail argument parsing before the
+    // Resolved BEFORE argv so --model (a global Codex option, issue #609) can be
+    // spliced ahead of the `review` subcommand, same positioning rule as --profile.
+    const modelResolution = resolveCodexModel(codex);
+    const codexEffort = resolveCodexReviewEffort(reviewStrength, reviewStrengthSource);
+    // `--profile`/`--model` are GLOBAL Codex options, not `codex review` options,
+    // so they must precede the `review` subcommand (`codex --model x review …`).
+    // Splicing them after `review` makes Codex fail argument parsing before the
     // review starts. The `-c` overrides are accepted after the subcommand and
     // stay there alongside the effort `-c` (issue #376 review follow-up).
     const argv: string[] = [];
+    if (modelResolution.source !== "unset") {
+      argv.push("--model", modelResolution.model);
+    }
     if (ctxMode.status === "enabled" && ctxMode.profile) {
       argv.push("--profile", ctxMode.profile);
     }
     argv.push("review", "--base", baseBranch);
-    if (reviewStrength === "high") {
-      argv.push("-c", "model_reasoning_effort=high");
-    } else if (reviewStrength === "low") {
-      argv.push("-c", "model_reasoning_effort=low");
-    }
+    argv.push("-c", `model_reasoning_effort=${codexEffort.effort}`);
     if (ctxMode.status === "enabled") {
       for (const entry of ctxMode.config) argv.push("-c", entry);
     }
     const resolvedProfile: ResolvedReviewProfile = {
-      phase: "review", agentId: agent, cmd: "codex", argv, modelSource: "cli-default",
+      phase: "review", agentId: agent, cmd: "codex", argv,
+      model: modelResolution.model,
+      modelSource: modelResolution.source === "unset" ? "cli-default" : modelResolution.source,
+      effort: codexEffort.effort,
+      effortSource: codexEffort.source,
       reviewStrength, reviewStrengthSource,
       provider: providerForAgent("codex"),
       contextMode: ctxMode.status === "enabled" ? "enabled" : "unset",
@@ -184,27 +227,41 @@ function reviewCommand(
 }
 
 // ---------------------------------------------------------------------------
-// Review base
+// Review base vs. PR merge base (issue #667)
 //
-// Every PR — dependency-started or not — targets the session base branch
-// (`main` by default), so the review always diffs against the session base
-// (issue #242). A dependency-started PR's branch was created from the blocker
-// PR head, so its diff against `main` may also contain the blocker's changes;
-// that is expected and acceptable.
+// Two distinct concepts, kept separate on purpose:
 //
-// One safety exception: a PR created under the PRIOR stacked-base flow may still
-// actually target the blocker branch on GitHub. When `dependencyBase` metadata
-// is present, the handler therefore queries the live `baseRefName` (Step 0) and
-// blocks for a human if the PR does not yet target the session base, rather than
-// reviewing it against `main` and marking it ready while it would still merge
-// into the blocker branch.
+//   PR merge base   — every PR, dependency-started or not, targets the session
+//                      base branch (`main` by default; issue #228/#242). Step 0
+//                      below confirms the PR's live `baseRefName` actually is
+//                      the session base, blocking for a human on a PR still
+//                      targeting the blocker branch (the #216/#217 trap).
+//
+//   Review diff base — for a plain task this is also the session base. But a
+//                      dependency-started task's branch was created FROM the
+//                      blocker PR head (issue #208), which is typically not
+//                      yet merged into the session base — so diffing against
+//                      the session base would review the whole cumulative
+//                      stack (every predecessor's changes plus this issue's)
+//                      as if it all belonged to this issue. The diff base for
+//                      a dependency-started task is instead the exact
+//                      predecessor commit (`dependencyBase.baseHeadSha`)
+//                      implementation recorded when it created the branch —
+//                      never inferred from a live `blockedBy` relation, which
+//                      can close or change by review time. Missing or
+//                      non-ancestor metadata fails the review closed rather
+//                      than silently falling back to the cumulative diff.
+//
+// One PR review therefore diffs `<predecessor-head>...HEAD` while still
+// targeting `<session-base>` for merge — see `reviewBase` / `dependencyBase`
+// below and Step 3.4's ancestry guard.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Review loop cap helpers
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MAX_REVIEW_CYCLES = 5;
+const DEFAULT_MAX_REVIEW_CYCLES = 10;
 
 // Maximum number of review→conflict_resolution→review cycles before escalating
 // to human (issue #540). A separate cap from the conflict-resolution attempt cap
@@ -516,11 +573,12 @@ function conflictReviewLoopState(
 //   2. git checkout <baseBranch> && git pull --ff-only
 //   3. gh pr checkout <PR number or branch> — check out PR branch
 //   4. Run each session.verification command — fail if any fails
-//   5. codex review --base <session.baseBranch> --title "<issue/task review brief>"
-//      The review always diffs against the session base branch (`main`), since
-//      every PR targets it (issue #242); the brief carries the issue requirements
-//      + acceptance criteria so the reviewer checks requirement fit, not only
-//      generic code quality.
+//   5. codex review --base <reviewBase> --title "<issue/task review brief>"
+//      `reviewBase` is the session base branch (`main`) for a plain task, or the
+//      recorded predecessor head for a dependency-started task (issue #667) — the
+//      PR itself still targets the session base (issue #242). The brief carries
+//      the issue requirements + acceptance criteria so the reviewer checks
+//      requirement fit, not only generic code quality.
 //   6. Write artifacts, return success -> ready_for_human
 // ---------------------------------------------------------------------------
 
@@ -530,9 +588,9 @@ export function createReviewHandler(
   // Injectable so the per-issue worktree materialization (issue #456) can be
   // stubbed in tests, mirroring the implementation handler's resolveWorktree seam.
   resolveWorktree: typeof resolveIssueWorktree = resolveIssueWorktree,
-  // Issue-scoped advisory lock that serializes one issue's worktree execution. Only
-  // used in worktree mode. Injectable so tests point it at a temp lock dir; in
-  // production it defaults to the managed lock dir `admin doctor` already inspects.
+  // Issue-scoped advisory lock that serializes one issue's worktree execution.
+  // Injectable so tests point it at a temp lock dir; in production it defaults to
+  // the managed lock dir `admin doctor` already inspects.
   issueLock?: IssueWorktreeLock,
   // Injectable repo-host resolver so tests can exercise a non-GitHub (e.g. Gitea)
   // provider — whose PR reads go over a synchronous HTTP client that cannot be
@@ -551,9 +609,46 @@ export function createReviewHandler(
     const { session, runId } = context;
     const maxCycles = session.reviewLoop?.maxCycles ?? DEFAULT_MAX_REVIEW_CYCLES;
     const artifactDir = runArtifactDir(session.artifactRoot, runId);
-    // `cwd` is the canonical checkout until a worktree-enabled review materializes
-    // the per-issue worktree below and runs there instead (issue #456).
+    // `cwd` starts at the canonical checkout (`session.repoRoot`); the worktree
+    // setup below always materializes the per-issue worktree and switches `cwd`
+    // to run there instead (issue #456).
     let cwd = session.repoRoot;
+
+    // issue #681: a single review-admission preflight gates entry into this
+    // handler before any side effect — repo-host resolve, worktree lock or
+    // materialization, artifact writes, or the review agent invocation. It
+    // requires durable evidence (computable from `task.context` alone) that
+    // the task is actually ready for review: no unresolved implementation
+    // Tool Request (issue #677 — a live handoff is authoritative over
+    // whatever queued this review run, e.g. a mistaken `admin recover` or a
+    // stale/conflicting GitHub review label), a durable PR reference with a
+    // resolvable head, and — for a dependency-started task — the predecessor
+    // review-base metadata (issue #667). In production this SAME check also
+    // runs as `runNextPhase`'s `admitPhase` hook (wired in run-one-phase.ts),
+    // BEFORE the issue lock is taken or the worktree is resolved, so a
+    // rejection there never reaches this handler and never touches the lock,
+    // worktree, or Tool Request context. The copy here is a defense-in-depth
+    // backstop for a caller that invokes this handler function directly
+    // (bypassing the runner's admission gate, e.g. a test or an alternate
+    // wiring) — a `failed`/`blocked` result at this point still cannot
+    // overwrite the real `ready_for_human`/`implementation` handoff row since
+    // nothing has been resolved, locked, checked out, or written yet. See
+    // `review-admission.ts`.
+    const admission = checkReviewAdmission(task);
+    if (!admission.ok) {
+      if (admission.result === "failed") {
+        return {
+          result: "failed",
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true },
+          error: admission.error,
+        };
+      }
+      return {
+        result: "blocked",
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true },
+        message: admission.message,
+      };
+    }
 
     const agentId = agentForPhase(task, session, "review");
     const baseBranch = session.baseBranch ?? "main";
@@ -591,66 +686,90 @@ export function createReviewHandler(
     } catch (err) {
       return {
         result: "failed",
-        context: { artifactDir, prUrl, branch },
+        context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch },
         error: `Failed to resolve repo-host provider: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
-    // Issue #456: per-issue worktree review. When the session enables worktrees the
-    // review runs INSIDE the issue worktree (materialized below) instead of the
-    // canonical checkout, so it never collides with the held `ai/issue-<n>` branch and
-    // concurrent reviews for different issues never mutate the shared canonical
-    // checkout. A worktree-only session never advances the worktree's local `main`, so
-    // a worktree review diffs against the freshly-fetched `origin/<base>` — matching
-    // the `git pull` the canonical path runs in Step 2.
-    const worktreeMode = session.worktrees?.enabled === true;
-    // The review always diffs against the session base branch (`main`): every PR
-    // targets it, including a dependency-started PR whose branch was created from
-    // a blocker head (issue #242). For dependency-started PRs, Step 0 below first
-    // confirms the PR's live base actually is the session base before reviewing.
-    const reviewBase = worktreeMode ? `origin/${baseBranch}` : baseBranch;
+    // Issue #456: per-issue worktree review. The review always runs INSIDE the issue
+    // worktree (materialized below) instead of the canonical checkout, so it never
+    // collides with the held `ai/issue-<n>` branch and concurrent reviews for
+    // different issues never mutate the shared canonical checkout. A worktree
+    // session never advances the worktree's local `main`, so a worktree review
+    // diffs against the freshly-fetched `origin/<base>`.
+    // The PR itself always targets the session base branch (`main`), including a
+    // dependency-started PR whose branch was created from a blocker head (issue
+    // #242); Step 0 below confirms the PR's live base actually is the session base
+    // before reviewing. But the REVIEW DIFF BASE is a separate concept (issue #667):
+    // a dependency-started branch was built on top of the blocker PR head, which is
+    // typically not yet merged into the session base, so diffing against the session
+    // base would review the whole cumulative stack (predecessor + current issue) as
+    // if it were all this issue's change. Resolve the diff base from the durable
+    // `dependencyBase.baseHeadSha` metadata the implementation phase recorded when it
+    // created the branch (issue #667) — never from a live `blockedBy` relation, which
+    // can close or change by review time — so the diff is `<predecessor-head>...HEAD`
+    // for a dependency-started task and `<session-base>...HEAD` otherwise.
+    // The review-admission preflight (issue #681) already parsed and validated
+    // `context.dependencyBase` before any side effect ran — a dependency-started
+    // task with no durable `baseHeadSha` never reaches this point (it fails
+    // closed in `checkReviewAdmission` above). Reuse its result instead of
+    // re-parsing.
+    const dependencyReviewBaseSha = admission.dependencyReviewBase?.sha;
+    const dependencyReviewBaseRefName = admission.dependencyReviewBase?.refName;
+    const reviewBase = dependencyReviewBaseSha ?? `origin/${baseBranch}`;
     const { strength: reviewStrength, source: reviewStrengthSource } = labelsToReviewStrength(taskLabels);
     const cmdSpec = reviewCommand(agentId, reviewBase, reviewStrength, reviewStrengthSource, session.codex);
     if ("error" in cmdSpec) {
-      writeAssignmentFailureArtifact(artifactDir, {
-        phase: "review", agentId, sessionId: task.sessionId, issueNumber: task.issueNumber, runId, error: cmdSpec.error,
-      });
-      return { result: "failed", error: cmdSpec.error, context: { artifactDir, assignmentError: { phase: "review", agent: agentId ?? null } } };
+      // Skip the artifact write when it would land INSIDE the not-yet-materialized
+      // issue worktree (issue #729 review, P2 — mirrors the implementation handler's
+      // issue #732 fix). `writeAssignmentFailureArtifact` `mkdirSync(artifactDir, {
+      // recursive: true })`s eagerly, and this check runs before the worktree setup
+      // below materializes it. When `session.artifactRoot` is configured inside that
+      // future worktree path (issue #629), the eager mkdir would leave a non-empty
+      // directory tree at the target `git worktree add` requires empty — so a later
+      // run, after the operator fixes the agent assignment, would fail to materialize
+      // the worktree at all. Computing the future worktree path is pure (no git side
+      // effect), so this check is safe to run before materialization; a
+      // root-resolution failure here just means materialization would have failed
+      // closed on the same error anyway, so fall back to the normal write.
+      let artifactDirInsideFutureWorktree = false;
+      try {
+        const futureWorktreeRoot = resolveWorktreeRoot({ sessionRoot: session.worktrees?.root });
+        const futureWorktreePath = canonicalizePath(
+          issueWorktreePath(futureWorktreeRoot, task.sessionId, task.issueNumber),
+        );
+        artifactDirInsideFutureWorktree = isPathInside(canonicalizePath(artifactDir), futureWorktreePath);
+      } catch {
+        artifactDirInsideFutureWorktree = false;
+      }
+      if (!artifactDirInsideFutureWorktree) {
+        writeAssignmentFailureArtifact(artifactDir, {
+          phase: "review", agentId, sessionId: task.sessionId, issueNumber: task.issueNumber, runId, error: cmdSpec.error,
+        });
+      }
+      return {
+        result: "failed",
+        error: cmdSpec.error,
+        context: {
+          artifactDir,
+          [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true,
+          assignmentError: { phase: "review", agent: agentId ?? null },
+        },
+      };
     }
     const resolvedProfile = cmdSpec.resolvedProfile;
 
-    try {
-      mkdirSync(artifactDir, { recursive: true });
-    } catch (err) {
-      return {
-        result: "failed",
-        context: { resolvedProfile },
-        error: `Failed to create artifact dir: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-
-    const title = typeof ctx.title === "string" ? ctx.title : `Issue #${task.issueNumber}`;
-
-    // Write context snapshot before agent invocation so interrupted runs retain audit metadata.
-    // Include the full persisted assignment (flow, source, resolvedAt, all phase
-    // agents) so the run dir is self-describing, not just the per-phase resolvedProfile.
-    const assignment = readResolvedAssignment(task);
-    writeFileSync(
-      join(artifactDir, "review-context.json"),
-      JSON.stringify({ issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId, prUrl, branch, title, resolvedProfile, ...(assignment ? { assignment } : {}) }, null, 2),
-      "utf8",
-    );
-
-    // The issue-scoped worktree lock is held across the whole review in worktree mode
-    // and released in the `finally` below — on every return path AND on a thrown
-    // writeFileSync — so the next phase for this issue is never blocked by a leaked
-    // lock (the lock store's stale window is 24h, so a leak is not self-healing in
-    // any practical time). `releaseLock` stays undefined when worktrees are disabled,
-    // so the canonical path is unchanged (issue #456).
+    // The issue-scoped worktree lock is held across the whole review and released in
+    // the `finally` below — on every return path AND on a thrown writeFileSync — so
+    // the next phase for this issue is never blocked by a leaked lock (the lock
+    // store's stale window is 24h, so a leak is not self-healing in any practical
+    // time). `releaseLock` stays undefined when `phaseLockOwnerId` is set — the phase
+    // runner already acquired the lock and owns releasing it (issue #515) — otherwise
+    // this handler acquires and releases it itself (issue #456).
     let releaseLock: (() => void) | undefined;
     const reviewLockScope = issueLockScope(task.sessionId, task.issueNumber);
 
-    // Path of the materialized per-issue review worktree (worktree mode only).
-    // Set when the worktree is created below; consumed by the conflict handoff.
+    // Path of the materialized per-issue review worktree. Set when the worktree is
+    // created below; consumed by the conflict handoff.
     let worktreePath: string | undefined;
 
     // True when the review worktree was materialized on the SYNTHETIC `ai/pr-<n>`
@@ -670,8 +789,8 @@ export function createReviewHandler(
     // back to — they refuse forked heads outright. So a forked PR whose review yields
     // a blocking outcome (`needs_fix` / `conflict`) must be handed to a human rather
     // than auto-queued into a downstream phase that would deterministically fail
-    // (issue #459 review, P2). Set only in worktree mode (where the synthetic
-    // `ai/pr-<n>` path enables forked-PR review); the canonical path is unchanged.
+    // (issue #459 review, P2). Set when the synthetic `ai/pr-<n>` path resolves the
+    // worktree onto a forked (cross-repository) PR head.
     let prIsCrossRepository = false;
 
     // Free the per-issue review worktree so the held PR branch is released for a
@@ -688,14 +807,55 @@ export function createReviewHandler(
     // work is safe on origin). Returns the path + error on failure (worktree left in
     // place) so the caller can escalate to a human instead of queuing a doomed phase.
     // The advisory lock is released independently in the `finally`.
-    const freeReviewWorktree = (): { ok: true } | { ok: false; error: string; path: string } => {
-      if (!worktreeMode || worktreePath === undefined) return { ok: true };
+    //
+    // The `retained: true` outcome (issue #729 review, P1) is DISTINCT from `ok:
+    // true`: the worktree was intentionally left in place (holding the PR branch)
+    // rather than actually freed, so callers must treat it like a failure to free —
+    // NOT like a successful release — or they would queue a downstream phase
+    // (`conflict_resolution`, or an implementation fix onto the real PR head) onto a
+    // branch this worktree still holds, which fails immediately.
+    const freeReviewWorktree = ():
+      | { ok: true }
+      | { ok: false; retained: true; path: string }
+      | { ok: false; retained?: false; error: string; path: string } => {
+      if (worktreePath === undefined) return { ok: true };
       const path = worktreePath;
+      // `session.artifactRoot` may be configured to live INSIDE the managed issue
+      // worktree (issue #729 review, P1 — mirrors the implementation handler's issue
+      // #732 fix). Force-removing the worktree in that configuration would delete the
+      // artifact tree this run is about to report as `artifactDir` before the caller
+      // returns it, and there is no relocation target that is both durable AND still
+      // under `artifactRoot` (its own directory lives inside the tree being removed).
+      // Leave the worktree — and its branch — exactly where they already are instead
+      // of freeing it. A downstream `conflict_resolution` resolves its own worktree via
+      // the same `resolveIssueWorktree`, which tolerates reusing an existing worktree
+      // still on the expected (same) branch, so that path is unaffected. A synthetic
+      // `ai/pr-<n>` review's `needs_fix` handoff resolves the fix worktree on a
+      // DIFFERENT branch (the PR's real head), so retaining this worktree there instead
+      // fails that fix phase closed on the branch mismatch rather than losing artifacts —
+      // preserving durable state takes priority over that narrower case re-materializing
+      // cleanly. Report this as `retained`, not `ok: true` — the branch is still held
+      // here, so the caller must escalate to a human instead of queuing the doomed
+      // downstream phase (issue #729 review, P1).
+      if (isPathInside(canonicalizePath(session.artifactRoot), canonicalizePath(path))) {
+        return { ok: false, retained: true, path };
+      }
       const freed = removeWorktree(session.repoRoot, path, { force: true, runner });
       if (!freed.ok) return { ok: false, error: freed.error, path };
       worktreePath = undefined;
       return { ok: true };
     };
+    // Render a human-actionable message for a `freeReviewWorktree` failure —
+    // whether the worktree was `retained` (artifactRoot lives inside it) or removal
+    // genuinely `error`ed — for a given downstream-phase description (issue #729
+    // review, P1).
+    const describeWorktreeFreeFailure = (
+      freed: { ok: false; retained?: boolean; error?: string; path: string },
+      downstreamPhaseDetail: string,
+    ): string =>
+      freed.retained
+        ? `the review worktree at ${freed.path} could not be freed because \`artifactRoot\` is configured inside it, leaving the PR branch checked out there. ${downstreamPhaseDetail} Preserving the worktree's artifacts takes priority over releasing the branch, so escalating to human instead of queuing a phase that would immediately fail. Relocate \`artifactRoot\` outside the managed worktree, or manually copy out the artifacts and remove the worktree (e.g. \`git worktree remove --force ${freed.path}\`), before retrying.`
+        : `freeing the issue worktree at ${freed.path} failed, leaving the PR branch checked out there: ${freed.error}. ${downstreamPhaseDetail} Escalating to human instead of queuing a phase that would immediately fail. Remove the worktree manually (e.g. \`git worktree remove --force ${freed.path}\`) before retrying.`;
 
     // Before any `needs_fix` handoff, remove a SYNTHETIC `ai/pr-<n>` review worktree
     // (issue #459 review, P2). The implementation fix phase resolves the worktree on the
@@ -705,7 +865,7 @@ export function createReviewHandler(
     // on the real head. Returns a `blocked` result (escalate to human) when the synthetic
     // worktree exists but cannot be removed, else `undefined` so the caller proceeds with
     // its `needs_fix` return. A no-op for non-synthetic reviews (their fix phase reuses the
-    // worktree on the same branch) and when worktrees are disabled.
+    // worktree on the same branch).
     const releaseSyntheticWorktreeForFix = (
       extraContext: Record<string, unknown>,
     ): PhaseHandlerResult | undefined => {
@@ -716,7 +876,7 @@ export function createReviewHandler(
       return {
         result: "blocked",
         context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope, ...extraContext },
-        message: `Review requires fixes, but freeing the synthetic \`ai/pr-${prNum ?? "<n>"}\` review worktree at ${freed.path} failed, leaving it checked out on \`ai/pr-<n>\`: ${freed.error}. The implementation fix phase resolves the worktree on the PR's real head and Git refuses a path already checked out on another branch, so escalating to human instead of queuing a fix that would immediately fail. Remove the worktree manually (e.g. \`git worktree remove --force ${freed.path}\`) before retrying.`,
+        message: `Review requires fixes, but ${describeWorktreeFreeFailure(freed, `The implementation fix phase resolves the worktree on the PR's real head and Git refuses a path already checked out on another branch (currently \`ai/pr-${prNum ?? "<n>"}\`).`)}`,
       };
     };
     // Release a SYNTHETIC `ai/pr-<n>` review worktree before an EARLY terminal human
@@ -729,7 +889,7 @@ export function createReviewHandler(
     // branch. Release it here so the fix phase re-materializes cleanly. When removal
     // itself fails, append that to the human message rather than swallowing the leftover.
     // A no-op for non-synthetic reviews (their fix phase reuses the worktree on the same
-    // branch) and when worktrees are disabled.
+    // branch).
     const withSyntheticWorktreeReleased = (
       blocked: Exclude<PhaseHandlerResult, { result: "failed" }>,
     ): PhaseHandlerResult => {
@@ -762,7 +922,7 @@ export function createReviewHandler(
       const priorMessage = "message" in blocked && blocked.message ? blocked.message : "";
       return {
         ...blocked,
-        message: `${priorMessage} Additionally, freeing the synthetic \`ai/pr-${prNum ?? "<n>"}\` review worktree at ${freed.path} failed: ${freed.error}. A later human-requested implementation fix resolves the worktree on the PR's real head and Git refuses a path already checked out on another branch, so remove it manually (e.g. \`git worktree remove --force ${freed.path}\`) before returning this task to implementation.`.trim(),
+        message: `${priorMessage} Additionally, ${describeWorktreeFreeFailure(freed, `A later human-requested implementation fix resolves the worktree on the PR's real head and Git refuses a path already checked out on another branch (currently \`ai/pr-${prNum ?? "<n>"}\`).`)}`.trim(),
       };
     };
 
@@ -776,9 +936,7 @@ export function createReviewHandler(
     // else `undefined` so same-repository PRs keep their auto-queue lanes. The review
     // worktree is already freed by the caller (`releaseSyntheticWorktreeForFix` for
     // `needs_fix`, `freeReviewWorktree` for `conflict`) before this handoff, matching
-    // the other terminal human handoffs. A no-op when worktrees are disabled (the flag
-    // stays false on the canonical path, which reviews forked heads via `gh pr
-    // checkout` and is out of scope here).
+    // the other terminal human handoffs.
     const forkedPrHandoff = (
       intended: "needs_fix" | "conflict",
       context: Record<string, unknown>,
@@ -798,17 +956,28 @@ export function createReviewHandler(
         message: `Review of forked PR #${prNum ?? "<n>"} found ${blocker}, but the automated ${phase} phase cannot push to the contributor's fork (forked heads are refused there). Escalating to a human to relay the review feedback to the contributor instead of queuing a phase that would deterministically fail.`,
       };
     };
+
+    // Assigned once the worktree is materialized below, alongside the `artifactDir`
+    // mkdir + review-context.json write (issue #729 review, P1) — declared here so
+    // the review-brief/prompt code further below (which runs after this whole setup
+    // block completes) can still read `title` though it is scoped inside the bare
+    // block that materializes the worktree. Every path that skips the assignment
+    // returns before reaching that later code, but it is typed as possibly
+    // `undefined` (rather than asserted) since TS cannot prove that across this
+    // function's control flow.
+    let title: string | undefined;
+
     try {
     // ---- Issue #456: per-issue worktree review setup ----------------------------
     // Reviewing from the canonical checkout would (a) collide with the held
     // `ai/issue-<n>` branch on `git checkout` / `gh pr checkout` (Git refuses a
     // branch already checked out in another worktree), and (b) let concurrent reviews
-    // for different issues mutate the shared canonical checkout at the same time. So a
-    // worktree-enabled review serializes on the issue-scoped worktree lock — the same
-    // scope `admin doctor` reports — and runs inside the per-issue worktree, which is
-    // already on the PR head. Different issues use different worktrees + lock scopes,
-    // so a review never touches the canonical checkout and two issues never collide.
-    if (worktreeMode) {
+    // for different issues mutate the shared canonical checkout at the same time. So
+    // review serializes on the issue-scoped worktree lock — the same scope `admin
+    // doctor` reports — and runs inside the per-issue worktree, which is already on
+    // the PR head. Different issues use different worktrees + lock scopes, so a
+    // review never touches the canonical checkout and two issues never collide.
+    {
       if (phaseLockOwnerId === undefined) {
         // No pre-acquired lock: acquire it here and register release for the finally.
         // When phaseLockOwnerId IS set the phase runner holds the lock already (issue
@@ -821,7 +990,7 @@ export function createReviewHandler(
           // the lock contention is visible in the task event + lock diagnostics.
           return {
             result: "blocked",
-            context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope, reviewLockHeldBy: acquired.ownerContextId },
+            context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope, reviewLockHeldBy: acquired.ownerContextId },
             message: `Issue #${task.issueNumber} review skipped: worktree lock '${reviewLockScope}' is held by ${acquired.ownerContextId} (since ${acquired.ownerStartedAt}) — another execution owns this issue's worktree. Escalating to human.`,
           };
         }
@@ -831,23 +1000,24 @@ export function createReviewHandler(
       // Pick the branch the worktree must check out (issue #456 review, P2). A
       // recorded `branch` is authoritative. Otherwise, when only a `prUrl` is
       // recorded, the PR head may be NON-conventional (an externally-created PR whose
-      // head is not `ai/issue-<n>`). The canonical path below supports this input by
-      // checking out the PR number, so the worktree path must materialize the SAME
-      // head — assuming the convention would fetch a nonexistent `ai/issue-<n>` branch
-      // or review the wrong one. Resolve the live head from the PR metadata (number
-      // preferred over the raw URL so the selector is backend-neutral, matching the
-      // other PR reads here) and fail closed if it cannot be resolved.
+      // head is not `ai/issue-<n>`). `gh pr checkout <number>` would resolve this
+      // input by checking out the PR number, so the worktree path must materialize
+      // the SAME head — assuming the convention would fetch a nonexistent
+      // `ai/issue-<n>` branch or review the wrong one. Resolve the live head from the
+      // PR metadata (number preferred over the raw URL so the selector is
+      // backend-neutral, matching the other PR reads here) and fail closed if it
+      // cannot be resolved.
       // A GitHub worktree review needs a PR selector (recorded `prUrl` or `branch`)
-      // exactly like the canonical `gh` path, which fails `No PR URL or branch` rather
-      // than checking out `ai/issue-<n>` by convention (issue #456 review, P2).
+      // exactly like `gh pr checkout`, which fails `No PR URL or branch` rather than
+      // checking out `ai/issue-<n>` by convention (issue #456 review, P2).
       // Materializing the convention branch here would let a worktree review promote a
       // task to `ready_for_human` with no PR to hand off. Non-GitHub hosts keep the
-      // head-branch convention (matching the canonical non-`gh` path), so this guard is
-      // GitHub-only. Fail closed before touching any branch.
+      // head-branch convention, so this guard is GitHub-only. Fail closed before
+      // touching any branch.
       if (sessionRepoHost.ghRunner && branch === undefined && prUrl === undefined) {
         return {
           result: "failed",
-          context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope },
           error: `No PR URL or branch in task context for issue #${task.issueNumber}; cannot materialize review worktree`,
         };
       }
@@ -897,7 +1067,7 @@ export function createReviewHandler(
         if (!prRead.ok) {
           return {
             result: "failed",
-            context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+            context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope },
             error: `Failed to resolve PR head for issue #${task.issueNumber} from ${prUrl} (selector ${prSelector}) to materialize the review worktree: ${prRead.error}`,
           };
         }
@@ -907,14 +1077,14 @@ export function createReviewHandler(
       // Validate a branch-only GitHub selector has an OPEN PR before materializing the
       // worktree (issue #447 review, P2). With a recorded `branch` but no `prUrl` there is
       // no PR number to resolve, so `validateRecordedBranch` above is false and GitHub is
-      // never consulted — the path just fetches `origin/<branch>` and reviews it. The
-      // canonical path instead runs `gh pr checkout <branch>`, which FAILS when the branch
-      // is stale or has no open PR, so a review never runs against a branch with no PR to
-      // hand off. Without this check a stale branch would review green and promote the task
+      // never consulted — the path just fetches `origin/<branch>` and reviews it.
+      // `gh pr checkout <branch>` instead FAILS when the branch is stale or has no
+      // open PR, so a review never runs against a branch with no PR to hand off.
+      // Without this check a stale branch would review green and promote the task
       // to human handoff with NO open PR. So ask the provider (backend-neutral
       // `getPullRequest`, `gh pr view <branch>` here) whether the recorded branch still has
       // an OPEN PR, and fail closed when the read fails (no PR for the branch) or the PR is
-      // closed/merged — matching the canonical checkout's failure mode. State is compared
+      // closed/merged — matching `gh pr checkout`'s failure mode. State is compared
       // leniently (treat absent as open) exactly like the recorded-PR fix guard. GitHub-only:
       // non-`gh` hosts keep the head-branch convention and have no branch-checkout gate to mirror.
       if (sessionRepoHost.ghRunner && branch !== undefined && prUrl === undefined) {
@@ -922,14 +1092,14 @@ export function createReviewHandler(
         if (!branchPrRead.ok) {
           return {
             result: "failed",
-            context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+            context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope },
             error: `No open PR found for branch '${branch}' (issue #${task.issueNumber}) to materialize the review worktree: ${branchPrRead.error}`,
           };
         }
         if (branchPrRead.value.state !== undefined && branchPrRead.value.state.toLowerCase() !== "open") {
           return {
             result: "failed",
-            context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+            context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope },
             error: `Recorded branch '${branch}' for issue #${task.issueNumber} has a ${branchPrRead.value.state.toLowerCase()} PR, not an open one; refusing to review a branch with no open PR to hand off.`,
           };
         }
@@ -949,8 +1119,8 @@ export function createReviewHandler(
       // head must still MATCH the PR's `headRefName` to be trusted. A stale or mistyped
       // `branch` would otherwise make the fetch/`rev-parse`/review below operate on that
       // (wrong) origin branch while the result still points at the PR URL — promoting code
-      // that is not actually in the PR (the old canonical path would have checked out the
-      // PR number instead). When the recorded name disagrees with the live head,
+      // that is not actually in the PR (`gh pr checkout <number>` would instead check out
+      // the PR head by number). When the recorded name disagrees with the live head,
       // materialize the PR head by its ref via the synthetic path rather than trusting the
       // recorded name (issue #459 review, P2).
       const recordedBranchMismatch =
@@ -985,7 +1155,7 @@ export function createReviewHandler(
       if (prIsCrossRepository && !usePrHeadRef) {
         return {
           result: "failed",
-          context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope },
           error:
             `Refusing to review issue #${task.issueNumber}${effectivePrNumber !== undefined ? ` on PR #${effectivePrNumber}` : ""} in a worktree: its head is on a fork (a cross-repository PR head lives on the contributor's fork, not origin), so resolving it as the origin branch '${prHeadRefName ?? ""}' would review the base repository's branch instead of the PR head. Carry the PR head repository/remote through before reviewing forked PRs on this host.`,
         };
@@ -1006,10 +1176,10 @@ export function createReviewHandler(
       // by implementation, so fetch it by name as before. But a PR-url-only review may be
       // a PR whose head is NOT a branch on `origin` (a forked PR); `git fetch origin
       // <head>` would fail for it. GitHub publishes every PR head — including forked-PR
-      // heads — under `refs/pull/<n>/head`, which is what `gh pr checkout <n>` fetched on
-      // the canonical path, so fetch by that PR ref whenever the head is GitHub-resolved
-      // from the PR number alone. Non-GitHub hosts (no `gh` runner) resolve the head as
-      // an ordinary origin branch via the convention, so they keep the branch fetch.
+      // heads — under `refs/pull/<n>/head`, which is what `gh pr checkout <n>` fetches, so
+      // fetch by that PR ref whenever the head is GitHub-resolved from the PR number
+      // alone. Non-GitHub hosts (no `gh` runner) resolve the head as an ordinary origin
+      // branch via the convention, so they keep the branch fetch.
       const prHeadFetchSource =
         usePrHeadRef
           ? `pull/${effectivePrNumber}/head`
@@ -1029,11 +1199,10 @@ export function createReviewHandler(
       if (prUrl === undefined && usePrHeadRef && branchOnlyPrUrl !== undefined) {
         prUrl = branchOnlyPrUrl;
       }
-      // Refresh `origin/<base>` so the worktree review diffs against a current base
-      // (the canonical path gets this from its `git pull`; a worktree-only session
-      // never advances local `main`). Fetch runs in the canonical repo whose object
-      // store the worktree shares; it updates a remote-tracking ref only and never
-      // mutates the canonical checkout. Use an explicit
+      // Refresh `origin/<base>` so the worktree review diffs against a current base — a
+      // worktree session never advances local `main`. Fetch runs in the canonical repo
+      // whose object store the worktree shares; it updates a remote-tracking ref only
+      // and never mutates the canonical checkout. Use an explicit
       // `+<base>:refs/remotes/origin/<base>` refspec (issue #457 review, P2): a bare
       // `git fetch origin <base>` only updates `FETCH_HEAD` when the clone's
       // `remote.origin.fetch` does not track `<base>` (e.g. a single-branch clone),
@@ -1043,7 +1212,7 @@ export function createReviewHandler(
       if (fetchBase.exitCode !== 0) {
         return {
           result: "failed",
-          context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope },
           error: `git fetch origin ${baseBranch} (refresh worktree review base) failed (exit ${fetchBase.exitCode}): ${(fetchBase.stderr || fetchBase.stdout).slice(0, 300)}`,
         };
       }
@@ -1062,7 +1231,7 @@ export function createReviewHandler(
         if (fetchPrHead.exitCode !== 0) {
           return {
             result: "failed",
-            context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+            context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope },
             error: `git fetch origin ${prHeadFetchSource} (materialize review worktree from PR head) failed (exit ${fetchPrHead.exitCode}): ${(fetchPrHead.stderr || fetchPrHead.stdout).slice(0, 300)}`,
           };
         }
@@ -1083,7 +1252,7 @@ export function createReviewHandler(
       if (!materialized.ok) {
         return {
           result: "failed",
-          context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, prUrl, branch, resolvedProfile, reviewLockScope },
           error: `Failed to prepare issue #${task.issueNumber} review worktree: ${materialized.error}`,
         };
       }
@@ -1093,6 +1262,44 @@ export function createReviewHandler(
       // downstream `needs_fix` knows to remove it before the fix phase resolves the
       // worktree on the real `headRefName` (issue #459 review, P2).
       worktreeOnSyntheticPrBranch = usePrHeadRef;
+
+      // Create the artifact dir AFTER worktree materialization, not before (issue
+      // #729 review, P1 — mirrors the implementation handler's issue #732 fix): a
+      // session may configure `artifactRoot` to live INSIDE the managed worktree
+      // (issue #629), a path that does not exist until `resolveWorktree` above runs
+      // `git worktree add`. Creating it earlier would pre-populate that path with an
+      // empty directory tree, and `git worktree add` refuses to materialize a
+      // worktree at an already-existing, non-empty target.
+      try {
+        mkdirSync(artifactDir, { recursive: true });
+      } catch (err) {
+        return {
+          result: "failed",
+          context: { resolvedProfile },
+          error: `Failed to create artifact dir: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+
+      title = typeof ctx.title === "string" ? ctx.title : `Issue #${task.issueNumber}`;
+
+      // Write context snapshot before agent invocation so interrupted runs retain audit metadata.
+      // Include the full persisted assignment (flow, source, resolvedAt, all phase
+      // agents) so the run dir is self-describing, not just the per-phase resolvedProfile.
+      const assignment = readResolvedAssignment(task);
+      writeFileSync(
+        join(artifactDir, "review-context.json"),
+        JSON.stringify({
+          issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId, prUrl, branch, title, resolvedProfile,
+          // Operator diagnostics (issue #667): the PR's merge target vs. the diff base
+          // this run actually reviewed against — distinct for a dependency-started task.
+          prMergeBase: baseBranch, reviewDiffBase: reviewBase,
+          ...(dependencyReviewBaseSha !== undefined
+            ? { dependencyReviewBase: { sha: dependencyReviewBaseSha, refName: dependencyReviewBaseRefName } }
+            : {}),
+          ...(assignment ? { assignment } : {}),
+        }, null, 2),
+        "utf8",
+      );
 
       // git worktrees don't inherit gitignored directories from the canonical
       // checkout. Symlink node_modules from the canonical root so npm lifecycle
@@ -1262,96 +1469,37 @@ export function createReviewHandler(
       };
     }
 
-    // Step 2: Reset to base branch. Skipped in worktree mode (issue #456): the
-    // worktree is already checked out on the PR head, `main` is checked out in the
-    // canonical tree so `git checkout main` here would fail (or move the worktree off
-    // the issue branch), and the review base is the freshly-fetched `origin/<base>`
-    // rather than local `main`.
-    const baseResetSteps: [string, ...string[]][] = worktreeMode
-      ? []
-      : [
-          ["git", "checkout", baseBranch],
-          ["git", "pull", "--ff-only"],
-        ];
-    for (const [cmd, ...args] of baseResetSteps) {
-      const r = runner.run(cmd, args, { cwd });
-      if (r.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `${cmd} ${args.join(" ")} failed (exit ${r.exitCode}): ${(r.stderr || r.stdout).slice(0, 300)}`,
-        };
-      }
-    }
+    // Steps 2 and 3 (reset to base branch, checkout PR branch) are not needed: the
+    // per-issue worktree materialized above is already checked out on the PR head,
+    // and the review base is the freshly-fetched `origin/<base>` rather than local
+    // `main` (issue #456).
 
-    // Step 3: Checkout PR branch
-    //
-    // GitHub: prefer `gh pr checkout` by PR number (extracted from URL) or branch
-    // name. `gh pr checkout` accepts <number>, <url>, or <branch> as the selector
-    // (`--branch` is the local branch name to create, NOT the selector, so the
-    // branch name is passed directly). It runs through the resolved `gh` runner so
-    // it authenticates as the GitHub App when configured (else the operator's `gh`
-    // session); the raw `runner` would drop the App token for this operation.
-    //
-    // Non-GitHub (e.g. Gitea): `gh pr checkout` is GitHub-only, but the PR head is
-    // an ordinary branch already pushed to origin, so check it out with plain local
-    // git — checkout is a local git operation regardless of repo host. Use the
-    // head-branch convention (`ai/issue-<n>`) when the task carries no explicit
-    // branch, with an explicit refspec so the ref is fresh and checkoutable even in
-    // a single-branch clone.
-    if (worktreeMode) {
-      // Issue #456: the per-issue worktree is already checked out on the PR head, so
-      // there is no canonical PR checkout to perform — and `gh pr checkout` / `git
-      // checkout` here would collide with the branch the worktree holds. Skip Step 3.
-    } else if (sessionRepoHost.ghRunner) {
-      const prNumber = prUrl ? extractPrNumber(prUrl) : undefined;
-      const checkoutArgs = prNumber
-        ? ["pr", "checkout", prNumber]
-        : branch
-        ? ["pr", "checkout", branch]
-        : null;
-
-      if (!checkoutArgs) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `No PR URL or branch in task context for issue #${task.issueNumber}; cannot checkout review branch`,
-        };
+    // Step 3.4: Validate the dependency review base is an ancestor of HEAD (issue
+    // #667). Runs after the worktree checkout above, so `HEAD` is the actual
+    // reviewed commit. `dependencyReviewBaseSha` was recorded
+    // by implementation when it created this issue's branch; if the predecessor
+    // branch was since force-pushed/rebased, the recorded commit was pruned, or the
+    // checkout never had it, fail closed rather than let `reviewBase` silently fall
+    // back to a `git diff` that errors or — worse — resolves to something else. The
+    // predecessor commit is normally already present locally (it is an ancestor of
+    // the fetched issue branch); the ref fetch below is a fallback for a checkout
+    // that never pulled it in.
+    if (dependencyReviewBaseSha !== undefined) {
+      const haveSha = runner.run("git", ["cat-file", "-e", `${dependencyReviewBaseSha}^{commit}`], { cwd });
+      if (haveSha.exitCode !== 0 && dependencyReviewBaseRefName) {
+        runner.run(
+          "git",
+          ["fetch", "origin", `+${dependencyReviewBaseRefName}:refs/remotes/origin/${dependencyReviewBaseRefName}`],
+          { cwd },
+        );
       }
-
-      const checkoutResult = sessionRepoHost.ghRunner.run(checkoutArgs, { cwd });
-      if (checkoutResult.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `gh ${checkoutArgs.join(" ")} failed (exit ${checkoutResult.exitCode}): ${(checkoutResult.stderr || checkoutResult.stdout).slice(0, 300)}`,
-        };
-      }
-    } else {
-      const headBranch = branch ?? branchName(task.issueNumber);
-      const fetchResult = runner.run(
-        "git",
-        ["fetch", "origin", `+${headBranch}:refs/remotes/origin/${headBranch}`],
-        { cwd },
-      );
-      if (fetchResult.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `git fetch origin ${headBranch} failed (exit ${fetchResult.exitCode}): ${(fetchResult.stderr || fetchResult.stdout).slice(0, 300)}`,
-        };
-      }
-      const checkoutResult = runner.run(
-        "git",
-        ["checkout", "-B", headBranch, `refs/remotes/origin/${headBranch}`],
-        { cwd },
-      );
-      if (checkoutResult.exitCode !== 0) {
-        return {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: `git checkout ${headBranch} failed (exit ${checkoutResult.exitCode}): ${(checkoutResult.stderr || checkoutResult.stdout).slice(0, 300)}`,
-        };
+      const isAncestor = runner.run("git", ["merge-base", "--is-ancestor", dependencyReviewBaseSha, "HEAD"], { cwd });
+      if (isAncestor.exitCode !== 0) {
+        return withSyntheticWorktreeReleased({
+          result: "blocked",
+          context: { artifactDir, prUrl, branch, resolvedProfile, reviewLockScope },
+          message: `Recorded dependency review base ${dependencyReviewBaseSha}${dependencyReviewBaseRefName ? ` (${dependencyReviewBaseRefName})` : ""} for issue #${task.issueNumber} is not an ancestor of HEAD (exit ${isAncestor.exitCode}); the recorded predecessor commit is missing, stale, or unreachable. Refusing to fall back to a cumulative review against ${baseBranch} — escalating to human.`,
+        });
       }
     }
 
@@ -1417,7 +1565,7 @@ export function createReviewHandler(
           // implementation, which resolves the worktree on the PR's real `headRefName` —
           // and `resolveIssueWorktree` refuses the path while it is still checked out on
           // the synthetic branch. Same release as the non-cap fix handoff below; a no-op
-          // for non-synthetic reviews and when worktrees are disabled.
+          // for non-synthetic reviews.
           const syntheticBlocked = releaseSyntheticWorktreeForFix({
             reviewFeedback,
             verificationFeedback,
@@ -1552,7 +1700,7 @@ export function createReviewHandler(
     const postConflictReview = ctx["postConflictReview"] === true;
     const reviewBrief = buildReviewContext({
       issueNumber: task.issueNumber,
-      title,
+      title: title ?? `Issue #${task.issueNumber}`,
       url,
       labels: taskLabels,
       body,
@@ -1677,7 +1825,7 @@ export function createReviewHandler(
       // Quota/rate-limit exhaustion is recoverable on its own (issue #25): the
       // review agent ran out of its usage window, so delay the retry rather than
       // failing the task.
-      const quota = classifyQuotaExhaustion(`${reviewResult.stdout}\n${reviewResult.stderr}`, agentId);
+      const quota = classifyQuotaExhaustion(extractAgentFailureDiagnostic(agentId, reviewResult, { cmdSource: resolvedProfile.cmdSource }));
       writeFileSync(
         join(artifactDir, "review-result.json"),
         JSON.stringify({
@@ -1691,8 +1839,10 @@ export function createReviewHandler(
       if (quota.isQuotaExhaustion) {
         return {
           result: "delayed",
-          context: { artifactDir, reviewOutputPath, resolvedProfile, quotaSignal: quota.signal },
-          message: `Review agent (${agentId}) hit a quota/rate-limit (signal: "${quota.signal}"); delaying retry`,
+          context: { artifactDir, reviewOutputPath, resolvedProfile, quotaSignal: quota.signal, category: quota.category },
+          message: `Review agent (${agentId}) hit a ${describeFailureCategory(quota.category)} condition (signal: "${quota.signal}"); delaying retry`,
+          retryAfterMs: resolveRetryDelayOverrideMsForCategory(quota.category),
+          category: quota.category,
         };
       }
       return {
@@ -1720,6 +1870,8 @@ export function createReviewHandler(
         exitCode: 0,
         success: true,
         artifactDir,
+        prMergeBase: baseBranch,
+        reviewDiffBase: reviewBase,
         ...classification,
       }, null, 2),
       "utf8",
@@ -1746,7 +1898,7 @@ export function createReviewHandler(
         // implementation, which resolves the worktree on the PR's real `headRefName` —
         // and `resolveIssueWorktree` refuses the path while it is still checked out on
         // the synthetic branch. Same release as the non-cap fix handoff below; a no-op
-        // for non-synthetic reviews and when worktrees are disabled.
+        // for non-synthetic reviews.
         const syntheticBlocked = releaseSyntheticWorktreeForFix({
           reviewAgentUsed: agentId,
           reviewFeedback: boundReviewFeedback(reviewFeedbackText),
@@ -1847,7 +1999,7 @@ export function createReviewHandler(
             ...(reviewResidue !== undefined ? { reviewResidue } : {}),
             ...classification,
           },
-          message: `Review found merge conflicts, but freeing the issue worktree at ${freed.path} failed, leaving the PR branch checked out there: ${freed.error}. conflict_resolution runs in the canonical checkout and Git refuses a branch already held by another worktree, so escalating to human instead of queuing a phase that would immediately fail. Remove the worktree manually (e.g. \`git worktree remove --force ${freed.path}\`) before retrying.`,
+          message: `Review found merge conflicts, but ${describeWorktreeFreeFailure(freed, "conflict_resolution runs in the canonical checkout and Git refuses a branch already held by another worktree.")}`,
         };
       }
       if (conflictLoopState?.capReached) {
@@ -1891,7 +2043,7 @@ export function createReviewHandler(
     // re-materialize cleanly. The Gemini merge check below queries `gh pr view` in
     // `session.repoRoot` rather than the worktree, so it is unaffected by this removal.
     // Escalate to a human when the synthetic worktree cannot be removed. A no-op for
-    // non-synthetic reviews and when worktrees are disabled.
+    // non-synthetic reviews.
     if (worktreeOnSyntheticPrBranch) {
       const freed = freeReviewWorktree();
       if (!freed.ok) {
@@ -1903,7 +2055,7 @@ export function createReviewHandler(
             ...(reviewResidue !== undefined ? { reviewResidue } : {}),
             ...classification,
           },
-          message: `Review completed (${classification.classification}) but freeing the synthetic \`ai/pr-${prNum ?? "<n>"}\` review worktree at ${freed.path} failed, leaving it checked out on \`ai/pr-<n>\`: ${freed.error}. A later human-requested implementation fix resolves the worktree on the PR's real head and Git refuses a path already checked out on another branch, so escalating to human. Remove the worktree manually (e.g. \`git worktree remove --force ${freed.path}\`) before retrying.`,
+          message: `Review completed (${classification.classification}) but ${describeWorktreeFreeFailure(freed, `A later human-requested implementation fix resolves the worktree on the PR's real head and Git refuses a path already checked out on another branch (currently \`ai/pr-${prNum ?? "<n>"}\`).`)}`,
         };
       }
     }
@@ -2028,7 +2180,7 @@ export function createReviewHandler(
           return {
             result: "blocked",
             context: geminiConflictContext,
-            message: `Gemini review passed but PR has unresolved merge conflicts (mergeable=${String(mergeData.mergeable)}, mergeStateStatus=${String(mergeData.mergeStateStatus)}); freeing the issue worktree at ${freed.path} failed, leaving the PR branch checked out there: ${freed.error}. conflict_resolution runs in the canonical checkout and Git refuses a branch already held by another worktree, so escalating to human. Remove the worktree manually (e.g. \`git worktree remove --force ${freed.path}\`) before retrying.`,
+            message: `Gemini review passed but PR has unresolved merge conflicts (mergeable=${String(mergeData.mergeable)}, mergeStateStatus=${String(mergeData.mergeStateStatus)}); ${describeWorktreeFreeFailure(freed, "conflict_resolution runs in the canonical checkout and Git refuses a branch already held by another worktree.")}`,
           };
         }
         const forkBlocked = forkedPrHandoff("conflict", geminiConflictContext);
@@ -2055,6 +2207,9 @@ export function createReviewHandler(
       result: classification.classification,
       context: {
         artifactDir, reviewAgentUsed: agentId, prUrl, branch, resolvedProfile,
+        // Operator diagnostics (issue #667): the PR's merge target vs. the diff base
+        // this run actually reviewed against — distinct for a dependency-started task.
+        prMergeBase: baseBranch, reviewDiffBase: reviewBase,
         ...(reviewResidue !== undefined ? { reviewResidue } : {}),
         ...(diffClassification !== undefined ? { diffClassification } : {}),
         ...(issueRequiredVerifications !== undefined ? { issueRequiredVerifications } : {}),
@@ -2065,8 +2220,9 @@ export function createReviewHandler(
       message: classification.reason,
     };
     } finally {
-      // Release the issue worktree lock on every path (no-op when worktrees are
-      // disabled), so the next phase for this issue is never blocked (issue #456).
+      // Release the issue worktree lock on every path (no-op when the phase runner
+      // already owns the lock, i.e. `phaseLockOwnerId` is set), so the next phase
+      // for this issue is never blocked (issue #456).
       releaseLock?.();
     }
   };

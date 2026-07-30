@@ -211,7 +211,7 @@ Default location: `~/.config/n8n-ai-cli-loop/sessions.json`
     {
       "sessionId": "ai-cli-loop",
       "repoKey": "thunderbird-auth-results-filter",
-      "repoRoot": "/Users/you/git/thunderbird-auth-results-filter",
+      "repoRoot": "/path/to/thunderbird-auth-results-filter",
       "githubRepo": "m2dw/thunderbird-auth-results-filter",
       "artifactDir": ".n8n-artifacts",
       "defaults": {
@@ -453,10 +453,11 @@ After `dispatch-outbox` fires:
 - **Label**: the issue label should have changed to one of `ai:active`,
   `ai:blocked`, or `ai:ready-for-human` depending on the task's new status.
   Label side effects are emitted for every phase.
-- **Comment**: a bot comment is posted for `implementation` and `review`
-  phases (success, failure, or escalation notice). The `research` phase does
-  **not** generate a bot comment — only label changes are emitted. Missing
-  comments after a research run are expected, not a failure.
+- **Comment**: a bot comment is posted for `implementation`, `review`, and
+  `research` phases (success, failure, or escalation notice). For `research`,
+  the success comment contains a bounded excerpt of the research findings and
+  the failure comment contains the first 500 characters of stderr (see
+  `docs/content-research-mvp-contract.md`).
 
 If the label / comment did not appear, check the pending outbox:
 

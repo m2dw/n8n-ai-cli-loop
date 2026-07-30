@@ -562,6 +562,87 @@ describe('github-intake — supported phase gating', () => {
   });
 });
 
+describe('github-intake — report-only rollout mode (issue #532)', () => {
+  function writeReportOnlySession() {
+    writeFileSync(sessionsPath, JSON.stringify({ sessions: [{ ...SESSION, reportOnly: { enabled: true } }] }), 'utf8');
+  }
+
+  function captureIntake(args) {
+    const chunks = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { chunks.push(chunk); return true; };
+    return runIntake(args, fakeGh, noBlockerChecker).finally(() => {
+      process.stdout.write = origWrite;
+    }).then(() => JSON.parse(chunks.join('').trim()));
+  }
+
+  // FAKE_ISSUES: 101 -> implementation, 102 -> review, 103 -> no match.
+  test('defers the implementation candidate instead of enqueuing it, and still enqueues review', async () => {
+    writeReportOnlySession();
+    const args = { sessionId: 'addon-dev', sessionsPath, dbPath, limit: 100, dryRun: false, supportedPhases: ['implementation', 'review'] };
+
+    const out = await captureIntake(args);
+    expect(out).toMatchObject({ ok: true, reportOnly: true, reportOnlyDeferred: 1, candidates: 2, enqueued: 1 });
+
+    const deferred = out.results.find((r) => r.issueNumber === 101);
+    expect(deferred).toMatchObject({ action: 'report_only_deferred', phase: 'implementation' });
+    expect(deferred.message).toMatch(/report-only mode/i);
+    expect(deferred.message).toMatch(/issue #101/);
+
+    const enqueued = out.results.find((r) => r.issueNumber === 102);
+    expect(enqueued).toMatchObject({ action: 'enqueued', phase: 'review' });
+
+    const store = new SqliteTaskStore(dbPath);
+    const implTask = await store.getTask({ sessionId: 'addon-dev', issueNumber: 101 });
+    const reviewTask = await store.getTask({ sessionId: 'addon-dev', issueNumber: 102 });
+    store.close();
+    expect(implTask).toBeUndefined();
+    expect(reviewTask).toBeDefined();
+  });
+
+  test('a session without reportOnly enqueues the implementation candidate normally', async () => {
+    const args = { sessionId: 'addon-dev', sessionsPath, dbPath, limit: 100, dryRun: false, supportedPhases: ['implementation', 'review'] };
+
+    const out = await captureIntake(args);
+    expect(out).toMatchObject({ ok: true, reportOnly: false, reportOnlyDeferred: 0, enqueued: 2 });
+    expect(out.results.some((r) => r.action === 'report_only_deferred')).toBe(false);
+  });
+
+  test('reportOnly.enabled: false behaves exactly like no reportOnly block', async () => {
+    writeFileSync(sessionsPath, JSON.stringify({ sessions: [{ ...SESSION, reportOnly: { enabled: false } }] }), 'utf8');
+    const args = { sessionId: 'addon-dev', sessionsPath, dbPath, limit: 100, dryRun: false, supportedPhases: ['implementation', 'review'] };
+
+    const out = await captureIntake(args);
+    expect(out).toMatchObject({ ok: true, reportOnly: false, reportOnlyDeferred: 0, enqueued: 2 });
+  });
+
+  // --dry-run must preview report-only deferrals accurately (issue #532 review
+  // follow-up): the implementation candidate should be classified as
+  // `report_only_deferred`, not `dry_run`, and nothing should be written.
+  test('--dry-run reports the implementation candidate as report_only_deferred, not dry_run', async () => {
+    writeReportOnlySession();
+    const args = { sessionId: 'addon-dev', sessionsPath, dbPath, limit: 100, dryRun: true, supportedPhases: ['implementation', 'review'] };
+
+    const out = await captureIntake(args);
+    expect(out).toMatchObject({ ok: true, dryRun: true, reportOnly: true, reportOnlyDeferred: 1, candidates: 2, enqueued: 0 });
+
+    const deferred = out.results.find((r) => r.issueNumber === 101);
+    expect(deferred).toMatchObject({ action: 'report_only_deferred', phase: 'implementation' });
+    expect(deferred.message).toMatch(/report-only mode/i);
+    expect(deferred.message).toMatch(/issue #101/);
+
+    const enqueued = out.results.find((r) => r.issueNumber === 102);
+    expect(enqueued).toMatchObject({ action: 'dry_run', phase: 'review' });
+
+    const store = new SqliteTaskStore(dbPath);
+    const implTask = await store.getTask({ sessionId: 'addon-dev', issueNumber: 101 });
+    const reviewTask = await store.getTask({ sessionId: 'addon-dev', issueNumber: 102 });
+    store.close();
+    expect(implTask).toBeUndefined();
+    expect(reviewTask).toBeUndefined();
+  });
+});
+
 describe('github-intake — contextId-only resolution (no --session-id)', () => {
   const fakeGh = { listIssues: () => [] };
   const noBlocker = { getBlockedBy: async () => [] };
@@ -678,6 +759,188 @@ describe('github-intake — blocked label cleared on reactivation (issue #224)',
       (e) => e.topic === 'gh:label:remove' && e.payload.label === 'ai:blocked',
     );
     expect(labelRemove).toBeUndefined();
+  });
+
+  test('reactivates a conflict_resolution task held blocked by report-only mode once report-only is disabled (issue #532 review)', async () => {
+    // Simulate a review that queued conflict_resolution, then a run-one-phase
+    // attempt while the session was in report-only mode: the admission gate
+    // (checkReportOnlyAdmission) rejects it and transitions.ts holds the task
+    // at `blocked`/conflict_resolution (not ready_for_human) so it stays
+    // eligible for reactivation — the GitHub issue keeps its
+    // status:needs-conflict-resolution label throughout.
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({
+      sessionId: 'addon-dev',
+      issueNumber: 201,
+      phase: 'conflict_resolution',
+      now: '2026-06-07T09:00:00.000Z',
+    });
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 201 },
+      { status: 'queued' },
+      { status: 'blocked', phase: 'conflict_resolution' },
+    );
+    store.close();
+
+    // report-only mode is now disabled (normal SESSION), and the issue is
+    // still carrying the conflict-resolution label an operator never removed.
+    const conflictGh = {
+      listIssues: () => [
+        {
+          number: 201,
+          title: 'Resolve merge conflict for C',
+          url: 'https://github.com/m2dw/thunderbird-auth-results-filter/issues/201',
+          labels: [{ name: 'status:needs-conflict-resolution' }],
+        },
+      ],
+    };
+    const chunks = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { chunks.push(chunk); return true; };
+    let out;
+    try {
+      await runIntake(
+        { sessionId: 'addon-dev', sessionsPath, dbPath, limit: 100, dryRun: false, supportedPhases: ['conflict_resolution'] },
+        conflictGh,
+        noBlockerChecker,
+      );
+    } finally {
+      process.stdout.write = origWrite;
+    }
+    out = JSON.parse(chunks.join('').trim());
+
+    expect(out).toMatchObject({ ok: true, enqueued: 1 });
+    const reactivatedResult = out.results.find((r) => r.issueNumber === 201);
+    expect(reactivatedResult).toMatchObject({ action: 'reactivated', phase: 'conflict_resolution' });
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 201 });
+    store2.close();
+    expect(task?.status).toBe('queued');
+    expect(task?.phase).toBe('conflict_resolution');
+
+    const outboxStore = new SqliteOutboxStore(dbPath);
+    const pending = await outboxStore.listPending();
+    outboxStore.close();
+    const labelRemove = pending.find(
+      (e) => e.topic === 'gh:label:remove' && e.payload.issueNumber === 201 && e.payload.label === 'ai:blocked',
+    );
+    expect(labelRemove).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Intake must never resurrect a cancelled task (issue #608)
+// ---------------------------------------------------------------------------
+
+describe('github-intake — does not resurrect a cancelled task (issue #608)', () => {
+  function captureIntake(args) {
+    const chunks = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { chunks.push(chunk); return true; };
+    return runIntake(args, fakeGh, noBlockerChecker).finally(() => {
+      process.stdout.write = origWrite;
+    }).then(() => JSON.parse(chunks.join('').trim()));
+  }
+
+  test('a cancelled task is reported already_exists and is not requeued', async () => {
+    // The operator cancelled the task while the GitHub issue stayed open and
+    // still carries the labels that make it an intake candidate (e.g. the
+    // issue was deprioritized without being closed). A later intake pass must
+    // not silently bring it back to `queued`.
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({
+      sessionId: 'addon-dev',
+      issueNumber: 101,
+      phase: 'implementation',
+      now: '2026-06-07T09:00:00.000Z',
+    });
+    const cancelled = await store.cancelTask(
+      { sessionId: 'addon-dev', issueNumber: 101 },
+      { reason: 'operator abandoned', now: '2026-06-07T09:05:00.000Z' },
+    );
+    expect(cancelled.ok).toBe(true);
+    store.close();
+
+    const args = { sessionId: 'addon-dev', sessionsPath, dbPath, limit: 100, dryRun: false, supportedPhases: ['implementation'] };
+    const out = await captureIntake(args);
+
+    expect(out).toMatchObject({ ok: true, enqueued: 0, alreadyExists: 1 });
+    const result = out.results.find((r) => r.issueNumber === 101);
+    expect(result).toMatchObject({ action: 'already_exists' });
+
+    const after = new SqliteTaskStore(dbPath);
+    const task = await after.getTask({ sessionId: 'addon-dev', issueNumber: 101 });
+    after.close();
+    expect(task.status).toBe('cancelled');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GitHub label intake must never override an unresolved Tool Request (issue #677)
+// ---------------------------------------------------------------------------
+
+describe('github-intake — unresolved Tool Request is authoritative over conflicting labels (issue #677)', () => {
+  function captureIntake(args, gh = fakeGh) {
+    const chunks = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { chunks.push(chunk); return true; };
+    return runIntake(args, gh, noBlockerChecker).finally(() => {
+      process.stdout.write = origWrite;
+    }).then(() => JSON.parse(chunks.join('').trim()));
+  }
+
+  // Issue #102 in FAKE_ISSUES carries `agent:codex` + `status:needs-review` — the
+  // exact conflicting-label shape from the issue #677 incident (an operator/label
+  // change routing the issue toward review while implementation left it parked on
+  // an unresolved Tool Request).
+  test('an existing ready_for_human/implementation Tool Request handoff is left untouched by a conflicting status:needs-review label', async () => {
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({
+      sessionId: 'addon-dev',
+      issueNumber: 102,
+      phase: 'implementation',
+      implementationAgent: 'claude',
+      now: '2026-06-07T09:00:00.000Z',
+    });
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 102 },
+      { status: 'queued' },
+      {
+        status: 'ready_for_human',
+        phase: 'implementation',
+        context: {
+          toolRequest: {
+            command: 'npm install left-pad',
+            displayCommand: 'npm install left-pad',
+            reason: 'needed for the fix',
+            expectedFiles: ['package.json'],
+            necessity: 'required',
+            requestedBy: 'claude',
+            mode: 'new',
+            requestedAt: '2026-06-07T09:00:00.000Z',
+            resolved: false,
+          },
+        },
+      },
+    );
+    store.close();
+
+    const args = {
+      sessionId: 'addon-dev', sessionsPath, dbPath, limit: 100, dryRun: false,
+      supportedPhases: ['implementation', 'review'],
+    };
+    const out = await captureIntake(args);
+
+    const result102 = out.results.find((r) => r.issueNumber === 102);
+    expect(result102).toMatchObject({ action: 'already_exists' });
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 102 });
+    store2.close();
+    expect(task.status).toBe('ready_for_human');
+    expect(task.phase).toBe('implementation');
+    expect(task.context.toolRequest.resolved).toBe(false);
   });
 });
 

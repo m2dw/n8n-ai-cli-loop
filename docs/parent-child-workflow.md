@@ -252,7 +252,7 @@ Default location: `~/.config/n8n-ai-cli-loop/sessions.json`
       "sessionNo": 2,
       "aliases": ["addon", "tar"],
       "repoKey": "thunderbird-auth-results-filter",
-      "repoRoot": "/Users/you/git/thunderbird-auth-results-filter",
+      "repoRoot": "/path/to/thunderbird-auth-results-filter",
       "githubRepo": "m2dw/thunderbird-auth-results-filter",
       "artifactDir": ".n8n-artifacts",
       "defaults": {

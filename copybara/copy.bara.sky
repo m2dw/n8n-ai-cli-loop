@@ -1,0 +1,115 @@
+# Prototype Copybara SQUASH export config — issue #767.
+#
+# LOCAL-ONLY PROTOTYPE. `origin` and `destination` below are placeholder
+# tokens substituted by scripts/copybara-export.mjs with file:// URLs of
+# temporary local Git repositories it creates itself. This file is never
+# invoked against github.com/m2dw/n8n-ai-cli-loop directly; there is no push
+# target here at all. See docs/copybara-export-poc.md for the full
+# reproducible command and rationale.
+#
+# Substituted tokens (see scripts/copybara-export.mjs#renderConfig):
+#   __COPYBARA_ORIGIN_URL__       file:// path to a local clone of the
+#                                  private source-of-truth repo
+#   __COPYBARA_ORIGIN_REF__       the private revision to export (default:
+#                                  "main")
+#   __COPYBARA_DEST_URL__         file:// path to a local destination repo
+#                                  (may already contain the unrelated public
+#                                  history — see "initial baseline" in the
+#                                  doc above; SQUASH does not require shared
+#                                  history with the destination branch tip)
+#   __COPYBARA_DEST_REF__         destination branch to fetch/push (default:
+#                                  "main")
+
+# Generated public-facing docs/metrics output. Owned by the public
+# repository's own CI, not by this export. Excluded from BOTH
+# origin_files and destination_files so SQUASH neither deletes it (absent
+# from origin_files) nor overwrites it (absent from destination_files).
+DESTINATION_OWNED_PATHS = [
+    "docs/metrics/latest.md",
+    "docs/metrics/latest.json",
+    "docs/metrics/badges/**",
+]
+
+# Internal-only planning/design material that must never reach the public
+# mirror. This is a human-curated allowlist-by-exclusion, not something
+# Copybara can infer from content — see docs/copybara-export-poc.md
+# ("curation is a human decision, not a Copybara feature") for why this
+# list must be reviewed whenever a new top-level doc is added.
+PRIVATE_ONLY_PATHS = [
+    "docs/DOMAIN.md",
+    "docs/design/**",
+]
+
+# Internal engineering-planning artifacts that are dependency-coupled to
+# PRIVATE_ONLY_PATHS above: docs/handlers-extraction-plan.md and its
+# structural test both read docs/DOMAIN.md and
+# docs/design/handlers-responsibility-inventory.md at module load time, so
+# exporting either without the other produces a dangling reference (ENOENT
+# in the public repo's own CI, not a transient failure — see issue #811).
+# There is no documented reason this planning doc or its test belongs in the
+# public product, so both are excluded rather than pulling PRIVATE_ONLY_PATHS
+# into the export.
+INTERNAL_PLANNING_PATHS = [
+    "docs/handlers-extraction-plan.md",
+    "test/docs-handlers-extraction-plan.test.js",
+]
+
+# Local development/build artifacts that should never be considered part of
+# the exported tree even though some may be gitignored (and therefore never
+# reach git.origin() anyway) — listed explicitly so the policy is legible
+# without cross-referencing .gitignore.
+LOCAL_ARTIFACT_PATHS = [
+    ".n8n-artifacts/**",
+    "node_modules/**",
+    "coverage/**",
+    "dist/**",
+    ".env",
+    ".env.*",
+]
+
+core.workflow(
+    name = "private_to_public_squash",
+    origin = git.origin(
+        url = "__COPYBARA_ORIGIN_URL__",
+        ref = "__COPYBARA_ORIGIN_REF__",
+    ),
+    destination = git.destination(
+        url = "__COPYBARA_DEST_URL__",
+        fetch = "__COPYBARA_DEST_REF__",
+        push = "__COPYBARA_DEST_REF__",
+    ),
+    # overwrite (not pass_thru): the export must always attribute to the
+    # fixed bot identity, never to the private source commit's author, since
+    # a private-repo author name/email is not necessarily fit for the public
+    # mirror — see issue #767 review feedback.
+    authoring = authoring.overwrite("n8n-ai-cli-loop export bot <noreply@example.invalid>"),
+
+    # SQUASH: one destination commit per run, no private commit history or
+    # commit messages are carried over. Copybara records the exported
+    # private revision as a `GitOrigin-RevId:` trailer on that commit and
+    # uses it on the next run to compute the diff window — this is also
+    # what lets the very first run land on top of the existing unrelated
+    # public root history without a force-push (SQUASH never requires
+    # shared history with the destination branch tip; it always creates a
+    # normal child commit of the destination's current HEAD).
+    mode = "SQUASH",
+
+    origin_files = glob(
+        ["**"],
+        exclude = PRIVATE_ONLY_PATHS + INTERNAL_PLANNING_PATHS + LOCAL_ARTIFACT_PATHS + DESTINATION_OWNED_PATHS,
+    ),
+    destination_files = glob(
+        ["**"],
+        exclude = DESTINATION_OWNED_PATHS,
+    ),
+
+    # v20260727's core.workflow() has no top-level `message` argument; the
+    # fixed public-safe commit message (replacing whatever the private
+    # source commit's message was, so it never propagates) is instead set
+    # via a transformation, per that release's supported API.
+    transformations = [
+        metadata.replace_message(
+            "Public snapshot export\n\nSquashed, history-free export of the private source-of-truth tree.\nNo private commit history or commit messages are included.\n",
+        ),
+    ],
+)

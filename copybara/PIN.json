@@ -1,0 +1,7 @@
+{
+  "_note": "Unpopulated by design. scripts/copybara-export.mjs verifies jarSha256 against a locally downloaded jar before every invocation and fails closed while release/jarSha256 are null. Populate via the pin-bootstrap procedure in docs/copybara-export-poc.md#pinning after independently verifying the downloaded jar against the official google/copybara release page — this repo does not fabricate or auto-fetch a checksum. \"downloadUrl\" (optional) lets scripts/copybara-jar-cache.mjs fetch and cache the pinned jar automatically for scripts/public-export.mjs; without it, an operator must download the jar manually and pass --jar <path>. Either way jarSha256 is re-verified before every export — a downloadUrl is never trusted on its own.",
+  "release": null,
+  "jarSha256": null,
+  "downloadUrl": null,
+  "javaMinVersion": 21
+}

@@ -463,6 +463,13 @@ include local absolute paths (e.g. `/Users/you/.n8n-artifacts/…`) in any
 GitHub comment — those paths are machine-specific and may leak system details.
 Refer to a run by its run ID or a short sanitized description instead.
 
+A repository-wide scan (`rg "/Users/" --hidden -g '!node_modules' -g '!.git' .`)
+confirms the only remaining `/Users/...` references live under `test/` — fixture
+data for path-redaction and path-handling coverage (e.g. `test/text-sanitize.test.js`,
+`test/tool-request.test.js`) — plus the neutral placeholder examples above
+(`/Users/you/...`, `/Users/alice/...`). Those are intentional and should not be
+changed to satisfy a "no personal paths" scan.
+
 ---
 
 ## Other Entry Points

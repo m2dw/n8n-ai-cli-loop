@@ -157,6 +157,10 @@ describe('resolveIssueWorktree', () => {
     expect(existsSync(result.path)).toBe(true);
     const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], result.path).trim();
     expect(branch).toBe('ai/issue-101');
+    // Neither a local nor a remote ref existed — created fresh from baseRef, so it is
+    // guaranteed to start exactly there (issue #667 review, P1).
+    expect(result.branchReused).toBe(false);
+    expect(result.startedFromRemoteHead).toBe(false);
   });
 
   test('resumes (reuses) an existing issue worktree without recreating it', () => {
@@ -366,6 +370,12 @@ describe('resolveIssueWorktree', () => {
     // commit and its file are present.
     expect(git(['rev-parse', 'HEAD'], result.path).trim()).toBe(prHead);
     expect(existsSync(join(result.path, 'pr-head.txt'))).toBe(true);
+    // No local branch existed to "reuse" (branchReused: false), but the branch was
+    // recovered from an existing remote head rather than created fresh from baseRef —
+    // callers that validate a dependency start point's ancestry must treat this the
+    // same as a reused branch (issue #667 review, P1).
+    expect(result.branchReused).toBe(false);
+    expect(result.startedFromRemoteHead).toBe(true);
   });
 
   test('fails closed when the local issue branch has diverged from origin', () => {

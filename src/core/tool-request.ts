@@ -434,6 +434,29 @@ function asResolvedToolRequest(
 }
 
 /**
+ * Whether `context.toolRequest` holds a live (unresolved) implementation Tool
+ * Request handoff — i.e. a request has been recorded but no
+ * `manual-done`/`reject`/`guided-run`/`grant` resolution has been stored yet.
+ *
+ * An unresolved request is authoritative over any conflicting phase routing —
+ * a mistaken `admin recover` into another phase, a stale/incorrect GitHub
+ * review label, or label-driven intake — until an operator resolves it through
+ * the dedicated `tool-request resolve` / `tool-request grant` flows (issue
+ * #677). Callers that could otherwise move a task off its current handoff must
+ * check this first and refuse the transition rather than silently overriding
+ * the SQLite Tool Request state.
+ *
+ * Reads `task.context.toolRequest` (typed as `unknown` once it leaves the
+ * persisted JSON), so it can be called with a task's `context` directly.
+ */
+export function hasUnresolvedToolRequest(context: unknown): boolean {
+  if (typeof context !== "object" || context === null) return false;
+  const tr = (context as Record<string, unknown>)["toolRequest"];
+  if (typeof tr !== "object" || tr === null || Array.isArray(tr)) return false;
+  return (tr as { resolved?: unknown }).resolved !== true;
+}
+
+/**
  * Build the "Operator Response To Previous Tool Request" prompt section (issue
  * #422). When the implementation task is requeued after an operator resolved a
  * prior Tool Request, the next implementation prompt must replay that request
@@ -532,6 +555,19 @@ export function toolRequestResolutionPromptSection(toolRequestContext: unknown):
       "it changed nothing, so the captured output above is the answer you were missing.",
       "Use it to continue, and do not repeat the same verification request unless you",
       "can explain what is still unresolved after that output.",
+    );
+  } else if (disposition === "failed") {
+    // The command ran and exited non-zero (issue #678): a failing exit code is
+    // diagnostic information for the agent, not a reason to stop. The captured
+    // stdout/stderr above is the deliverable — point the agent at it and make
+    // clear a fresh Tool Request is only warranted for a genuinely different
+    // operator action, not a retry of the same failure.
+    lines.push(
+      "Treat this as the human responding to your request. The command was run and",
+      "FAILED — see the captured exit code and output above. Diagnose the failure and",
+      "either fix the underlying issue and continue implementation, or emit a new Tool",
+      "Request only if a different operator action is genuinely needed. Do not simply",
+      "re-request the same command expecting a different result.",
     );
   } else {
     // manual-done (operator ran it), grant/guided-run committed (orchestrator ran
