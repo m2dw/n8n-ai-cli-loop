@@ -6,6 +6,8 @@ import {
   main,
   CONTENT_RULES,
   FORBIDDEN_PATH_RULES,
+  DEPENDENCY_MANIFEST,
+  checkDependencyManifest,
 } from '../scripts/copybara-validate.mjs';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
@@ -139,6 +141,52 @@ describe('scanPath', () => {
   test('does not flag an ordinary public doc', () => {
     expect(scanPath('docs/install.md')).toHaveLength(0);
   });
+
+  test('flags the handlers extraction plan and its structural test (issue #811)', () => {
+    expect(scanPath('docs/handlers-extraction-plan.md').some(f => f.rule === 'forbidden-handlers-extraction-plan')).toBe(true);
+    expect(scanPath('test/docs-handlers-extraction-plan.test.js').some(f => f.rule === 'forbidden-handlers-extraction-plan-test')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkDependencyManifest (issue #811 dependency closure)
+// ---------------------------------------------------------------------------
+
+describe('checkDependencyManifest', () => {
+  test('is silent when no dependent path is present', () => {
+    const present = new Set(['README.md', 'docs/install.md']);
+    expect(checkDependencyManifest(present)).toHaveLength(0);
+  });
+
+  test('is silent when a dependent is present alongside everything it requires', () => {
+    const present = new Set([
+      'docs/handlers-extraction-plan.md',
+      'test/docs-handlers-extraction-plan.test.js',
+      'docs/DOMAIN.md',
+      'docs/design/handlers-responsibility-inventory.md',
+    ]);
+    expect(checkDependencyManifest(present)).toHaveLength(0);
+  });
+
+  test('flags a dependent present without its required paths', () => {
+    const present = new Set(['docs/handlers-extraction-plan.md']);
+    const findings = checkDependencyManifest(present);
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.some(f => f.match === 'docs/DOMAIN.md')).toBe(true);
+    expect(findings.some(f => f.match === 'docs/design/handlers-responsibility-inventory.md')).toBe(true);
+  });
+
+  test('flags only the missing requirement when one of two requirements is present', () => {
+    const present = new Set(['test/docs-handlers-extraction-plan.test.js', 'docs/DOMAIN.md']);
+    const findings = checkDependencyManifest(present);
+    expect(findings.some(f => f.match === 'docs/design/handlers-responsibility-inventory.md')).toBe(true);
+    expect(findings.some(f => f.match === 'docs/DOMAIN.md')).toBe(false);
+  });
+
+  test('every manifest rule id is unique', () => {
+    const ids = DEPENDENCY_MANIFEST.map(r => r.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -218,6 +266,35 @@ describe('scanTree', () => {
     const result = scanTree(dir);
     expect(result.ok).toBe(false);
     expect(result.findings.some(f => f.rule === 'credential-github-token')).toBe(true);
+  });
+
+  // Issue #811 regression guard: this is the exact failure mode from public
+  // PR m2dw/n8n-ai-cli-loop#1 — a tree that (mis)exports the handlers
+  // extraction plan/test without their private-only dependencies must fail
+  // validation before it's presented as a clean public snapshot.
+  test('fails on a reintroduced dangling handlers-extraction-plan dependency', () => {
+    const dir = join(TMP, 'dangling-dependency-tree');
+    mkdirSync(join(dir, 'docs'), { recursive: true });
+    mkdirSync(join(dir, 'test'), { recursive: true });
+    writeFileSync(join(dir, 'docs', 'handlers-extraction-plan.md'), '# plan\n');
+    writeFileSync(join(dir, 'test', 'docs-handlers-extraction-plan.test.js'), 'test("x", () => {});\n');
+    const result = scanTree(dir);
+    expect(result.ok).toBe(false);
+    expect(result.findings.some(f => f.rule === 'handlers-extraction-plan-requires-private-only-docs')).toBe(true);
+  });
+
+  test('passes when the plan/test are exported alongside their required private-only docs', () => {
+    const dir = join(TMP, 'complete-dependency-tree');
+    mkdirSync(join(dir, 'docs', 'design'), { recursive: true });
+    mkdirSync(join(dir, 'test'), { recursive: true });
+    writeFileSync(join(dir, 'docs', 'handlers-extraction-plan.md'), '# plan\n');
+    writeFileSync(join(dir, 'test', 'docs-handlers-extraction-plan.test.js'), 'test("x", () => {});\n');
+    writeFileSync(join(dir, 'docs', 'DOMAIN.md'), '# domain\n');
+    writeFileSync(join(dir, 'docs', 'design', 'handlers-responsibility-inventory.md'), '# inventory\n');
+    // The forbidden-path rules still fire independently for these paths
+    // (defense in depth); isolate the dependency-manifest check specifically.
+    const result = scanTree(dir, { pathRules: [] });
+    expect(result.findings.some(f => f.rule === 'handlers-extraction-plan-requires-private-only-docs')).toBe(false);
   });
 });
 

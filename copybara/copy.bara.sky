@@ -40,6 +40,20 @@ PRIVATE_ONLY_PATHS = [
     "docs/design/**",
 ]
 
+# Internal engineering-planning artifacts that are dependency-coupled to
+# PRIVATE_ONLY_PATHS above: docs/handlers-extraction-plan.md and its
+# structural test both read docs/DOMAIN.md and
+# docs/design/handlers-responsibility-inventory.md at module load time, so
+# exporting either without the other produces a dangling reference (ENOENT
+# in the public repo's own CI, not a transient failure — see issue #811).
+# There is no documented reason this planning doc or its test belongs in the
+# public product, so both are excluded rather than pulling PRIVATE_ONLY_PATHS
+# into the export.
+INTERNAL_PLANNING_PATHS = [
+    "docs/handlers-extraction-plan.md",
+    "test/docs-handlers-extraction-plan.test.js",
+]
+
 # Local development/build artifacts that should never be considered part of
 # the exported tree even though some may be gitignored (and therefore never
 # reach git.origin() anyway) — listed explicitly so the policy is legible
@@ -82,7 +96,7 @@ core.workflow(
 
     origin_files = glob(
         ["**"],
-        exclude = PRIVATE_ONLY_PATHS + LOCAL_ARTIFACT_PATHS + DESTINATION_OWNED_PATHS,
+        exclude = PRIVATE_ONLY_PATHS + INTERNAL_PLANNING_PATHS + LOCAL_ARTIFACT_PATHS + DESTINATION_OWNED_PATHS,
     ),
     destination_files = glob(
         ["**"],

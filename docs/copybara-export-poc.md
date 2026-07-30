@@ -155,11 +155,21 @@ while still being simple, reviewable Starlark.
   `coverage/**`, `dist/**`, `.env*`. Mostly redundant with `.gitignore`
   (`git.origin()` only ever sees tracked files) but listed explicitly so the
   export policy is legible on its own.
+- `INTERNAL_PLANNING_PATHS` — currently `docs/handlers-extraction-plan.md`
+  and `test/docs-handlers-extraction-plan.test.js`. These are internal
+  engineering-planning artifacts that are dependency-coupled to
+  `PRIVATE_ONLY_PATHS`: both read `docs/DOMAIN.md` and
+  `docs/design/handlers-responsibility-inventory.md` at module load time, so
+  exporting either without also exporting those private-only files produces
+  a dangling reference (an `ENOENT` in the public repo's own CI, not
+  something Copybara or `npm test` would catch at export time — see issue
+  #811). Excluded rather than pulling `PRIVATE_ONLY_PATHS` into the export.
 
-`scripts/copybara-validate.mjs` re-checks `docs/DOMAIN.md` and `docs/design/**`
-as forbidden paths independently of the config (defense in depth against
-config drift), alongside content-based rules — see
-[Post-transform validation](#post-transform-validation).
+`scripts/copybara-validate.mjs` re-checks `docs/DOMAIN.md`, `docs/design/**`,
+and both `INTERNAL_PLANNING_PATHS` entries as forbidden paths independently
+of the config (defense in depth against config drift), alongside
+content-based rules and a small dependency-closure manifest (see
+[Post-transform validation](#post-transform-validation)).
 
 ## README public mirror note
 
@@ -228,7 +238,15 @@ closed (nonzero exit) on:
   never appear literally in exported output.
 - **Files that must never be published** — `.n8n-artifacts/**`, `.env*`,
   stored git credentials, private key/certificate files by name or
-  extension, and (defense in depth) `docs/DOMAIN.md` / `docs/design/**`.
+  extension, and (defense in depth) `docs/DOMAIN.md`, `docs/design/**`,
+  `docs/handlers-extraction-plan.md`, and
+  `test/docs-handlers-extraction-plan.test.js`.
+- **Dangling private-only dependencies** — a small, human-curated
+  `DEPENDENCY_MANIFEST` of exported-file → required-file couplings (not a
+  general source-dependency analyzer). It only fires when a listed dependent
+  path is actually present in the tree, so it stays silent for the normal
+  export (where `INTERNAL_PLANNING_PATHS` keeps the dependent out entirely)
+  and exists purely as a regression guard against issue #811 reappearing.
 
 `test/**` is exempt from the content rules above (path-based rules still
 apply there) since this repository's own tests deliberately contain
@@ -284,7 +302,8 @@ This maps to the Verification checklist in issue #767:
 3. **Tree comparison against the intended public file set** — `diff -rq
    $workdir/origin $workdir/destination-checkout` (excluding `.git`) should
    show differences only for paths in `PRIVATE_ONLY_PATHS`,
-   `LOCAL_ARTIFACT_PATHS`, and `DESTINATION_OWNED_PATHS`. (`$workdir/destination`
+   `INTERNAL_PLANNING_PATHS`, `LOCAL_ARTIFACT_PATHS`, and
+   `DESTINATION_OWNED_PATHS`. (`$workdir/destination`
    itself is bare and has no working tree to diff against — see
    [Reproducible command](#reproducible-command).)
 4. **Adversarial leak-check fixture** — `test/copybara-validate.test.js`

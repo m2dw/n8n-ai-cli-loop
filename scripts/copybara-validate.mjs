@@ -120,10 +120,67 @@ export const FORBIDDEN_PATH_RULES = [
   // job (config drift) — see docs/copybara-export-poc.md.
   { id: 'forbidden-internal-doc', description: 'Internal-only planning document', pattern: /^docs\/DOMAIN\.md$/ },
   { id: 'forbidden-internal-design-dir', description: 'Internal-only design directory', pattern: /^docs\/design\// },
+  // Mirrors copy.bara.sky's INTERNAL_PLANNING_PATHS (issue #811): this doc
+  // and its structural test both depend on docs/DOMAIN.md and
+  // docs/design/handlers-responsibility-inventory.md, which are private-only,
+  // so they must stay excluded too rather than dangling in the public tree.
+  { id: 'forbidden-handlers-extraction-plan', description: 'Internal-only engineering plan (depends on excluded DOMAIN.md/docs/design)', pattern: /^docs\/handlers-extraction-plan\.md$/ },
+  { id: 'forbidden-handlers-extraction-plan-test', description: 'Structural test for the excluded handlers extraction plan', pattern: /^test\/docs-handlers-extraction-plan\.test\.js$/ },
 ];
 
 function toPosixRelative(root, filePath) {
   return relative(root, filePath).split(sep).join('/');
+}
+
+// ---------------------------------------------------------------------------
+// Dependency-closure rules
+// ---------------------------------------------------------------------------
+
+/**
+ * Narrow, human-curated manifest of exported-file -> required-file
+ * couplings — not a general source-dependency analyzer (see issue #811
+ * scope). copy.bara.sky's origin_files exclusions are a human decision, not
+ * something Copybara enforces for consistency; this catches the specific
+ * failure mode where a file that IS exported reads (at module load, per
+ * docs, etc.) a file that is NOT, which otherwise only surfaces as an
+ * ENOENT in the public repo's own CI rather than in export validation.
+ */
+export const DEPENDENCY_MANIFEST = [
+  {
+    id: 'handlers-extraction-plan-requires-private-only-docs',
+    // docs/handlers-extraction-plan.md and its structural test both read
+    // docs/DOMAIN.md and docs/design/handlers-responsibility-inventory.md
+    // at load time; those two are intentionally PRIVATE_ONLY_PATHS in
+    // copy.bara.sky and must never be exported (see issue #811).
+    dependents: ['docs/handlers-extraction-plan.md', 'test/docs-handlers-extraction-plan.test.js'],
+    requires: ['docs/DOMAIN.md', 'docs/design/handlers-responsibility-inventory.md'],
+  },
+];
+
+/**
+ * Check a manifest of dependent -> required-path couplings against the set
+ * of paths present in a tree. Only fires when at least one dependent path is
+ * actually present, so it is silent for a tree (like the real public export)
+ * that excludes the dependents entirely.
+ */
+export function checkDependencyManifest(presentPaths, manifest = DEPENDENCY_MANIFEST) {
+  const findings = [];
+  for (const rule of manifest) {
+    const presentDependents = rule.dependents.filter((p) => presentPaths.has(p));
+    if (presentDependents.length === 0) continue;
+    for (const required of rule.requires) {
+      if (!presentPaths.has(required)) {
+        findings.push({
+          rule: rule.id,
+          description: `${presentDependents.join(', ')} requires ${required}, which is absent from this tree`,
+          file: presentDependents[0],
+          line: null,
+          match: required,
+        });
+      }
+    }
+  }
+  return findings;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +295,11 @@ export function scanPath(relPath, rules = FORBIDDEN_PATH_RULES) {
 export function scanTree(rootDir, opts = {}) {
   const contentRules = opts.contentRules ?? CONTENT_RULES;
   const pathRules = opts.pathRules ?? FORBIDDEN_PATH_RULES;
+  const dependencyManifest = opts.dependencyManifest ?? DEPENDENCY_MANIFEST;
   const files = walkFiles(rootDir);
   const findings = [];
+  const presentPaths = new Set(files.map((file) => toPosixRelative(rootDir, file)));
+  findings.push(...checkDependencyManifest(presentPaths, dependencyManifest));
 
   for (const file of files) {
     const relPath = toPosixRelative(rootDir, file);
