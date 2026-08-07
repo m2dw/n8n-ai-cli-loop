@@ -1,20 +1,20 @@
 {
-  "generated": "2026-07-30T16:18:13.956Z",
+  "generated": "2026-08-07T11:54:15.815Z",
   "src": {
-    "files": 94,
-    "lines": 62258,
-    "nonBlankLines": 58166
+    "files": 129,
+    "lines": 92258,
+    "nonBlankLines": 86569
   },
   "tests": {
-    "files": 120,
-    "suites": 920,
-    "cases": 4921
+    "files": 165,
+    "suites": 1248,
+    "cases": 6909
   },
   "coverage": {
-    "lines": 75.42,
-    "statements": 75.42,
-    "functions": 79.5,
-    "branches": 84.19
+    "lines": 80.75,
+    "statements": 80.75,
+    "functions": 84.71,
+    "branches": 85.94
   },
   "dependencies": {
     "circularCycles": 0,

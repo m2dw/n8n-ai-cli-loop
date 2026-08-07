@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="171" height="20" role="img" aria-label="tests: 4921 cases / 120 files">
-  <title>tests: 4921 cases / 120 files</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="171" height="20" role="img" aria-label="tests: 6909 cases / 165 files">
+  <title>tests: 6909 cases / 165 files</title>
   <linearGradient id="s" x2="0" y2="100%">
     <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
     <stop offset="1" stop-opacity=".1"/>
@@ -15,7 +15,7 @@
   <g fill="#fff" text-anchor="middle" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="110">
     <text x="200" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="295" lengthAdjust="spacing">tests</text>
     <text x="200" y="140" transform="scale(.1)" textLength="295" lengthAdjust="spacing">tests</text>
-    <text x="1055" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="1214" lengthAdjust="spacing">4921 cases / 120 files</text>
-    <text x="1055" y="140" transform="scale(.1)" textLength="1214" lengthAdjust="spacing">4921 cases / 120 files</text>
+    <text x="1055" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="1214" lengthAdjust="spacing">6909 cases / 165 files</text>
+    <text x="1055" y="140" transform="scale(.1)" textLength="1214" lengthAdjust="spacing">6909 cases / 165 files</text>
   </g>
 </svg>

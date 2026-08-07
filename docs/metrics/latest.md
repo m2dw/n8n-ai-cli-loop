@@ -1,31 +1,31 @@
 # Project Metrics
 
-Generated: 2026-07-30T16:18:13.956Z
+Generated: 2026-08-07T11:54:15.815Z
 
 ## Source
 
 | Metric | Value |
 |--------|-------|
-| TypeScript files | 94 |
-| Total lines | 62258 |
-| Non-blank lines | 58166 |
+| TypeScript files | 129 |
+| Total lines | 92258 |
+| Non-blank lines | 86569 |
 
 ## Tests
 
 | Metric | Value |
 |--------|-------|
-| Test files | 120 |
-| Suites (describe blocks) | 920 |
-| Cases (test/it calls) | 4921 |
+| Test files | 165 |
+| Suites (describe blocks) | 1248 |
+| Cases (test/it calls) | 6909 |
 
 ## Coverage
 
 | Metric | Value |
 |--------|-------|
-| Lines | 75.42% |
-| Statements | 75.42% |
-| Functions | 79.5% |
-| Branches | 84.19% |
+| Lines | 80.75% |
+| Statements | 80.75% |
+| Functions | 84.71% |
+| Branches | 85.94% |
 
 ## Dependencies
 
