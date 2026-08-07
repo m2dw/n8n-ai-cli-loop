@@ -58,11 +58,13 @@ Out of scope (explicitly deferred to #611's split issues, §13):
 | Run artifacts | `<artifactRoot>/runs/<run-id>/` on disk | Execution | Yes — one directory per phase run |
 | `repositories` table | `stores/sqlite-task-store.ts` | Orchestration | No — one row per distinct `owner/name`, not per-event |
 | `outbox_scan_cursor` table | `stores/sqlite-outbox-store.ts` | Delivery | No — one row per scan key, overwritten in place |
+| `outbox_scan_cursor_fence` table | `stores/sqlite-outbox-store.ts` | Delivery | No — one row per dispatch identity, incremented in place (issue #820) |
 | `runs` table (`sqlite-task-store.ts` schema) | — | — | **Dead schema**: defined by `CREATE TABLE`, never written or read anywhere in the codebase. Out of scope for this contract; a candidate for a separate schema-cleanup issue, not for a retention floor |
 | `idempotency_keys` table (both stores) | — | — | **Dead schema**, same as above. Outbox de-duplication is actually enforced by the `UNIQUE` constraint on `outbox.idempotency_key`, not this table. Out of scope for the same reason |
 
 Rows that are small dimension tables or already self-overwriting
-(`repositories`, `outbox_scan_cursor`) need no retention floor — they do not
+(`repositories`, `outbox_scan_cursor`, `outbox_scan_cursor_fence`) need no
+retention floor — they do not
 accumulate history to prune. The two dead tables need no floor because
 nothing ever populates them; a later cleanup issue may drop them, but that is
 schema hygiene, not retention policy, and must not be bundled into #611.
@@ -814,8 +816,8 @@ world across two files. Restoring therefore requires:
    resurrect a dangling DB→artifact reference in the first place — but
    restore treats this as a checked invariant, not a guarantee taken on
    faith. **This check is scoped to task rows' artifact-directory context
-   fields — today exactly four keys are known to name a
-   `<artifactRoot>/runs/<run-id>/` directory, and all four must be
+   fields — today exactly five keys are known to name a
+   `<artifactRoot>/runs/<run-id>/` directory, and all five must be
    validated:**
    - `context.artifactDir` — set by every phase handler that produces a run
      artifact directory; the field most handlers overwrite each phase.
@@ -829,6 +831,12 @@ world across two files. Restoring therefore requires:
      blocked/success paths (`content-review.ts:764,793,810,819`), preserving
      the review run dir separately from whichever draft/research dir
      `artifactDir` already carries forward.
+   - `context.reviewArtifactDir` — the review handler's admitted-findings
+     path (`review.ts`), a dedicated reference to the review run that wrote
+     `review-findings.json`, carried forward unchanged across every later
+     implementation retry so a fix-mode prompt build can still find it after
+     `artifactDir` has moved on to that retry's own run directory (issue
+     #837 review).
 
    Plus any future handler-specific key following the same naming pattern
    per `handlers/artifact-dir.ts` — it does not walk `events.run_id`. The
@@ -1268,6 +1276,122 @@ deletion and no lock covering the intervening commands, does not — and a
 design that closes this race for `tasks` while leaving `outbox` covered by
 neither alternative does not satisfy this contract.
 
+**Outbox side: implemented via the first alternative (issue #818).** Every
+`outbox` mutation now reads `maintenance_lock` *inside the same SQLite
+transaction as its own write*, per the atomicity requirement above — never as
+a separate pre-check:
+
+- `enqueue` and `replacePendingPrSummary` (`stores/sqlite-outbox-store.ts`),
+  plus the transactional phase-completion/cancellation enqueues
+  `completePhaseWithEffects` / `cancelTaskWithEffects`
+  (`stores/sqlite-task-store.ts`, issue #701) — so a phase or an operator
+  command can never add a row to a file `restore` is replacing;
+- `claimForDispatch` — the fail-closed point for dispatch: no row is claimed,
+  and therefore no external side effect performed, while the lock is held.
+  This is the mirror image of the acquisition-time non-stale-claim refusal
+  described above; the two together make claim and acquisition mutually
+  exclusive in both orders;
+- `retryEntry` / `cancelEntry` — the `admin outbox retry` / `cancel` bucket
+  changes this section names explicitly. `retryEntry`'s guarded transaction also
+  carries the scan-cursor rewind that keeps a revived row visible to future
+  dispatch scans (issue #820, `docs/outbox-scan-cursor-contract.md` §13), so a
+  refusal leaves both the row and every cursor untouched;
+- `setScanCursor` — the dispatcher's persisted scan cursors are rows in the
+  maintained database too (issue #818 review follow-up). The lock can be
+  acquired *after* a drain's last claim resolved but before its cursors are
+  persisted, so `dispatchOutbox`'s pre-check and its in-loop contention flag
+  cannot cover this write; the guard belongs in the mutator, atomically. A
+  refusal is non-destructive — the cursor keeps the last complete run's value,
+  which is also what the next unlocked run wants to resume from — and the
+  dispatcher stops persisting the remaining cursors and reports contention.
+
+Refusals are typed, never generic process failures. `retryEntry`/`cancelEntry`
+report `reason: "maintenance_locked"`, `claimForDispatch` returns `false`
+without mutating anything, `setScanCursor` returns `{ persisted: false }`,
+the two `*WithEffects` task-store calls return
+`code: "maintenance_locked"` (refusing the completion *in full* — transition,
+event, and effects — which is what preserves #701's all-or-nothing contract
+under contention), and the enqueue paths throw a typed
+`MaintenanceLockedError` rather than reusing `{ enqueued: false }`, which
+already means "duplicate idempotency key, safe no-op" and would silently drop
+a real side effect. `dispatch-outbox` surfaces contention as **exit 0** with
+`outcome: "maintenance_locked"` — an expected idle outcome, like an empty
+outbox, with no public comment, label mutation, or provider request performed
+after the lock was observed. A run that met the lock before its first claim
+reports zero dispatched/failed counts; one that met it part-way (a lock
+acquired mid-drain, or only at cursor persistence) still reports the rows it
+had already completed, since those effects were genuinely published.
+`run-one-phase` likewise reports
+`outcome: "maintenance_locked"` at exit 0.
+
+**A refusal must never arrive after a task has already moved.** A typed
+refusal only helps if the caller has nothing half-applied to clean up, so every
+write that changes a task *and* enqueues the effects announcing that change
+goes through a single transaction that reads the lock before either half lands
+(issue #818 review follow-up):
+
+- `SqliteTaskStore.transitionTaskWithEffects` is the generic form of that
+  commit, used by the operator commands that move a task between lanes —
+  `human-review-return` / `github-app-review-return` /
+  `review-verification-resolve` (via `enqueueFixModeRequeue`) and the
+  review-verification requeue. They previously transitioned the task first and
+  enqueued their labels/comment afterwards through a second connection, so a
+  held lock aborted them mid-sequence: task requeued for a fix run, lane labels
+  never queued, for the whole maintenance window. The public status comment
+  announcing the move belongs to that same effect set, for the same reason: once
+  the task has left `ready_for_human`, the command refuses to run again, so a
+  comment enqueued separately afterwards is unrecoverable if it is refused.
+  Those commands also read the lock once up front so the refusal is reported
+  before any live repo-host lookup, and exit non-zero saying nothing was
+  changed.
+- `runNextPhase` commits a completion's effects through
+  `completePhaseWithEffects` whenever the task store and the outbox store report
+  the same `backendId` — one database, one transaction, one in-transaction lock
+  read covering the transition and every effect. Under the supported
+  separate-backend pairing (a task store that is not the outbox's database)
+  there is no such transaction, so the effects are written to the outbox store
+  *before* the transition is attempted. That ordering is what makes a refusal
+  safe: the lock is met while nothing has moved, so the run reports
+  `maintenance_locked` and the phase re-runs intact. Writing them afterwards
+  (best-effort, behind a pre-check) left the unrecoverable direction exposed —
+  a lock acquired after the pre-check dropped the completion's comments and
+  labels while the run reported `completed`, with no way to replay them from a
+  task that had already left the phase. The residual risk of the chosen order —
+  effects outliving a transition that then fails its CAS — is recoverable:
+  every effect is idempotency-keyed and the re-run re-derives the same set.
+  That separate write is itself all-or-nothing: `OutboxStore.enqueueEffects`
+  commits the whole effect set in one transaction behind one in-transaction
+  lock read, so a lock acquired part-way through cannot leave some rows durable
+  while the completion is handed back — otherwise the dispatcher would later
+  publish a completion comment or status label for a phase that never committed
+  and is about to re-run. A store that cannot offer that transaction falls back
+  to per-effect writes, and a refusal that lands mid-set is then treated as
+  *non*-retryable: the completion commits (so the already-durable rows announce
+  a phase that really did complete) and the shortfall is recorded as an
+  `outbox.enqueue.failed` event.
+  A `maintenance_locked` completion also hands the claim back (`queued`,
+  unowned, pre-claim attempt count) instead of leaving the task `running` on a
+  live lease: `archive rollup` acquires with `skipActivityChecks`, so the lock
+  can land while a phase is legitimately live, and the retry this outcome
+  promises must not wait out a 30-minute lease. That requeue goes through
+  `completePhaseWithEffects` with an empty effect set — the one interface
+  transition that reads the lock inside its own transaction — never a bare
+  `transitionTask`, which is unguarded and would write into a database a
+  `restore` is replacing. So when the refusal came from the task store's own
+  database the requeue is refused too, and the task is deliberately left
+  `running` for lease expiry / `admin task recover` to recover *after*
+  maintenance rather than racing it. The re-run still cannot start during
+  maintenance, since `claimNextTask` is itself lock-guarded (§ above).
+
+Deliberately **not** guarded: `markSent`, `markFailed`, and `renewClaim`.
+Those do not start new work — they resolve or keep alive a dispatch attempt
+claimed *before* the lock was acquired, whose external side effect may already
+have been published. Since acquisition already refuses while any non-stale
+claim exists, a lock can only coexist with an in-flight attempt whose claim has
+gone stale, and recording that attempt's outcome is strictly safer than losing
+it (the alternative strands the row or lets a second dispatcher duplicate the
+effect). Backup remains exempt from this lock entirely, per §8.
+
 **Batched, resumable, never one giant transaction.** Prune processes one data
 class and one bounded time/row window per committed SQLite transaction. Each
 batch's commit persists a watermark (e.g. "events for session S up to id N
@@ -1285,6 +1409,90 @@ verification), the operation stops, reports exactly which watermark it
 reached, and leaves everything before that watermark committed. It does not
 roll back prior batches — that would re-grow a table the operator already
 confirmed removing, and violates the "resumable" property above.
+
+**Guarded status and force-release recovery (issue #817).** A maintenance
+process killed before its `finally`/`close()` path runs (an OOM kill, a
+`SIGKILL`, a host crash) leaves the `maintenance_lock` row populated with no
+live holder able to call `release()` — every later phase claim and
+maintenance run then refuses indefinitely with `lock_contended`/
+`phase_active`-shaped outcomes, and until this issue the only recovery was
+direct SQLite editing. `admin maintenance-lock status --session-ref <ref>
+[--json]` is a read-only diagnostic: it reports whether the lock is held,
+its holder, acquisition time, age, whether it was acquired via
+`skipActivityChecks` (`activityExempt` — see below), the count of task
+phases still claimed/running with an unexpired lease, and the count of
+`outbox` rows with a non-stale dispatch claim — the exact two counts this
+section's acquisition refusal bullets above are computed from, so an
+operator can see not just that the lock is held but whether the work it
+protects is still genuinely in flight. `status` opens the database
+**read-only** and never creates `maintenance_lock` or migrates it (review
+follow-up to issue #817) — a naive `CREATE TABLE IF NOT EXISTS` run
+unconditionally on open would otherwise mutate a legacy database that
+predates this table the first time an operator merely inspects it, and fail
+outright against a filesystem-read-only backup. `admin maintenance-lock
+release --session-ref <ref> [--yes] [--confirm-stranded] [--json]`
+force-releases the lock: unlike the lock's own `release()`, it **ignores the
+recorded holder** (the whole reason it exists — no live holder remains to
+release its own lock), but it reuses the identical
+phase-active/non-stale-outbox-claim predicates `acquire()` refuses on, so a
+force-release can never clear a lock while the work it protects is still
+genuinely in flight — and (P1 review follow-up below) also requires
+`--confirm-stranded` alongside `--yes` before it will delete any held lock,
+regardless of holder kind. It follows the standard admin CLI mutation
+contract: preview by default, mutates only with `--yes`, and — like `status`
+— stays read-only for the preview path, only opening the database for
+read/write once `--yes` is actually given. A database with no lock held is a
+safe no-op, both in preview and with `--yes` — so a repeated release after
+the lock has already cleared (by this recovery path or by its own holder)
+never errors. Neither command's output includes the local `dbPath`; the
+holder token (e.g. `prune:<pid>:<timestamp>`) identifies a process/run, not
+a filesystem path.
+
+**Every holder needs an explicit confirmation, not just `--yes` (issue #817
+review, P1).** `admin archive rollup` acquires this lock with
+`skipActivityChecks: true` (§9 above) because it only needs mutual exclusion
+against another maintenance-lock holder, not the phase/outbox guards
+`prune`/`restore` need — which means a rollup's lock shows **zero** live
+task phases and **zero** non-stale outbox claims for its entire lifetime,
+whether it is genuinely still running or has been stranded by a crash. An
+initial version of `forceRelease` treated that as evidence unique to
+`skipActivityChecks` holders and required an explicit confirmation only from
+them — but `prune`/`restore` are exactly as invisible to those two counts:
+both acquire an ordinary, non-`activityExempt` lock and then do their own
+destructive work — a delete batch, a file rename — without ever creating a
+task lease or outbox claim for it, so a live one of either also shows zero
+of both for its entire run. Those being the only two predicates
+`forceRelease` checked for a normal holder meant `admin maintenance-lock
+release --yes` could force-release a live `prune run --yes` or `restore`
+lock exactly as readily as a truly stranded one, letting a second one start
+concurrently against it and violate the lock's data-safety contract — the
+same race `runArchiveRollup`'s own comments document for the rollup case,
+just for `prune`/`restore` too. `acquire()` persists whether an acquisition
+used `skipActivityChecks` (the `activity_exempt` column, surfaced as
+`status`'s `activityExempt`) purely for `status`/error-message context now;
+`forceRelease` refuses to delete *any* held lock — regardless of holder kind
+or the phase/outbox counts — unless the caller also passes `confirmStranded`
+(`admin maintenance-lock release --yes --confirm-stranded`). This is **not**
+a TTL or liveness check the tool performs: `--confirm-stranded` is a
+deliberate, explicit operator override, asserting (after checking
+out-of-band, e.g. the process list, that no such process still targets this
+database) that this specific lock is in fact stranded — the same "an
+operator running `status` first is the one positioned to judge this" posture
+the paragraph below already applies to every holder kind.
+
+This recovery path is **deliberately** not TTL-based and does not couple to
+PID/host liveness — an implementation must not "helpfully" add either. A
+maintenance run legitimately holds this lock for as long as its batched
+prune/rollup/restore work takes (§9's "batched, resumable, never one giant
+transaction" above), which has no fixed upper bound; any TTL short enough to
+be useful for stranded-lock detection is also short enough to fire on a
+still-running, healthy maintenance pass on a large table, and PID liveness
+is meaningless across the host reboots and container respawns this system
+already has to tolerate (a crashed process's PID can be reused by an
+unrelated process before an operator ever looks). The two activity checks
+above are the only correctness gate this contract requires; "is a
+maintenance run *actually* stranded" is a judgment only an operator running
+`status` first, then `release --yes`, is positioned to make.
 
 ## 10. Multi-session isolation
 

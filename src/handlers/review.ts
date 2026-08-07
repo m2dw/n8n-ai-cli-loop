@@ -4,7 +4,10 @@ import type { AiTask } from "../core/task.js";
 import type { PhaseHandler, PhaseHandlerContext, PhaseHandlerResult } from "../core/phase-runner.js";
 import { defaultCommandRunner } from "./command-runner.js";
 import type { CommandRunner } from "./command-runner.js";
-import { classifyReviewOutput, BLOCKING_PATTERNS } from "../core/review-classifier.js";
+// The read-only §3.3 evidence access the fix run (issue #843) shares with this
+// review run, so both resolve references under one admission posture.
+import { captureTrackedFiles, createTrackedFileReader } from "./evidence-checkout.js";
+import { classifyReviewOutput, hasConflictSignal, BLOCKING_PATTERNS, type ClassificationDetail } from "../core/review-classifier.js";
 import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory } from "../core/quota-classifier.js";
 import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
 import { runArtifactDir, writeAssignmentFailureArtifact, ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "./artifact-dir.js";
@@ -23,6 +26,19 @@ import { resolveIssueWorktree, removeWorktree, IssueWorktreeLock, issueLockScope
 import { resolveWorktreeRoot, issueWorktreePath } from "../core/worktree-paths.js";
 import { checkReviewAdmission } from "./review-admission.js";
 import { type DiffClassification, classifyDiffFromUnified } from "../core/review-diff-context.js";
+import { resolveReviewDisputeSettings, type ReviewDisputeLimits } from "../core/review-dispute.js";
+import { REVIEW_FINDINGS_ARTIFACT } from "../core/review-dispute-lineage.js";
+import { validateReviewDisputeContext, type EvidenceRefResolver } from "../core/review-dispute-validation.js";
+import {
+  createReviewEvidenceResolver,
+  openLineagePrompts,
+  processReviewFindings,
+  resolveFindingHumanGate,
+  reviewFindingsInstructions,
+  structuredFindingsSupport,
+  type ReviewFindingsOutcome,
+  type ReviewPromptLineage,
+} from "../core/review-finding-envelope.js";
 
 // ---------------------------------------------------------------------------
 // Agent command selection
@@ -347,6 +363,19 @@ interface ReviewContextInput {
    * reviewer receives only the note that this is a post-conflict review (issue #540).
    */
   postConflictReview?: boolean;
+  /**
+   * Append the structured finding output contract (issue #841). Set only when the
+   * review-dispute protocol is enabled AND the configured review agent can honor
+   * an output contract; otherwise the brief is byte-identical to today's (§13).
+   */
+  structuredFindings?: boolean;
+  /**
+   * Open lineages an earlier review of this branch persisted (§2.2). Shown to the
+   * reviewer so a re-raise of the same defect echoes the id it belongs to and
+   * attaches to the live finding instead of opening a second one. Empty or absent
+   * on a first review, which leaves the brief byte-identical to today's.
+   */
+  liveLineages?: readonly ReviewPromptLineage[];
 }
 
 /**
@@ -430,6 +459,22 @@ function buildReviewContext(input: ReviewContextInput): string {
       "",
       "Do NOT flag the absence of merge-conflict markers (`<<<<<<<`, `>>>>>>>`) — their absence is expected after a successful conflict resolution.",
       "Do NOT reference internal merge rationale files, local artifact paths, or structured resolution fields in your findings.",
+    );
+  }
+
+  if (input.structuredFindings) {
+    // `issueBodyAvailable` mirrors the evidence resolver below: an `issue_quote`
+    // is only checkable when this run captured a body to check it against, so the
+    // reviewer is offered that reference form on exactly the runs where it can
+    // resolve (§3.3).
+    lines.push(
+      "",
+      reviewFindingsInstructions({
+        issueBodyAvailable: Boolean(body),
+        ...(input.liveLineages !== undefined && input.liveLineages.length > 0
+          ? { liveLineages: input.liveLineages }
+          : {}),
+      }),
     );
   }
 
@@ -527,6 +572,146 @@ function boundReviewFeedback(text: string): string {
   }
 
   return text.slice(0, MAX_REVIEW_FEEDBACK_CHARS) + "\n\n…(truncated for storage)";
+}
+
+// ---------------------------------------------------------------------------
+// Structured finding envelope (issue #841)
+//
+// The protocol is gated behind `session.reviewDispute.enabled`, which defaults
+// to false; with it off, none of the code below runs and the review lane is
+// byte-identical to today (§13). With it on, the envelope refines the review
+// OUTCOME and adds bounded §10.1 state — it never replaces the free-form
+// `reviewFeedback` payload, which #837/#842 own.
+// ---------------------------------------------------------------------------
+
+/**
+ * The bounded, literals-only summary of a review's structured output, written to
+ * `task.context` alongside the §10.1 block.
+ *
+ * Every member is a fixed token or a count: the finding prose, the evidence, and
+ * the reviewer's own report stay in the run artifacts (§10.1, §10.2).
+ */
+interface ReviewFindingsSummary {
+  mode: "unsupported" | "legacy" | "rejected" | "admitted";
+  agentId: string;
+  /** The envelope status, when one was admitted. */
+  status?: string;
+  /** How the §13 classifier read the review as a whole. */
+  reviewStructure?: string;
+  admitted?: number;
+  /**
+   * §2.2 re-raises: lineages of an earlier review that a finding in this
+   * envelope attached to. Runner-minted ids only, so the whole list is literals.
+   */
+  attachedLineages?: string[];
+  /** Lineages of an earlier review carried into the block this run wrote. */
+  retainedLineages?: number;
+  blockedReason?: string;
+  /** Closed #836 failure reason plus its content-free locator. */
+  rejection?: { reason: string; detail: string | null };
+  /** Why the configured agent was never asked for an envelope. */
+  compatibility?: string;
+  /** §2.1: runner-owned fields the reviewer supplied; dropped, and logged here. */
+  ignoredRunnerOwnedFields?: string[];
+}
+
+/**
+ * Fold a structured envelope outcome into today's classifier verdict.
+ *
+ * The existing severity policy is preserved rather than replaced: `conflict`
+ * still wins outright (a conflict marker is structural evidence no envelope can
+ * argue with), and a classifier `needs_fix` is never downgraded — a `success`
+ * envelope emitted alongside prose that names a [P1] still routes to fix, which
+ * is the §13 rule that mixed reviews fail closed.
+ *
+ * Two upgrades are added, both toward the safer outcome:
+ *  - an envelope carrying blocking findings routes to `needs_fix` even though the
+ *    classifier's [P1]/[P2] markers never appear inside JSON;
+ *  - an envelope declaring `blocked` execution routes to a human, since a
+ *    reviewer that could not complete cannot have certified anything.
+ *
+ * §12 malformed output falls back to today's semantics, with one exception in the
+ * same direction: an envelope that was EMITTED and rejected cannot be read as a
+ * clean pass, because the reviewer plainly tried to say something the runner
+ * could not validate. That downgrades `success` to a human handoff and leaves
+ * every other verdict alone.
+ */
+function applyFindingsToClassification(
+  classification: ClassificationDetail,
+  outcome: ReviewFindingsOutcome,
+): ClassificationDetail {
+  if (classification.classification === "conflict") return classification;
+  if (outcome.kind === "legacy") return classification;
+  if (outcome.kind === "rejected") {
+    if (classification.classification !== "success") return classification;
+    return {
+      classification: "blocked",
+      hasBlockingFindings: false,
+      hasConflictSignal: false,
+      findingCount: 0,
+      reason: "Review emitted a structured finding envelope that failed validation — escalating to human rather than passing an unvalidated review",
+    };
+  }
+  if (outcome.status === "blocked") {
+    return {
+      classification: "blocked",
+      hasBlockingFindings: false,
+      hasConflictSignal: false,
+      findingCount: 0,
+      reason: `Review reported blocked execution (${outcome.blockedReason ?? "unspecified"}) in its structured envelope`,
+    };
+  }
+  // §2.2: a re-raise of a lineage an earlier review opened records no new
+  // finding, but it is blocking exactly as a fresh one is — counting only the
+  // newly written records would pass a review whose every finding re-asserted an
+  // open defect (issue #841 review, P1).
+  const blockingFindings = outcome.findings.length + outcome.attachments.length;
+  if (blockingFindings > 0) {
+    // A prose request for human judgment already classified as `blocked`; the
+    // findings do not overrule it. Routing them back to automation would drop a
+    // reviewer's explicit escalation, which is the wrong direction.
+    if (classification.classification === "blocked") return classification;
+    return {
+      classification: "needs_fix",
+      hasBlockingFindings: true,
+      hasConflictSignal: false,
+      findingCount: blockingFindings,
+      reason: `Review reported ${blockingFindings} blocking finding(s) in its structured envelope`,
+    };
+  }
+  return classification;
+}
+
+/**
+ * Classify a review whose envelope was admitted, from its PROSE alone.
+ *
+ * The §13 prose rules were written for free-form reviewer text and read the
+ * whole output, so they also read the envelope's JSON — where a finding that
+ * merely QUOTES user-facing wording such as "manual review required" matches the
+ * human-escalation patterns and routes an actionable finding to a human instead
+ * of to the fix lane (issue #841 review, P2). Once an envelope is admitted, the
+ * classifier is therefore given the residual prose only: the reviewer's own
+ * words about the diff, which is exactly what those patterns were built to read.
+ *
+ * Two boundaries are kept:
+ *  - a structural conflict signal is tested against the COMPLETE output, since
+ *    it is Git's own evidence rather than a reviewer statement, and a truncated
+ *    or malformed region inside the block is no reason to ignore it;
+ *  - a review with no prose at all is not "empty output" — the envelope IS the
+ *    verdict — so it starts from a clean read that the envelope then refines.
+ */
+function classifyStructuredReviewProse(fullOutput: string, residual: string): ClassificationDetail {
+  if (hasConflictSignal(fullOutput)) return classifyReviewOutput(fullOutput);
+  if (residual.trim().length === 0) {
+    return {
+      classification: "success",
+      hasBlockingFindings: false,
+      hasConflictSignal: false,
+      findingCount: 0,
+      reason: "Fully structured review — no free-form reviewer prose to classify",
+    };
+  }
+  return classifyReviewOutput(residual);
 }
 
 /**
@@ -1698,6 +1883,66 @@ export function createReviewHandler(
     // Triggers conflict-specific review instructions and loop-cap tracking. Raw rationale
     // fields are never passed here; only this boolean reaches the review prompt.
     const postConflictReview = ctx["postConflictReview"] === true;
+    // Issue #841: resolve the review-dispute protocol gate and the configured
+    // agent's ability to honor an output contract. Session load already rejects
+    // an invalid `reviewDispute` block (§6.1), so an unresolvable config here can
+    // only mean a hand-built session object. Failing the run is the fail-closed
+    // reading: treating it as "protocol disabled" would let an invalid limit
+    // silently drop the review back to legacy semantics — including a clean
+    // success — which is exactly the enforcement bypass the gate exists to
+    // prevent (issue #841 review, P2). The failure is raised before the review
+    // agent is invoked, so nothing structured is produced or persisted.
+    const disputeResolution = resolveReviewDisputeSettings(session.reviewDispute);
+    if (!disputeResolution.ok) {
+      // Config errors carry only literals and numbers (see ReviewDisputeConfigError),
+      // so both the artifact and the bounded context are safe to record verbatim.
+      const detail = disputeResolution.errors.map((e) => e.message).join("; ");
+      writeFileSync(
+        join(artifactDir, "review-result.json"),
+        JSON.stringify({
+          issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
+          success: false, step: "review-dispute-config:invalid",
+          reviewDisputeConfigErrors: disputeResolution.errors,
+        }, null, 2),
+        "utf8",
+      );
+      return {
+        result: "failed",
+        context: {
+          artifactDir,
+          prUrl,
+          branch,
+          labels: taskLabels,
+          resolvedProfile,
+          reviewDisputeConfigError: {
+            paths: disputeResolution.errors.map((e) => e.path),
+            codes: disputeResolution.errors.map((e) => e.code),
+          },
+          ...(diffClassification !== undefined ? { diffClassification } : {}),
+        },
+        error: `Invalid session.reviewDispute configuration: ${detail}. Review cannot run under the review-dispute protocol until the configuration is corrected.`,
+      };
+    }
+    const disputeEnabled = disputeResolution.settings.enabled;
+    const disputeLimits: ReviewDisputeLimits = disputeResolution.settings.limits;
+    const findingsSupport = structuredFindingsSupport(cmdSpec.resolvedProfile.agentId);
+    const structuredFindingsRequested = disputeEnabled && findingsSupport.supported;
+    // Issue #841 review (P1): a task re-enters review carrying the lineages an
+    // earlier review opened, and §2.2 attaches a re-raise of the same defect to
+    // the live one. The reviewer is shown those ids so an echo it emits is one
+    // admission will recognize — an id it was never shown is rejected, and an
+    // unlabelled re-raise would otherwise be admitted as a second version-1
+    // finding for a debate that is already open.
+    //
+    // A prior block that does not validate yields no ids: the run then proceeds
+    // exactly as before and `processReviewFindings` refuses the envelope on the
+    // same block afterwards, so the corrupt state is reported once, from the
+    // place that owns persistence, rather than silently half-trusted here.
+    let liveLineages: readonly ReviewPromptLineage[] = [];
+    if (structuredFindingsRequested && ctx.reviewDispute !== undefined && ctx.reviewDispute !== null) {
+      const priorContext = validateReviewDisputeContext(ctx.reviewDispute, "priorReviewDispute", disputeLimits);
+      if (priorContext.ok) liveLineages = openLineagePrompts(priorContext.value);
+    }
     const reviewBrief = buildReviewContext({
       issueNumber: task.issueNumber,
       title: title ?? `Issue #${task.issueNumber}`,
@@ -1710,6 +1955,8 @@ export function createReviewHandler(
       ...(issueRequiredVerifications !== undefined ? { issueRequiredVerifications } : {}),
       ...(reviewDependencies.length > 0 ? { dependencies: reviewDependencies } : {}),
       ...(postConflictReview ? { postConflictReview: true } : {}),
+      ...(structuredFindingsRequested ? { structuredFindings: true } : {}),
+      ...(liveLineages.length > 0 ? { liveLineages } : {}),
     });
 
     let reviewPromptArtifact: string;
@@ -1858,7 +2105,118 @@ export function createReviewHandler(
     }
 
     // Classify the review output
-    const classification = classifyReviewOutput(reviewResult.stdout || reviewResult.stderr);
+    const reviewOutput = reviewResult.stdout || reviewResult.stderr;
+    const baseClassification = classifyReviewOutput(reviewOutput);
+
+    // Issue #841: extract, validate, and admit the structured finding envelope.
+    // The complete raw output is already on disk (`review-output.md`); only the
+    // bounded §10.1 block and a literals-only summary reach task context, and
+    // nothing at all is persisted unless every finding admitted.
+    let classification = baseClassification;
+    let findingsContext: Record<string, unknown> = {};
+    if (disputeEnabled) {
+      if (!findingsSupport.supported) {
+        // The explicit compatibility path (§13): the agent was never asked for an
+        // envelope, so its absence is recorded as a configuration fact rather than
+        // surfacing as a malformed-output diagnostic. Routing is today's.
+        const summary: ReviewFindingsSummary = {
+          mode: "unsupported",
+          agentId: cmdSpec.resolvedProfile.agentId,
+          compatibility: findingsSupport.reason,
+        };
+        writeFileSync(join(artifactDir, "review-findings-diagnostic.json"), JSON.stringify(summary, null, 2), "utf8");
+        findingsContext = { reviewFindings: summary };
+      } else {
+        let evidenceResolver: EvidenceRefResolver | undefined;
+        const outcome = processReviewFindings({
+          output: reviewOutput,
+          reviewerMeta: {
+            agentId: cmdSpec.resolvedProfile.agentId,
+            ...(resolvedProfile.model !== undefined ? { model: resolvedProfile.model } : {}),
+            ...(resolvedProfile.effort !== undefined ? { effort: resolvedProfile.effort } : {}),
+            reviewRunId: runId,
+            timestamp: new Date().toISOString(),
+          },
+          humanGate: resolveFindingHumanGate(ctx),
+          // Built on first use: a legacy review (no envelope) never reaches an
+          // evidence reference, and it must not pay for a `git ls-files` capture.
+          resolveEvidenceRef: (ref) => {
+            evidenceResolver ??= createReviewEvidenceResolver({
+              trackedFiles: captureTrackedFiles(runner, cwd),
+              // Content-level checks (does the cited range exist, does the cited
+              // heading exist) read the reviewed checkout itself, bounded and
+              // cached per path by the resolver.
+              readTrackedFile: createTrackedFileReader(cwd),
+              // Only a body with content is something a quote can resolve
+              // against — the same condition the prompt was built under.
+              ...(body !== undefined && body.trim() !== "" ? { issueBody: body } : {}),
+            });
+            return evidenceResolver(ref);
+          },
+          repoRoot: cwd,
+          limits: disputeLimits,
+          // What an earlier review of this task persisted. The block written
+          // below replaces it wholesale (task context merges shallowly), so it
+          // is handed in to be carried forward rather than overwritten (issue
+          // #841 review, P1).
+          ...(ctx.reviewDispute !== undefined && ctx.reviewDispute !== null
+            ? { priorContext: ctx.reviewDispute }
+            : {}),
+        });
+        classification = applyFindingsToClassification(
+          // An admitted envelope takes the prose rules off its own JSON; every
+          // other outcome keeps reading the complete output as before.
+          outcome.kind === "admitted"
+            ? classifyStructuredReviewProse(reviewOutput, outcome.residual)
+            : baseClassification,
+          outcome,
+        );
+        const summary: ReviewFindingsSummary = {
+          mode: outcome.kind,
+          agentId: cmdSpec.resolvedProfile.agentId,
+          ...(outcome.kind === "legacy" ? { reviewStructure: outcome.structure.mode } : {}),
+          ...(outcome.kind === "rejected"
+            ? { rejection: { reason: outcome.failure.reason, detail: outcome.failure.detail } }
+            : {}),
+          ...(outcome.kind === "admitted"
+            ? {
+                status: outcome.status,
+                reviewStructure: outcome.structure.mode,
+                admitted: outcome.findings.length,
+                ...(outcome.attachments.length > 0
+                  ? { attachedLineages: outcome.attachments.map((a) => a.lineageId) }
+                  : {}),
+                ...(outcome.retainedLineages > 0 ? { retainedLineages: outcome.retainedLineages } : {}),
+                ...(outcome.blockedReason !== undefined ? { blockedReason: outcome.blockedReason } : {}),
+                ...(outcome.ignoredRunnerOwnedFields.length > 0
+                  ? { ignoredRunnerOwnedFields: outcome.ignoredRunnerOwnedFields }
+                  : {}),
+              }
+            : {}),
+        };
+        writeFileSync(join(artifactDir, "review-findings-diagnostic.json"), JSON.stringify(summary, null, 2), "utf8");
+        findingsContext = { reviewFindings: summary };
+        if (outcome.kind === "admitted") {
+          // §10.2: the full records — prose, evidence, reviewer metadata — are a
+          // LOCAL artifact. Only the bounded block below crosses into SQLite.
+          // Both were produced together by admission: an envelope whose records
+          // could not be serialized never reaches here, so every lineage THIS
+          // run opens and the artifact that backs it are written as a pair. A
+          // lineage carried over from an earlier review keeps its record in that
+          // earlier run's artifact directory.
+          writeFileSync(join(artifactDir, REVIEW_FINDINGS_ARTIFACT), outcome.findingsArtifact, "utf8");
+          // `artifactDir` on the task context is the CURRENT phase run's own
+          // directory and is overwritten by every later implementation retry
+          // (quota delay, agent/verification failure, ...), but the findings
+          // prose this run just wrote to disk only ever lives under THIS
+          // review run's directory. Carry a dedicated, never-overwritten
+          // reference alongside `reviewDispute` so a later fix-mode prompt
+          // build can still find `review-findings.json` after any number of
+          // implementation retries (issue #837 review, P2).
+          findingsContext = { reviewFindings: summary, reviewDispute: outcome.context, reviewArtifactDir: artifactDir };
+        }
+      }
+    }
 
     writeFileSync(
       join(artifactDir, "review-result.json"),
@@ -1876,8 +2234,6 @@ export function createReviewHandler(
       }, null, 2),
       "utf8",
     );
-
-    const reviewOutput = reviewResult.stdout || reviewResult.stderr;
 
     // When the review agent left residue, append the diff as suggested changes so
     // the implementation agent has concrete guidance alongside the review text.
@@ -1907,6 +2263,7 @@ export function createReviewHandler(
           reviewLoopCapReached: true,
           reviewLoopMaxCycles: maxCycles,
           ...(reviewResidue !== undefined ? { reviewResidue } : {}),
+          ...findingsContext,
           ...classification,
         });
         if (syntheticBlocked) return syntheticBlocked;
@@ -1926,6 +2283,7 @@ export function createReviewHandler(
             resolvedProfile,
             ...(reviewResidue !== undefined ? { reviewResidue } : {}),
             ...(diffClassification !== undefined ? { diffClassification } : {}),
+            ...findingsContext,
             ...classification,
           },
           message: capMessage,
@@ -1934,9 +2292,15 @@ export function createReviewHandler(
       // Free a synthetic `ai/pr-<n>` review worktree before the fix handoff so the
       // implementation phase can re-materialize it on the PR's real head (issue #459
       // review, P2). Escalates to a human if the synthetic worktree cannot be removed.
+      //
+      // That handoff returns before `needsFixContext` below is built, so it has to
+      // carry the findings state itself (issue #841 review, P2): `review-findings.json`
+      // is already on disk, and a blocked context without the lineages it backs would
+      // strand the artifact on this cleanup-failure path.
       const syntheticBlocked = releaseSyntheticWorktreeForFix({
         reviewAgentUsed: agentId,
         ...(reviewResidue !== undefined ? { reviewResidue } : {}),
+        ...findingsContext,
         ...classification,
       });
       if (syntheticBlocked) return syntheticBlocked;
@@ -1953,6 +2317,7 @@ export function createReviewHandler(
         ...(loopState.escalatedEffort !== undefined ? { escalatedEffort: loopState.escalatedEffort } : {}),
         ...(reviewResidue !== undefined ? { reviewResidue } : {}),
         ...(diffClassification !== undefined ? { diffClassification } : {}),
+        ...findingsContext,
         ...classification,
         // Reset conflict-review tracking so a subsequent implementation→review cycle
         // does not inherit the post-conflict loop counter (issue #540).
@@ -1997,6 +2362,7 @@ export function createReviewHandler(
           context: {
             artifactDir, reviewAgentUsed: agentId, prUrl, branch, resolvedProfile, reviewLockScope,
             ...(reviewResidue !== undefined ? { reviewResidue } : {}),
+            ...findingsContext,
             ...classification,
           },
           message: `Review found merge conflicts, but ${describeWorktreeFreeFailure(freed, "conflict_resolution runs in the canonical checkout and Git refuses a branch already held by another worktree.")}`,
@@ -2011,15 +2377,24 @@ export function createReviewHandler(
             conflictReviewLoopCapReached: true,
             conflictReviewLoopMaxCycles: maxConflictReviewCycles,
             ...(reviewResidue !== undefined ? { reviewResidue } : {}),
+            ...findingsContext,
             ...classification,
           },
           message: `Conflict-review loop cap reached after ${conflictLoopState.completedCycles}/${maxConflictReviewCycles} cycle(s) — this PR has been returned from conflict_resolution to review and still shows merge-conflict signals. Escalating to human.`,
         };
       }
+      // Carry the admitted finding state across the conflict handoff (issue #841
+      // review, P1). A conflict signal does not overrule an envelope that already
+      // validated: `applyFindingsToClassification` keeps the `conflict` routing
+      // while `processReviewFindings` has already written the findings artifact and
+      // built the persisted `reviewDispute` block. Since task context is taken from
+      // this result, dropping `findingsContext` here would strand that artifact
+      // without the lineages it is the backing store for.
       const conflictContext = {
         artifactDir, reviewAgentUsed: agentId, prUrl, branch, resolvedProfile,
         ...(reviewResidue !== undefined ? { reviewResidue } : {}),
         ...(conflictLoopState !== undefined ? { conflictReviewCycles: conflictLoopState.completedCycles } : {}),
+        ...findingsContext,
         ...classification,
       };
       const forkBlocked = forkedPrHandoff("conflict", conflictContext);
@@ -2053,6 +2428,7 @@ export function createReviewHandler(
           context: {
             artifactDir, reviewAgentUsed: agentId, prUrl, branch, resolvedProfile, reviewLockScope,
             ...(reviewResidue !== undefined ? { reviewResidue } : {}),
+            ...findingsContext,
             ...classification,
           },
           message: `Review completed (${classification.classification}) but ${describeWorktreeFreeFailure(freed, `A later human-requested implementation fix resolves the worktree on the PR's real head and Git refuses a path already checked out on another branch (currently \`ai/pr-${prNum ?? "<n>"}\`).`)}`,
@@ -2076,6 +2452,12 @@ export function createReviewHandler(
       const mergeContext = {
         artifactDir, reviewAgentUsed: agentId, prUrl, branch,
         ...(reviewResidue !== undefined ? { reviewResidue } : {}),
+        // Same reason as the classifier conflict lane above (issue #841
+        // review, P1): a clean Gemini review can still have admitted an envelope,
+        // and every outcome built from this context — the live-mergeability
+        // conflict handoff and its blocked escalations — must carry that state
+        // rather than strand the findings artifact.
+        ...findingsContext,
         ...classification,
       };
       // A truncated diff means any blocking change after the cutoff was never shown
@@ -2213,6 +2595,7 @@ export function createReviewHandler(
         ...(reviewResidue !== undefined ? { reviewResidue } : {}),
         ...(diffClassification !== undefined ? { diffClassification } : {}),
         ...(issueRequiredVerifications !== undefined ? { issueRequiredVerifications } : {}),
+        ...findingsContext,
         ...classification,
         postConflictReview: null,
         conflictReviewCycles: null,

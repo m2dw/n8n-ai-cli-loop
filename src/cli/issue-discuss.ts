@@ -56,6 +56,7 @@ import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import {
   DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
   JsonSessionRegistry,
 } from "../registries/json-session-registry.js";
 import { emit, die } from "./cli-io.js";
@@ -240,7 +241,7 @@ async function resolveSession(
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    return { error: `Unknown sessionId: ${sessionId} (not found in ${sessionsPath})` };
+    return { error: describeUnresolvedSessionId(registry, sessionId, sessionsPath) };
   }
 
   return {

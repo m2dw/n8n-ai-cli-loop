@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteTaskStore, SqliteOutboxStore } from '../dist/index.js';
+import { SqliteMaintenanceLock } from '../dist/stores/sqlite-maintenance-lock.js';
 
 const CLI = new URL('../dist/cli/admin.js', import.meta.url).pathname;
 
@@ -487,7 +488,121 @@ describe('admin CLI — human-review-return: GitHub label outbox', () => {
     expect(adds).toContain('status:needs-fix');
     expect(adds).toContain('agent:claude');
     expect(removes).toContain('ai:ready-for-human');
+
+    // The public status comment is part of the SAME effect set as those labels
+    // (issue #818 review follow-up), not a separate enqueue issued after the
+    // transaction: the task leaving `ready_for_human` is what makes this command
+    // non-repeatable, so anything refused after that point can never be posted.
+    const comments = entries.filter((e) => e.topic === 'gh:comment');
+    expect(comments).toHaveLength(1);
+    expect(comments[0].payload.body).toContain('Returned to implementation fix mode by operator');
   });
+});
+
+// Issue #818 review follow-up. This command is a compound task-and-effect
+// operation: it transitions the task into the fix lane AND enqueues the label
+// swap that tells the repo host about it. Under a held maintenance lock the
+// enqueue is refused, so the transition must not happen either — otherwise the
+// human-handoff lane is left half-applied for the whole maintenance window,
+// with the task queued for a fix run nobody has been told about.
+describe('admin CLI — human-review-return: maintenance lock', () => {
+  test('refuses the whole requeue while a maintenance lock is held', async () => {
+    writeSession();
+    await seedReadyForHumanTask(60);
+
+    const lock = new SqliteMaintenanceLock(dbPath);
+    expect(lock.acquire('prune:1234').ok).toBe(true);
+    let r;
+    try {
+      r = run(
+        'human-review-return',
+        '--session-id', 'addon-dev',
+        '--issue-number', '60',
+        '--db-path', dbPath,
+        '--sessions-path', sessionsPath,
+        '--feedback', 'fix the regression',
+      );
+    } finally {
+      lock.release();
+      lock.close();
+    }
+
+    expect(r.code).not.toBe(0);
+    expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('maintenance_locked') });
+
+    // Neither half landed.
+    const task = await getTask(60);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.implementationMode).toBeUndefined();
+    expect(task.context.reviewFeedback).toBeUndefined();
+    expect(await getOutbox()).toHaveLength(0);
+  });
+
+  test('the same command requeues normally once the lock is released', async () => {
+    writeSession();
+    await seedReadyForHumanTask(61);
+
+    const lock = new SqliteMaintenanceLock(dbPath);
+    expect(lock.acquire('prune:1234').ok).toBe(true);
+    lock.release();
+    lock.close();
+
+    const r = run(
+      'human-review-return',
+      '--session-id', 'addon-dev',
+      '--issue-number', '61',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--feedback', 'fix the regression',
+    );
+    expect(r.code).toBe(0);
+    expect(parse(r)).toMatchObject({ ok: true, status: 'queued', phase: 'implementation' });
+    expect((await getOutbox()).length).toBeGreaterThan(0);
+  });
+
+  test('the refusal withholds the public status comment too, so the command stays repeatable', async () => {
+    writeSession();
+    await seedReadyForHumanTask(62);
+
+    const lock = new SqliteMaintenanceLock(dbPath);
+    expect(lock.acquire('prune:1234').ok).toBe(true);
+    try {
+      const refused = run(
+        'human-review-return',
+        '--session-id', 'addon-dev',
+        '--issue-number', '62',
+        '--db-path', dbPath,
+        '--sessions-path', sessionsPath,
+        '--feedback', 'fix the regression',
+      );
+      expect(refused.code).not.toBe(0);
+    } finally {
+      lock.release();
+      lock.close();
+    }
+
+    // The comment announcing the move is committed with the transition, so a
+    // refusal leaves nothing to reconcile: the task is still ready_for_human and
+    // re-running the command posts the announcement exactly once. Enqueued
+    // separately, the announcement could be lost for good — the task would have
+    // already left the status this command accepts.
+    expect((await getTask(62)).status).toBe('ready_for_human');
+    expect(await getOutbox()).toHaveLength(0);
+
+    const retry = run(
+      'human-review-return',
+      '--session-id', 'addon-dev',
+      '--issue-number', '62',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--feedback', 'fix the regression',
+    );
+    expect(retry.code).toBe(0);
+    const comments = (await getOutbox()).filter((e) => e.topic === 'gh:comment');
+    expect(comments).toHaveLength(1);
+    expect(comments[0].payload.body).toContain('Returned to implementation fix mode by operator');
+    // Two CLI subprocesses in one test — well past jest's 5s default.
+  }, 30_000);
 });
 
 describe('admin CLI — human-review-return: sanitization', () => {

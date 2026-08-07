@@ -20,6 +20,54 @@ export interface ReviewLoopConfig {
   maxCycles?: number;
 }
 
+/**
+ * Per-lineage protocol limits (§6.1 of docs/review-dispute-contract.md).
+ *
+ * Session config may only LOWER these; the contract maxima are the defaults.
+ * Four of them additionally reject 0 at session load, because at 0 the protocol
+ * would have a state with no next action — see `REVIEW_DISPUTE_LIMIT_SPECS` in
+ * core/review-dispute.ts, which owns the normative table and the validation.
+ */
+export interface ReviewDisputeLimitsConfig {
+  /** `MAX_REBUTTALS_PER_VERSION`. Default 1; must not be lowered. */
+  maxRebuttalsPerVersion?: number;
+  /** `MAX_VERSIONS_PER_LINEAGE`. Default 2; must not be lowered below 1. */
+  maxVersionsPerLineage?: number;
+  /** `MAX_RECONSIDERATIONS_PER_LINEAGE`. Default 1; 0 skips the round (row 25). */
+  maxReconsiderationsPerLineage?: number;
+  /** `MAX_ARBITRATION_PASSES_PER_LINEAGE`. Default 2; must not be lowered below 1. */
+  maxArbitrationPassesPerLineage?: number;
+  /** `MAX_MALFORMED_ARBITER_ATTEMPTS_PER_LINEAGE`. Default 2; must not be lowered below 1. */
+  maxMalformedArbiterAttemptsPerLineage?: number;
+  /** `MAX_EVIDENCE_ROUNDS_PER_LINEAGE`. Default 1; 0 makes the round unavailable (row 17). */
+  maxEvidenceRoundsPerLineage?: number;
+}
+
+/** Arbiter selection policy (§8.3). Selection itself is issue #839/#846. */
+export interface ReviewDisputeArbiterConfig {
+  /** Ordered candidate agent ids; the runner takes the first cross-provider one. */
+  providers?: string[];
+  /** A same-provider (never same-model) candidate is allowed only by explicit opt-in. */
+  allowSameProvider?: boolean;
+  /** Confidence threshold for the decisive verdicts of rows 13–14 and 18. Default 0.7. */
+  minConfidence?: number;
+}
+
+/**
+ * Review dispute, reconsideration, and arbitration protocol
+ * (docs/review-dispute-contract.md). Off by default: with `enabled` absent or
+ * false, review and fix behave byte-identically to today — free-form feedback,
+ * no lineages, no dispositions, and a no-change fix run fails (§13).
+ */
+export interface ReviewDisputeConfig {
+  /** Master switch. Default false. */
+  enabled?: boolean;
+  /** Per-lineage limits; may only be lowered (§6.1). */
+  limits?: ReviewDisputeLimitsConfig;
+  /** Arbiter selection policy (§8.3). */
+  arbiter?: ReviewDisputeArbiterConfig;
+}
+
 export interface ConflictResolutionLoopConfig {
   /**
    * Maximum number of same-kind verification-failure attempts before escalating
@@ -205,7 +253,7 @@ export interface ClaudeConfig {
   /**
    * Overrides the built-in complexity-label -> Claude model/effort/budget
    * mapping. Optional and a no-op when absent: a session without it uses the
-   * built-in defaults (e.g. `complexity:xhigh` -> Fable 5 / high / $20),
+   * built-in defaults (e.g. `complexity:xhigh` -> Fable 5 / xhigh / $20),
    * preserving today's behavior.
    */
   complexityProfiles?: ClaudeComplexityProfilesConfig;
@@ -225,6 +273,44 @@ export interface AntigravityResearchConfig {
    * When absent the CLI default model is used.
    */
   model?: string;
+  /**
+   * `--print-timeout` passed to `agy --print` (issue #861). A Go-duration
+   * string such as `"15m"`, `"90s"`, or `"1h30m"`; validated and bounded by
+   * `parseAntigravityPrintTimeout` (src/core/antigravity-print-timeout.ts).
+   * When absent, `ANTIGRAVITY_PRINT_TIMEOUT_DEFAULT` ("15m") is used instead
+   * of Antigravity's own five-minute CLI default, which is too short for
+   * large but valid research tasks.
+   */
+  printTimeout?: string;
+  /** Runner-owned workspace permission profile (issue #826). */
+  workspaceSettings?: AntigravityWorkspaceSettingsSessionConfig;
+}
+
+/**
+ * Bounded, runner-owned `<workspace_root>/.gemini/settings.json` generation for
+ * headless research (issue #826, docs/antigravity-workspace-settings.md). Off by
+ * default: with `enabled` absent or false the research phase writes nothing into
+ * the workspace and behaves exactly as before.
+ */
+export interface AntigravityWorkspaceSettingsSessionConfig {
+  /** Master switch for the workspace-settings preparation step. Default false. */
+  enabled?: boolean;
+  /**
+   * Register the EXACT research workspace in the Antigravity CLI trust store
+   * when it is not already trusted. Default false — an untrusted workspace fails
+   * closed instead. A parent-directory grant is never written either way.
+   */
+  registerTrust?: boolean;
+  /**
+   * Absolute path of the global Antigravity CLI settings file holding the trust
+   * store. When absent the runtime resolves `ANTIGRAVITY_CLI_SETTINGS`, then the
+   * user default `~/.gemini/antigravity-cli/settings.json`.
+   *
+   * It only moves where the *runner* writes: `agy` still reads its own store, so
+   * a research run that launches the CLI is refused unless this resolves to that
+   * same file (`global-settings-not-canonical`, issue #830).
+   */
+  globalSettingsPath?: string;
 }
 
 /**
@@ -248,11 +334,50 @@ export interface ResearchEvidenceConfig {
   maxTurns?: number;
 }
 
+/**
+ * Research Publication policy (issue #834,
+ * docs/research-publication-contract.md). Off by default: with `mode` absent or
+ * `"local_only"` the research phase behaves exactly as before — no publication
+ * prompt section, no publication artifact, and the existing fixed-status
+ * comment on the originating Issue.
+ *
+ * `sanitized_summary` turns on the separately validated publication path: the
+ * agent emits a closed-schema report envelope, the runner validates and
+ * sanitizes it deterministically, and only that report is enqueued. It is not a
+ * relaxation of the raw-output withholding conditions — raw agent stdout is
+ * never published under either mode.
+ */
+export interface ResearchPublicationConfig {
+  /** Publication mode. Default `"local_only"`; an unrecognized value resolves to it. */
+  mode?: "local_only" | "sanitized_summary";
+  /**
+   * Size budget for the rendered public report. Clamped to the module's
+   * floor/ceiling; when absent the contract default (12,000) applies.
+   */
+  maxChars?: number;
+  /**
+   * Explicit operator acknowledgment that a validated report may be published
+   * even though every research run is untrusted by provenance: the run exists
+   * because a GitHub Issue asked for it, and everything an Issue carries is
+   * written by whoever can file or edit it. Setting this accepts that
+   * deterministic validation and known-pattern redaction cannot guarantee the
+   * removal of arbitrary or unknown secrets from AI-authored prose — a steered
+   * agent can place one inside an otherwise well-formed field.
+   *
+   * Without it, `sanitized_summary` builds and sanitizes the report but keeps it
+   * local, so this flag is what enables publication at all. Default `false`;
+   * only a literal `true` enables it.
+   */
+  allowUntrustedInputs?: boolean;
+}
+
 export interface ResearchConfig {
   /** Antigravity-specific research model configuration. */
   antigravity?: AntigravityResearchConfig;
   /** Repository evidence configuration (issue #806). */
   evidence?: ResearchEvidenceConfig;
+  /** Research Publication policy (issue #834). */
+  publication?: ResearchPublicationConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +711,13 @@ export interface SessionConfig {
   verification: VerificationCommands;
   labels: SessionLabels;
   reviewLoop?: ReviewLoopConfig;
+  /**
+   * Review-dispute protocol (issue #835, docs/review-dispute-contract.md).
+   * Optional and disabled by default; a session without it behaves exactly as
+   * today. Limits that would leave the protocol unusable are rejected at
+   * session load rather than clamped (§6.1).
+   */
+  reviewDispute?: ReviewDisputeConfig;
   conflictResolutionLoop?: ConflictResolutionLoopConfig;
   /**
    * Per-issue worktree isolation (issue #400). Optional — only present to

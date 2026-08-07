@@ -30,7 +30,8 @@ implementation handler all exist to manage this single shared mutable tree.
 Each work item runs in its own durable git worktree, keyed by session + issue:
 
 ```text
-<root>/<session>/issue-<n>/repo/      # git worktree checkout for ai/issue-<n>
+<root>/<session>/issue-<n>/repo/               # git worktree checkout for ai/issue-<n>
+<root>/<session>/issue-<n>/research-<runId>/   # detached, per-run research checkout
 ```
 
 - `<root>` is the managed state root. Resolution order: per-session
@@ -46,6 +47,43 @@ Each work item runs in its own durable git worktree, keyed by session + issue:
   recorded in task context so later phases (and admin commands) re-resolve the
   same worktree even if `<root>` moved.
 
+### Research worktree (issue #855)
+
+Research is read-only, so it does not use the durable `issue-<n>/repo` checkout
+and creates no `ai/issue-<n>` branch. It gets a throwaway checkout of its own:
+
+1. `git fetch origin +<base>:refs/remotes/origin/<base>` in the canonical repo,
+2. `git rev-parse refs/remotes/origin/<base>^{commit}` → an immutable SHA,
+3. `git worktree add --detach <root>/<session>/issue-<n>/research-<runId> <sha>`.
+
+Rules:
+
+- **No fallback.** A failed fetch or SHA resolution fails the phase *before* the
+  agent is invoked. Running against whatever the local checkout happens to hold
+  is the failure mode this exists to prevent: a research run once reported a
+  merged dependency's data as missing, exited 0, and was recorded as valid.
+- **Per-run path.** The `runId` segment keeps the checkout unique, so research
+  never collides with the durable worktree, another phase, or a retry.
+- **Same lock.** The run takes the existing `IssueWorktreeLock` for
+  `<session>::issue-<n>`; no new lock class exists for research.
+- **Removed afterwards.** `git worktree remove --force` runs on every exit path.
+  Run artifacts live under `session.artifactRoot`, outside the checkout, so they
+  survive; if an operator configured that root *inside* the checkout, the
+  worktree is retained instead and the result artifact records
+  `workspace.release: "retained-artifacts-inside"`.
+- **Reclaimable when the run crashes.** A process killed between
+  `git worktree add` and that removal leaks the checkout, and nothing in the
+  normal flow can reclaim it — a retry allocates a new `runId`, so it creates a
+  new path rather than reusing the abandoned one. Both admin cleanup routes
+  therefore treat a research checkout as disposable rather than as the issue's
+  durable worktree; see the Cleanup model below.
+- **Recorded, not published.** `research-context.json` and
+  `research-result.json` carry `workspace.{worktreeId,baseBranch,baseRef,baseSha}`
+  — an identity label and refs, never the absolute checkout path.
+- **Nothing is copied in.** No `node_modules` symlink, no gitignored operator
+  inputs: research that needs those must use the explicit, audited evidence /
+  capture-bundle mechanism.
+
 ### Path / identity helpers
 
 `src/core/worktree-paths.ts` (pure, dependency-free):
@@ -53,6 +91,13 @@ Each work item runs in its own durable git worktree, keyed by session + issue:
 - `resolveWorktreeRoot({ sessionRoot?, env? })`
 - `issueWorktreeId(sessionId, issueNumber)`
 - `issueWorktreePath(root, sessionId, issueNumber)`
+- `researchWorktreeId(sessionId, issueNumber, runId)`
+- `researchWorktreePath(root, sessionId, issueNumber, runId)`
+- `classifyManagedWorktree(relativePath)` — inverse of the two path builders:
+  maps a path relative to `sessionWorktreeDir` back to
+  `{ kind: "issue" | "research", issueNumber, runId? }`, or null when it is not a
+  managed layout. Admin cleanup uses it so the durable and per-run checkouts get
+  different policies without re-deriving the layout regex per call site.
 - `sessionWorktreeDir(root, sessionId)`
 - `redactWorktreePaths(text, root)`
 
@@ -73,6 +118,14 @@ so the logic is unit-testable without a real repo):
 - `removeWorktree(repoRoot, path, { force })` — `git worktree remove`; refuses a
   dirty/locked worktree unless `force`.
 - `IssueWorktreeLock` — issue-scoped advisory lock (see Locking).
+
+`src/handlers/research-worktree.ts` (same primitives, research sequencing):
+
+- `prepareResearchWorkspace(input)` — fetch base → resolve SHA → `git worktree
+  add --detach`; returns a typed `{ stage, error }` failure instead of a
+  half-usable workspace.
+- `releaseResearchWorkspace(input)` — force-remove the checkout unless a
+  `preservePaths` entry lives inside it.
 
 ## Lifecycle
 
@@ -306,6 +359,15 @@ sanitized summaries are posted.
   worktree. Previews by default; `--yes` removes; `--force` discards a
   dirty/locked worktree. A missing worktree is a safe no-op. Branches are never
   deleted and the canonical checkout is never touched.
+- `admin worktree prune --session-id <id> --issue-number <n> --research`
+  (issue #855) instead removes that issue's leaked `research-<runId>` checkouts —
+  the targeted route for a research run killed before its own cleanup ran, which
+  the plain prune above cannot reach (it addresses exactly `issue-<n>/repo`).
+  Previews by default; `--yes` removes; no matching checkout is a safe no-op.
+  Lock-aware, unlike the durable prune: a live issue lock means a research run
+  may still be in flight, so it is reported and skipped unless `--force`.
+  Removal itself always forces — the checkout is detached at a fetched base
+  commit and owns no branch, so anything in the tree is agent scratch.
 - `admin worktree cleanup --session-id <id>` (issue #407) bulk-classifies every
   managed per-issue worktree for the session from the worktree registry + task
   store and prunes the ones safe to remove:
@@ -313,6 +375,15 @@ sanitized summaries are posted.
     `ready_for_human`, or it holds a live issue lock → never pruned.
   - **terminal** — the issue's task is `done` → prune candidate.
   - **orphaned** — no task row backs the worktree → prune candidate.
+  - **research-leaked** — an `issue-<n>/research-<runId>` checkout (issue #855)
+    → prune candidate **regardless of the issue's task status**. The checkout
+    belongs to one finished process and no retry can reclaim it, so the task
+    being `running`/`queued` says nothing about whether the directory is in use;
+    gating it on `active` would leak it until the task went terminal. A live
+    issue lock still skips it — that is the interlock which distinguishes a run
+    genuinely in flight. The dirty/unpushed facts are reported but do not gate
+    the decision (a detached checkout has no branch to push), and removal forces
+    without `--force`, matching the in-run release path.
   - any other terminal-ish status (e.g. `failed`) is also a candidate, still
     protected by the dirty/unpushed guards below.
 

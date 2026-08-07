@@ -14,6 +14,8 @@ import {
   issueWorktreePath,
   issueWorktreeId,
   sessionWorktreeDir,
+  researchWorktreePath,
+  classifyManagedWorktree,
   redactWorktreePaths,
   resolveWorktreeRoot,
   DEFAULT_WORKTREE_ROOT,
@@ -668,6 +670,54 @@ describe('IssueWorktreeLock', () => {
     const released = lock.release('run-A', 'addon-dev', 7);
     expect(released.released).toBe(true);
     expect(lock.acquire('run-B', 'addon-dev', 7).locked).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyManagedWorktree: the inverse of the path builders (issue #855).
+// Admin cleanup walks `git worktree list` output and must tell the durable
+// per-issue checkout apart from a throwaway per-run research checkout, because
+// the two get opposite preservation policies.
+// ---------------------------------------------------------------------------
+
+describe('classifyManagedWorktree', () => {
+  const SESSION = 'addon-dev';
+  const ROOT = '/state/worktrees';
+  const prefix = sessionWorktreeDir(ROOT, SESSION) + '/';
+
+  test('classifies the durable per-issue checkout', () => {
+    const rel = issueWorktreePath(ROOT, SESSION, 42).slice(prefix.length);
+    expect(classifyManagedWorktree(rel)).toEqual({ kind: 'issue', issueNumber: 42 });
+  });
+
+  test('classifies a per-run research checkout and recovers its run id', () => {
+    const rel = researchWorktreePath(ROOT, SESSION, 42, 'run-855-1').slice(prefix.length);
+    expect(classifyManagedWorktree(rel)).toEqual({
+      kind: 'research',
+      issueNumber: 42,
+      runId: 'run-855-1',
+    });
+  });
+
+  test('round-trips a run id that needed path encoding', () => {
+    // researchWorktreePath percent-encodes the run id segment, so the
+    // classifier must decode it or the reported run id would not match the run.
+    const runId = 'run/855 #1';
+    const rel = researchWorktreePath(ROOT, SESSION, 7, runId).slice(prefix.length);
+    expect(classifyManagedWorktree(rel)).toEqual({ kind: 'research', issueNumber: 7, runId });
+  });
+
+  test('treats any other child of issue-<n> as the durable worktree', () => {
+    // Preserves the historical behavior of the cleanup scan: the whole
+    // issue-<n> subtree belongs to that issue unless it is a research sibling.
+    expect(classifyManagedWorktree('issue-9')).toEqual({ kind: 'issue', issueNumber: 9 });
+    expect(classifyManagedWorktree('issue-9/repo/src')).toEqual({ kind: 'issue', issueNumber: 9 });
+  });
+
+  test('returns null for a path that is not a managed layout', () => {
+    expect(classifyManagedWorktree('scratch/repo')).toBeNull();
+    expect(classifyManagedWorktree('issue-abc/repo')).toBeNull();
+    expect(classifyManagedWorktree('')).toBeNull();
   });
 });
 

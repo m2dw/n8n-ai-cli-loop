@@ -1036,3 +1036,32 @@ describe('admin status — session pause (issue #531)', () => {
     expect(human.stdout).toContain('admin session resume --session-id addon-dev');
   });
 });
+
+describe('admin status — tolerates non-object session entries (issue #823 review fix)', () => {
+  test('a leading null entry does not prevent status from finding the valid session', async () => {
+    const sessions = {
+      sessions: [
+        null,
+        {
+          sessionId: 'addon-dev',
+          repoKey: 'test-repo',
+          repoRoot,
+          githubRepo: 'm2dw/test-repo',
+          artifactDir: '.n8n-artifacts',
+          baseBranch: 'main',
+          defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
+          verification: { test: 'npm test' },
+          labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
+          worktrees: { root: worktreeRoot },
+        },
+      ],
+    };
+    writeFileSync(sessionsPath, JSON.stringify(sessions, null, 2));
+
+    await enqueue(303);
+    const payload = statusJson('--issue-number', '303');
+    expect(payload.ok).toBe(true);
+    const e = entryFor(payload, 303);
+    expect(e).toBeDefined();
+  });
+});

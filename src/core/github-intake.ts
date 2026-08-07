@@ -185,17 +185,18 @@ export function resolveComplexityTier(labels: string[]): ComplexityTier {
  * | complexity:low   | sonnet | low    | $2     |
  * | (no label)       | sonnet | high   | $5     |
  * | complexity:high  | opus   | high   | $10    |
- * | complexity:xhigh | fable  | high   | $20    |
+ * | complexity:xhigh | fable  | xhigh  | $20    |
  *
  * When multiple complexity labels are present the strongest wins:
  * `xhigh > high > low`.
  *
- * `complexity:xhigh` selects Fable 5 (`fable`) at `high` effort rather than
- * Opus 5 at `xhigh` effort (issue #748): Opus 5 is a distilled model, and
- * pushing its effort past `high` degrades implementation quality rather than
- * improving it, whereas Fable 5 is the strongest available implementation
- * profile. The `xhigh` effort tier remains valid elsewhere (env override,
- * escalation rank) — it is simply no longer what `complexity:xhigh` implies.
+ * `complexity:xhigh` selects Fable 5 (`fable`) at `xhigh` effort (issue #857,
+ * a follow-up policy correction to #748): #748 moved `xhigh` off Opus 5 (a
+ * distilled model, degraded by pushing effort past `high`) onto Fable 5, but
+ * capped it at `high` effort — leaving `xhigh` no stronger than
+ * `complexity:high`. Since Opus 5 at `high` and Fable 5 at `high` are judged
+ * roughly equivalent, `xhigh` now runs Fable 5 at its own `xhigh` effort so
+ * the tier is materially stronger than `complexity:high`.
  *
  * `overrides` lets a session retarget any tier's model/effort/budget without
  * a source change (docs: see session `claude.complexityProfiles`).
@@ -207,7 +208,7 @@ export function labelsToComplexity(
   const tier = resolveComplexityTier(labels);
   const base: ComplexityProfile =
     tier === "xhigh"
-      ? { model: "fable", effort: "high", budget: "20" }
+      ? { model: "fable", effort: "xhigh", budget: "20" }
       : tier === "high"
       ? { model: "opus", effort: "high", budget: "10" }
       : tier === "low"

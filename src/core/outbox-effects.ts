@@ -21,6 +21,7 @@
 import type { AiTask, TaskPhase, TaskStatus } from "./task.js";
 import type { ResolvedSession, WorkItemProviderKind } from "./session.js";
 import type { OutboxStore, OutboxEnqueueInput } from "./outbox.js";
+import type { OutboxEffect } from "./task-store.js";
 import type { PhaseHandlerResult } from "./phase-runner.js";
 import type { AgentFailureKind } from "./agent-diagnostics.js";
 import { makeOutboxKey } from "./outbox.js";
@@ -31,7 +32,19 @@ import { boundedExcerpt, fencedDetailsExcerpt, sanitizeBody } from "./text-sanit
 import { realpathSync } from "fs";
 import { resolveWorktreeRoot } from "./worktree-paths.js";
 import { renderPrSummary, PR_SUMMARY_MARKER } from "./pr-summary.js";
+import {
+  PUBLICATION_WITHHOLD_PHRASES,
+  RESEARCH_PUBLICATION_FAILED_STATUS,
+} from "./research-publication.js";
+import type { PublicationWithholdReason } from "./research-publication.js";
 import { renderHumanGateSummary, HUMAN_GATE_MARKER } from "./human-gate-summary.js";
+import type { DisputeTransitionApplication } from "./review-dispute-transition.js";
+import {
+  disputeOutcomeIdempotencyKey,
+  disputePublicationTarget,
+  publishableDisputeOutcomes,
+  renderDisputeOutcomeComment,
+} from "./review-dispute-publication.js";
 import type { DiffClassification } from "./review-diff-context.js";
 import type { IssueRequiredVerification } from "../handlers/verification.js";
 
@@ -174,18 +187,60 @@ export function workItemOutbox(outboxStore: OutboxStore, session: ResolvedSessio
   if (provider === "github-issues") return outboxStore;
   const owner = provider === "gitea-issues" && wi.gitea ? wi.gitea.owner : session.githubOwner;
   const repo = provider === "gitea-issues" && wi.gitea ? wi.gitea.repo : session.githubName;
+  const enqueueEffects = outboxStore.enqueueEffects?.bind(outboxStore);
+  const getScanCursorFence = outboxStore.getScanCursorFence?.bind(outboxStore);
   return {
+    // Forwarded for the same reason as the lock read below (issue #818 review
+    // follow-up): rewriting a row's address does not change which database it
+    // lands in, so the wrapper must report the wrapped store's backend
+    // identity. Reporting `undefined` would tell a caller pairing this with a
+    // task store on that same file that they share nothing, and it would write
+    // the effects a second time, outside the transaction that already covers
+    // them.
+    backendId: outboxStore.backendId,
+    // Forwarded, not dropped (issue #818): this wrapper only rewrites where a
+    // work-item row is addressed — a wrapped store must still report the same
+    // maintenance-lock state as the store underneath it, or a caller holding
+    // the wrapper would read "unlocked" for a database that is under
+    // maintenance. Resolves to `false` when the wrapped store has no such lock.
+    isMaintenanceLocked: () =>
+      outboxStore.isMaintenanceLocked ? outboxStore.isMaintenanceLocked() : Promise.resolve(false),
     enqueue: (input) => outboxStore.enqueue(rewriteWorkItemEnqueue(input, provider, owner, repo)),
+    // Rewritten and forwarded as one batch (issue #818 review follow-up), so a
+    // wrapped store does not cost its caller the all-or-nothing effect-set
+    // transaction underneath. Omitted entirely when the wrapped store has none,
+    // which leaves the caller on the same per-effect fallback it would use
+    // without this wrapper.
+    ...(enqueueEffects
+      ? {
+          enqueueEffects: (effects: OutboxEffect[]) =>
+            enqueueEffects(
+              effects.map((effect) =>
+                effect.kind === "enqueue"
+                  ? { ...effect, input: rewriteWorkItemEnqueue(effect.input, provider, owner, repo) }
+                  : effect,
+              ),
+            ),
+        }
+      : {}),
     replacePendingPrSummary: (input, key) => outboxStore.replacePendingPrSummary(input, key),
     listPending: (limit) => outboxStore.listPending(limit),
     listPendingEntries: (opts) => outboxStore.listPendingEntries(opts),
     markSent: (id, sentAt, claimToken) => outboxStore.markSent(id, sentAt, claimToken),
     markFailed: (id, error, now, claimToken) => outboxStore.markFailed(id, error, now, claimToken),
     getScanCursor: (key) => outboxStore.getScanCursor(key),
-    setScanCursor: (key, id) => outboxStore.setScanCursor(key, id),
+    // The fence is forwarded whole (issue #820 review follow-up): dropping it
+    // here would silently turn a fenced cursor write back into the
+    // unconditional upsert it replaced, so a dispatch running through this
+    // wrapper could re-strand a row an operator retry just recovered. The
+    // getter is forwarded only when the wrapped store has one, so a store
+    // without fence support still reports "no capability" rather than a
+    // fabricated generation 0 that would make every stale write look current.
+    ...(getScanCursorFence ? { getScanCursorFence } : {}),
+    setScanCursor: (key, id, fence) => outboxStore.setScanCursor(key, id, fence),
     getById: (id) => outboxStore.getById(id),
     listUnsent: () => outboxStore.listUnsent(),
-    retryEntry: (id, now) => outboxStore.retryEntry(id, now),
+    retryEntry: (id, now, opts) => outboxStore.retryEntry(id, now, opts),
     cancelEntry: (id, now) => outboxStore.cancelEntry(id, now),
     claimForDispatch: (id, now) => outboxStore.claimForDispatch(id, now),
     renewClaim: (id, claimedAt, now) => outboxStore.renewClaim(id, claimedAt, now),
@@ -1201,13 +1256,74 @@ export async function enqueueHandlerCommentEffect(
       // reach agent stdout, so the excerpt is suppressed even for an Issue
       // with no body. The two conditions are ORed; neither is narrowed.
       const evidenceEnabled = ctx.evidenceEnabled === true;
+      // issue #826: the runner-owned workspace permission profile lets the
+      // agent read and search the workspace with its own tools, so repository
+      // content can reach stdout on a run with no body and no evidence
+      // channel. Suppressed the same way; the conditions are ORed and none is
+      // narrowed.
+      const workspaceSettingsEnabled = ctx.workspaceSettingsEnabled === true;
       const researchOutput = typeof ctx.researchOutput === "string" ? ctx.researchOutput : "";
       const excerptSection = researchOutput
         ? `\n\n<details>\n<summary>Research findings</summary>\n\n\`\`\`\n${boundedExcerpt(researchOutput, 3000)}\n\`\`\`\n</details>`
         : "";
-      body = bodyIncluded || evidenceEnabled
-        ? `🔬 **Research complete** for issue #${task.issueNumber}. Findings recorded locally (not published here because ${evidenceEnabled ? "repository evidence was enabled for the run" : "the Issue body was included as agent input"}).`
-        : `🔬 **Research complete** for issue #${task.issueNumber}.${excerptSection}`;
+      // issue #834 review: `sanitized_summary` is gated at the level of the
+      // run's PROVENANCE, not of the three flags above — a research run is
+      // Issue-originated, so its inputs are untrusted whether or not any
+      // particular work-item field reached the prompt. When the handler withheld
+      // a validated report it names that reason, so the comment explains itself
+      // instead of falling through to a bare "Research complete." A `local_only`
+      // session never sets the field, so its comment is unchanged.
+      const withheldPublicationReason =
+        typeof ctx.researchPublicationWithheld === "object" && ctx.researchPublicationWithheld !== null
+          ? (ctx.researchPublicationWithheld as Record<string, unknown>).reason
+          : undefined;
+      const withheldPublicationBecause =
+        typeof withheldPublicationReason === "string"
+          && Object.hasOwn(PUBLICATION_WITHHOLD_PHRASES, withheldPublicationReason)
+          ? PUBLICATION_WITHHOLD_PHRASES[withheldPublicationReason as PublicationWithholdReason]
+          : undefined;
+      const withheldBecause = withheldPublicationBecause ?? (evidenceEnabled
+        ? "repository evidence was enabled for the run"
+        : workspaceSettingsEnabled
+          ? "a workspace read-only permission profile was enabled for the run"
+          : "the Issue body was included as agent input");
+      // issue #834: under the `sanitized_summary` publication policy the
+      // handler has already extracted a closed-schema publication envelope from
+      // the agent's findings and validated, sanitized, and rendered it. That
+      // report — never raw stdout — is what gets published. Its own gate is
+      // stricter than the flags above: the handler only puts the report in the
+      // context when the operator has explicitly accepted the untrusted
+      // provenance of an Issue-originated run (`allowUntrustedInputs`), because
+      // a steered agent can place a secret inside a well-formed envelope that
+      // known-pattern redaction cannot recognize. When it stayed local, no
+      // field is set here and the fixed "recorded locally" status below is what
+      // gets posted. Both publication branches are entered only when the handler
+      // put the corresponding field in the context, so a `local_only` session
+      // reaches neither and its comment is unchanged.
+      const publication: Record<string, unknown> =
+        typeof ctx.researchPublication === "object" && ctx.researchPublication !== null
+          ? ctx.researchPublication as Record<string, unknown>
+          : {};
+      const publishedReport = typeof publication.report === "string" ? publication.report.trim() : "";
+      const publicationFailed =
+        typeof ctx.researchPublicationFailed === "object" && ctx.researchPublicationFailed !== null;
+      if (publishedReport) {
+        const truncationNote = publication.truncated === true
+          ? "\n\n_(report truncated to the configured publication size budget)_"
+          : "";
+        body =
+          `🔬 **Research complete** for issue #${task.issueNumber}.\n\n${publishedReport}${truncationNote}`;
+      } else if (publicationFailed) {
+        // Fixed public-safe status. The closed-vocabulary reason names runner
+        // internals an Issue reader cannot act on, so it stays in the local
+        // diagnostic; raw stdout/stderr is never a fallback here.
+        body =
+          `🔬 **Research complete** for issue #${task.issueNumber}. ${RESEARCH_PUBLICATION_FAILED_STATUS}`;
+      } else {
+        body = bodyIncluded || evidenceEnabled || workspaceSettingsEnabled || withheldPublicationBecause
+          ? `🔬 **Research complete** for issue #${task.issueNumber}. Findings recorded locally (not published here because ${withheldBecause}).`
+          : `🔬 **Research complete** for issue #${task.issueNumber}.${excerptSection}`;
+      }
     } else if (result.result === "failed") {
       body = `❌ **Research failed** for issue #${task.issueNumber}.\n\nError: ${result.error}`;
     }
@@ -1860,6 +1976,125 @@ export async function enqueueHumanGateSummaryEffect(
     marker: HUMAN_GATE_MARKER,
     body,
     configuredPaths: sessionRedactionPaths(session),
+    now,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Review-dispute outcome comments (issue #848, §11)
+// ---------------------------------------------------------------------------
+
+/**
+ * The repository a public repo-host comment must be addressed to.
+ *
+ * The dispatcher builds the repo-host provider from the row's own
+ * `owner`/`repo` (`gh-dispatcher.ts`, `repohost:pr-comment`), so the address
+ * has to name the *code* repository the configured provider actually serves.
+ * For `github` that is `githubRepo`, unchanged. For `gitea` the code repo is
+ * declared explicitly in `repoHostProvider.gitea` and may differ from
+ * `githubRepo` entirely (a self-hosted instance has no implicit relationship to
+ * it), so addressing a Gitea row with `githubOwner`/`githubName` would post the
+ * outcome to the wrong repository or 404 forever. Mirrors the work-item side's
+ * resolution in {@link workItemOutbox}.
+ *
+ * Falls back to the GitHub tuple when a `gitea` provider carries no block —
+ * `validateSession` rejects that combination, so this is only a type-level
+ * guard, not a supported configuration.
+ */
+function repoHostCommentTarget(session: ResolvedSession): { owner: string; repo: string } {
+  const rh = session.repoHostProvider;
+  if (rh.provider === "gitea" && rh.gitea) return { owner: rh.gitea.owner, repo: rh.gitea.repo };
+  return { owner: session.githubOwner, repo: session.githubName };
+}
+
+/**
+ * Enqueue the bounded §11 comment for a review-dispute transition, if that
+ * transition resolved or escalated anything.
+ *
+ * Everything policy-shaped is decided in `review-dispute-publication.ts` (which
+ * lineages may be published, what a body may contain, what the idempotency key
+ * is keyed on); this function only addresses the result and hands it to the
+ * outbox. That split is deliberate: the §11 rules are pure and testable without
+ * a store, while the choice of provider/topic is a delivery detail that belongs
+ * with the other effect builders.
+ *
+ * Delivery is PR-first. When the task has a current PR the comment lands there,
+ * as a Tier 2 public repo-host comment; otherwise it lands on the work item,
+ * routed through the session's configured provider exactly like every other
+ * `gh:comment` enqueue here. Only one of the two ever receives it, so a lineage
+ * resolution is never announced twice in different words.
+ *
+ * The whole builder is a no-op unless the session actually enabled the protocol:
+ * a session with `reviewDispute.enabled: false` never produces a transition to
+ * publish, and gating here as well keeps a stray application (a legacy task
+ * carrying a block written while the flag was on, say) from publishing under a
+ * configuration that has since turned the protocol off.
+ */
+export async function enqueueDisputeOutcomeEffects(
+  outboxStore: OutboxStore,
+  session: ResolvedSession,
+  task: AiTask,
+  application: DisputeTransitionApplication | undefined,
+  now: string,
+  prUrlOverride?: string,
+): Promise<void> {
+  if (session.reviewDispute?.enabled !== true) return;
+  if (application === undefined) return;
+
+  const outcomes = publishableDisputeOutcomes(application);
+  if (outcomes.length === 0) return;
+
+  const body = renderDisputeOutcomeComment(outcomes);
+  const target = disputePublicationTarget(task, prUrlOverride);
+  const configuredPaths = sessionRedactionPaths(session);
+
+  if (target.kind === "pr") {
+    // One comment carrying every lineage this delivery resolved, rather than one
+    // per lineage: the §11 fields are per-lineage, but a run that resolves three
+    // findings at once has produced ONE outcome for the reader, and three
+    // comments would be exactly the public noise the policy bounds. The
+    // idempotency key still names a single lineage — the first, in the sorted
+    // order the projection fixes — so a re-derived completion dedupes against
+    // itself while a later delivery resolving a different lineage does not.
+    const prTarget = repoHostCommentTarget(session);
+    await enqueueRepoHostPrComment(outboxStore, {
+      provider: session.repoHostProvider.provider,
+      owner: prTarget.owner,
+      repo: prTarget.repo,
+      prNumber: target.prNumber,
+      idempotencyKey: disputeOutcomeIdempotencyKey({
+        sessionId: session.sessionId,
+        issueNumber: task.issueNumber,
+        surface: "pr",
+        outcome: outcomes[0],
+      }),
+      body,
+      configuredPaths,
+      now,
+    });
+    return;
+  }
+
+  // No PR yet — the work item is the fallback surface. Routed through
+  // `workItemOutbox` so a non-GitHub work-item provider receives a
+  // `workitem:comment` row instead of a `gh:comment` the dispatcher's GitHub
+  // runner would fail forever.
+  const workItemStore = workItemOutbox(outboxStore, session);
+  await workItemStore.enqueue({
+    idempotencyKey: disputeOutcomeIdempotencyKey({
+      sessionId: session.sessionId,
+      issueNumber: task.issueNumber,
+      surface: "work-item",
+      outcome: outcomes[0],
+    }),
+    topic: "gh:comment",
+    payload: {
+      topic: "gh:comment",
+      owner: session.githubOwner,
+      repo: session.githubName,
+      issueNumber: target.issueNumber,
+      body: sanitizeBody(body, configuredPaths),
+    },
     now,
   });
 }

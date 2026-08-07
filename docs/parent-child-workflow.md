@@ -77,6 +77,7 @@ internally, so `sessionId` never crosses the workflow boundary.
 | **Stable parent** | The parent workflow never needs reimporting when CLI logic changes. Only the child changes when the three command strings evolve. |
 | **Isolated runId scope** | The child inlines `$execution.id` directly in the `run-one-phase` command expression. Each child execution has a clean, independent run ID that is not shared with the parent. |
 | **Easier n8n canvas management** | The Config node in the parent remains a single editable location for the session ID, separate from the execution nodes. |
+| **Multi-session deployment** | Each session gets its own parent workflow (derived ID + name, canonical `sessionId` in Config) while all of them share one child. Adding a session means importing one more parent, not a second copy of the whole pipeline. |
 
 ---
 
@@ -134,13 +135,26 @@ The compiled CLI entrypoints land in `dist/cli/`.
 
 ```sh
 npm run build:parent-child-workflow
-# Writes TWO copies of each workflow (issue #391):
+# Writes the tracked templates (issue #391) plus the local deployment
+# artifacts, with one session-specific parent per session (issue #821):
 #
-#   docs/n8n-thin-parent-workflow.json            ← tracked template (canonical CLI path)
+#   docs/n8n-thin-parent-workflow.json            ← tracked template (canonical CLI path, generic identity)
 #   docs/n8n-thin-child-workflow.json             ← tracked template (canonical CLI path)
-#   .n8n-artifacts/workflows/n8n-thin-parent-workflow.json   ← local, baked with your CLI_BASE
-#   .n8n-artifacts/workflows/n8n-thin-child-workflow.json    ← local, baked with your CLI_BASE
+#   .n8n-artifacts/workflows/ai-dev-loop-parent-<slug>-<digest>.json  ← local parent, one per session
+#   .n8n-artifacts/workflows/n8n-thin-child-workflow.json             ← local, SHARED child
+
+# Generate parents for specific sessions (references are resolved through
+# sessions.json to canonical sessionIds before anything is written):
+SESSION_REF=my-project npm run build:parent-child-workflow
+SESSION_REF=my-project,2,addon npm run build:parent-child-workflow
 ```
+
+> **One parent per session, one child for all of them.** The parent's workflow ID
+> and name are derived from the **canonical `sessionId`**, so two sessions can
+> never collide in n8n and regenerating the same session is deterministic. The
+> child is stateless with respect to the session (it receives only `contextId`),
+> so every parent points at the same stable child ID
+> (`ai-dev-loop-thin-phase-runner`) and you import the child exactly once.
 
 > **Which files do I import?** For a local deployment, import the copies under
 > **`.n8n-artifacts/workflows/`** — they carry the correct `dist/cli` path for
@@ -165,46 +179,54 @@ npm run build:parent-child-workflow
    (workflow ID: `ai-dev-loop-thin-phase-runner`).
 4. Save the child workflow.
 5. Import the matching parent workflow —
-   **`.n8n-artifacts/workflows/n8n-thin-parent-workflow.json`** (local) or
-   **`docs/n8n-thin-parent-workflow.json`** (template)  
-   (workflow ID: `ai-dev-loop-thin-parent`).
+   **`.n8n-artifacts/workflows/ai-dev-loop-parent-<slug>-<digest>.json`** (local,
+   one file per session) or **`docs/n8n-thin-parent-workflow.json`** (template)  
+   (workflow ID: the derived `ai-dev-loop-parent-…` for a local artifact,
+   `ai-dev-loop-thin-parent` for the tracked template).
 6. Save the parent workflow. Do **not** activate the Schedule Trigger yet.
+7. Repeat step 5 for each additional session's parent artifact. Do **not**
+   re-import the child — it is shared.
 
-### 3 — Edit the Config node in the parent
+### 3 — Check the Config node in the parent
 
-After import, open the **Config** node in the **parent** workflow and set
-**`sessionRef`** to a value that identifies your `sessions.json` entry.
+The generator already baked the canonical `sessionId` for the session you built
+the artifact for, so there is normally **nothing to edit** after import. Open the
+**Config** node to confirm it names the session you expect:
 
-| Field | Default | Description |
+| Field | Value | Description |
 |---|---|---|
-| `sessionRef` | `ai-cli-loop` | **Editable — a short session reference: a `sessionId`, a numeric `sessionNo`, or an `alias`** |
+| `sessionId` | the canonical `sessionId` (e.g. `ai-cli-loop`) | **Baked at generation time — edit only to repoint this parent at another session** |
 | `repoKeyReference` | `(resolved from sessions.json by sessionId)` | Read-only hint |
 | `repoRootReference` | `(resolved from sessions.json by sessionId)` | Read-only hint |
 | `githubRepoReference` | `(resolved from sessions.json by sessionId)` | Read-only hint |
 
 #### Session reference vs. canonical identifiers
 
-The Config node holds a **`sessionRef`**, not the canonical `sessionId`. This
-keeps n8n tags / Config values compact while the system still stores and reports
-the canonical identifier everywhere it matters. Three identifiers are involved:
+Three identifiers are involved:
 
 | Identifier | Role | Example | Where it lives |
 |---|---|---|---|
-| **`sessionRef`** | Short, operator-facing reference passed into the workflow | `2`, `addon`, `tar` | n8n tag / parent Config |
-| **`sessionId`** | Canonical internal identifier | `thunderbird-auth-results` | DB state, context records, task rows, lock files, artifacts, diagnostics |
+| **`sessionRef`** | Short, operator-facing reference | `2`, `addon`, `tar` | n8n tag, `SESSION_REF` at generation time, `--session-ref` on the CLI |
+| **`sessionId`** | Canonical internal identifier | `thunderbird-auth-results` | Parent Config, DB state, context records, task rows, lock files, artifacts, diagnostics |
 | **`repoKey`** | Repository identity | `thunderbird-auth-results-filter` | `sessions.json` |
 
-The **Create Context** node runs `admin.js context create --json --execution-id
-<id> --session-ref <ref>`, which resolves `sessionRef` to the canonical `sessionId`
-(via exact `sessionId`, numeric `sessionNo`, or string alias) and persists the
-**`sessionId`** into the context store. Resolution fails closed: an unknown or
-ambiguous reference aborts the run with a clear error. The child workflow still
-receives only `--context-id`, so neither `sessionRef` nor `sessionId` crosses the
-workflow boundary.
+A `sessionRef` is **mutable** — reassigning a `sessionNo` or moving an alias in
+`sessions.json` would silently repoint an already-imported workflow at a
+different session. So the reference is resolved **once, at generation time**
+(issue #821) and only the canonical `sessionId` is written into the parent. The
+**Create Context** node therefore runs `admin.js context create --json
+--execution-id <id> --session-id <sessionId>` and persists that `sessionId` into
+the context store. The child workflow still receives only `--context-id`, so no
+session identifier crosses the workflow boundary.
 
-`admin.js context create` also still accepts `--session-id <id>` directly for
-backward compatibility, as do `task-status`, `session-doctor`, `repo-lock
-status`, and `recover` (each gains a `--session-ref` alternative).
+Resolution fails closed at generation time: an unknown or ambiguous
+`SESSION_REF` aborts the build with a clear error instead of baking an
+unresolved reference into a workflow.
+
+`admin.js context create` accepts `--session-ref <ref>` as the alternative to
+`--session-id <id>` when you invoke it by hand, as do `task-status`,
+`session-doctor`, `repo-lock status`, and `recover`. The generated parent always
+uses `--session-id`.
 
 The workflow nodes that parse `admin.js` stdout (`context create`, `repo-lock
 acquire`, `repo-lock release`) pass `--json` explicitly. These commands already
@@ -234,9 +256,26 @@ default to JSON, but the explicit flag follows the CLI output contract (see
 > with the canonical `/opt/n8n-ai-cli-loop/dist/cli` path so the committed JSON
 > stays stable and environment-independent (issue #391).
 >
-> `SESSION_REF` (or the legacy `SESSION_ID` fallback) only controls the
-> **initial value** shown in the Config node's `sessionRef` field.
-> Edit it in the n8n UI after import; it is not required at build time.
+> `SESSION_REF` (or the legacy `SESSION_ID` fallback) selects which session(s)
+> get a local parent artifact. It accepts one reference or a comma-separated
+> list, each resolved to a canonical `sessionId` through `sessions.json`
+> (override the file location with `SESSIONS_PATH`). Unset, the build generates a
+> single parent for the default session `ai-cli-loop` and needs no session
+> registry at all — so a plain `npm run build` works on a fresh checkout.
+>
+> In that list a backslash escapes the next character, so a reference that
+> `sessions.json` accepts but the list syntax would otherwise consume can still
+> be named: `SESSION_REF='team\,a'` is the single reference `team,a`, and
+> `'\ padded\ '` keeps the spaces a bare entry would have trimmed. Write `\\` for
+> a literal backslash; a trailing lone backslash is rejected.
+>
+> `SESSION_REF` never affects the tracked `docs/` template, which always keeps
+> the generic `ai-dev-loop-thin-parent` identity and the `ai-cli-loop` default:
+> it is review/onboarding output, not a machine-specific deployment artifact.
+>
+> Parent artifacts are named after the workflow ID they register, so generating
+> for a new session adds a file rather than overwriting an existing one. Delete
+> the artifact of a session you have retired; the generator never removes files.
 
 ---
 
@@ -277,8 +316,8 @@ Default location: `~/.config/n8n-ai-cli-loop/sessions.json`
 The `sessions.json` format is identical to the flat thin workflow. No changes
 are needed if you already have it configured for the thin workflow.
 
-`sessionNo` and `aliases` are **optional** short references that let the parent
-Config / n8n tags use a compact value (e.g. `2` or `addon`) instead of the full
+`sessionNo` and `aliases` are **optional** short references that let n8n tags and
+`SESSION_REF` use a compact value (e.g. `2` or `addon`) instead of the full
 `sessionId`. Each must be unique across the registry: a `sessionNo` must not
 clash with another session's `sessionNo`, an `alias` must not clash with another
 session's `alias`, `sessionId`, or numeric `sessionNo`. A duplicate or colliding
@@ -396,7 +435,10 @@ written or PR opened.
 - [ ] Research agent CLI is available (`agy --version` or `$ANTIGRAVITY_BIN`)
 - [ ] n8n is running
 - [ ] Child workflow is imported with ID `ai-dev-loop-thin-phase-runner`
-- [ ] Parent workflow is imported with ID `ai-dev-loop-thin-parent`
+- [ ] Parent workflow is imported with the ID stated by the artifact filename
+      (`ai-dev-loop-parent-<slug>-<digest>` for a local artifact, or
+      `ai-dev-loop-thin-parent` for the tracked template)
+- [ ] Parent's Config node shows the canonical `sessionId` you intended
 - [ ] Parent workflow is **not** yet activated (Schedule Trigger off)
 
 ### Step 1 — Verify child workflow ID

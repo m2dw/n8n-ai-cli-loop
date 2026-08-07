@@ -1,9 +1,17 @@
 import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createResearchHandler } from '../dist/handlers/research.js';
+import { createResearchHandler as createResearchHandlerRaw } from '../dist/handlers/research.js';
 import { SqliteTaskStore } from '../dist/index.js';
 import { runNextPhase } from '../dist/index.js';
+import { researchHandlerFactory } from './helpers/research-worktree-stub.js';
+
+// Issue #855: research runs in a per-run detached worktree. These tests cover
+// the handler's own behaviour, so the worktree lifecycle is stubbed to hand back
+// `session.repoRoot` as the workspace root — every cwd/path assertion below
+// therefore still asserts what it did before. The real fetch/SHA/create/cleanup
+// lifecycle is covered in test/research-worktree.test.js.
+const createResearchHandler = researchHandlerFactory(createResearchHandlerRaw);
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -179,6 +187,114 @@ describe('research handler — artifacts', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tests: issue #860 — a failed command's substantial partial stdout must never
+// suppress a distinct stderr failure reason. `research-output.md` keeps its
+// pre-#860 `stdout || stderr` selection for backward compatibility, but the
+// stream it did NOT select must still be recoverable from its own artifact.
+// ---------------------------------------------------------------------------
+
+describe('research handler — separate stdout/stderr artifacts (issue #860)', () => {
+  const runDir = () => join(artifactRoot, 'runs', 'run-test-1');
+  const readRun = (name) => readFileSync(join(runDir(), name), 'utf8');
+  const readResultJson = () => JSON.parse(readRun('research-result.json'));
+
+  test('failed command with partial stdout and a distinct stderr error persists both streams', async () => {
+    const partialStdout = '{"seq":"seq-009", "partial": true'; // truncated mid-JSON
+    const distinctStderr = 'FATAL: stream interrupted after 40595 bytes';
+    const runner = {
+      run: () => ({ stdout: partialStdout, stderr: distinctStderr, exitCode: 1 }),
+    };
+    const handler = createResearchHandler(CONTEXT(), runner);
+    const result = await handler(makeTask());
+
+    expect(result.result).toBe('failed');
+    // research-output.md keeps selecting stdout (backward compatible), but the
+    // exact stderr must be independently recoverable after the handler returns.
+    expect(readRun('research-output.md')).toBe(partialStdout);
+    expect(readRun('research-stdout.md')).toBe(partialStdout);
+    expect(readRun('research-stderr.log')).toBe(distinctStderr);
+
+    const resultJson = readResultJson();
+    expect(resultJson.streams).toMatchObject({
+      stdoutArtifact: 'research-stdout.md',
+      stderrArtifact: 'research-stderr.log',
+      stdoutBytes: Buffer.byteLength(partialStdout, 'utf8'),
+      stderrBytes: Buffer.byteLength(distinctStderr, 'utf8'),
+      primaryOutputSource: 'stdout',
+    });
+  });
+
+  test('failed command with stderr only falls back research-output.md to stderr and still records both artifacts', async () => {
+    const handler = createResearchHandler(CONTEXT(), fakeFail('agy: auth error'));
+    await handler(makeTask());
+
+    expect(readRun('research-output.md')).toBe('agy: auth error');
+    expect(readRun('research-stdout.md')).toBe('');
+    expect(readRun('research-stderr.log')).toBe('agy: auth error');
+    expect(readResultJson().streams.primaryOutputSource).toBe('stderr');
+  });
+
+  test('successful command with stdout records the stdout artifact and an empty stderr artifact', async () => {
+    const handler = createResearchHandler(CONTEXT(), fakeOk('## Findings\n\nAll good.'));
+    await handler(makeTask());
+
+    expect(readRun('research-stdout.md')).toBe('## Findings\n\nAll good.');
+    expect(readRun('research-stderr.log')).toBe('');
+    expect(readResultJson().streams.primaryOutputSource).toBe('stdout');
+  });
+
+  test('successful command that also writes diagnostics to stderr preserves both streams', async () => {
+    const runner = {
+      run: () => ({ stdout: '## Findings\n\nAll good.', stderr: 'warning: deprecated flag used', exitCode: 0 }),
+    };
+    const handler = createResearchHandler(CONTEXT(), runner);
+    const result = await handler(makeTask());
+
+    expect(result.result).toBe('success');
+    expect(readRun('research-stdout.md')).toBe('## Findings\n\nAll good.');
+    expect(readRun('research-stderr.log')).toBe('warning: deprecated flag used');
+    // research-output.md is unaffected: stdout has visible content, so it wins.
+    expect(readRun('research-output.md')).toBe('## Findings\n\nAll good.');
+  });
+
+  // Mirrors the existing #794 withholding regression (body-steered agent output
+  // must not reach the published failure message), extended to confirm the
+  // local stderr artifact stays fully inspectable even though the public
+  // message stays fixed and sanitized.
+  test('public failure message stays sanitized under the withholding profile while local stderr remains inspectable', async () => {
+    const distinctStderr = 'SECRET_TOKEN=abc123 leaked from local config';
+    const runner = {
+      run: () => ({ stdout: 'partial findings before the crash', stderr: distinctStderr, exitCode: 1 }),
+    };
+    const handler = createResearchHandler(CONTEXT(), runner);
+    const result = await handler(makeTask({
+      context: {
+        title: 'Memory leak',
+        url: 'https://github.com/m2dw/test-repo/issues/42',
+        labels: [],
+        body: 'Untrusted issue body content.',
+      },
+    }));
+
+    expect(result.result).toBe('failed');
+    expect(result.error).not.toMatch(/SECRET_TOKEN/);
+    expect(result.error).toMatch(/withheld/);
+    // Local artifacts still hold the exact stderr for an operator to recover.
+    expect(readRun('research-stderr.log')).toBe(distinctStderr);
+    expect(readRun('research-stdout.md')).toBe('partial findings before the crash');
+  });
+
+  test('existing research-output.md consumers remain compatible: it is still written with the pre-#860 stdout||stderr selection', async () => {
+    const handler = createResearchHandler(CONTEXT(), fakeOk('detailed findings'));
+    await handler(makeTask());
+    // Unchanged from the pre-#860 contract: research-output.md exists and holds
+    // the raw stdout when stdout has visible content.
+    expect(existsSync(join(runDir(), 'research-output.md'))).toBe(true);
+    expect(readRun('research-output.md')).toContain('detailed findings');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tests: quota/rate-limit delay (issue #672 — applies the shared category/
 // retry policy to the research handler)
 // ---------------------------------------------------------------------------
@@ -269,12 +385,14 @@ describe('research handler — command execution', () => {
     expect(spy.calls[0].cmd).toBe('agy');
   });
 
-  test('passes --print as first arg to the runner', async () => {
+  test('passes --print-timeout then --print to the runner', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const handler = createResearchHandler(CONTEXT(), spy);
     await handler(makeTask());
-    expect(spy.calls[0].args[0]).toBe('--print');
+    expect(spy.calls[0].args[0]).toBe('--print-timeout');
+    expect(spy.calls[0].args[1]).toBe('15m');
+    expect(spy.calls[0].args[2]).toBe('--print');
   });
 
   test('passes the prompt as the --print argument and via stdin', async () => {
@@ -282,22 +400,24 @@ describe('research handler — command execution', () => {
     delete process.env['ANTIGRAVITY_BIN'];
     const handler = createResearchHandler(CONTEXT(), spy);
     await handler(makeTask());
-    // --print followed by the prompt string, matching: agy --print "$(cat "$PROMPT")"
-    expect(spy.calls[0].args).toHaveLength(2);
-    expect(spy.calls[0].args[0]).toBe('--print');
-    expect(spy.calls[0].args[1]).toContain('Research Task');
+    // --print-timeout 15m --print followed by the prompt string, matching:
+    // agy --print-timeout 15m --print "$(cat "$PROMPT")"
+    expect(spy.calls[0].args).toHaveLength(4);
+    expect(spy.calls[0].args[2]).toBe('--print');
+    expect(spy.calls[0].args[3]).toContain('Research Task');
     expect(typeof spy.calls[0].opts.stdin).toBe('string');
     expect(spy.calls[0].opts.stdin).toContain('Research Task');
   });
 
-  test('ANTIGRAVITY_BIN is honoured and --print is still first arg', async () => {
+  test('ANTIGRAVITY_BIN is honoured and --print-timeout is still first arg', async () => {
     const spy = spyRunner();
     process.env['ANTIGRAVITY_BIN'] = '/opt/custom-agy';
     try {
       const handler = createResearchHandler(CONTEXT(), spy);
       await handler(makeTask());
       expect(spy.calls[0].cmd).toBe('/opt/custom-agy');
-      expect(spy.calls[0].args[0]).toBe('--print');
+      expect(spy.calls[0].args[0]).toBe('--print-timeout');
+      expect(spy.calls[0].args[2]).toBe('--print');
     } finally {
       delete process.env['ANTIGRAVITY_BIN'];
     }
@@ -933,7 +1053,7 @@ describe('research handler — resolved profile metadata', () => {
     const handler = createResearchHandler(CONTEXT(), fakeOk());
     await handler(makeTask());
     const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
-    expect(ctx.resolvedProfile.argv).toEqual(['--print']);
+    expect(ctx.resolvedProfile.argv).toEqual(['--print-timeout', '15m', '--print']);
   });
 
   test('research-context.json exists even on agent failure (pre-run audit)', async () => {
@@ -966,17 +1086,19 @@ describe('research handler — resolved profile metadata', () => {
 describe('research handler — Antigravity model configuration', () => {
   const dir = () => join(artifactRoot, 'runs', 'run-test-1');
 
-  test('no configured model: uses agy --print (default behavior unchanged)', async () => {
+  test('no configured model: uses agy --print-timeout 15m --print (default behavior otherwise unchanged)', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const handler = createResearchHandler(CONTEXT(), spy);
     await handler(makeTask());
     expect(spy.calls[0].cmd).toBe('agy');
-    expect(spy.calls[0].args[0]).toBe('--print');
+    expect(spy.calls[0].args[0]).toBe('--print-timeout');
+    expect(spy.calls[0].args[1]).toBe('15m');
+    expect(spy.calls[0].args[2]).toBe('--print');
     expect(spy.calls[0].args).not.toContain('--model');
   });
 
-  test('configured model: passes --model <model> before --print', async () => {
+  test('configured model: passes --model <model> before --print-timeout and --print', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const session = SESSION({ research: { antigravity: { model: 'Gemini 3.1 Pro (Low)' } } });
@@ -985,7 +1107,9 @@ describe('research handler — Antigravity model configuration', () => {
     expect(spy.calls[0].cmd).toBe('agy');
     expect(spy.calls[0].args[0]).toBe('--model');
     expect(spy.calls[0].args[1]).toBe('Gemini 3.1 Pro (Low)');
-    expect(spy.calls[0].args[2]).toBe('--print');
+    expect(spy.calls[0].args[2]).toBe('--print-timeout');
+    expect(spy.calls[0].args[3]).toBe('15m');
+    expect(spy.calls[0].args[4]).toBe('--print');
   });
 
   test('configured model: prompt still appended after --print', async () => {
@@ -994,9 +1118,9 @@ describe('research handler — Antigravity model configuration', () => {
     const session = SESSION({ research: { antigravity: { model: 'Gemini 3.1 Pro (Low)' } } });
     const handler = createResearchHandler(CONTEXT({ session }), spy);
     await handler(makeTask());
-    // args: ['--model', 'Gemini 3.1 Pro (Low)', '--print', <prompt>]
-    expect(spy.calls[0].args).toHaveLength(4);
-    expect(spy.calls[0].args[3]).toContain('Research Task');
+    // args: ['--model', 'Gemini 3.1 Pro (Low)', '--print-timeout', '15m', '--print', <prompt>]
+    expect(spy.calls[0].args).toHaveLength(6);
+    expect(spy.calls[0].args[5]).toContain('Research Task');
   });
 
   test('configured model: resolvedProfile records modelSource as session-config', async () => {
@@ -1017,10 +1141,12 @@ describe('research handler — Antigravity model configuration', () => {
     const handler = createResearchHandler(CONTEXT({ session }), spy);
     await handler(makeTask());
     const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
-    expect(ctx.resolvedProfile.argv).toEqual(['--model', 'Gemini 3.5 Flash (Medium)', '--print']);
+    expect(ctx.resolvedProfile.argv).toEqual([
+      '--model', 'Gemini 3.5 Flash (Medium)', '--print-timeout', '15m', '--print',
+    ]);
   });
 
-  test('no configured model: resolvedProfile has no model field and argv is [--print]', async () => {
+  test('no configured model: resolvedProfile has no model field and argv is [--print-timeout, 15m, --print]', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const handler = createResearchHandler(CONTEXT(), spy);
@@ -1028,7 +1154,7 @@ describe('research handler — Antigravity model configuration', () => {
     const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
     expect(ctx.resolvedProfile.modelSource).toBe('cli-default');
     expect(ctx.resolvedProfile.model).toBeUndefined();
-    expect(ctx.resolvedProfile.argv).toEqual(['--print']);
+    expect(ctx.resolvedProfile.argv).toEqual(['--print-timeout', '15m', '--print']);
   });
 
   test('configured model: research-result.json includes model and modelSource', async () => {
@@ -1040,6 +1166,109 @@ describe('research handler — Antigravity model configuration', () => {
     const result = JSON.parse(readFileSync(join(dir(), 'research-result.json'), 'utf8'));
     expect(result.resolvedProfile.modelSource).toBe('session-config');
     expect(result.resolvedProfile.model).toBe('Claude Opus 4.6 (Thinking)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Antigravity print-mode timeout configuration (issue #861)
+// ---------------------------------------------------------------------------
+
+describe('research handler — Antigravity print-timeout configuration', () => {
+  const dir = () => join(artifactRoot, 'runs', 'run-test-1');
+
+  test('default: resolvedProfile records printTimeout 15m from cli-default', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const handler = createResearchHandler(CONTEXT(), spy);
+    await handler(makeTask());
+    const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile.printTimeout).toBe('15m');
+    expect(ctx.resolvedProfile.printTimeoutMs).toBe(15 * 60 * 1000);
+    expect(ctx.resolvedProfile.printTimeoutSource).toBe('cli-default');
+  });
+
+  test('configured printTimeout overrides the default in argv and resolvedProfile', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const session = SESSION({ research: { antigravity: { printTimeout: '25m' } } });
+    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    await handler(makeTask());
+    expect(spy.calls[0].args).toEqual(['--print-timeout', '25m', '--print', expect.any(String)]);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile.printTimeout).toBe('25m');
+    expect(ctx.resolvedProfile.printTimeoutMs).toBe(25 * 60 * 1000);
+    expect(ctx.resolvedProfile.printTimeoutSource).toBe('session-config');
+  });
+
+  test('model and printTimeout are emitted together in a stable argv order', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const session = SESSION({
+      research: { antigravity: { model: 'Gemini 3.1 Pro (Low)', printTimeout: '10m' } },
+    });
+    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    await handler(makeTask());
+    expect(spy.calls[0].args.slice(0, 5)).toEqual([
+      '--model', 'Gemini 3.1 Pro (Low)', '--print-timeout', '10m', '--print',
+    ]);
+  });
+
+  test('research-result.json includes printTimeout and printTimeoutSource', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const session = SESSION({ research: { antigravity: { printTimeout: '45m' } } });
+    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    await handler(makeTask());
+    const result = JSON.parse(readFileSync(join(dir(), 'research-result.json'), 'utf8'));
+    expect(result.resolvedProfile.printTimeout).toBe('45m');
+    expect(result.resolvedProfile.printTimeoutSource).toBe('session-config');
+  });
+
+  test('a malformed printTimeout fails the run before the agent is invoked', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const session = SESSION({ research: { antigravity: { printTimeout: 'not-a-duration' } } });
+    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const result = await handler(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('printTimeout');
+    expect(spy.calls).toHaveLength(0);
+  });
+
+  test('a zero printTimeout fails the run before the agent is invoked', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const session = SESSION({ research: { antigravity: { printTimeout: '0m' } } });
+    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const result = await handler(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('printTimeout');
+    expect(spy.calls).toHaveLength(0);
+  });
+
+  test('an excessive printTimeout fails the run before the agent is invoked', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const session = SESSION({ research: { antigravity: { printTimeout: '10h' } } });
+    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const result = await handler(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('printTimeout');
+    expect(spy.calls).toHaveLength(0);
+  });
+
+  test('non-Gemini research agent behavior is unchanged by printTimeout', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const session = SESSION({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'codex', researchAgent: 'codex' },
+      research: { antigravity: { printTimeout: '25m' } },
+    });
+    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const result = await handler(makeTask({ researchAgent: 'codex' }));
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/Unsupported research agent: codex/);
+    expect(spy.calls).toHaveLength(0);
   });
 });
 
@@ -1253,19 +1482,22 @@ describe('research handler — MVP input contract', () => {
     expect(brief.inputsExcluded).toBeUndefined();
   });
 
-  test('research-brief.json records cwdPolicy as session.repoRoot', async () => {
+  // Issue #855 changed the label from `session.repoRoot` to the per-run research
+  // worktree: research no longer reads the shared canonical checkout at all.
+  test('research-brief.json records cwdPolicy as the research worktree', async () => {
     const handler = createResearchHandler(CONTEXT(), fakeOk());
     await handler(makeTask());
     const brief = JSON.parse(readFileSync(join(dir(), 'research-brief.json'), 'utf8'));
-    expect(brief.cwdPolicy).toBe('session.repoRoot');
+    expect(brief.cwdPolicy).toBe('issue-research-worktree');
   });
 
   // Regression tests for the issue #794 review finding: switching the agent's
-  // cwd away from session.repoRoot when a body is interpolated left it without
-  // a source tree, breaking the Research phase's required code investigation
-  // for the common case of a body-bearing Issue. The agent must always run
-  // with session.repoRoot as its cwd, regardless of whether a body is present.
-  test('body present: agent still runs with session.repoRoot as cwd, preserving repository access', async () => {
+  // cwd away from the repository checkout when a body is interpolated left it
+  // without a source tree, breaking the Research phase's required code
+  // investigation for the common case of a body-bearing Issue. The agent must
+  // always run in the prepared research workspace (the stub hands back
+  // `repoRoot`), regardless of whether a body is present.
+  test('body present: agent still runs in the research workspace, preserving repository access', async () => {
     const spy = spyRunner();
     const handler = createResearchHandler(CONTEXT(), spy);
     await handler(makeTask({
@@ -1279,14 +1511,14 @@ describe('research handler — MVP input contract', () => {
     expect(spy.calls[0].opts.cwd).toBe(repoRoot);
   });
 
-  test('body absent: agent still runs with session.repoRoot as cwd', async () => {
+  test('body absent: agent still runs in the research workspace', async () => {
     const spy = spyRunner();
     const handler = createResearchHandler(CONTEXT(), spy);
     await handler(makeTask());
     expect(spy.calls[0].opts.cwd).toBe(repoRoot);
   });
 
-  test('research-brief.json records cwdPolicy as session.repoRoot when the body is present', async () => {
+  test('research-brief.json records cwdPolicy as the research worktree when the body is present', async () => {
     const handler = createResearchHandler(CONTEXT(), fakeOk());
     await handler(makeTask({
       context: {
@@ -1297,7 +1529,7 @@ describe('research handler — MVP input contract', () => {
       },
     }));
     const brief = JSON.parse(readFileSync(join(dir(), 'research-brief.json'), 'utf8'));
-    expect(brief.cwdPolicy).toBe('session.repoRoot');
+    expect(brief.cwdPolicy).toBe('issue-research-worktree');
   });
 
   test('research-brief.json is written before agent runs (present even on failure)', async () => {

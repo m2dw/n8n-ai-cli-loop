@@ -348,6 +348,34 @@ describe('pruneTasks', () => {
     expect(result.artifactsSkipped).toEqual([dirShared]);
   });
 
+  test('tracks reviewArtifactDir as a live artifact reference, not just artifactDir (issue #837 review)', () => {
+    // `reviewArtifactDir` is the dedicated, never-overwritten reference to the
+    // review run that produced `review-findings.json`, carried on the task
+    // context across implementation retries. Before it was added to
+    // `ARTIFACT_DIR_CONTEXT_FIELDS`, retention had no way to see that an
+    // active task (#2) still references `dirShared` via this field, and
+    // would have wrongly treated it the same as the truly orphaned
+    // `dirOrphaned` referenced only by a deleted row.
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const dirShared = join(artifactRoot, 'runs', 'review-run-shared');
+    const dirOrphaned = join(artifactRoot, 'runs', 'review-run-orphaned');
+    mkdirSync(dirShared, { recursive: true });
+    mkdirSync(dirOrphaned, { recursive: true });
+
+    seedTask('s1', 1, { status: 'done', updatedAt: OLD_TERMINAL, context: { reviewArtifactDir: dirShared } });
+    seedTask('s1', 2, { status: 'queued', updatedAt: OLD_TERMINAL, context: { reviewArtifactDir: dirShared } }); // active, keeps dirShared alive
+    seedTask('s1', 3, { status: 'done', updatedAt: OLD_TERMINAL, context: { reviewArtifactDir: dirOrphaned } });
+    primeCoverage('s1');
+
+    const result = retentionStore.pruneTasks('s1', NOW, { artifactRoot });
+    expect(result.tasksDeleted).toBe(2);
+    expect(existsSync(dirShared)).toBe(true);
+    expect(existsSync(dirOrphaned)).toBe(true);
+    expect(result.artifactsDeleted).toEqual([]);
+    expect(result.artifactsPending).toEqual([dirOrphaned]);
+    expect(result.artifactsSkipped).toEqual([dirShared]);
+  });
+
   test('never deletes an artifact directory outside artifactRoot even if context claims one is there (symlink/escape safety)', () => {
     const artifactRoot = join(tmpDir, 'artifacts');
     mkdirSync(artifactRoot, { recursive: true });

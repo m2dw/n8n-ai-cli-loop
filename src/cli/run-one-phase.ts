@@ -15,9 +15,14 @@
  * Writes a single JSON object to stdout so n8n can read it as Execute Command output.
  */
 
-import { JsonSessionRegistry, DEFAULT_SESSIONS_PATH } from "../registries/json-session-registry.js";
+import {
+  JsonSessionRegistry,
+  DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
+} from "../registries/json-session-registry.js";
 import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
 import { SqliteOutboxStore } from "../stores/sqlite-outbox-store.js";
+import { MaintenanceLockedError } from "../stores/maintenance-lock-guard.js";
 import { SqliteContextStore } from "../stores/sqlite-context-store.js";
 import { SqliteSessionControlStore } from "../stores/sqlite-session-control-store.js";
 import { recordRunAndEvaluate, resolveCircuitBreakerPolicy } from "../core/session-control.js";
@@ -359,7 +364,7 @@ async function main(): Promise<void> {
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   // Build handler map after session is resolved so handlers can close over
@@ -381,6 +386,10 @@ async function main(): Promise<void> {
   // it, else the runId) so admin recovery can attribute a stale lock to its origin.
   const issueLock = new IssueWorktreeLock();
   const lockOwnerId = contextId ?? runId;
+
+  // Hoisted above the try so the maintenance-contention catch below can report
+  // the same context envelope every outcome carries.
+  const ctx = contextId !== undefined ? { contextId } : {};
 
   try {
     const outcome = await runNextPhase({
@@ -450,8 +459,6 @@ async function main(): Promise<void> {
         }
       },
     });
-
-    const ctx = contextId !== undefined ? { contextId } : {};
 
     switch (outcome.status) {
       case "idle":
@@ -533,7 +540,37 @@ async function main(): Promise<void> {
           ...ctx,
         });
         break;
+
+      case "maintenance_locked":
+        // Whole-file maintenance contention (issue #818): a prune/restore/rollup
+        // pass holds the store's maintenance lock, so the phase completion was
+        // refused in full — no transition, no event, no outbox effect. Exit 0 so
+        // n8n does not treat a normal maintenance window as a workflow crash. The
+        // runner also tries to hand the claim back rather than leave it leased
+        // (issue #818 review follow-up), so the reported task is `queued` — and
+        // the next tick re-runs the phase as soon as the lock clears — whenever
+        // that requeue is not itself refused by the same lock; when it is, the
+        // task stays `running` and lease expiry recovers it after maintenance.
+        emit({
+          ok: true,
+          outcome: "maintenance_locked",
+          sessionId,
+          ...(outcome.task !== undefined ? { task: summariseTask(outcome.task) } : {}),
+          repoRoot: session.repoRoot,
+          ...ctx,
+        });
+        break;
     }
+  } catch (err) {
+    // A direct outbox enqueue met a held maintenance lock and threw (issue
+    // #818) from a path outside handler execution — a handler's own throw is
+    // already converted to a `failed` result by `runHandler`, whose completion
+    // then reports `maintenance_locked` through the switch above. Nothing was
+    // persisted either way, so report the same retryable contention at exit 0
+    // rather than letting a prune/restore window surface to n8n as a crashed
+    // step. Every other error propagates unchanged.
+    if (!(err instanceof MaintenanceLockedError)) throw err;
+    emit({ ok: true, outcome: "maintenance_locked", sessionId, repoRoot: session.repoRoot, ...ctx });
   } finally {
     store.close();
     outboxStore.close();

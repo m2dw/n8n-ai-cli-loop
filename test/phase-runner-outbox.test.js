@@ -1191,6 +1191,36 @@ describe('runNextPhase outbox side effects — research success', () => {
     expect(comment.payload.body).not.toContain('/tmp/research-artifacts/run-1');
   });
 
+  test('publishes a fixed-form comment when the workspace permission profile was enabled', async () => {
+    // issue #826: the profile lets the agent read the workspace with its own
+    // tools, so a stale `researchOutput` must never be excerpted on its basis.
+    await enqueueTask('research', {});
+    const handler = async () => ({
+      result: 'success',
+      context: {
+        artifactDir: '/tmp/research-artifacts/run-1',
+        researchAgentUsed: 'gemini',
+        workspaceSettingsEnabled: true,
+        researchOutput: 'Contents of an ignored local file.',
+      },
+    });
+
+    await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { research: handler },
+      outboxStore,
+      session: SESSION,
+      now: NOW,
+    });
+
+    const pending = await outboxStore.listPending();
+    const comment = pending.find(e => e.topic === 'gh:comment');
+    expect(comment.payload.body).toContain('Research complete');
+    expect(comment.payload.body).toContain('a workspace read-only permission profile was enabled for the run');
+    expect(comment.payload.body).not.toContain('ignored local file');
+  });
+
   test('enqueues comment without findings section when researchOutput is absent', async () => {
     await enqueueTask('research', {});
     const handler = async () => ({

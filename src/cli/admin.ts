@@ -23,7 +23,7 @@
  * Exits 1 for validation or setup errors.
  */
 
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 import { randomBytes } from "crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, statfsSync, statSync, writeFileSync } from "fs";
 import { dirname, isAbsolute, join, relative, resolve } from "path";
@@ -55,14 +55,18 @@ import { SqliteMaintenanceLock, seedMaintenanceLock } from "../stores/sqlite-mai
 import { SqliteRetentionStore } from "../stores/sqlite-retention-store.js";
 import type { PreviewResult, PruneRunResult } from "../stores/sqlite-retention-store.js";
 import { RepoLockStore } from "../stores/repo-lock-store.js";
-import type { AgentId, AiTask, TaskAttempts, TaskPhase, TaskStatus } from "../core/task.js";
+import type { AgentId, AiTask, TaskAttempts, TaskPatch, TaskPhase, TaskStatus } from "../core/task.js";
 import type { ResolvedSession } from "../core/session.js";
-import { isClaimExpired } from "../core/transitions.js";
+import { applyTaskPatch, isClaimExpired } from "../core/transitions.js";
 import {
   selectChangesRequestedFeedback,
   type ReviewFeedbackSelection,
 } from "../core/github-app-review.js";
-import { DEFAULT_SESSIONS_PATH, JsonSessionRegistry } from "../registries/json-session-registry.js";
+import {
+  DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
+  JsonSessionRegistry,
+} from "../registries/json-session-registry.js";
 import { agentForPhase, ASSIGNMENT_CONTEXT_KEY, DEFAULT_FLOW, readResolvedAssignment } from "../core/assignment.js";
 import type { ResolvedAssignment } from "../core/assignment.js";
 import { enqueueStatusLabelEffects, workItemOutbox, sessionRedactionPaths } from "../core/outbox-effects.js";
@@ -93,6 +97,7 @@ import {
   issueWorktreePath,
   issueWorktreeId,
   sessionWorktreeDir,
+  classifyManagedWorktree,
   WORKTREE_ROOT_ENV,
 } from "../core/worktree-paths.js";
 import { assessWorktreeRecovery } from "../core/worktree-recovery.js";
@@ -101,8 +106,38 @@ import { boundVerificationOutput } from "../handlers/verification.js";
 import { runArtifactDir } from "../handlers/artifact-dir.js";
 import { makeOutboxKey, categorizeOutboxEntry, isOutboxClaimActive } from "../core/outbox.js";
 import type { OutboxEntry, OutboxDeliveryStatus } from "../core/outbox.js";
+import {
+  deriveOwnershipScanCursorKey,
+  planScanCursorRewind,
+  scanCursorKeysFor,
+  OUTBOX_SCAN_CURSOR_ROLES,
+  type OutboxScanCursorAfterIds,
+  type OutboxScanCursorRewindPlan,
+} from "../core/outbox-scan-cursor.js";
 import { branchName, resolvePrContext } from "../handlers/pr-helpers.js";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
+// Issue #822: `admin n8n deploy`. All ordering, verification, and publish
+// policy is pure and lives in core/n8n-deploy.ts; this module only resolves the
+// local facts (paths, derived workflow identity) and supplies the two side
+// effects (a command runner and an artifact reader).
+import {
+  N8N_DEPLOY_LOCK_STALE_TTL_MS,
+  N8N_RESTART_NOTICE,
+  collectN8nDeployLocalPaths,
+  executeN8nDeploy,
+  formatCommandLine,
+  n8nDeployChildLockScope,
+  n8nDeployLockScope,
+  planN8nDeploy,
+  sanitizeDeployText,
+} from "../core/n8n-deploy.js";
+import type {
+  N8nDeployCommand,
+  N8nDeployExecution,
+  N8nDeployLockAcquisition,
+  N8nDeployPlan,
+  N8nDeployStepResult,
+} from "../core/n8n-deploy.js";
 import {
   emit,
   die,
@@ -118,8 +153,34 @@ import {
   resolveSessionSelector,
   tokenizeArgs,
 } from "./admin-command.js";
-import { runAdminUi } from "./admin-ui.js";
+import { runAdminUi, formatAdminCommand } from "./admin-ui.js";
 import { ECOSYSTEM_PRESETS, PRESET_NAMES, findPreset } from "../core/presets.js";
+import { resolveReviewDisputeSettings, isTerminalLineageState } from "../core/review-dispute.js";
+// Issue #848: the operator surface of the review-dispute protocol. The
+// projection is shared with the admin UI so the two cannot disagree; the
+// transition/commit path is #840's, reused rather than reimplemented, so an
+// operator action is bound by the same CAS, caps, and audit record a run is.
+import { isLineageId } from "../core/review-dispute-lineage.js";
+import { validateReviewDisputeContext } from "../core/review-dispute-validation.js";
+import type { ReviewDisputeFailure } from "../core/review-dispute-validation.js";
+import { applyDisputeTransition } from "../core/review-dispute-transition.js";
+import {
+  REVIEW_DISPUTE_CONTEXT_KEY,
+  REVIEW_DISPUTE_TRANSITION_EVENT,
+  commitDisputeTransition,
+} from "../core/review-dispute-commit.js";
+import { disputeReopenArgv, summarizeDisputeStatus } from "../core/review-dispute-status.js";
+import type { DisputeTaskStatus } from "../core/review-dispute-status.js";
+// Issue #849: the read-only, event-derived operator report. Pure aggregation
+// lives in core; this file only resolves the session's tasks and renders.
+import { aggregateDisputeMetrics } from "../core/review-dispute-metrics.js";
+import type { DisputeMetrics } from "../core/review-dispute-metrics.js";
+import type { AntigravityResearchConfig, CodexConfig, ReviewDisputeConfig } from "../core/session.js";
+import {
+  createArbiterCandidateResolver,
+  evaluateArbiterCandidates,
+  type ArbiterCandidateRejection,
+} from "../core/review-arbiter-profile.js";
 import type { EcosystemPreset } from "../core/presets.js";
 import {
   parseIssueDiscussArgs,
@@ -147,19 +208,25 @@ import { buildUntrackedPatch } from "../handlers/implementation.js";
 // Subcommand: help
 // ---------------------------------------------------------------------------
 
-interface CommandOption {
+export interface CommandOption {
   flag: string;
   description: string;
 }
 
-interface CommandInfo {
+export interface CommandInfo {
   name: string;
   description: string;
   entrypoint?: string;
   options: CommandOption[];
 }
 
-const COMMANDS: CommandInfo[] = [
+/**
+ * The command registry, exported so a documentation test can check a document's
+ * claims against the CLI itself (issue #849) rather than against a second copy
+ * of the command list written in the test. Read-only for every caller: `help`
+ * renders it, and nothing mutates it.
+ */
+export const COMMANDS: CommandInfo[] = [
   {
     name: "help",
     description: "Show this help message.",
@@ -276,7 +343,7 @@ const COMMANDS: CommandInfo[] = [
   {
     name: "outbox retry",
     description:
-      "Recover a single outbox row for another dispatch attempt (issue #607): clears its delayed/dead-letter/cancelled state and resets its attempt count, so the next `dispatch-outbox` run treats it as freshly eligible. Refuses a row that does not belong to the given session's repo(s). Previews by default; pass --yes to apply. A row already sent, or already immediately eligible with nothing to recover, is a safe no-op.",
+      "Recover a single outbox row for another dispatch attempt (issue #607): clears its delayed/dead-letter/cancelled state and resets its attempt count, so the next `dispatch-outbox` run treats it as freshly eligible. When the session's persisted scan cursors have already advanced past the row, they are rewound to just before it in the same transaction so the revived row is actually re-scanned instead of stranded below the scan window (issue #820); a cursor that does not exist is never created. Refuses a row that does not belong to the given session's repo(s). Previews by default (the preview reports which cursor roles would be rewound); pass --yes to apply. A row already sent, or already immediately eligible with nothing to recover, is a safe no-op.",
     options: [
       { flag: "--session-id <id>", description: "Canonical session ID that owns the row (required unless --session-ref is given)." },
       { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
@@ -332,6 +399,47 @@ const COMMANDS: CommandInfo[] = [
       { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
       { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
       { flag: "--dry-run", description: "Preview which tasks would be recovered without making changes." },
+    ],
+  },
+  {
+    name: "dispute status",
+    description:
+      "Show the persisted review-dispute state for one task (issue #848, docs/review-dispute-contract.md): every structured lineage with its version, severity, repository-relative affected boundary, current state and terminal outcome, the rebuttal/reconsideration/arbitration-pass/malformed-arbiter/evidence-round counters, humanGate and reopenRequested flags, the task-level pendingReReview and resolvedWithoutChanges flags, the §7.1 routing intent recorded by the last transition event, and the one supported next action — or an explicit statement that no automated action is authorized, with the exact stop reason. Read-only. Reads persisted task context and bounded task events only; arbiter reasoning, confidence, and evidence content are not persisted state and are never shown. A task with no reviewDispute block reports that and exits cleanly.",
+    options: [
+      { flag: "--session-id <id>", description: "Canonical session ID (required unless --session-ref is given)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--issue-number <n>", description: "Issue number whose dispute state to show (required)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "dispute reopen",
+    description:
+      "Record a §6.4 reopen request on a TERMINAL review-dispute lineage (issue #848). This is the only operator-initiated transition the contract defines: it flags a resolution for human attention and parks the task at ready_for_human under §7.1 rule 1. It does NOT overturn the resolution, change the lineage's state (terminal states are immutable audit records), reset any counter, or bypass any §6.1 cap, and it posts no public comment (§11 publishes resolutions and escalations, not requests). Requires the exact lineage ID and its current version: a lineage at a different version, in a non-terminal state, or on a claimed/running task is refused. Preview by default; pass --yes to apply. A request already on file is an informative no-op that exits 0. There is no command to resolve an escalated_human lineage back into automation — the contract defines no such transition; see §15 of docs/review-dispute-contract.md.",
+    options: [
+      { flag: "--session-id <id>", description: "Canonical session ID (required unless --session-ref is given)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--issue-number <n>", description: "Issue number whose lineage to flag (required)." },
+      { flag: "--lineage-id <id>", description: "Exact runner-minted lineage ID to flag, e.g. ln-0123456789ab (required). List them with `admin dispute status`." },
+      { flag: "--version <n>", description: "The lineage's CURRENT version (required). A mismatch is refused rather than applied, so a revised finding cannot be flagged by a stale command." },
+      { flag: "--yes", description: "Actually record the request (without it, the command only previews)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref and the session's §6.1 limits (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "dispute metrics",
+    description:
+      "Report review-dispute activity for one session, derived entirely from the persisted review.dispute.transition task events (issue #849, docs/review-dispute-operations.md). Counts findings opened, rebuttals recorded and rejected, reconsiderations, material/non-material/ambiguous revisions, arbitration verdicts and malformed attempts, evidence rounds requested and recorded, terminal outcomes by literal, human escalations, and §6.4 reopen requests. Read-only and offline: it makes no GitHub or network call, mutates nothing, opens no §10.2 artifact, and reads no public comment. Duplicate deliveries are deduplicated by transition key, so a retried worker or a replayed outbox row cannot inflate a count. lineagesResolvedWithoutHuman is an observable proxy — lineages that reached a non-escalated terminal state inside the window — not a claim about review loops that would otherwise have happened.",
+    options: [
+      { flag: "--session-id <id>", description: "Canonical session ID to report on (required unless --session-ref is given)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--issue-number <n>", description: "Restrict the report to one task (optional; omit to cover every task in the session)." },
+      { flag: "--since <iso>", description: "Only count transition events at or after this ISO-8601 timestamp (optional). Applied to the event's createdAt; no schema change and no new index." },
+      { flag: "--until <iso>", description: "Only count transition events at or before this ISO-8601 timestamp (optional)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
     ],
   },
   {
@@ -627,12 +735,14 @@ const COMMANDS: CommandInfo[] = [
   },
   {
     name: "worktree prune",
-    description: "Remove a single issue's per-issue git worktree (issue #400). Previews by default; pass --yes to remove. Refuses a dirty/locked worktree unless --force is given. A missing worktree is a safe no-op. Does not delete branches or touch the canonical checkout.",
+    description: "Remove a single issue's per-issue git worktree (issue #400). Previews by default; pass --yes to remove. Refuses a dirty/locked worktree unless --force is given. A missing worktree is a safe no-op. Does not delete branches or touch the canonical checkout. With --research it instead removes the issue's leaked per-run research checkouts (issue #855), which a crashed research run can leave behind and no retry can reclaim.",
     options: [
       { flag: "--session-id <id>", description: "Session ID that owns the worktree (required)." },
       { flag: "--issue-number <n>", description: "Issue number whose worktree to prune (required)." },
       { flag: "--yes", description: "Actually remove the worktree (without it, the command only previews)." },
-      { flag: "--force", description: "Discard a dirty or locked worktree (git worktree remove --force)." },
+      { flag: "--force", description: "Discard a dirty or locked worktree (git worktree remove --force); with --research, proceed despite a live issue lock." },
+      { flag: "--research", description: "Target the issue's leaked per-run research checkouts (issue-<n>/research-<runId>) instead of the durable worktree. Refuses a live issue lock unless --force; removal always forces, since the detached research checkout is disposable." },
+      { flag: "--lock-dir <path>", description: "Directory holding per-issue worktree locks (optional; used by --research to skip an issue with a live lock)." },
       { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
     ],
   },
@@ -651,7 +761,7 @@ const COMMANDS: CommandInfo[] = [
   {
     name: "worktree cleanup",
     description:
-      "Inspect and bulk-prune stale per-issue worktrees for a session (issue #407). Classifies every managed worktree as active (an in-flight/awaiting-human task or a live issue lock — never pruned), terminal (issue task done), or orphaned (no task row), then prunes the terminal/orphaned ones. Previews by default (changes nothing) so candidates can be reviewed; pass --yes to remove. Refuses to remove a dirty worktree or one whose branch has commits not pushed to origin unless --force is given, and reports every skip with its reason. Never deletes branches or touches the canonical checkout. Worktree paths are local-only and never published. Unknown flags fail fast.",
+      "Inspect and bulk-prune stale per-issue worktrees for a session (issue #407). Classifies every managed worktree as active (an in-flight/awaiting-human task or a live issue lock — never pruned), terminal (issue task done), orphaned (no task row), or research-leaked (a per-run research checkout left by a crashed run — a candidate regardless of task status, since no retry can reclaim it, but still never removed under a live issue lock), then prunes the terminal/orphaned/research-leaked ones. Previews by default (changes nothing) so candidates can be reviewed; pass --yes to remove. Refuses to remove a dirty worktree or one whose branch has commits not pushed to origin unless --force is given, and reports every skip with its reason. Never deletes branches or touches the canonical checkout. Worktree paths are local-only and never published. Unknown flags fail fast.",
     options: [
       { flag: "--session-id <id>", description: "Session ID whose worktrees to clean up (required)." },
       { flag: "--yes", description: "Actually remove prune candidates (without it, the command only previews)." },
@@ -706,6 +816,34 @@ const COMMANDS: CommandInfo[] = [
       { flag: "--yes", description: "Actually release the lock (without it, the command only previews)." },
       { flag: "--force", description: "Release even a live (non-stale) lock (use only when certain no run is active)." },
       { flag: "--lock-dir <path>", description: "Directory holding per-issue worktree locks (optional)." },
+    ],
+  },
+  {
+    name: "maintenance-lock status",
+    description:
+      "Inspect the whole-file maintenance lock (issue #817, docs/retention-backup-contract.md §9). A maintenance process (prune/archive rollup/restore) killed before its finally/close() path runs can leave `maintenance_lock` populated with no live holder, stalling later task claims and maintenance runs. Read-only (issue #817 review: never creates the table or migrates the database, so it can inspect a legacy or filesystem-read-only database without mutating or failing against it): reports whether the lock is held, its holder, acquisition time, age, whether it was acquired via skipActivityChecks (e.g. `admin archive rollup` — activityExempt), the count of task phases still claimed/running with an unexpired lease, and the count of outbox rows with a non-stale dispatch claim. Never includes the local database path.",
+    options: [
+      { flag: "--session-id <id>", description: "Session ID (mutually exclusive with --session-ref)." },
+      { flag: "--session-ref <ref>", description: "Session ID, session number, or alias (mutually exclusive with --session-id)." },
+      { flag: "--db-path <path>", description: "Path to the SQLite database (optional; defaults to the standard location)." },
+      { flag: "--json", description: "Emit structured JSON instead of human-readable text." },
+    ],
+  },
+  {
+    name: "maintenance-lock release",
+    description:
+      "Force-release the whole-file maintenance lock (issue #817), recovering from a maintenance process killed before its finally/close() path ran. Ignores the recorded holder, unlike the lock's own release(), but refuses while any task phase is still claimed/running with an unexpired lease or any outbox row has a non-stale dispatch claim — the same activity checks acquire() itself refuses on — so it can never clear a lock while the work it protects is genuinely still in flight. Also requires --confirm-stranded (P1 review follow-up) before releasing any lock, of any holder kind: zero of the two activity counts above is not by itself evidence a holder has finished, since prune/restore do their own destructive work — a delete batch, a file rename — without ever creating a task lease or outbox claim for it, so a live one of either shows zero of both for its entire run, indistinguishable from a genuinely stranded lock (the same is true of a skipActivityChecks holder, e.g. `admin archive rollup`) — releasing without confirmation could let a second `prune run --yes`/`restore` start concurrently against a live one. Deliberately no TTL-based auto-recovery and no PID-liveness check: this guarded action (plus the explicit --confirm-stranded override, itself an operator confirmation rather than a liveness check this command performs) is the only supported recovery path. Previews by default; pass --yes to release. A database with no lock held is a safe no-op. Read-only until --yes is given (issue #817 review): preview never creates the table or migrates the database.",
+    options: [
+      { flag: "--session-id <id>", description: "Session ID (mutually exclusive with --session-ref)." },
+      { flag: "--session-ref <ref>", description: "Session ID, session number, or alias (mutually exclusive with --session-id)." },
+      { flag: "--db-path <path>", description: "Path to the SQLite database (optional; defaults to the standard location)." },
+      { flag: "--yes", description: "Actually release the lock (without it, the command only previews)." },
+      {
+        flag: "--confirm-stranded",
+        description:
+          "Required alongside --yes to release any held lock — confirm out-of-band first that no maintenance process (prune, restore, archive rollup) is still running against this database.",
+      },
+      { flag: "--json", description: "Emit structured JSON instead of human-readable text." },
     ],
   },
   {
@@ -786,6 +924,20 @@ const COMMANDS: CommandInfo[] = [
       { flag: "--issue-number <n>", description: "Issue number to post to (required)." },
       { flag: "--artifact <path>", description: "Path to the issue-discuss-context.json produced by the preview command (required)." },
       { flag: "--approve <token>", description: "Fingerprint emitted by the preview command confirming the artifact has been reviewed (required)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
+    ],
+  },
+  {
+    name: "n8n deploy",
+    description: "Generate the deployment artifacts for one session and import the shared child plus that session's parent workflow into a local n8n (issue #822). Previews by default and imports nothing; --yes applies. Imports the child before the parent (the parent references the child by its stable ID), verifies the imported IDs/names with `n8n list:workflow` and the parent's Config sessionId and child reference, and refuses to publish when verification fails. A parent that was already active is re-activated after the import, so a re-deploy never silently deactivates a running workflow; an apply holds a lock scoped to that parent workflow, so two concurrent deploys of the same session cannot lose each other's activation. Local/same-host n8n CLI v1 only — no REST API or remote Docker deployment. Local filesystem paths are redacted from the output.",
+    options: [
+      { flag: "--session-ref <ref>", description: "Session to deploy the parent workflow for: sessionId, sessionNo, or alias (required, or use --session-id)." },
+      { flag: "--session-id <id>", description: "Canonical session ID, as an alternative to --session-ref." },
+      { flag: "--project-id <id>", description: "n8n project to import both workflows into (optional; n8n's default project otherwise)." },
+      { flag: "--n8n-bin <path>", description: "Path to the n8n binary (default: n8n from PATH)." },
+      { flag: "--yes", description: "Apply the deployment. Without it nothing is generated, imported, or published." },
+      { flag: "--publish", description: "Activate the parent workflow after verification passes. Requires --yes. Not needed to keep an already active parent active — that is restored automatically." },
+      { flag: "--lock-dir <path>", description: "Directory holding the per-parent-workflow deployment lock that serializes concurrent deploys of the same session (optional; defaults to ~/.local/state/n8n-ai-cli-loop/locks)." },
       { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
     ],
   },
@@ -925,6 +1077,14 @@ function renderTaskStatus(
       attempts?: unknown;
       lastError?: string;
       missingVerificationCommands?: string[] | null;
+      /**
+       * Issue #848: the persisted §10.1 protocol state, or null for a task that
+       * carries none. Null is the legacy answer — a task from before the
+       * protocol, or from a session with `reviewDispute.enabled: false`, which
+       * never writes a block — and it renders nothing at all, so existing output
+       * is byte-identical for every such task.
+       */
+      reviewDispute?: DisputeTaskStatus | null;
       updatedAt: string;
     }>;
   },
@@ -956,6 +1116,12 @@ function renderTaskStatus(
     if (t.missingVerificationCommands && t.missingVerificationCommands.length > 0) {
       lines.push(`        missing verification: ${t.missingVerificationCommands.join(", ")}`);
     }
+    // Issue #848. Rendered through the same helper `admin dispute status` and
+    // the admin UI use, so the three surfaces show one projection rather than
+    // three that happen to agree today.
+    if (t.reviewDispute) {
+      lines.push(...renderDisputeLines(t.reviewDispute, "        "));
+    }
   }
   return lines.join("\n");
 }
@@ -972,6 +1138,20 @@ async function runTaskStatus(argv: string[]): Promise<void> {
       issueNumber !== undefined
         ? await store.getTask({ sessionId, issueNumber }).then((t) => (t ? [t] : []))
         : await store.listSessionTasks(sessionId);
+    // Issue #848: the §10.3 routing/stop reason lives on a task event, not in the
+    // context block, so it needs a per-task event read — taken ONLY for a task
+    // that actually carries a protocol block. A session that never enabled the
+    // protocol therefore does exactly the queries it did before, and a listing of
+    // many legacy tasks costs nothing extra.
+    const disputeSummaries = new Map<number, DisputeTaskStatus | null>();
+    for (const t of tasks) {
+      if (t.context?.[REVIEW_DISPUTE_CONTEXT_KEY] === undefined) {
+        disputeSummaries.set(t.issueNumber, null);
+        continue;
+      }
+      const events = await store.listEvents({ sessionId: t.sessionId, issueNumber: t.issueNumber });
+      disputeSummaries.set(t.issueNumber, summarizeDisputeStatus(t, events));
+    }
     const result = {
       ok: true,
       sessionId,
@@ -992,6 +1172,7 @@ async function runTaskStatus(argv: string[]): Promise<void> {
         missingVerificationCommands: Array.isArray(t.context?.["missingVerificationCommands"])
           ? (t.context["missingVerificationCommands"] as unknown[]).filter((c): c is string => typeof c === "string")
           : null,
+        reviewDispute: disputeSummaries.get(t.issueNumber) ?? null,
         createdAt: t.createdAt,
         updatedAt: t.updatedAt,
       })),
@@ -1557,6 +1738,786 @@ async function runRecoverCapHandoff(argv: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Subcommand: dispute status / dispute reopen (issue #848)
+//
+// The operator surface of the review-dispute protocol
+// (docs/review-dispute-contract.md). Both actions read the SAME projection
+// `task-status` and the admin UI use (`summarizeDisputeStatus`), so the three
+// surfaces cannot disagree about what the task holds, and neither one opens a
+// §10.2 artifact: arbiter reasoning, confidence, and evidence content are not
+// persisted state and are therefore not shown.
+//
+// `dispute reopen` is the ONLY mutating dispute action, and it is deliberately
+// the narrowest one the contract defines: §6.4's `reopen_requested` flag on a
+// terminal lineage. It records that a human wants a resolution revisited — it
+// does not overturn it, does not reset a counter, and does not move the lineage
+// out of its terminal state (§6.4: terminal states are immutable audit records).
+// Everything else an operator might want here is a specification gap, recorded
+// in §15 of the contract rather than invented locally; `dispute status` prints
+// the exact stop reason for those instead of offering a command.
+// ---------------------------------------------------------------------------
+
+/**
+ * A §12 failure as operator-facing text. `detail` is a content-free locator by
+ * construction (a field path plus a length/count/version), so it is safe to
+ * print; `null` means the reason alone located it.
+ */
+function disputeFailureText(failure: ReviewDisputeFailure): string {
+  return failure.detail === null ? failure.reason : `${failure.reason} at ${failure.detail}`;
+}
+
+interface DisputeStatusArgs {
+  sessionId: string;
+  issueNumber: number;
+  sessionsPath: string;
+  dbPath: string | undefined;
+}
+
+function parseDisputeStatusArgs(argv: string[]): DisputeStatusArgs | { error: string } {
+  const opts = parseCommonOptions(argv, { session: "required", issueNumber: "required" });
+  if ("error" in opts) return { error: opts.error };
+  return {
+    sessionId: opts.sessionId,
+    issueNumber: opts.issueNumber!,
+    // Not used to read anything here — this command touches only the task store —
+    // but the `dispute reopen` line it prints DOES resolve the session, so the
+    // registry the operator is inspecting under has to reach that command.
+    sessionsPath: opts.sessionsPath,
+    dbPath: opts.dbPath,
+  };
+}
+
+/**
+ * The shared human rendering of one task's dispute state.
+ *
+ * Used by `dispute status`, by `task-status --verbose`, and (via the UI's task
+ * detail) by the interactive surface, so "UI/JSON parity" is a property of there
+ * being one renderer rather than of three of them agreeing.
+ */
+function renderDisputeLines(summary: DisputeTaskStatus, indent = ""): string[] {
+  const lines: string[] = [];
+  const flags: string[] = [];
+  if (summary.pendingReReview) flags.push("pendingReReview");
+  if (summary.resolvedWithoutChanges) flags.push("resolvedWithoutChanges");
+  lines.push(
+    `${indent}review dispute: ${summary.lineages.length} lineage(s)` +
+      (summary.reviewStructure ? `  review=${summary.reviewStructure}` : "") +
+      (flags.length > 0 ? `  ${flags.join(" ")}` : ""),
+  );
+  for (const l of summary.lineages) {
+    const c = l.counters;
+    lines.push(
+      `${indent}  ${l.lineageId}  v${l.version}  ${l.state ?? "(unreadable state)"}` +
+        (l.outcome ? ` → ${l.outcome}` : "") +
+        `  ${l.severity ?? "?"}  ${l.affectedBoundary ?? "(no boundary)"}`,
+    );
+    lines.push(
+      `${indent}      rebuttals=${c.rebuttals} reconsiderations=${c.reconsiderations} ` +
+        `arbitrationPasses=${c.arbitrationPasses} malformedArbiter=${c.malformedArbiterAttempts} ` +
+        `evidenceRounds=${c.evidenceRoundsUsed}` +
+        (l.humanGate ? " humanGate" : "") +
+        (l.reopenRequested ? " reopenRequested" : ""),
+    );
+  }
+  const r = summary.routing;
+  if (r) {
+    lines.push(
+      `${indent}  routing: rule=${r.rule ?? "-"} outcome=${r.outcome ?? "-"} turn=${r.turn ?? "-"} ` +
+        `nextPhase=${r.nextPhase ?? "-"}` +
+        (r.undispatchedTurn ? `  undispatchedTurn=${r.undispatchedTurn}` : ""),
+    );
+  } else {
+    lines.push(`${indent}  routing: (no recorded ${REVIEW_DISPUTE_TRANSITION_EVENT} event)`);
+  }
+  const action = summary.nextAction;
+  lines.push(`${indent}  next action: ${action.authorized ? action.action : `none (${action.reason})`}`);
+  lines.push(`${indent}    ${action.description}`);
+  if (action.authorized && action.command) {
+    lines.push(`${indent}    ${formatAdminCommand(action.command)}`);
+  }
+  return lines;
+}
+
+/**
+ * `scope` carries the flags the printed `dispute reopen` line must repeat so it
+ * acts on the same registry and store this command read. They are PLACEHOLDERS
+ * rather than the real values, for the same reason `worktreeDirtyHint` uses
+ * them: this output is forwarded and recorded, and it carries no absolute local
+ * path. The flag is still shown, so an operator on a custom registry is told to
+ * supply it rather than silently running against the default one.
+ */
+function renderDisputeStatus(
+  payload: { sessionId: string; issueNumber: number; reason?: string; dispute: DisputeTaskStatus | null },
+  _mode: OutputMode,
+  scope: { sessionsPath?: string; dbPath?: string } = {},
+): string {
+  if (payload.reason === "not_found") {
+    return `No task found for issue #${payload.issueNumber} in session ${payload.sessionId}.`;
+  }
+  if (payload.dispute === null) {
+    return (
+      `No review-dispute state for issue #${payload.issueNumber} (session ${payload.sessionId}).\n` +
+      `The task carries no reviewDispute block — either the session has not enabled the protocol ` +
+      `(session.reviewDispute.enabled defaults to false) or no structured review has run for it yet.`
+    );
+  }
+  return [
+    `Review dispute — issue #${payload.issueNumber} (session ${payload.sessionId}):`,
+    ...renderDisputeLines(payload.dispute, "  "),
+    ...(payload.dispute.reopenEligibleLineageIds.length > 0
+      ? [
+          `  §6.4 reopen request available for: ${payload.dispute.reopenEligibleLineageIds.join(", ")}`,
+          `    ${formatAdminCommand(
+            disputeReopenArgv({
+              sessionId: payload.sessionId,
+              issueNumber: payload.issueNumber,
+              lineageId: payload.dispute.reopenEligibleLineageIds[0],
+              version:
+                payload.dispute.lineages.find(
+                  (l) => l.lineageId === payload.dispute!.reopenEligibleLineageIds[0],
+                )?.version ?? 1,
+              dbPath: scope.dbPath,
+              sessionsPath: scope.sessionsPath,
+            }),
+          )}`,
+        ]
+      : []),
+  ].join("\n");
+}
+
+async function runDisputeStatus(argv: string[]): Promise<void> {
+  const parsed = parseDisputeStatusArgs(argv);
+  if ("error" in parsed) die(parsed.error);
+  const { sessionId, issueNumber, sessionsPath, dbPath } = parsed;
+
+  // Placeholders, not the values themselves: the flags belong in the suggested
+  // command (see `renderDisputeStatus`), the local paths do not — and they stay
+  // out of the `--json` payload for the same reason.
+  const scope = {
+    sessionsPath: sessionsPath !== DEFAULT_SESSIONS_PATH ? "<SESSIONS_PATH>" : undefined,
+    dbPath: dbPath !== undefined && dbPath !== DEFAULT_DB_PATH ? "<DB_PATH>" : undefined,
+  };
+
+  const store = new SqliteTaskStore(dbPath);
+  try {
+    const task = await store.getTask({ sessionId, issueNumber });
+    if (!task) {
+      const result = { ok: false, sessionId, issueNumber, reason: "not_found", dispute: null };
+      report(result, (mode) => renderDisputeStatus(result, mode, scope));
+      process.exitCode = 1;
+      return;
+    }
+    const dispute = summarizeDisputeStatus(task, await store.listEvents({ sessionId, issueNumber }));
+    const result = { ok: true, sessionId, issueNumber, taskStatus: task.status, phase: task.phase, dispute };
+    report(result, (mode) => renderDisputeStatus(result, mode, scope));
+  } finally {
+    store.close();
+  }
+}
+
+interface DisputeReopenArgs {
+  sessionId: string;
+  issueNumber: number;
+  lineageId: string;
+  version: number;
+  sessionsPath: string;
+  dbPath: string | undefined;
+  yes: boolean;
+}
+
+function parseDisputeReopenArgs(argv: string[]): DisputeReopenArgs | { error: string } {
+  const opts = parseCommonOptions(argv, {
+    session: "required",
+    issueNumber: "required",
+    booleanFlags: ["yes"],
+    valueFlags: ["lineage-id", "version"],
+  });
+  if ("error" in opts) return { error: opts.error };
+
+  const lineageId = opts.args["lineage-id"];
+  if (lineageId === undefined) return { error: "--lineage-id is required" };
+  // Validated against the minting rule rather than merely non-empty: a lineage
+  // id is the only operator-supplied value that is interpolated into a §10.2
+  // artifact name elsewhere, and accepting an arbitrary string here would be the
+  // one place a path could be smuggled into that.
+  if (!isLineageId(lineageId)) {
+    return { error: `--lineage-id must be a runner-minted lineage id (e.g. ln-0123456789ab), got: ${lineageId}` };
+  }
+  const rawVersion = opts.args["version"];
+  if (rawVersion === undefined) return { error: "--version is required" };
+  const version = Number(rawVersion);
+  if (!Number.isInteger(version) || version <= 0) {
+    return { error: `--version must be a positive integer, got: ${rawVersion}` };
+  }
+
+  return {
+    sessionId: opts.sessionId,
+    issueNumber: opts.issueNumber!,
+    lineageId,
+    version,
+    sessionsPath: opts.sessionsPath,
+    dbPath: opts.dbPath,
+    yes: opts.flags.has("yes"),
+  };
+}
+
+function renderDisputeReopen(
+  payload: {
+    ok: boolean;
+    sessionId: string;
+    issueNumber: number;
+    lineageId: string;
+    version: number;
+    reason?: string;
+    detail?: string;
+    wouldRecord?: boolean;
+    recorded?: boolean;
+    taskStatus?: string;
+    lineageState?: string;
+  },
+  _mode: OutputMode,
+): string {
+  const scope = `lineage ${payload.lineageId} v${payload.version} (issue #${payload.issueNumber}, session ${payload.sessionId})`;
+  if (payload.reason !== undefined) {
+    return [`Refusing to record a §6.4 reopen request for ${scope}.`, `  ${payload.detail ?? payload.reason}`].join("\n");
+  }
+  if (payload.wouldRecord) {
+    return [
+      `Preview: would record a §6.4 reopen request on ${scope}.`,
+      `  Current lineage state: ${payload.lineageState} (unchanged by this action — terminal states are immutable).`,
+      `  Effect: the task parks at ready_for_human under §7.1 rule 1 so a human decides. No counter is spent,`,
+      `          no cap is bypassed, and no public comment is posted (§11 publishes resolutions, not requests).`,
+      `Run with --yes to apply.`,
+    ].join("\n");
+  }
+  if (payload.recorded) {
+    return [
+      `Recorded a §6.4 reopen request on ${scope}.`,
+      `  Task status is now ready_for_human; the lineage keeps state ${payload.lineageState}.`,
+    ].join("\n");
+  }
+  return `Unexpected state for ${scope}.`;
+}
+
+async function runDisputeReopen(argv: string[]): Promise<void> {
+  const parsed = parseDisputeReopenArgs(argv);
+  if ("error" in parsed) die(parsed.error);
+  const { sessionId, issueNumber, lineageId, version, sessionsPath, dbPath, yes } = parsed;
+
+  // The session supplies the §6.1 limits the applicator validates the stored
+  // block against. A session that is not in the registry is a hard error rather
+  // than a default-limits fallback: validating a lowered-limit block against the
+  // normative maxima would accept counters that session could never have
+  // produced.
+  let registry: JsonSessionRegistry;
+  try {
+    registry = new JsonSessionRegistry(sessionsPath);
+  } catch (err) {
+    die(`Failed to load sessions file (${sessionsPath}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const session = await registry.getSessionById(sessionId);
+  if (!session) die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
+  const settings = resolveReviewDisputeSettings(session.reviewDispute);
+  if (!settings.ok) {
+    die(
+      `Session ${sessionId} has an invalid reviewDispute configuration; fix it before acting on protocol state: ` +
+        settings.errors.map((e) => e.message).join("; "),
+    );
+  }
+
+  const refuse = (
+    reason: string,
+    detail: string,
+    extra: { taskStatus?: string; lineageState?: string } = {},
+  ): void => {
+    const result = { ok: false, sessionId, issueNumber, lineageId, version, reason, detail, ...extra };
+    report(result, (mode) => renderDisputeReopen(result, mode));
+    process.exitCode = 1;
+  };
+
+  // A session with `reviewDispute.enabled: false` runs the legacy flow and
+  // ignores structured dispute state entirely, so a block left on an older task
+  // by a previously-enabled session is inert history, not live protocol state.
+  // Writing to it here would move the task to `ready_for_human` and record a
+  // §6.4 request that nothing in this session can ever act on — and the
+  // publication path already refuses to publish for a disabled session, so the
+  // resulting state would be invisible as well as unreachable. Refuse before
+  // opening the store: a disabled session should not be reading protocol state
+  // to decide anything.
+  if (!settings.settings.enabled) {
+    refuse(
+      "protocol_disabled",
+      `Session ${sessionId} has reviewDispute.enabled: false, so it runs the legacy review flow and ignores ` +
+        `any structured dispute state left on its tasks. Re-enable the protocol for this session before acting ` +
+        `on protocol state, or use \`admin recover\` for an ordinary handoff.`,
+    );
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const store = new SqliteTaskStore(dbPath);
+
+  try {
+    const task = await store.getTask({ sessionId, issueNumber });
+    if (!task) {
+      refuse("not_found", `No task found for issue #${issueNumber} in session ${sessionId}.`);
+      return;
+    }
+    // A claimed/running task has a live run that may be applying its own
+    // transition against the same block. Writing here would either lose the CAS
+    // below or land between that run's read and its write, so refuse before
+    // either can happen.
+    if (task.status === "claimed" || task.status === "running") {
+      refuse(
+        "active_task",
+        `Task is ${task.status}${task.ownerRunId ? ` (owner: ${task.ownerRunId})` : ""}; a run may be applying its ` +
+          `own transition to the same lineage. Wait for it to finish or recover the task first.`,
+        { taskStatus: task.status },
+      );
+      return;
+    }
+
+    const rawBlock = task.context?.[REVIEW_DISPUTE_CONTEXT_KEY];
+    if (rawBlock === undefined) {
+      refuse(
+        "no_dispute_state",
+        `Task carries no reviewDispute block. There is no protocol state to act on; ` +
+          `use \`admin recover\` for an ordinary handoff.`,
+        { taskStatus: task.status },
+      );
+      return;
+    }
+    const validated = validateReviewDisputeContext(rawBlock, "reviewDispute", settings.settings.limits);
+    if (!validated.ok) {
+      refuse(
+        "invalid_block",
+        `The stored reviewDispute block is not one this session's §6.1 limits could have produced ` +
+          `(${disputeFailureText(validated.failure)}); refusing to write against it. ` +
+          `Inspect it with \`admin dispute status\`.`,
+        { taskStatus: task.status },
+      );
+      return;
+    }
+
+    const lineage = Object.prototype.hasOwnProperty.call(validated.value.lineages, lineageId)
+      ? validated.value.lineages[lineageId]
+      : undefined;
+    if (lineage === undefined) {
+      refuse("unknown_lineage", `Task has no lineage ${lineageId}. Run \`admin dispute status\` to list them.`, {
+        taskStatus: task.status,
+      });
+      return;
+    }
+    // Exact-version CAS, checked here as well as inside the transaction: an
+    // operator naming a version the reviewer has since revised is acting on a
+    // finding that no longer exists, and the preview must refuse it for the same
+    // reason the write would.
+    if (lineage.version !== version) {
+      refuse(
+        "stale_version",
+        `Lineage ${lineageId} is at version ${lineage.version}, not ${version}. Re-read the current state ` +
+          `with \`admin dispute status\` before acting — a newer version means the finding was revised.`,
+        { taskStatus: task.status, lineageState: lineage.state },
+      );
+      return;
+    }
+    if (!isTerminalLineageState(lineage.state)) {
+      refuse(
+        "not_terminal",
+        `§6.4 applies only to a terminal lineage; ${lineageId} is \`${lineage.state}\` and the debate is still ` +
+          `running. Nothing to reopen.`,
+        { taskStatus: task.status, lineageState: lineage.state },
+      );
+      return;
+    }
+    // `escalated_human` is terminal but is NOT a resolution: §6.4 lets a human
+    // ask for a RESOLUTION to be revisited, and an escalated lineage is already
+    // with a human. Recording the flag here would re-escalate what is already
+    // escalated — a second §7.1 rule 1 park and an audit event that says a
+    // decision was requested when none was made — so it is refused rather than
+    // applied. `summarizeDisputeStatus` reaches the same answer (it never lists
+    // an escalated lineage as reopen-eligible, and reports
+    // `lineage_escalated_human` as a stop reason with no authorized action);
+    // this keeps the command from accepting what the status surface says is
+    // unavailable. The way out of an escalation is the human decision on the PR
+    // itself — the contract defines no transition back into automation (§15/G1).
+    if (lineage.state === "escalated_human") {
+      refuse(
+        "escalated_lineage",
+        `§6.4 applies to a RESOLVED lineage; ${lineageId} is \`escalated_human\` and is already with a human. ` +
+          `Recording a reopen request would not change its state or authorize any automated continuation — the ` +
+          `contract defines no transition that returns an escalated lineage to the debate (§15/G1). Decide it on ` +
+          `the PR; \`admin dispute status\` shows the exact stop reason and the lineage record behind it.`,
+        { taskStatus: task.status, lineageState: lineage.state },
+      );
+      return;
+    }
+    if (lineage.reopenRequested === true) {
+      // Already on file: an informative no-op that exits 0, per the admin CLI
+      // contract's treatment of safe no-ops.
+      const result = {
+        ok: true,
+        sessionId,
+        issueNumber,
+        lineageId,
+        version,
+        recorded: false,
+        alreadyRequested: true,
+        taskStatus: task.status,
+        lineageState: lineage.state,
+      };
+      report(result, () =>
+        `A §6.4 reopen request is already recorded on lineage ${lineageId} v${version} ` +
+        `(issue #${issueNumber}, session ${sessionId}); nothing to do.`,
+      );
+      return;
+    }
+
+    if (!yes) {
+      const result = {
+        ok: true,
+        sessionId,
+        issueNumber,
+        lineageId,
+        version,
+        wouldRecord: true,
+        taskStatus: task.status,
+        lineageState: lineage.state,
+      };
+      report(result, (mode) => renderDisputeReopen(result, mode));
+      return;
+    }
+
+    // The run id is derived from the lineage and version rather than minted
+    // fresh, so a re-run of this exact command produces the SAME `<lineageId>@
+    // <version>#<runId>` digest and is recognized as the replay it is. (The flag
+    // check above already makes it idempotent; this makes the ledger agree.)
+    const runId = `admin-dispute-reopen-${lineageId}-v${version}`;
+    const application = applyDisputeTransition({
+      context: validated.value,
+      decision: { kind: "reopen_request", lineageId },
+      run: { runId, actor: "runner" },
+      limits: settings.settings.limits,
+    });
+    if (!application.ok) {
+      refuse(
+        "transition_refused",
+        `The transition layer refused the request (${disputeFailureText(application.failure)}).`,
+        { taskStatus: task.status, lineageState: lineage.state },
+      );
+      return;
+    }
+    if (application.value.refused.length > 0) {
+      const first = application.value.refused[0];
+      refuse(
+        "transition_refused",
+        `The transition layer refused the request for ${first.lineageId} (${disputeFailureText(first.failure)}).`,
+        { taskStatus: task.status, lineageState: lineage.state },
+      );
+      return;
+    }
+
+    const committed = await commitDisputeTransition({
+      store,
+      key: { sessionId, issueNumber },
+      // The CAS guard. `revision` is what makes it exact: it moves on every write,
+      // so any write to this task between the read above and this call — a
+      // competing operator, a run that claimed it, a cancellation — loses the
+      // completion rather than overwriting newer state. `updatedAt` alone is not
+      // enough: two reopens racing on a `ready_for_human` task leave status and
+      // phase unchanged and can share a millisecond timestamp, which would let the
+      // stale second write through to duplicate the transition and audit events.
+      expected: {
+        status: task.status,
+        phase: task.phase,
+        updatedAt: task.updatedAt,
+        revision: task.revision,
+      },
+      application: application.value,
+      runId,
+      now,
+      // A bounded operator audit record alongside the mandatory §10.3 transition
+      // event: literals and counts only, and no operator prose field exists to
+      // carry a free-form human verdict (§15/G1 — the contract defines none).
+      extraEvents: [
+        {
+          task: { sessionId, issueNumber },
+          type: "review.dispute.operator",
+          runId,
+          data: {
+            action: "reopen_request",
+            lineageId,
+            version,
+            lineageState: lineage.state,
+            taskStatusBefore: task.status,
+          },
+          createdAt: now,
+        },
+      ],
+      // No effects: §11 publishes resolutions and escalations, and a reopen
+      // REQUEST is neither — the lineage keeps the terminal state it was already
+      // published under. `publishableDisputeOutcomes` reaches the same answer for
+      // the phase-runner path; stating it here keeps the two from drifting.
+      effects: [],
+    });
+
+    if (committed.status === "duplicate") {
+      const result = {
+        ok: true,
+        sessionId,
+        issueNumber,
+        lineageId,
+        version,
+        recorded: false,
+        alreadyRequested: true,
+        taskStatus: task.status,
+        lineageState: lineage.state,
+      };
+      report(result, () =>
+        `A §6.4 reopen request is already recorded on lineage ${lineageId} v${version} ` +
+        `(issue #${issueNumber}, session ${sessionId}); nothing to do.`,
+      );
+      return;
+    }
+    if (committed.status === "maintenance_locked") {
+      refuse(
+        "maintenance_locked",
+        `The database is under a maintenance lock; nothing was written. Retry once maintenance completes.`,
+        { taskStatus: task.status, lineageState: lineage.state },
+      );
+      return;
+    }
+    if (committed.status === "claim_lost") {
+      refuse(
+        "stale_task",
+        `The task changed between reading it and writing (now ${committed.current?.status ?? "unknown"}); ` +
+          `nothing was written. Re-read it with \`admin dispute status\` and retry.`,
+        { taskStatus: committed.current?.status, lineageState: lineage.state },
+      );
+      return;
+    }
+
+    const result = {
+      ok: true,
+      sessionId,
+      issueNumber,
+      lineageId,
+      version,
+      recorded: true,
+      taskStatus: committed.task.status,
+      lineageState: lineage.state,
+    };
+    report(result, (mode) => renderDisputeReopen(result, mode));
+  } finally {
+    store.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: dispute metrics (issue #849)
+//
+// The read-only operator report over the protocol's own audit events. It is a
+// sibling of `dispute status`, not a replacement: status answers "what is this
+// ONE task waiting on", metrics answers "what did the protocol DO across this
+// session". Both read persisted state only — no GitHub call, no §10.2 artifact,
+// no public comment — and neither writes anything.
+//
+// Everything countable is decided in `core/review-dispute-metrics.ts`. This
+// layer resolves the session's tasks, hands their event streams over, and
+// renders. That split is what keeps the report testable without a CLI and
+// deterministic with one.
+// ---------------------------------------------------------------------------
+
+interface DisputeMetricsArgs {
+  sessionId: string;
+  issueNumber: number | undefined;
+  since: string | undefined;
+  until: string | undefined;
+  dbPath: string | undefined;
+}
+
+/**
+ * ISO-8601 with an explicit UTC `Z`, which is what the stores write and what
+ * the string comparison in the aggregator assumes. A local-time or offset form
+ * is REFUSED rather than silently converted: an operator who passes
+ * `2026-08-01T00:00+09:00` and gets a UTC-shifted window back has been given a
+ * wrong answer that looks right.
+ */
+const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+
+function parseWindowBound(flag: string, raw: string | undefined): { value: string | undefined } | { error: string } {
+  if (raw === undefined) return { value: undefined };
+  const parsed = Date.parse(raw);
+  if (!ISO_UTC_RE.test(raw) || Number.isNaN(parsed)) {
+    return {
+      error:
+        `${flag} must be an ISO-8601 UTC timestamp ending in Z, e.g. 2026-08-01T00:00:00Z, got: ${raw}`,
+    };
+  }
+  const normalized = new Date(parsed).toISOString();
+  // A date that is well-formed but does not exist — `2026-02-31T00:00:00Z` — is
+  // not rejected by `Date.parse`: it rolls the overflow forward to March 3 and
+  // would hand the operator a report for a window they never asked for. Round
+  // the parse back to a string and require it to name the same calendar
+  // instant. `toISOString` always renders a 4-digit year here because the regex
+  // above admits nothing else, so the seconds-precision prefixes are comparable.
+  if (normalized.slice(0, 19) !== raw.slice(0, 19)) {
+    return {
+      error:
+        `${flag} is not a real calendar date: ${raw} would be read as ${normalized}`,
+    };
+  }
+  // Normalized to the store's own millisecond form before it is compared. The
+  // aggregator compares timestamps as strings, and `2026-08-04T00:00:00Z` sorts
+  // BELOW `2026-08-04T00:00:00.000Z` ('.' < 'Z') — so an un-normalized bound
+  // would silently exclude an event that landed on exactly that second.
+  return { value: normalized };
+}
+
+function parseDisputeMetricsArgs(argv: string[]): DisputeMetricsArgs | { error: string } {
+  const opts = parseCommonOptions(argv, {
+    session: "required",
+    issueNumber: "optional",
+    valueFlags: ["since", "until"],
+  });
+  if ("error" in opts) return { error: opts.error };
+
+  const since = parseWindowBound("--since", opts.args["since"]);
+  if ("error" in since) return { error: since.error };
+  const until = parseWindowBound("--until", opts.args["until"]);
+  if ("error" in until) return { error: until.error };
+  if (since.value !== undefined && until.value !== undefined && since.value > until.value) {
+    return { error: `--since (${since.value}) must not be later than --until (${until.value})` };
+  }
+
+  return {
+    sessionId: opts.sessionId,
+    issueNumber: opts.issueNumber,
+    since: since.value,
+    until: until.value,
+    dbPath: opts.dbPath,
+  };
+}
+
+/**
+ * The human rendering.
+ *
+ * Grouped the way the lifecycle runs — findings, then the debate, then how it
+ * ended — rather than alphabetically, so an operator reading top to bottom sees
+ * the protocol's shape. Zero-valued lines are kept: "0 escalations" is the
+ * answer most operators are looking for, and a report that omitted it would be
+ * indistinguishable from one that never looked.
+ */
+function renderDisputeMetrics(
+  payload: { sessionId: string; issueNumber: number | undefined; metrics: DisputeMetrics },
+  _mode: OutputMode,
+): string {
+  const m = payload.metrics;
+  const scope = payload.issueNumber === undefined
+    ? `session ${payload.sessionId}`
+    : `session ${payload.sessionId}, issue #${payload.issueNumber}`;
+  const window = m.window.from === null && m.window.to === null
+    ? "all recorded events"
+    : `${m.window.from ?? "(open)"} .. ${m.window.to ?? "(open)"}`;
+
+  const lines = [
+    `Review-dispute metrics — ${scope}`,
+    `  window: ${window}`,
+    `  tasks scanned: ${m.tasksScanned}  with dispute activity: ${m.tasksWithDisputeActivity}`,
+    `  transition events: ${m.transitionEvents}  applied: ${m.transitionsApplied}` +
+      `  deduplicated: ${m.transitionsDeduplicated}  refused: ${m.decisionsRefused}` +
+      `  operational failures: ${m.operationalFailures}`,
+    `  findings opened: ${m.findingsOpened}`,
+    `  rebuttals: recorded=${m.rebuttalsRecorded} rejected=${m.rebuttalsRejected}`,
+    `  reconsiderations: ${m.reconsiderations}`,
+    `  revisions: material=${m.revisions.material} non-material=${m.revisions.nonMaterial}` +
+      ` ambiguous=${m.revisions.ambiguous}`,
+    `  arbitration: verdicts=${m.arbitration.verdicts} malformed=${m.arbitration.malformedAttempts}`,
+    `  evidence rounds: requested=${m.evidence.requested} recorded=${m.evidence.recorded}`,
+    `  terminal outcomes:`,
+  ];
+  for (const [outcome, count] of Object.entries(m.terminalOutcomes)) {
+    lines.push(`    ${outcome}: ${count}`);
+  }
+  lines.push(
+    `  human escalations: ${m.humanEscalations}  §6.4 reopen requests: ${m.reopenRequests}`,
+    `  lineages reaching a terminal state: ${m.lineagesReachedTerminal}`,
+    `  lineagesResolvedWithoutHuman: ${m.lineagesResolvedWithoutHuman}` +
+      `  tasksResolvedWithoutHuman: ${m.tasksResolvedWithoutHuman}` +
+      `  tasksEscalatedToHuman: ${m.tasksEscalatedToHuman}`,
+    // Said in the output, not only in the docs: this number is what was
+    // observed in the window, never a claim about a loop that did not happen.
+    `    (observed in this window; not a claim about review loops that would otherwise have run)`,
+  );
+  if (m.transitionEvents === 0) {
+    lines.push(
+      `  No ${REVIEW_DISPUTE_TRANSITION_EVENT} events in scope. Either the session has not enabled the`,
+      `  protocol (session.reviewDispute.enabled defaults to false), no structured review has run, or the`,
+      `  window excludes every recorded transition.`,
+    );
+  }
+  return lines.join("\n");
+}
+
+async function runDisputeMetrics(argv: string[]): Promise<void> {
+  const parsed = parseDisputeMetricsArgs(argv);
+  if ("error" in parsed) die(parsed.error);
+  const { sessionId, issueNumber, since, until, dbPath } = parsed;
+
+  const store = new SqliteTaskStore(dbPath);
+  try {
+    // One task or the whole session, read through the ordinary store ports. A
+    // task with no dispute block contributes zero events and still counts
+    // towards `tasksScanned`, which is the denominator an operator needs.
+    let tasks;
+    if (issueNumber === undefined) {
+      tasks = await store.listSessionTasks(sessionId);
+    } else {
+      const one = await store.getTask({ sessionId, issueNumber });
+      tasks = one ? [one] : [];
+    }
+    // One read for the whole session, then grouped by issue in memory (issue
+    // #849 review). Reading per task meant one events query per task; for a
+    // session-wide report that is O(tasks x events) of work in a command whose
+    // whole job is to be a cheap read. The aggregator folds exactly one event
+    // type, so the filter belongs in the query rather than in the fold.
+    const events = issueNumber === undefined
+      ? await store.listSessionEventsByType(sessionId, REVIEW_DISPUTE_TRANSITION_EVENT)
+      : await store.listEvents({ sessionId, issueNumber });
+    const byIssue = new Map<number, typeof events>();
+    for (const event of events) {
+      const bucket = byIssue.get(event.task.issueNumber);
+      if (bucket) bucket.push(event);
+      else byIssue.set(event.task.issueNumber, [event]);
+    }
+    // Every scanned task appears, including one with no events at all: the
+    // report's denominator is tasks scanned, not tasks that had activity.
+    const withEvents = tasks.map((task) => ({
+      issueNumber: task.issueNumber,
+      events: byIssue.get(task.issueNumber) ?? [],
+    }));
+    // Sorted by issue number so two runs over the same data produce byte-identical
+    // output regardless of the order the store happened to return rows in.
+    withEvents.sort((a, b) => a.issueNumber - b.issueNumber);
+
+    const metrics = aggregateDisputeMetrics({
+      sessionId,
+      tasks: withEvents,
+      window: { from: since, to: until },
+    });
+    const result = {
+      ok: true,
+      sessionId,
+      ...(issueNumber === undefined ? {} : { issueNumber }),
+      metrics,
+    };
+    report(result, (mode) => renderDisputeMetrics({ sessionId, issueNumber, metrics }, mode));
+  } finally {
+    store.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Subcommand: task clear-delay (issue #584)
 //
 // Clear the not_before delay on a queued task so it becomes immediately
@@ -1792,6 +2753,14 @@ function renderTaskCancel(
   if (reasonCode === "already_cancelled") {
     return `Task for issue #${issueNumber} (session ${sessionId}) is already cancelled; nothing to do.`;
   }
+  if (reasonCode === "maintenance_locked") {
+    return (
+      `Refusing: a maintenance lock is held on this database, so cancelling issue #${issueNumber} ` +
+      `(session ${sessionId}) would have written its cancellation comment into a database under ` +
+      `maintenance. Nothing was changed — re-run once \`admin maintenance-lock status\` reports the ` +
+      `lock released.`
+    );
+  }
   if (reasonCode === "terminal") {
     return (
       `Refusing: task for issue #${issueNumber} (session ${sessionId}) already reached a terminal ` +
@@ -1831,7 +2800,7 @@ async function runTaskCancel(argv: string[]): Promise<void> {
   }
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   const store = new SqliteTaskStore(dbPath);
@@ -1925,6 +2894,23 @@ async function runTaskCancel(argv: string[]): Promise<void> {
           issueNumber,
           reasonCode: "already_cancelled",
           taskStatus: storeResult.current?.status,
+        };
+        report(result, (mode) => renderTaskCancel(result, mode));
+        process.exitCode = 1;
+        return;
+      }
+      // Maintenance contention (issue #818): the whole call — transition, event,
+      // and the cancellation comment — was refused, so the task is untouched and
+      // re-running this command once the lock clears cancels cleanly. Reported as
+      // its own reason code rather than the terminal-status die() below, which
+      // would claim a task state that is not what actually happened.
+      if (storeResult.code === "maintenance_locked") {
+        const result = {
+          ok: false,
+          sessionId,
+          issueNumber,
+          reasonCode: "maintenance_locked",
+          taskStatus: task.status,
         };
         report(result, (mode) => renderTaskCancel(result, mode));
         process.exitCode = 1;
@@ -2071,7 +3057,7 @@ async function runTaskReconcileClosed(argv: string[]): Promise<void> {
   }
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
   const workItemKind = session.workItemProvider?.provider ?? "github-issues";
   if (workItemKind !== "github-issues") {
@@ -2277,7 +3263,7 @@ async function requireKnownSession(sessionId: string, sessionsPath: string): Pro
   }
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 }
 
@@ -2522,7 +3508,7 @@ async function runSessionStatus(argv: string[]): Promise<void> {
 
 interface CheckResult {
   name: string;
-  category: "repo" | "github" | "aiCli" | "storage" | "worktree";
+  category: "repo" | "github" | "aiCli" | "storage" | "worktree" | "registry";
   ok: boolean;
   detail?: string;
   error?: string;
@@ -2732,6 +3718,37 @@ function checkWorktreeStateRoot(sessionWorktreeRootOverride: string | undefined)
   } catch {
     return { name, category, ok: true, detail: root };
   }
+}
+
+/** A plain JSON object — the shape every optional session block must have. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Rejection reasons that mean a candidate could not become an invocable arbiter
+ * profile AT ALL (issue #839). Provider overlap and the same-model refusals are
+ * deliberately absent: those candidates resolved fine and were refused by §8.3's
+ * independence policy, which is the `arbiterSelection` check's subject.
+ */
+const UNUSABLE_ARBITER_REASONS: ReadonlySet<string> = new Set([
+  "not-an-agent-id",
+  "unsupported-role",
+  "candidate-not-found",
+  "cli-unavailable",
+  "profile-error",
+  "candidate-limit-exceeded",
+]);
+
+/** Render bounded arbiter rejections as one operator-readable line. */
+function describeArbiterRejections(rejections: readonly ArbiterCandidateRejection[]): string {
+  return rejections
+    .map(
+      (r) =>
+        `${r.candidate ?? "<not a string>"}[${r.index}]: ${r.reason}`
+        + `${r.detail === null ? "" : ` (${r.detail})`}`,
+    )
+    .join("; ");
 }
 
 function probe(cmd: string, args: string[], cwd?: string): { ok: boolean; output: string } {
@@ -3084,7 +4101,10 @@ function runSessionDoctor(argv: string[]): void {
   }
 
   const sessions = fileContent.sessions as Array<Record<string, unknown>>;
-  const session = sessions.find((s) => s["sessionId"] === sessionId);
+  const sessionIndex = sessions.findIndex(
+    (s) => s !== null && typeof s === "object" && s["sessionId"] === sessionId,
+  );
+  const session = sessionIndex === -1 ? undefined : sessions[sessionIndex];
   if (!session) {
     die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
   }
@@ -3359,9 +4379,27 @@ function runSessionDoctor(argv: string[]): void {
     agentSet.add("claude" as AgentId);
   }
 
-  for (const agent of agentSet) {
+  /**
+   * One `--version` spawn per distinct agent binary, memoized (issue #839).
+   *
+   * The arbiter-candidate diagnostics below ask about the same agents the role
+   * checks above already probed, and §8.3's candidate list can name every one of
+   * them; without memoization an enabled dispute config would re-spawn each CLI
+   * once per candidate. Several checks may still REPORT the same probe — that is
+   * a reporting choice — but the process is only ever run once per agent.
+   */
+  const cliProbes = new Map<AgentId, { ok: boolean; output: string }>();
+  const probeAgentCli = (agent: AgentId): { ok: boolean; output: string } => {
+    const cached = cliProbes.get(agent);
+    if (cached) return cached;
     const bin = agent === "gemini" ? (process.env["ANTIGRAVITY_BIN"] ?? "agy") : agent;
-    const cliCheck = probe(bin, ["--version"]);
+    const result = probe(bin, ["--version"]);
+    cliProbes.set(agent, result);
+    return result;
+  };
+
+  for (const agent of agentSet) {
+    const cliCheck = probeAgentCli(agent);
     checks.push({
       name: `${agent}Cli`,
       category: "aiCli",
@@ -3373,8 +4411,7 @@ function runSessionDoctor(argv: string[]): void {
   }
 
   if (reviewAgent === "gemini" && VALID_AGENTS.includes(reviewAgent as AgentId)) {
-    const reviewBin = process.env["ANTIGRAVITY_BIN"] ?? "agy";
-    const cliCheck = probe(reviewBin, ["--version"]);
+    const cliCheck = probeAgentCli("gemini");
     checks.push({
       name: "geminiReviewCli",
       category: "aiCli",
@@ -3391,6 +4428,157 @@ function runSessionDoctor(argv: string[]): void {
   // probe — e.g. a Gemini research agent already yields one `geminiCli` check —
   // so no research-specific probe is emitted.
 
+  // ---- Review-dispute arbiter checks (issue #839, contract §8.3) ----
+  //
+  // Diagnosed only for an ENABLED dispute configuration: with the protocol off no
+  // lineage can ever reach arbitration, so an unconfigured arbiter is not a
+  // finding. Read-only throughout — the candidate resolver is handed the
+  // availability facts `probeAgentCli` already produced and never spawns
+  // anything of its own, and nothing here resolves an actual task.
+  const disputeRaw = session["reviewDispute"];
+  const disputeEnabled =
+    typeof disputeRaw === "object"
+    && disputeRaw !== null
+    && !Array.isArray(disputeRaw)
+    && (disputeRaw as Record<string, unknown>)["enabled"] === true;
+  if (disputeEnabled) {
+    const skip = (name: string, why: string): void => {
+      checks.push({ name, category: "aiCli", ok: false, error: `Skipped: ${why}` });
+    };
+    const resolvedDispute = resolveReviewDisputeSettings(disputeRaw as ReviewDisputeConfig);
+    if (!resolvedDispute.ok) {
+      checks.push({
+        name: "arbiterConfig",
+        category: "aiCli",
+        ok: false,
+        error:
+          `reviewDispute configuration is invalid: ${resolvedDispute.errors.map((e) => e.message).join("; ")}`,
+      });
+      skip("arbiterCandidates", "reviewDispute configuration is invalid (see arbiterConfig)");
+      skip("arbiterSelection", "reviewDispute configuration is invalid (see arbiterConfig)");
+    } else {
+      const policy = resolvedDispute.settings.arbiter;
+      if (policy.providers.length === 0) {
+        checks.push({
+          name: "arbiterConfig",
+          category: "aiCli",
+          ok: false,
+          error:
+            "reviewDispute.enabled is true but reviewDispute.arbiter.providers is empty; with no candidate "
+            + "every arbitration escalates to a human (contract §8.3, §7 row 19). List the agent ids that may "
+            + `arbitrate, e.g. "arbiter": { "providers": ["claude", "codex"] }`,
+        });
+      } else {
+        checks.push({
+          name: "arbiterConfig",
+          category: "aiCli",
+          ok: true,
+          detail:
+            `${policy.providers.length} candidate(s) in order: ${policy.providers.join(", ")}; `
+            + `allowSameProvider: ${policy.allowSameProvider}; minConfidence: ${policy.minConfidence}`,
+        });
+      }
+      // §8.3 measures a candidate against the IMPLEMENTER and the REVIEWER. A
+      // doctor run has no task, so it answers the question for the session's
+      // configured/default parties; a task whose assignment or review run
+      // resolved elsewhere is measured against those at arbitration time.
+      const implOk =
+        !!implementationAgent
+        && VALID_AGENTS.includes(implementationAgent as AgentId)
+        && IMPLEMENTATION_SUPPORTED.includes(implementationAgent as AgentId);
+      const reviewOk =
+        !!reviewAgent
+        && VALID_AGENTS.includes(reviewAgent as AgentId)
+        && REVIEW_SUPPORTED.includes(reviewAgent as AgentId);
+      if (!implOk || !reviewOk) {
+        const why = "the session's default implementation/review agents are unusable (see the role checks above)";
+        skip("arbiterCandidates", why);
+        skip("arbiterSelection", why);
+      } else {
+        const evaluation = evaluateArbiterCandidates({
+          policy,
+          implementation: { agentId: implementationAgent as AgentId },
+          review: { agentId: reviewAgent as AgentId },
+          resolveCandidate: createArbiterCandidateResolver({
+            config: {
+              ...(isRecord(session["codex"]) ? { codex: session["codex"] as CodexConfig } : {}),
+              ...(isRecord(session["research"]) && isRecord((session["research"] as Record<string, unknown>)["antigravity"])
+                ? {
+                    antigravity: (session["research"] as Record<string, unknown>)[
+                      "antigravity"
+                    ] as AntigravityResearchConfig,
+                  }
+                : {}),
+            },
+            cliAvailable: (agent) => probeAgentCli(agent).ok,
+          }),
+        });
+        // Resolution-level problems: the candidate could not become an invocable
+        // profile at all. Provider overlap is deliberately NOT one of them — a
+        // candidate rejected for sharing a provider is correctly configured and
+        // correctly refused, and it belongs in the selection check below.
+        const unusable = evaluation.rejections.filter((r) => UNUSABLE_ARBITER_REASONS.has(r.reason));
+        const tried = evaluation.rejections.filter((r) => r.reason !== "candidate-limit-exceeded").length
+          + (evaluation.selected === null ? 0 : 1);
+        if (unusable.length > 0) {
+          checks.push({
+            name: "arbiterCandidates",
+            category: "aiCli",
+            ok: false,
+            error: `Unusable arbiter candidate(s): ${describeArbiterRejections(unusable)}`,
+          });
+        } else {
+          checks.push({
+            name: "arbiterCandidates",
+            category: "aiCli",
+            ok: true,
+            detail:
+              `${tried} of ${policy.providers.length} candidate(s) evaluated; none unusable`
+              + " (evaluation stops at the first acceptable candidate)",
+          });
+        }
+        const impl = evaluation.implementation;
+        const rev = evaluation.review;
+        const parties = `implementation ${impl.agentId}/${impl.provider}, review ${rev.agentId}/${rev.provider}`;
+        if (evaluation.selected !== null) {
+          const selected = evaluation.selected;
+          checks.push({
+            name: "arbiterSelection",
+            category: "aiCli",
+            ok: true,
+            detail:
+              `${selected.agentId}/${selected.provider}`
+              + `${selected.model === undefined ? "" : ` model ${selected.model}`}`
+              + `${selected.effort === undefined ? "" : ` effort ${selected.effort}`}`
+              + `${selected.maxBudgetUsd === undefined ? "" : ` budget ${selected.maxBudgetUsd}`}`
+              + ` for ${parties}; sameProviderFallback: ${selected.sameProviderFallback}`,
+          });
+        } else {
+          checks.push({
+            name: "arbiterSelection",
+            category: "aiCli",
+            ok: false,
+            error:
+              `No acceptable independent arbiter for ${parties}: `
+              + `${describeArbiterRejections(evaluation.rejections) || "no candidates configured"}. `
+              + "Every arbitration would escalate to a human (contract §8.3, §7 row 19). Add a candidate whose "
+              + "provider differs from both parties, or set reviewDispute.arbiter.allowSameProvider to true with "
+              + "a candidate whose model is provably different from both."
+              // A doctor run has no task, so it holds no resolved implementation
+              // or review profile to read a model off. Said plainly rather than
+              // left to look like a configuration defect: at arbitration time the
+              // parties' actual models ARE known, and the same candidate may well
+              // be accepted then.
+              + (evaluation.rejections.some((r) => r.reason === "same-provider-model-unknown")
+                ? " Note: a session-level check cannot prove a same-provider candidate differs by model, because"
+                  + " the parties' resolved models are only known once the implementation and review runs exist."
+                : ""),
+          });
+        }
+      }
+    }
+  }
+
   // ---- Storage checks ----
 
   checks.push(checkSqliteHealth(dbPath));
@@ -3403,6 +4591,58 @@ function runSessionDoctor(argv: string[]): void {
   // duplicated here (issue #695).
 
   checks.push(checkWorktreeStateRoot(sessionWorktreeRootOverride));
+
+  // ---- Registry checks (issue #823) ----
+  //
+  // The registry independently validates every entry in sessions.json and
+  // quarantines invalid/ambiguous ones without failing the whole file. Surface
+  // that here: whether THIS session loads cleanly (affects allPassed, since it
+  // directly determines whether the loop can run it) versus whether OTHER
+  // entries elsewhere in the file have diagnostics (informational only — a
+  // problem confined to an unrelated session must not fail this session's
+  // doctor run).
+  {
+    let registry: JsonSessionRegistry | undefined;
+    let registryError: string | undefined;
+    try {
+      registry = new JsonSessionRegistry(sessionsPath);
+    } catch (err) {
+      registryError = err instanceof Error ? err.message : String(err);
+    }
+
+    if (registry) {
+      const diagnostics = registry.getDiagnostics();
+      const ownDiagnostics = diagnostics.filter((d) => d.indices.includes(sessionIndex));
+      const otherDiagnostics = diagnostics.filter((d) => !d.indices.includes(sessionIndex));
+      checks.push({
+        name: "registryEntryValid",
+        category: "registry",
+        ok: ownDiagnostics.length === 0,
+        ...(ownDiagnostics.length === 0
+          ? { detail: `session "${sessionId}" loads cleanly in the session registry` }
+          : { error: ownDiagnostics.map((d) => d.message).join(" ") }),
+      });
+      checks.push({
+        name: "registryDiagnostics",
+        category: "registry",
+        // Never fails allPassed: a diagnostic on a different session entry is
+        // that session's problem, not this one's (issue #823).
+        ok: true,
+        detail:
+          otherDiagnostics.length === 0
+            ? "no other session registry entries have diagnostics"
+            : `${otherDiagnostics.length} other session registry entr${otherDiagnostics.length === 1 ? "y has" : "ies have"} ` +
+              `a diagnostic: ${otherDiagnostics.map((d) => d.message).join(" | ")}`,
+      });
+    } else {
+      checks.push({
+        name: "registryEntryValid",
+        category: "registry",
+        ok: false,
+        error: registryError ?? "Failed to load the session registry",
+      });
+    }
+  }
 
   const allPassed = checks.every((c) => c.ok);
 
@@ -3605,7 +4845,7 @@ function loadSessionInfo(
     return { error: "sessions.json does not contain a sessions array" };
   }
   const sessions = fileContent.sessions as Array<Record<string, unknown>>;
-  const session = sessions.find((s) => s["sessionId"] === sessionId);
+  const session = sessions.find((s) => s !== null && typeof s === "object" && s["sessionId"] === sessionId);
   if (!session) {
     return { error: `Unknown sessionId: ${sessionId}` };
   }
@@ -3733,17 +4973,23 @@ interface WorktreePruneArgs {
   sessionsPath: string;
   yes: boolean;
   force: boolean;
+  /** Target the issue's leaked per-run research checkouts instead of `issue-<n>/repo`. */
+  research: boolean;
+  lockDir?: string;
 }
 
 function parseWorktreePruneArgs(argv: string[]): WorktreePruneArgs | { error: string } {
   const args: Record<string, string> = {};
   let yes = false;
   let force = false;
+  let research = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--yes") {
       yes = true;
     } else if (argv[i] === "--force") {
       force = true;
+    } else if (argv[i] === "--research") {
+      research = true;
     } else if (argv[i].startsWith("--") && i + 1 < argv.length) {
       args[argv[i].slice(2)] = argv[i + 1];
       i++;
@@ -3761,7 +5007,126 @@ function parseWorktreePruneArgs(argv: string[]): WorktreePruneArgs | { error: st
     sessionsPath: args["sessions-path"] ?? DEFAULT_SESSIONS_PATH,
     yes,
     force,
+    research,
+    lockDir: args["lock-dir"],
   };
+}
+
+/**
+ * `worktree prune --research`: remove the leaked per-run research checkouts
+ * (`issue-<n>/research-<runId>`) for ONE issue (issue #855).
+ *
+ * Research runs in a throwaway detached checkout that its own handler removes on
+ * every normal exit path. A process killed mid-run leaks that directory, and
+ * nothing else can reclaim it: a retry allocates a fresh run id, so it creates a
+ * new path rather than reusing the abandoned one. The durable-worktree prune
+ * above cannot help — it addresses exactly `issue-<n>/repo` — so this is the
+ * targeted per-issue route, complementing the session-wide sweep in
+ * `worktree cleanup`.
+ *
+ * Lock-aware, unlike the durable prune: the issue lock is the one interlock that
+ * distinguishes "a research run is in flight right now" from "a research run
+ * died here", and removing a live run's checkout out from under it would break
+ * the run. A live lock is therefore refused (reported, exit 0) unless `--force`.
+ * Removal itself always forces, because the checkout is disposable by
+ * construction — detached at a fetched base commit, owning no branch, so
+ * anything in the tree is agent scratch.
+ */
+function runResearchWorktreePrune(
+  parsed: WorktreePruneArgs,
+  ctx: { repoRoot: string; worktreeRoot: string },
+): void {
+  const { sessionId, issueNumber, yes, force, lockDir } = parsed;
+  const { repoRoot, worktreeRoot } = ctx;
+
+  const sessionPrefix = canonicalizePath(sessionWorktreeDir(worktreeRoot, sessionId)) + "/";
+  const listed = listWorktrees(repoRoot);
+  if (!listed.ok) die(listed.error);
+
+  const matches = listed.worktrees
+    .map((w) => {
+      const cp = canonicalizePath(w.path);
+      if (!cp.startsWith(sessionPrefix)) return null;
+      const classified = classifyManagedWorktree(cp.slice(sessionPrefix.length));
+      if (!classified || classified.kind !== "research") return null;
+      if (classified.issueNumber !== issueNumber) return null;
+      return { path: cp, runId: classified.runId };
+    })
+    .filter((m): m is { path: string; runId: string } => m !== null);
+
+  // Checked before the lock so an issue with nothing leaked reports the plain
+  // no-op rather than a lock refusal that implies something was left alone.
+  if (matches.length === 0) {
+    // Safe no-op: nothing to remove. Exit 0 per the admin contract.
+    emit({
+      ok: true,
+      sessionId,
+      issueNumber,
+      research: true,
+      dryRun: !yes,
+      examined: 0,
+      removed: [],
+      skipped: [],
+      reason: "not_found",
+    });
+    return;
+  }
+
+  const lockHeld = new IssueWorktreeLock(lockDir).inspect(sessionId, issueNumber).locked;
+  if (lockHeld && !force) {
+    emit({
+      ok: true,
+      sessionId,
+      issueNumber,
+      research: true,
+      dryRun: !yes,
+      examined: matches.length,
+      removed: [],
+      skipped: matches.map((m) => ({
+        ...m,
+        reason: "locked (live issue lock — a research run may be active)",
+      })),
+      hint: "A live issue lock is held; re-run with --force only when certain no research run is active.",
+    });
+    return;
+  }
+
+  if (!yes) {
+    emit({
+      ok: true,
+      sessionId,
+      issueNumber,
+      research: true,
+      dryRun: true,
+      examined: matches.length,
+      wouldRemove: matches,
+      removed: [],
+      skipped: [],
+      hint: "Re-run with --yes to remove these leaked research checkouts.",
+    });
+    return;
+  }
+
+  const removed: Array<{ path: string; runId: string }> = [];
+  const errors: Array<{ path: string; runId: string; error: string }> = [];
+  for (const match of matches) {
+    const result = removeWorktree(repoRoot, match.path, { force: true });
+    if (result.ok) removed.push(match);
+    else errors.push({ ...match, error: result.error });
+  }
+
+  emit({
+    ok: errors.length === 0,
+    sessionId,
+    issueNumber,
+    research: true,
+    dryRun: false,
+    examined: matches.length,
+    removed,
+    skipped: [],
+    ...(errors.length > 0 ? { errors } : {}),
+  });
+  if (errors.length > 0) process.exitCode = 1;
 }
 
 function runWorktreePrune(argv: string[]): void {
@@ -3779,6 +5144,12 @@ function runWorktreePrune(argv: string[]): void {
   } catch (err) {
     die(err instanceof Error ? err.message : String(err));
   }
+
+  if (parsed.research) {
+    runResearchWorktreePrune(parsed, { repoRoot, worktreeRoot });
+    return;
+  }
+
   // Canonicalize to match git's symlink-resolved worktree paths.
   const path = canonicalizePath(issueWorktreePath(worktreeRoot, sessionId, issueNumber));
 
@@ -4408,6 +5779,11 @@ interface StatusPayload {
    * work, and the reason must be visible from the default status view. */
   sessionPause: SessionPauseState;
   repoLock: StatusLock;
+  /** Set when the session registry (issue #823) independently flagged THIS
+   * session as invalid or ambiguous — the loop cannot run it even though the
+   * hand-parsed session info above resolved. `null` when the registry loads
+   * this session cleanly or could not be consulted. */
+  registryDiagnostic: string | null;
   count: number;
   entries: StatusEntry[];
 }
@@ -4434,6 +5810,10 @@ function renderStatus(payload: StatusPayload, mode: OutputMode): string {
   const lines: string[] = [];
   if (!mode.quiet) {
     lines.push(`Status for ${scope} (as of ${payload.generatedAt}):`);
+    lines.push("");
+  }
+  if (payload.registryDiagnostic) {
+    lines.push(`  SESSION REGISTRY DIAGNOSTIC: ${payload.registryDiagnostic}`);
     lines.push("");
   }
   if (payload.sessionPause.paused) {
@@ -4598,6 +5978,23 @@ async function runStatus(argv: string[]): Promise<void> {
     controlStore.close();
   }
 
+  // Cross-check against the session registry (issue #823): `loadSessionInfo`
+  // above is a lenient hand-parse that only reads the fields status needs, so
+  // it can succeed for a session the stricter registry would quarantine as
+  // invalid or ambiguous — exactly the case the loop itself cannot run.
+  // Defensive: never let a registry-load problem hide the status this command
+  // exists to show.
+  let registryDiagnostic: string | null = null;
+  try {
+    const registry = new JsonSessionRegistry(sessionsPath);
+    const own = registry.getDiagnostics().find((d) => d.sessionIds.includes(sessionId));
+    if (own) registryDiagnostic = own.message;
+  } catch {
+    // Ignored: loadSessionInfo already validated the same file above, so a
+    // fatal registry error here would be surprising; status still has real
+    // task data to show and should not fail on this best-effort cross-check.
+  }
+
   const payload = {
     ok: true as const,
     sessionId,
@@ -4605,6 +6002,7 @@ async function runStatus(argv: string[]): Promise<void> {
     generatedAt: now,
     sessionPause,
     repoLock,
+    registryDiagnostic,
     count: entries.length,
     entries,
   };
@@ -4699,7 +6097,11 @@ interface CleanupItem {
   issueNumber: number;
   path: string;
   branch: string | null;
-  /** active | terminal | orphaned | <other task status, e.g. failed>. */
+  /** Which managed checkout this is: the durable issue worktree or a research run. */
+  kind: "issue" | "research";
+  /** Run id of a `research` checkout (absent for the durable issue worktree). */
+  runId?: string;
+  /** active | terminal | orphaned | research-leaked | <other task status, e.g. failed>. */
   classification: string;
   dirty: boolean;
   unpushedCommits: boolean;
@@ -4752,17 +6154,32 @@ async function runWorktreeCleanup(argv: string[]): Promise<void> {
       // canonical checkout or an unrelated worktree the operator added by hand.
       if (cp === canonicalRepoRoot || !cp.startsWith(sessionPrefix)) continue;
       const rel = cp.slice(sessionPrefix.length);
-      const m = /^issue-(\d+)(?:\/|$)/.exec(rel);
-      if (!m) continue; // not a recognized per-issue worktree layout
-      const issueNumber = Number(m[1]);
+      const classified = classifyManagedWorktree(rel);
+      if (!classified) continue; // not a recognized per-issue worktree layout
+      const { issueNumber } = classified;
       const branch = w.branch ? w.branch.replace(/^refs\/heads\//, "") : null;
 
       const task = await store.getTask({ sessionId, issueNumber });
       const lockHeld = lock.inspect(sessionId, issueNumber).locked;
 
+      // A per-run research checkout (issue #855) is disposable by construction:
+      // it is detached at a fetched base commit, owns no branch, and belongs to
+      // exactly ONE process. If that process dies before its `finally` removes
+      // the checkout, nothing can ever reclaim it — a retry gets a new run id and
+      // therefore a new path — so its issue's task status says nothing about
+      // whether the directory is still in use. Gating it on `active` (as the
+      // durable `issue-<n>/repo` worktree must be) would leak the checkout until
+      // the task went terminal, which is exactly the accumulation this branch of
+      // the classifier exists to prevent. The live issue lock below remains the
+      // interlock: a research run that is genuinely in flight holds it.
+      const isResearch = classified.kind === "research";
+
       let classification: string;
       let candidate: boolean;
-      if (!task) {
+      if (isResearch) {
+        classification = "research-leaked";
+        candidate = true;
+      } else if (!task) {
         classification = "orphaned";
         candidate = true;
       } else if (ACTIVE_TASK_STATUSES.has(task.status)) {
@@ -4788,6 +6205,13 @@ async function runWorktreeCleanup(argv: string[]): Promise<void> {
         reason = "locked (live issue lock — a run may be active)";
       } else if (!candidate) {
         reason = `active task (status=${task!.status})`;
+      } else if (isResearch) {
+        // The dirty / unpushed facts are still reported for the operator, but
+        // they cannot gate the decision here: read-only research is detached at a
+        // base commit with no branch to push, so leftover files are agent scratch
+        // and the "commits not on origin" comparison is meaningless. The in-run
+        // release path force-removes this same checkout on every normal exit.
+        decision = "remove";
       } else if (dirty && !force) {
         reason = "dirty (re-run with --force to discard uncommitted changes)";
       } else if (unpushedCommits && !force) {
@@ -4800,6 +6224,8 @@ async function runWorktreeCleanup(argv: string[]): Promise<void> {
         issueNumber,
         path: cp,
         branch,
+        kind: classified.kind,
+        ...(classified.kind === "research" ? { runId: classified.runId } : {}),
         classification,
         dirty,
         unpushedCommits,
@@ -4834,7 +6260,12 @@ async function runWorktreeCleanup(argv: string[]): Promise<void> {
   const removed: CleanupItem[] = [];
   const errors: Array<CleanupItem & { error: string }> = [];
   for (const item of toRemove) {
-    const result = removeWorktree(repoRoot, item.path, { force });
+    // A leaked research checkout is removed with force regardless of the flag:
+    // it was admitted as a candidate without the dirty/unpushed guards, so a
+    // plain `git worktree remove` would refuse the very scratch state that made
+    // those guards inapplicable, and the operator would be told to re-run with
+    // `--force` for a checkout that is disposable by construction.
+    const result = removeWorktree(repoRoot, item.path, { force: force || item.kind === "research" });
     if (result.ok) {
       removed.push(item);
     } else {
@@ -5362,6 +6793,14 @@ interface OutboxSessionScope {
    * persisted `lastError` would leak through `outbox list`.
    */
   redactionPaths: string[];
+  /**
+   * The dispatch-identity key whose persisted scan cursors govern this
+   * session's rows (issue #820), derived from the session config by the one
+   * shared derivation `dispatch-outbox.ts` uses — so an `outbox retry` rewinds
+   * exactly the cursors a later dispatch of this session will read, and cannot
+   * drift from them. See `docs/outbox-scan-cursor-contract.md` §13.
+   */
+  cursorIdentityKey: string;
 }
 
 /**
@@ -5385,7 +6824,7 @@ async function resolveOutboxSessionScope(
   }
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
   const { githubOwner, githubName } = session;
   const gitea =
@@ -5398,6 +6837,18 @@ async function resolveOutboxSessionScope(
       return false;
     },
     redactionPaths: sessionRedactionPaths(session),
+    // Same tuple, same derivation as `dispatch-outbox.ts` builds for the
+    // dispatcher (issue #820): session id plus the full repository/provider
+    // ownership tuple, including the Gitea instance when the session is
+    // split-provider. Deriving it from the session config — never from an
+    // operator-supplied flag — is what guarantees the retry rewinds the same
+    // cursor rows the next dispatch of this session will consult.
+    cursorIdentityKey: deriveOwnershipScanCursorKey({
+      sessionId,
+      githubOwner,
+      githubName,
+      ...(gitea ? { gitea: { owner: gitea.owner, repo: gitea.repo, baseUrl: gitea.baseUrl } } : {}),
+    }),
   };
 }
 
@@ -5615,12 +7066,44 @@ function parseOutboxRowActionArgs(argv: string[]): OutboxRowActionArgs | { error
  * neither delayed nor dead-lettered is already immediately dispatch-eligible
  * with nothing to recover.
  */
-function previewOutboxRetry(entry: OutboxEntry, nowIso: string): { wouldRetry: boolean; reason?: string } {
+function previewOutboxRetry(
+  entry: OutboxEntry,
+  nowIso: string,
+  maintenanceLocked = false,
+): { wouldRetry: boolean; reason?: string } {
   if (entry.sentAt !== undefined) return { wouldRetry: false, reason: "already_sent" };
   const isDelayed = entry.nextAttemptAt !== undefined && entry.nextAttemptAt > nowIso;
   const isDead = entry.deadLetterAt !== undefined;
   if (!isDelayed && !isDead) return { wouldRetry: false, reason: "already_pending" };
+  // Checked last (issue #818), mirroring `retryEntry`'s own order: it evaluates
+  // eligibility before reaching the guarded write, so an already-sent row
+  // reports `already_sent` under maintenance too, not `maintenance_locked`.
+  if (maintenanceLocked) return { wouldRetry: false, reason: "maintenance_locked" };
   return { wouldRetry: true };
+}
+
+/**
+ * Read the session identity's three persisted cursors and decide what an
+ * `outbox retry` of row `id` would have to rewind (issue #820).
+ *
+ * Read-only — three `SELECT`s and one pure function — so the preview stays
+ * non-mutating while still reporting the rewind by the *same* rule the store's
+ * transactional `UPDATE ... WHERE after_id >= ?` applies. Absent cursor rows
+ * are reported as absent (never as `0`), which is what makes "absent stays
+ * absent" visible to the operator before they pass `--yes`.
+ */
+async function previewOutboxCursorRewind(
+  outboxStore: { getScanCursor(key: string): Promise<number | undefined> },
+  cursorIdentityKey: string,
+  id: number,
+): Promise<OutboxScanCursorRewindPlan & { cursors: OutboxScanCursorAfterIds }> {
+  const keys = scanCursorKeysFor(cursorIdentityKey);
+  const cursors: OutboxScanCursorAfterIds = {};
+  for (const role of OUTBOX_SCAN_CURSOR_ROLES) {
+    const afterId = await outboxStore.getScanCursor(keys[role]);
+    if (afterId !== undefined) cursors[role] = afterId;
+  }
+  return { ...planScanCursorRewind(cursors, id), cursors };
 }
 
 /**
@@ -5630,7 +7113,15 @@ function previewOutboxRetry(entry: OutboxEntry, nowIso: string): { wouldRetry: b
  * safely reported as cancelled (that attempt may already have performed the
  * external side effect) — so the preview must not claim otherwise.
  */
-function previewOutboxCancel(entry: OutboxEntry, nowIso: string): { wouldCancel: boolean; reason?: string } {
+function previewOutboxCancel(
+  entry: OutboxEntry,
+  nowIso: string,
+  maintenanceLocked = false,
+): { wouldCancel: boolean; reason?: string } {
+  // Checked first (issue #818), mirroring `cancelEntry`'s own order: its
+  // maintenance guard sits ahead of the single conditional UPDATE that
+  // evaluates every other reason, so a held lock is what it reports for any row.
+  if (maintenanceLocked) return { wouldCancel: false, reason: "maintenance_locked" };
   if (entry.sentAt !== undefined) return { wouldCancel: false, reason: "already_sent" };
   if (entry.cancelledAt !== undefined) return { wouldCancel: false, reason: "already_cancelled" };
   if (isOutboxClaimActive(entry.claimedAt, nowIso)) return { wouldCancel: false, reason: "dispatch_in_progress" };
@@ -5653,7 +7144,12 @@ async function runOutboxRetry(argv: string[]): Promise<void> {
     if (!yes) {
       const now = new Date().toISOString();
       const status = categorizeOutboxEntry(entry, now);
-      const { wouldRetry, reason } = previewOutboxRetry(entry, now);
+      const { wouldRetry, reason } = previewOutboxRetry(entry, now, await outboxStore.isMaintenanceLocked());
+      // Reported on every preview, eligible or not (issue #820): whether the
+      // recovery also has to move a cursor is the part an operator cannot see
+      // from the row itself, and it is exactly what decides whether the row
+      // becomes discoverable again or silently stays stranded.
+      const rewind = await previewOutboxCursorRewind(outboxStore, scope.cursorIdentityKey, id);
       emit({
         ok: true,
         sessionId,
@@ -5662,13 +7158,27 @@ async function runOutboxRetry(argv: string[]): Promise<void> {
         wouldRetry,
         status,
         ...(reason !== undefined ? { reason } : {}),
+        cursorRewind: {
+          required: rewind.required,
+          targetAfterId: rewind.targetAfterId,
+          roles: rewind.roles,
+          cursors: rewind.cursors,
+        },
         hint: wouldRetry
-          ? "Re-run with --yes to retry this row."
-          : `No-op: this row is ${reason === "already_sent" ? "already sent" : "already pending"}.`,
+          ? rewind.required
+            ? `Re-run with --yes to retry this row (also rewinds scan cursor(s) ${rewind.roles.join(", ")} to ${rewind.targetAfterId}, atomically).`
+            : "Re-run with --yes to retry this row."
+          : reason === "maintenance_locked"
+            ? "Refused: a maintenance lock is held on this database; retry once it is released."
+            : `No-op: this row is ${reason === "already_sent" ? "already sent" : "already pending"}.`,
       });
       return;
     }
-    const result = await outboxStore.retryEntry(id);
+    // The cursor scope resolved from the session config travels with the
+    // mutation (issue #820) so the row update and every required rewind commit
+    // in one transaction — a retry that revived the row but left the cursors
+    // ahead of it would leave the row pending yet permanently unscanned.
+    const result = await outboxStore.retryEntry(id, undefined, { cursorIdentityKey: scope.cursorIdentityKey });
     emit({ ok: true, sessionId, id, ...result });
   } finally {
     outboxStore.close();
@@ -5691,7 +7201,7 @@ async function runOutboxCancel(argv: string[]): Promise<void> {
     if (!yes) {
       const now = new Date().toISOString();
       const status = categorizeOutboxEntry(entry, now);
-      const { wouldCancel, reason } = previewOutboxCancel(entry, now);
+      const { wouldCancel, reason } = previewOutboxCancel(entry, now, await outboxStore.isMaintenanceLocked());
       emit({
         ok: true,
         sessionId,
@@ -5702,11 +7212,13 @@ async function runOutboxCancel(argv: string[]): Promise<void> {
         ...(reason !== undefined ? { reason } : {}),
         hint: wouldCancel
           ? "Re-run with --yes to cancel this row."
-          : reason === "already_sent"
-            ? "No-op: this row is already sent."
-            : reason === "dispatch_in_progress"
-              ? "No-op: a dispatch attempt is currently in flight for this row; retry the cancel shortly."
-              : "No-op: this row is already cancelled.",
+          : reason === "maintenance_locked"
+            ? "Refused: a maintenance lock is held on this database; retry once it is released."
+            : reason === "already_sent"
+              ? "No-op: this row is already sent."
+              : reason === "dispatch_in_progress"
+                ? "No-op: a dispatch attempt is currently in flight for this row; retry the cancel shortly."
+                : "No-op: this row is already cancelled.",
       });
       return;
     }
@@ -6216,7 +7728,7 @@ async function runTaskAssign(argv: string[]): Promise<void> {
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   if (profile !== undefined && profile !== DEFAULT_FLOW) {
@@ -6897,6 +8409,19 @@ async function resolveOpenPrForFixModeRecovery(
 }
 
 /**
+ * Operator-facing suffix for a task-and-effect write a held maintenance lock
+ * refused (issue #818 review follow-up). Those writes are all-or-nothing, so
+ * the message's job is to say that nothing changed and the command is simply
+ * repeatable — not to describe a task state that never happened.
+ */
+function maintenanceRefusalHint(code: string): string {
+  return code === "maintenance_locked"
+    ? ". A maintenance lock is held on this database (see `admin maintenance-lock status`); " +
+        "nothing was changed — re-run once it is released."
+    : "";
+}
+
+/**
  * Requeue a task to `queued` / `implementation` in fix mode with the given
  * (already sanitized) review feedback, and swap GitHub labels to the fix lane via
  * the outbox. Shared by the operator and GitHub App human-review-return paths so
@@ -6907,6 +8432,11 @@ async function resolveOpenPrForFixModeRecovery(
  * review-loop cap state so an intentional return starts the review loop fresh.
  * The `reviewFeedbackSource` / `reviewFeedbackMeta` shape is supplied by the
  * caller. Expects the task's current status so a concurrent claim is detected.
+ *
+ * The transition and its label effects are committed together (issue #818
+ * review follow-up), so a held maintenance lock comes back as
+ * `code: "maintenance_locked"` with nothing applied — never a task moved into
+ * the fix lane whose lane labels were refused a moment later.
  */
 async function enqueueFixModeRequeue(args: {
   store: SqliteTaskStore;
@@ -6936,6 +8466,15 @@ async function enqueueFixModeRequeue(args: {
   // millisecond can read (and even write) an identical timestamp, letting a stale
   // timestamp-only CAS check pass (issue #622 review, P2).
   expectedRevision?: number;
+  // Public status comment announcing this requeue, committed in the SAME
+  // transaction as the transition and the lane labels (issue #818 review
+  // follow-up). Callers that post such a comment MUST pass it here rather than
+  // enqueueing it after this helper returns: once the task has left its
+  // human-handoff status, a maintenance lock (or any other failure) met on a
+  // separate enqueue can no longer be repaired by re-running the command, since
+  // the task is no longer in the state that command accepts. `keySuffix`
+  // distinguishes the comment from the caller's other effects for this runId.
+  statusComment?: { body: string; keySuffix: string };
 }): Promise<
   | { ok: true; task: AiTask; prUrl?: string; branch: string }
   | { ok: false; code: string; current?: AiTask }
@@ -6943,6 +8482,19 @@ async function enqueueFixModeRequeue(args: {
   const { store, outboxStore, session, task, now, runId } = args;
   const sessionId = session.sessionId;
   const issueNumber = task.issueNumber;
+
+  // Refuse the whole requeue up front while a maintenance lock is held (issue
+  // #818 review follow-up), BEFORE the live PR lookup and the transition below.
+  // This helper is a compound task-and-effect operation: without this check it
+  // would transition the task into the fix lane and only then meet the held
+  // lock on its outbox enqueue, aborting with the task already moved but its
+  // lane labels never queued. The commit below is additionally atomic against a
+  // lock acquired after this read (`transitionTaskWithEffects` re-checks inside
+  // its own transaction); this early read is what keeps the operator's command
+  // a clean, repeatable no-op rather than a mid-sequence abort.
+  if (await outboxStore.isMaintenanceLocked()) {
+    return { ok: false, code: "maintenance_locked" };
+  }
 
   const { prUrl, branch } = resolvePrContext(task);
   const resolvedBranch = branch ?? branchName(issueNumber);
@@ -6991,34 +8543,38 @@ async function enqueueFixModeRequeue(args: {
     ...(args.verificationStateOnFix === "preserveMissingOnly" ? {} : { missingVerificationCommands: undefined }),
   };
 
-  const result = await store.transitionTask(
-    { sessionId, issueNumber },
-    {
-      status: task.status,
-      ...(args.expectedRevision !== undefined ? { revision: args.expectedRevision } : {}),
-    },
-    {
-      status: "queued",
-      phase: "implementation",
-      ownerRunId: undefined,
-      leaseExpiresAt: undefined,
-      lastError: undefined,
-      context: newContext,
-      now,
-    },
-  );
-  if (!result.ok) {
-    return { ok: false, code: result.code, current: result.current };
-  }
+  const patch: TaskPatch = {
+    status: "queued",
+    phase: "implementation",
+    ownerRunId: undefined,
+    leaseExpiresAt: undefined,
+    lastError: undefined,
+    context: newContext,
+    now,
+  };
+
+  // Collect the label effects instead of writing them through the live outbox
+  // store, then commit them in the SAME transaction as the transition (issue
+  // #818 review follow-up), exactly as a phase completion does (issue #701) and
+  // as `admin task cancel` already does for its cancellation comment. The task
+  // moving into the fix lane and the labels announcing that move are one
+  // operator action; a maintenance lock (or any other failure) must take both
+  // or neither, never leave the human-handoff lane half-applied.
+  //
+  // The builders read the POST-transition task, so they run against the same
+  // `applyTaskPatch` preview `transitionTaskWithEffects` is about to persist —
+  // the identical shape phase-runner uses for the same reason.
+  const preview = applyTaskPatch(task, patch);
+  const effects = new OutboxEffectCollector();
 
   // Swap GitHub labels to the fix lane via the shared outbox logic: add
   // status:needs-fix + the implementation agent label and remove the
   // ready-for-human + review-lane labels. Modeled as a review→needs_fix requeue
   // so the ready-for-human / review-lane cleanup path is reached.
   await enqueueStatusLabelEffects(
-    outboxStore,
+    effects,
     session,
-    result.value,
+    preview,
     "queued",
     "implementation",
     runId,
@@ -7035,7 +8591,7 @@ async function enqueueFixModeRequeue(args: {
   // Route through the work-item provider so a non-GitHub session's label removals
   // reach the work-item repo instead of stranding behind the dispatcher's failing
   // GitHub runner; no-op passthrough for a GitHub session.
-  const workItemStore = workItemOutbox(outboxStore, session);
+  const workItemStore = workItemOutbox(effects, session);
   for (const label of [
     (session.labels["needsReview"] as string | undefined) ?? "status:needs-review",
     (session.labels["agentReview"] as string | undefined) ?? "agent:codex",
@@ -7052,6 +8608,42 @@ async function enqueueFixModeRequeue(args: {
       },
       now,
     });
+  }
+
+  // The caller's public status comment joins the same effect set (issue #818
+  // review follow-up). Enqueued separately after the transaction, it would be
+  // the one part of the operator action that a lock acquired mid-sequence can
+  // still strand: the task has already left `ready_for_human`, so re-running the
+  // command is refused and the announcement can never be posted.
+  if (args.statusComment) {
+    await workItemStore.enqueue({
+      idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", args.statusComment.keySuffix),
+      topic: "gh:comment",
+      payload: {
+        topic: "gh:comment",
+        owner: session.githubOwner,
+        repo: session.githubName,
+        issueNumber,
+        body: args.statusComment.body,
+      },
+      now,
+    });
+  }
+
+  // One transaction: the fix-lane transition plus every label effect above, or
+  // nothing at all. A held maintenance lock (checked again inside that
+  // transaction) comes back as `maintenance_locked` with the task untouched.
+  const result = await store.transitionTaskWithEffects(
+    { sessionId, issueNumber },
+    {
+      status: task.status,
+      ...(args.expectedRevision !== undefined ? { revision: args.expectedRevision } : {}),
+    },
+    patch,
+    effects.effects,
+  );
+  if (!result.ok) {
+    return { ok: false, code: result.code, current: result.current };
   }
 
   return { ok: true, task: result.value, prUrl: effectivePrUrl, branch: resolvedBranch };
@@ -7075,7 +8667,7 @@ export async function runHumanReviewReturn(
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   // Resolve the raw feedback text + machine-readable source token from exactly
@@ -7227,6 +8819,29 @@ export async function runHumanReviewReturn(
         ? { ...task, context: { ...task.context, prUrl: effectivePrUrl } }
         : task;
 
+    // Public status comment: announce the operator action with metadata only.
+    // The feedback text is forwarded to the fix agent privately via task context
+    // and is NOT echoed back to GitHub unless it originated from a comment that is
+    // already public on this issue. Operator-provided feedback (--feedback /
+    // --feedback-file) may carry credentials or private context that sanitizeBody
+    // (paths only) would not redact, so the public comment stays metadata-only for
+    // that source.
+    //
+    // Built BEFORE the requeue and handed to it (issue #818 review follow-up) so
+    // it is committed in the same transaction as the transition and the lane
+    // labels. Enqueued afterwards it could be refused on its own — by a
+    // maintenance lock taken in between, say — after the task had already left
+    // `ready_for_human`, and no re-run could then restore it.
+    let commentBody =
+      `🔧 **Returned to implementation fix mode by operator.**\n\n` +
+      `Feedback source: ${reviewFeedbackSource === "human_comment" ? "latest human issue comment" : "operator input"}.`;
+    if (reviewFeedbackSource === "human_comment") {
+      const excerpt = boundedExcerpt(sanitizedFeedback, 1500);
+      commentBody +=
+        `\n\n<details>\n<summary>Review feedback excerpt (sanitized)</summary>\n\n${fenceUntrusted(excerpt)}\n</details>`;
+    }
+    commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
+
     // Requeue to queued/implementation in fix mode and swap labels to the fix lane
     // via the shared helper (same context contract + label routing as the GitHub
     // App path). Expecting the current status detects a concurrent claim.
@@ -7246,47 +8861,16 @@ export async function runHumanReviewReturn(
       },
       now,
       runId,
+      statusComment: { body: commentBody, keySuffix: "human-review-return" },
     });
     if (!requeue.ok) {
       die(
         `Failed to requeue task: ${requeue.code}` +
-          (requeue.current ? ` (current status: ${requeue.current.status})` : ""),
+          (requeue.current ? ` (current status: ${requeue.current.status})` : "") +
+          maintenanceRefusalHint(requeue.code),
       );
     }
     const result = { value: requeue.task };
-
-    // Public status comment: announce the operator action with metadata only.
-    // The feedback text is forwarded to the fix agent privately via task context
-    // and is NOT echoed back to GitHub unless it originated from a comment that is
-    // already public on this issue. Operator-provided feedback (--feedback /
-    // --feedback-file) may carry credentials or private context that sanitizeBody
-    // (paths only) would not redact, so the public comment stays metadata-only for
-    // that source.
-    let commentBody =
-      `🔧 **Returned to implementation fix mode by operator.**\n\n` +
-      `Feedback source: ${reviewFeedbackSource === "human_comment" ? "latest human issue comment" : "operator input"}.`;
-    if (reviewFeedbackSource === "human_comment") {
-      const excerpt = boundedExcerpt(sanitizedFeedback, 1500);
-      commentBody +=
-        `\n\n<details>\n<summary>Review feedback excerpt (sanitized)</summary>\n\n${fenceUntrusted(excerpt)}\n</details>`;
-    }
-    commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-    // Route the status comment through the session's work-item provider so a
-    // non-GitHub session posts it to the work-item repo instead of stranding the
-    // legacy `gh:comment` row behind the dispatcher's failing GitHub runner;
-    // no-op passthrough for a GitHub session.
-    await workItemOutbox(outboxStore, session).enqueue({
-      idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "human-review-return"),
-      topic: "gh:comment",
-      payload: {
-        topic: "gh:comment",
-        owner: session.githubOwner,
-        repo: session.githubName,
-        issueNumber,
-        body: commentBody,
-      },
-      now,
-    });
 
     // Audit event — describes the operator action without leaking local paths or
     // the full raw feedback artifact.
@@ -7443,7 +9027,7 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   // Resolve the raw output text from exactly one source
@@ -7559,7 +9143,8 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
       if (!requeue.ok) {
         die(
           `Failed to requeue task: ${requeue.code}` +
-            (requeue.current ? ` (current status: ${requeue.current.status})` : ""),
+            (requeue.current ? ` (current status: ${requeue.current.status})` : "") +
+            maintenanceRefusalHint(requeue.code),
         );
       }
 
@@ -7716,37 +9301,21 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
       return;
     }
 
-    const result = await store.transitionTask(
-      { sessionId, issueNumber },
-      // See the P2 comment on the partial-record transitionTask above: pin to
-      // the exact snapshot this final-command context was built from so a
-      // last-second concurrent resolve can't be silently overwritten.
-      { status: task.status, revision: task.revision },
-      {
-        status: "queued",
-        phase: "review",
-        ownerRunId: undefined,
-        leaseExpiresAt: undefined,
-        lastError: undefined,
-        context: newContext,
-        now,
-      },
-    );
-    if (!result.ok) {
-      die(
-        `Failed to requeue task: ${result.code}` +
-          (result.current ? ` (current status: ${result.current.status})` : "") +
-          (result.code === "conflict"
-            ? ". Another resolve may have run concurrently; re-check missing commands and retry."
-            : ""),
-      );
-    }
+    // Collect this requeue's label + comment effects first and commit them in
+    // the SAME transaction as the transition below (issue #818 review
+    // follow-up). Enqueueing them afterwards, through the separate outbox
+    // connection, meant a maintenance lock acquired in between would throw with
+    // the task already back in the review lane but nothing telling GitHub about
+    // it — the half-applied human-handoff state the maintenance guard exists to
+    // prevent. None of these effects depends on the transition's result, so
+    // ordering them first costs nothing.
+    const effects = new OutboxEffectCollector();
 
     // Remove the ready-for-human label and restore the review-lane labels so
     // github-intake can discover the re-queued review task. The blocked-review
     // transition that set ready-for-human already removed status:needs-review
     // and the reviewer agent label, so we must add them back here.
-    const workItemStore = workItemOutbox(outboxStore, session);
+    const workItemStore = workItemOutbox(effects, session);
     const readyForHumanLabel = (session.labels["readyForHuman"] as string | undefined) ?? "status:ready-for-human";
     await workItemStore.enqueue({
       idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:remove", readyForHumanLabel),
@@ -7810,6 +9379,38 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
       },
       now,
     });
+
+    // One transaction: the review requeue plus every effect collected above, or
+    // nothing at all. A held maintenance lock is refused here with
+    // `maintenance_locked` and the task left untouched, so the command is simply
+    // re-runnable once maintenance releases the lock.
+    const result = await store.transitionTaskWithEffects(
+      { sessionId, issueNumber },
+      // See the P2 comment on the partial-record transitionTask above: pin to
+      // the exact snapshot this final-command context was built from so a
+      // last-second concurrent resolve can't be silently overwritten.
+      { status: task.status, revision: task.revision },
+      {
+        status: "queued",
+        phase: "review",
+        ownerRunId: undefined,
+        leaseExpiresAt: undefined,
+        lastError: undefined,
+        context: newContext,
+        now,
+      },
+      effects.effects,
+    );
+    if (!result.ok) {
+      die(
+        `Failed to requeue task: ${result.code}` +
+          (result.current ? ` (current status: ${result.current.status})` : "") +
+          (result.code === "conflict"
+            ? ". Another resolve may have run concurrently; re-check missing commands and retry."
+            : "") +
+          maintenanceRefusalHint(result.code),
+      );
+    }
 
     await store.appendEvent({
       task: { sessionId, issueNumber },
@@ -7996,7 +9597,7 @@ export async function runGithubAppReviewReturn(
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   // Gate: only identity-separated (GitHub App) repo-host providers may use this
@@ -8162,6 +9763,28 @@ export async function runGithubAppReviewReturn(
         ? { ...task, context: { ...task.context, prUrl: effectivePrUrl } }
         : task;
 
+    // Public status comment: metadata ONLY. The review feedback content is
+    // forwarded to the fix agent privately via task context and is never echoed
+    // back to the PR thread by the automation (the review itself is already on the
+    // PR under the human's identity; the bot must not re-post it).
+    //
+    // Built BEFORE the requeue and committed with it (issue #818 review
+    // follow-up), for the same reason as the operator path above: a separate
+    // enqueue can be refused after the task has already left `ready_for_human`,
+    // and the announcement is then unrecoverable.
+    const reviewCount = selection.reviewCount ?? 1;
+    const otherReviewers = reviewCount - 1;
+    const attribution =
+      (review.author ? ` by @${review.author}` : "") +
+      (otherReviewers > 0 ? ` and ${otherReviewers} other reviewer${otherReviewers > 1 ? "s" : ""}` : "");
+    const commentBody = sanitizeBody(
+      `🔧 **Returned to implementation fix mode** after ` +
+        (reviewCount > 1 ? `human \`CHANGES_REQUESTED\` reviews` : `a human \`CHANGES_REQUESTED\` review`) +
+        attribution +
+        `.\n\nThe requested changes are being addressed; see the review${reviewCount > 1 ? "s" : ""} above for details.`,
+      sessionRedactionPaths(session),
+    );
+
     const requeue = await enqueueFixModeRequeue({
       store,
       outboxStore,
@@ -8187,46 +9810,15 @@ export async function runGithubAppReviewReturn(
       },
       now,
       runId,
+      statusComment: { body: commentBody, keySuffix: "github-app-review-return" },
     });
     if (!requeue.ok) {
       die(
         `Failed to requeue task: ${requeue.code}` +
-          (requeue.current ? ` (current status: ${requeue.current.status})` : ""),
+          (requeue.current ? ` (current status: ${requeue.current.status})` : "") +
+          maintenanceRefusalHint(requeue.code),
       );
     }
-
-    // Public status comment: metadata ONLY. The review feedback content is
-    // forwarded to the fix agent privately via task context and is never echoed
-    // back to the PR thread by the automation (the review itself is already on the
-    // PR under the human's identity; the bot must not re-post it).
-    const reviewCount = selection.reviewCount ?? 1;
-    const otherReviewers = reviewCount - 1;
-    const attribution =
-      (review.author ? ` by @${review.author}` : "") +
-      (otherReviewers > 0 ? ` and ${otherReviewers} other reviewer${otherReviewers > 1 ? "s" : ""}` : "");
-    const commentBody = sanitizeBody(
-      `🔧 **Returned to implementation fix mode** after ` +
-        (reviewCount > 1 ? `human \`CHANGES_REQUESTED\` reviews` : `a human \`CHANGES_REQUESTED\` review`) +
-        attribution +
-        `.\n\nThe requested changes are being addressed; see the review${reviewCount > 1 ? "s" : ""} above for details.`,
-      sessionRedactionPaths(session),
-    );
-    // Route the status comment through the session's work-item provider so a
-    // non-GitHub session posts it to the work-item repo instead of stranding the
-    // legacy `gh:comment` row behind the dispatcher's failing GitHub runner;
-    // no-op passthrough for a GitHub session.
-    await workItemOutbox(outboxStore, session).enqueue({
-      idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "github-app-review-return"),
-      topic: "gh:comment",
-      payload: {
-        topic: "gh:comment",
-        owner: session.githubOwner,
-        repo: session.githubName,
-        issueNumber,
-        body: commentBody,
-      },
-      now,
-    });
 
     // Audit event — metadata only, no raw feedback or local paths.
     await store.appendEvent({
@@ -8460,7 +10052,7 @@ async function runToolRequestResolve(argv: string[]): Promise<void> {
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   const now = new Date().toISOString();
@@ -9295,7 +10887,7 @@ async function runToolRequestGrant(argv: string[], surface: "grant" | "run" = "g
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   const now = new Date().toISOString();
@@ -12109,6 +13701,717 @@ function runPruneStatus(argv: string[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Subcommand: maintenance-lock status / release (issue #817)
+//
+// Operator recovery for the whole-file maintenance lock (issue #611,
+// docs/retention-backup-contract.md §9). A maintenance process killed before
+// its `finally`/`close()` path runs leaves `maintenance_lock` populated with
+// no live holder able to call `release()` — later task claims and
+// maintenance runs then stop indefinitely with no supported recovery path
+// short of direct SQLite editing. `status` is a read-only diagnostic (issue
+// #817 review: opens the database read-only and never creates the table or
+// migrates it, so it can inspect a legacy or filesystem-read-only database
+// safely); `release` force-releases the lock, ignoring the recorded holder,
+// but reuses the exact activity predicates `SqliteMaintenanceLock.acquire`
+// refuses acquisition on (a live claimed/running task phase, a non-stale
+// outbox dispatch claim) so it can never clear a lock while the work it
+// protects is still genuinely in flight — and also stays read-only until
+// `--yes` is actually given. Passing those two predicates is never, by
+// itself, sufficient evidence a holder has actually finished (P1 review
+// follow-up): `prune`/`restore` do their own destructive work — a delete
+// batch, a file rename — without ever creating a task lease or outbox claim
+// for it, so a live one of either always shows zero of both, indistinguishable
+// from a genuinely stranded lock (exactly like a `skipActivityChecks` holder,
+// e.g. `admin archive rollup`, always does regardless of whether it is still
+// running). `release` therefore refuses *any* held lock unless
+// `--confirm-stranded` is also given — an explicit operator confirmation, not
+// a liveness check this command performs itself. Deliberately no TTL-based
+// auto-recovery and no PID-liveness check — either would let a still-running
+// maintenance process's lock be pulled out from under it; this is an
+// explicit, guarded operator action only, previewed by default and applied
+// only with --yes --confirm-stranded. Output never carries the local
+// `dbPath`: the holder token (e.g. `prune:<pid>:<timestamp>`) identifies a
+// process/run, not a filesystem path.
+// ---------------------------------------------------------------------------
+
+function formatLockAgeMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+interface MaintenanceLockStatusResult {
+  ok: true;
+  sessionId: string;
+  held: boolean;
+  holder?: string;
+  acquiredAt?: string;
+  ageMs?: number;
+  activityExempt?: boolean;
+  phaseActiveCount: number;
+  outboxClaimActiveCount: number;
+}
+
+function renderMaintenanceLockStatus(result: MaintenanceLockStatusResult, mode: OutputMode): string {
+  const lines: string[] = [];
+  if (!mode.quiet) lines.push("Maintenance lock status", "");
+  if (result.held) {
+    lines.push("Held: yes");
+    lines.push(`  holder:      ${result.holder}`);
+    lines.push(`  acquiredAt:  ${result.acquiredAt}`);
+    lines.push(`  age:         ${formatLockAgeMs(result.ageMs ?? 0)}`);
+    if (result.activityExempt) {
+      lines.push(
+        "  activityExempt: yes — acquired via skipActivityChecks (e.g. `admin archive rollup`); the two " +
+          "counts below are not evidence this lock is stranded for this holder.",
+      );
+    }
+  } else {
+    lines.push("Held: no");
+  }
+  lines.push("");
+  lines.push(`Live task phases:        ${result.phaseActiveCount}`);
+  lines.push(`Non-stale outbox claims: ${result.outboxClaimActiveCount}`);
+  return lines.join("\n");
+}
+
+function runMaintenanceLockStatus(argv: string[]): void {
+  const parsed = parseCommonOptions(argv, { session: "required", issueNumber: "none" });
+  if ("error" in parsed) die(parsed.error);
+  const { sessionId, dbPath } = parsed;
+  const resolvedDbPath = dbPath ?? DEFAULT_DB_PATH;
+
+  if (!existsSync(resolvedDbPath)) {
+    const result: MaintenanceLockStatusResult = {
+      ok: true,
+      sessionId,
+      held: false,
+      phaseActiveCount: 0,
+      outboxClaimActiveCount: 0,
+    };
+    report(result as unknown as Record<string, unknown>, (mode) => renderMaintenanceLockStatus(result, mode));
+    return;
+  }
+
+  // Read-only (issue #817 review): `status` must never create the
+  // `maintenance_lock` table or run any migration, so it can inspect a
+  // legacy database or a filesystem-read-only backup without mutating or
+  // failing against either.
+  const lock = new SqliteMaintenanceLock(resolvedDbPath, { readonly: true });
+  try {
+    const status = lock.status();
+    const ageMs =
+      status.held && status.acquiredAt ? Date.parse(status.now) - Date.parse(status.acquiredAt) : undefined;
+    const result: MaintenanceLockStatusResult = {
+      ok: true,
+      sessionId,
+      held: status.held,
+      ...(status.held
+        ? { holder: status.holder, acquiredAt: status.acquiredAt, ageMs, activityExempt: status.activityExempt }
+        : {}),
+      phaseActiveCount: status.phaseActiveCount,
+      outboxClaimActiveCount: status.outboxClaimActiveCount,
+    };
+    report(result as unknown as Record<string, unknown>, (mode) => renderMaintenanceLockStatus(result, mode));
+  } finally {
+    lock.close();
+  }
+}
+
+function renderMaintenanceLockRelease(result: Record<string, unknown>, _mode: OutputMode): string {
+  const reason = result.reason as string | undefined;
+  if (reason === "no_database") return "No database found — nothing to release.";
+  if (reason === "not_held") return "No maintenance lock is held; nothing to release.";
+  if (reason === "phase_active") {
+    return `Refused: ${result.activeCount} task phase(s) still claimed/running with an unexpired lease.`;
+  }
+  if (reason === "outbox_claim_active") {
+    return `Refused: ${result.activeCount} outbox dispatch claim(s) are not yet stale.`;
+  }
+  if (reason === "confirmation_required") {
+    const exemptNote = result.activityExempt ? ", acquired via skipActivityChecks (e.g. `admin archive rollup`)" : "";
+    return (
+      `Refused: held by ${result.holder}${exemptNote} (acquired ${result.acquiredAt}) — a zero live-phase/` +
+      `outbox count is not evidence this lock is stranded (prune/restore/archive rollup do their own ` +
+      `destructive work without ever registering a task phase or outbox claim for it). Re-run with --yes ` +
+      `--confirm-stranded only after confirming out-of-band that no such process is still running against ` +
+      `this database.`
+    );
+  }
+  if (result.wouldRelease !== undefined) {
+    if (result.wouldRelease) {
+      const exemptNote = result.activityExempt ? ", acquired via skipActivityChecks (e.g. `admin archive rollup`)" : "";
+      return (
+        `Would refuse to release without --confirm-stranded — held by ${result.holder}${exemptNote} (acquired ` +
+        `${result.acquiredAt}). No live task phase or non-stale outbox claim, but that alone is not evidence ` +
+        `this holder has finished. Re-run with --yes --confirm-stranded only after confirming out-of-band that ` +
+        `no such process is still running against this database.`
+      );
+    }
+    return (
+      `Would refuse to release — held by ${result.holder} (acquired ${result.acquiredAt}): ` +
+      `${result.phaseActiveCount} live task phase(s), ${result.outboxClaimActiveCount} non-stale outbox ` +
+      `claim(s). Re-run once those clear.`
+    );
+  }
+  return `Released lock held by ${result.holder} (acquired ${result.acquiredAt}).`;
+}
+
+async function runMaintenanceLockRelease(argv: string[]): Promise<void> {
+  const parsed = parseCommonOptions(argv, {
+    session: "required",
+    issueNumber: "none",
+    booleanFlags: ["yes", "confirm-stranded"],
+  });
+  if ("error" in parsed) die(parsed.error);
+  const { sessionId, dbPath, flags } = parsed;
+  const resolvedDbPath = dbPath ?? DEFAULT_DB_PATH;
+  const yes = flags.has("yes");
+  const confirmStranded = flags.has("confirm-stranded");
+
+  if (!existsSync(resolvedDbPath)) {
+    const result = { ok: true, sessionId, released: false, reason: "no_database" };
+    report(result, (mode) => renderMaintenanceLockRelease(result, mode));
+    return;
+  }
+
+  // Read-only until a release is actually attempted (issue #817 review):
+  // preview (`!yes`) must never create the `maintenance_lock` table or run
+  // any migration, so it can inspect a legacy database or a filesystem-
+  // read-only backup without mutating or failing against either. `--yes`
+  // itself is already a mutating request, so it opens normally.
+  const lock = new SqliteMaintenanceLock(resolvedDbPath, { readonly: !yes });
+  try {
+    const now = new Date().toISOString();
+    const before = lock.status(now);
+    if (!before.held) {
+      const result = { ok: true, sessionId, released: false, reason: "not_held" };
+      report(result, (mode) => renderMaintenanceLockRelease(result, mode));
+      return;
+    }
+
+    if (!yes) {
+      const wouldRelease = before.phaseActiveCount === 0 && before.outboxClaimActiveCount === 0;
+      const result = {
+        ok: true,
+        sessionId,
+        wouldRelease,
+        holder: before.holder,
+        acquiredAt: before.acquiredAt,
+        activityExempt: before.activityExempt,
+        phaseActiveCount: before.phaseActiveCount,
+        outboxClaimActiveCount: before.outboxClaimActiveCount,
+        hint: wouldRelease
+          ? "No live task phase or non-stale outbox claim, but that alone is not evidence this holder has " +
+            "finished (prune/restore/archive rollup do their own destructive work without ever registering a " +
+            "task phase or outbox claim for it). Re-run with --yes --confirm-stranded only after confirming " +
+            "out-of-band that no such process is still running against this database."
+          : "Refusing: a live task phase or non-stale outbox claim still exists. Re-run once those clear.",
+      };
+      report(result, (mode) => renderMaintenanceLockRelease(result, mode));
+      return;
+    }
+
+    const forceResult = lock.forceRelease(now, { confirmStranded });
+    if (!forceResult.ok) {
+      const result =
+        forceResult.reason === "confirmation_required"
+          ? {
+              ok: false,
+              sessionId,
+              reason: forceResult.reason,
+              holder: forceResult.holder,
+              acquiredAt: forceResult.acquiredAt,
+              activityExempt: forceResult.activityExempt,
+            }
+          : { ok: false, sessionId, reason: forceResult.reason, activeCount: forceResult.activeCount };
+      report(result, (mode) => renderMaintenanceLockRelease(result, mode));
+      process.exitCode = 1;
+      return;
+    }
+
+    if (!forceResult.released) {
+      // A race between the `before.held` check above and this call — another
+      // process released it in between. Report it the same way as the
+      // up-front not_held check: a safe no-op, not an error.
+      const result = { ok: true, sessionId, released: false, reason: "not_held" };
+      report(result, (mode) => renderMaintenanceLockRelease(result, mode));
+      return;
+    }
+
+    const result = { ok: true, sessionId, released: true, holder: forceResult.holder, acquiredAt: forceResult.acquiredAt };
+    report(result, (mode) => renderMaintenanceLockRelease(result, mode));
+  } finally {
+    lock.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: n8n deploy (issue #822)
+//
+// One supported command for getting the generated workflows into a local n8n:
+// generate the artifacts, import the shared child, import this session's
+// parent, verify, and — only when explicitly asked — publish.
+//
+// Everything decision-shaped (step order, verification rules, publish policy)
+// is pure and lives in core/n8n-deploy.ts. This layer resolves the local facts
+// and supplies the side effects, so the whole command is exercisable against a
+// fake runner without an n8n installation.
+// ---------------------------------------------------------------------------
+
+/** Generator script, relative to the control-plane install root. */
+const WORKFLOW_GENERATOR_SCRIPT = "scripts/build-parent-child-workflow.mjs";
+
+/**
+ * The parts of `scripts/build-parent-child-workflow.mjs` this command consumes.
+ *
+ * The derived parent identity and the shared child's ID/name/filename are read
+ * from the generator itself rather than re-derived here: they are the contract
+ * between what is generated and what is imported, and a second implementation
+ * of the sha256/slug derivation would eventually disagree with the first.
+ */
+interface WorkflowGeneratorModule {
+  CHILD_WORKFLOW_ID: string;
+  CHILD_WORKFLOW_NAME: string;
+  CHILD_ARTIFACT_FILE_NAME: string;
+  LOCAL_WORKFLOW_ARTIFACT_DIR: string;
+  deriveParentWorkflowId(sessionId: string): string;
+  deriveParentWorkflowName(sessionId: string): string;
+  parentArtifactFileName(sessionId: string): string;
+}
+
+/** Control-plane install root — the tree holding `dist/` and `scripts/`. */
+function n8nInstallRoot(): string {
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+}
+
+/**
+ * Load the workflow generator module. Importing it is side-effect free: its own
+ * CLI entrypoint is guarded by an `import.meta.url === process.argv[1]` check,
+ * so nothing is written by the import itself.
+ *
+ * Error messages name the script by its relative path only — an absolute one
+ * would be redacted by the output sanitizer anyway, and the relative path is
+ * what actually tells an operator which file is missing.
+ */
+async function loadWorkflowGenerator(installRoot: string): Promise<WorkflowGeneratorModule> {
+  const scriptPath = join(installRoot, WORKFLOW_GENERATOR_SCRIPT);
+  if (!existsSync(scriptPath)) {
+    die(
+      `${WORKFLOW_GENERATOR_SCRIPT} is missing from this install. ` +
+        "`admin n8n deploy` generates the deployment artifacts itself, so it must run from a " +
+        "full control-plane checkout.",
+    );
+  }
+  try {
+    return (await import(pathToFileURL(scriptPath).href)) as WorkflowGeneratorModule;
+  } catch (err) {
+    die(
+      `Cannot load ${WORKFLOW_GENERATOR_SCRIPT}: ` +
+        sanitizeDeployText(err instanceof Error ? err.message : String(err), [installRoot]),
+    );
+  }
+}
+
+/**
+ * Derive this session's parent workflow identity through the generator.
+ *
+ * `sessions.json` accepts any non-empty sessionId, but a few values (an empty
+ * or control-character-bearing one) cannot survive the trip into a workflow ID
+ * or an argv entry, and the generator refuses them. Failing here says so with
+ * the session named, rather than letting the generation subprocess fail later
+ * with the same message buried in its stderr.
+ */
+function deriveParentWorkflowIdentity(
+  generator: WorkflowGeneratorModule,
+  sessionId: string,
+  artifactDir: string,
+  installRoot: string,
+): { workflowId: string; workflowName: string; artifactPath: string; artifactFile: string } {
+  try {
+    const artifactFile = generator.parentArtifactFileName(sessionId);
+    return {
+      workflowId: generator.deriveParentWorkflowId(sessionId),
+      workflowName: generator.deriveParentWorkflowName(sessionId),
+      artifactPath: join(artifactDir, artifactFile),
+      artifactFile,
+    };
+  } catch (err) {
+    die(
+      `Cannot derive a parent workflow identity for session ${JSON.stringify(sessionId)}: ` +
+        sanitizeDeployText(err instanceof Error ? err.message : String(err), [installRoot]),
+    );
+  }
+}
+
+/**
+ * Run one planned command. No shell is involved: `file` and `args` are passed
+ * to `spawnSync` separately, so a path or project ID containing a space or a
+ * shell metacharacter is one argument and stays one argument.
+ */
+function runN8nDeployCommand(command: N8nDeployCommand) {
+  const result = spawnSync(command.file, command.args, {
+    cwd: command.cwd,
+    env: command.env === undefined ? process.env : { ...process.env, ...command.env },
+    encoding: "utf8",
+    timeout: command.timeoutMs,
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  // Node reports an exit code for every process that ran and a signal for every
+  // process it killed (the timeout above). A spawn that failed outright — no
+  // such binary, or one that could not be executed — is the only case with an
+  // error and neither of those, so it is the only case treated as "never
+  // started". Anything less clear-cut counts as started, which is the
+  // conservative answer: it can only over-report the restart requirement, never
+  // hide a write. The distinction cannot be read off the exit code, which this
+  // function reports as -1 either way.
+  const started = !(result.error !== undefined && result.status === null && result.signal === null);
+  if (result.error) {
+    // Could not be started (missing binary), was killed (timeout), or blew the
+    // output buffer. A negative status distinguishes it from a command that ran
+    // and reported a failure — and is forced even when the child did exit with a
+    // code, because an errored spawn is a failed step whatever that code says;
+    // the captured streams are not meaningful in this case either.
+    return { status: -1, stdout: "", stderr: result.error.message, started };
+  }
+  return { status: result.status ?? -1, stdout: result.stdout, stderr: result.stderr, started };
+}
+
+/**
+ * Take one of a deploy's two locks (see `src/core/n8n-deploy.ts`).
+ *
+ * The per-parent scope is held for the whole apply: the activation the deploy
+ * restores after its import is read *before* it, so the two must not interleave
+ * with another deploy of the same parent — a `--publish` run landing between a
+ * plain run's check and its import would be silently undone by that run's
+ * `active: false` artifact. The child scope is install-wide and held only across
+ * generation and the child import, which write and then read the one artifact
+ * every session's deploy shares.
+ *
+ * Both use the same on-disk lock store as the repo/worktree locks, with a TTL cut
+ * to the length of a deploy plus its overhead margin, since a crashed one must
+ * not hold the session — or, for the child, the whole install — hostage for the
+ * store's default day. The child's window is the shorter of the two, so the same
+ * TTL is simply the conservative bound for it.
+ */
+function acquireN8nDeployLock(
+  scope: string,
+  lockDir: string | undefined,
+): N8nDeployLockAcquisition {
+  const store = new RepoLockStore(lockDir, N8N_DEPLOY_LOCK_STALE_TTL_MS);
+  const ownerId = `n8n-deploy-${process.pid}`;
+  const acquired = store.acquire(ownerId, scope);
+  if (!acquired.locked) {
+    return {
+      acquired: false,
+      detail:
+        `held by ${acquired.ownerContextId} since ${acquired.ownerStartedAt} — ` +
+        "wait for that deploy to finish, then re-run",
+    };
+  }
+  return {
+    acquired: true,
+    release: () => {
+      try {
+        store.release(ownerId, scope);
+      } catch {
+        // A lock file that went missing or corrupt under us must not replace the
+        // deployment's own report with a release error; the TTL clears it.
+      }
+    },
+  };
+}
+
+function renderN8nDeployWorkflows(plan: N8nDeployPlan): string[] {
+  const lines = [
+    "Workflows:",
+    `  child   ${plan.child.workflowId}  "${plan.child.workflowName}"  (${plan.child.artifactFile})`,
+    `  parent  ${plan.parent.workflowId}  "${plan.parent.workflowName}"  (${plan.parent.artifactFile})`,
+  ];
+  if (plan.projectId !== undefined) lines.push(`  project ${plan.projectId}`);
+  return lines;
+}
+
+function renderN8nDeployPreview(plan: N8nDeployPlan, localPaths: readonly string[]): string {
+  const lines = [
+    `n8n deploy preview — session ${plan.sessionId}`,
+    "Nothing was generated, imported, or published.",
+    "",
+    ...renderN8nDeployWorkflows(plan),
+    "",
+    "Would run, in order:",
+  ];
+  plan.steps.forEach((step, index) => {
+    lines.push(`  ${index + 1}. ${step.id} — ${step.label}`);
+    lines.push(
+      step.command === undefined
+        ? "     (local check — runs no command)"
+        : `     $ ${sanitizeDeployText(formatCommandLine(step.command), localPaths)}`,
+    );
+  });
+  lines.push("");
+  // A preview never publishes, so `--publish` alone is rejected before this
+  // renderer is reached and the plan here never carries the publish step.
+  lines.push(
+    "Publish: never from a preview — pass --yes --publish to activate the parent once verification passes.",
+  );
+  lines.push(
+    "An already active parent is re-activated after the import, so applying this plan never deactivates a running workflow.",
+  );
+  lines.push(N8N_RESTART_NOTICE);
+  lines.push("Re-run with --yes to apply.");
+  return lines.join("\n");
+}
+
+function renderN8nDeployStep(step: N8nDeployStepResult): string[] {
+  const lines = [`  ${step.outcome.padEnd(8)}${step.id} — ${step.label}`];
+  if (step.detail !== undefined) {
+    for (const line of step.detail.split("; ")) lines.push(`             ${line}`);
+  }
+  return lines;
+}
+
+function renderN8nDeployApply(
+  plan: N8nDeployPlan,
+  execution: N8nDeployExecution,
+  hint: string | undefined,
+): string {
+  const lines = [`n8n deploy — session ${plan.sessionId}`, ...renderN8nDeployWorkflows(plan), ""];
+  for (const step of execution.steps) lines.push(...renderN8nDeployStep(step));
+  lines.push("");
+  if (execution.ok) {
+    lines.push(
+      `Imported and verified child ${plan.child.workflowId} and parent ${plan.parent.workflowId}.`,
+    );
+    if (execution.published) {
+      // "Marked active" rather than "active": the flag is written to the n8n
+      // database, and a server that was already running does not act on it
+      // until it restarts (the hint below says so).
+      lines.push("Parent workflow published — marked active in the n8n database.");
+    } else if (execution.parentActiveRestored) {
+      lines.push(
+        "Parent workflow was already active and was re-activated after the import (marked active in the n8n database).",
+      );
+    } else {
+      lines.push("Parent workflow imported but not published — pass --publish to activate it.");
+    }
+  } else {
+    const failure = execution.failure;
+    const reason = failure?.reason ?? "unknown";
+    // A failure with no step is one of the two contended deployment locks (this
+    // parent's, or the shared child's): the run stopped before its first step,
+    // so naming one would be wrong.
+    lines.push(
+      failure !== undefined && failure.step === undefined
+        ? `Deployment did not start: ${reason}${failure.detail === undefined ? "" : ` (${failure.detail})`}.`
+        : `Deployment failed at ${failure?.step ?? "an unknown step"}: ${reason}.`,
+    );
+    lines.push("The parent workflow was not published.");
+  }
+  if (hint !== undefined) lines.push(hint);
+  return lines.join("\n");
+}
+
+async function runN8nDeploy(argv: string[]): Promise<void> {
+  const parsed = parseCommonOptions(argv, {
+    session: "required",
+    issueNumber: "none",
+    booleanFlags: ["yes", "publish"],
+    valueFlags: ["project-id", "n8n-bin", "lock-dir"],
+  });
+  if ("error" in parsed) die(parsed.error);
+  const { sessionId, sessionsPath, args, flags } = parsed;
+  const apply = flags.has("yes");
+  const publish = flags.has("publish");
+
+  // Publication is the one irreversible-looking effect here: an activated
+  // parent starts driving its session on the schedule trigger. It is therefore
+  // never implied by a preview.
+  if (publish && !apply) {
+    die("--publish requires --yes: a preview never imports or publishes anything.");
+  }
+  const projectId = args["project-id"];
+  if (projectId !== undefined && projectId.trim() === "") {
+    die("--project-id must not be empty");
+  }
+  const n8nBinArg = args["n8n-bin"];
+  if (n8nBinArg !== undefined && n8nBinArg.trim() === "") {
+    die("--n8n-bin must not be empty");
+  }
+  const lockDirArg = args["lock-dir"];
+  if (lockDirArg !== undefined && lockDirArg.trim() === "") {
+    die("--lock-dir must not be empty");
+  }
+  const lockDir = lockDirArg === undefined ? undefined : resolve(lockDirArg);
+  // A bare command name (the default `n8n`) is a PATH lookup and must reach
+  // spawnSync unchanged; a separator-bearing value is a local path, absolutized
+  // so that the form printed is the form the sanitizer redacts. Resolution is
+  // against this process's cwd, which is the cwd the n8n steps would run in
+  // anyway, so the command executed is unchanged either way.
+  const n8nBin =
+    n8nBinArg === undefined ? "n8n" : /[/\\]/.test(n8nBinArg) ? resolve(n8nBinArg) : n8nBinArg;
+  // Absolutized for the same reason, and because the generator runs with cwd
+  // set to the install root rather than the operator's.
+  const resolvedSessionsPath = resolve(sessionsPath);
+
+  const installRoot = n8nInstallRoot();
+  const generator = await loadWorkflowGenerator(installRoot);
+  const artifactDir = join(installRoot, generator.LOCAL_WORKFLOW_ARTIFACT_DIR);
+  // CLI_BASE is passed explicitly rather than left to the generator's
+  // cwd-relative default, so the path baked into the Execute Command nodes is
+  // the install being deployed and not wherever the operator happened to stand.
+  const cliBase = process.env["CLI_BASE"] ?? join(installRoot, "dist", "cli");
+
+  const parent = deriveParentWorkflowIdentity(generator, sessionId, artifactDir, installRoot);
+
+  const plan = planN8nDeploy({
+    sessionId,
+    installRoot,
+    cliBase,
+    sessionsPath: resolvedSessionsPath,
+    nodeBin: process.execPath,
+    generatorScript: join(installRoot, WORKFLOW_GENERATOR_SCRIPT),
+    n8nBin,
+    ...(projectId === undefined ? {} : { projectId }),
+    publish,
+    parent,
+    child: {
+      workflowId: generator.CHILD_WORKFLOW_ID,
+      workflowName: generator.CHILD_WORKFLOW_NAME,
+      artifactPath: join(artifactDir, generator.CHILD_ARTIFACT_FILE_NAME),
+      artifactFile: generator.CHILD_ARTIFACT_FILE_NAME,
+    },
+  });
+
+  // Absolute paths are redacted from everything this command prints: deploy
+  // output is exactly what an operator pastes into an issue when it goes wrong,
+  // and the workflow IDs, names, and artifact filenames are what identify a
+  // deployment anyway. Every path the printed command lines can name is listed,
+  // including the binaries and the sessions file — an install under an
+  // unconventional root is redacted only because it is named here.
+  const localPaths = collectN8nDeployLocalPaths({
+    installRoot,
+    artifactDir,
+    cliBase,
+    nodeBin: process.execPath,
+    sessionsPath: resolvedSessionsPath,
+    n8nBin,
+  });
+  const workflows = {
+    child: {
+      workflowId: plan.child.workflowId,
+      workflowName: plan.child.workflowName,
+      artifactFile: plan.child.artifactFile,
+    },
+    parent: {
+      workflowId: plan.parent.workflowId,
+      workflowName: plan.parent.workflowName,
+      artifactFile: plan.parent.artifactFile,
+    },
+  };
+
+  if (!apply) {
+    const result = {
+      ok: true,
+      sessionId,
+      applied: false,
+      published: false,
+      publishRequested: publish,
+      // A preview writes nothing, so nothing needs a restart yet; the hint
+      // carries the requirement an apply would create.
+      restartRequired: false,
+      ...(plan.projectId === undefined ? {} : { projectId: plan.projectId }),
+      ...workflows,
+      steps: plan.steps.map((step) => ({
+        id: step.id,
+        label: step.label,
+        ...(step.command === undefined
+          ? {}
+          : { commandLine: sanitizeDeployText(formatCommandLine(step.command), localPaths) }),
+      })),
+      hint:
+        "Nothing was generated, imported, or published. Re-run with --yes to apply. " +
+        N8N_RESTART_NOTICE,
+    };
+    report(result as unknown as Record<string, unknown>, () =>
+      renderN8nDeployPreview(plan, localPaths),
+    );
+    return;
+  }
+
+  const execution = executeN8nDeploy(plan, {
+    run: runN8nDeployCommand,
+    readArtifact: (path) => readFileSync(path, "utf8"),
+    // Serializes this parent workflow's check/import/restore against any other
+    // deploy of the same session; released on every exit path by the executor.
+    acquireLock: () => acquireN8nDeployLock(n8nDeployLockScope(plan.parent.workflowId), lockDir),
+    // Serializes the shared child's generation and import against deploys of
+    // every other session, which write the same artifact from their own CLI_BASE.
+    acquireChildLock: () =>
+      acquireN8nDeployLock(n8nDeployChildLockScope(plan.child.workflowId), lockDir),
+    localPaths,
+  });
+
+  // A negative exit code means the binary never ran; for the n8n steps that is
+  // almost always a missing or misnamed n8n install, which the raw spawn error
+  // ("spawnSync n8n ENOENT") states far less usefully than this does.
+  const failedStep = execution.steps.find((step) => step.outcome === "failed");
+  const hints: string[] = [];
+  if (
+    !execution.ok &&
+    failedStep?.exitCode !== undefined &&
+    failedStep.exitCode < 0 &&
+    failedStep.id !== "generate"
+  ) {
+    hints.push("Could not run the n8n CLI. Check that n8n is installed and on PATH, or pass --n8n-bin <path>.");
+  }
+  // The import upserts the parent with the artifact's `active: false`, so a run
+  // that stops after the parent import leaves a previously active workflow down.
+  // That is the safe outcome — it failed verification — but it is a change in
+  // the deployment's behaviour and must not be discovered later, on a schedule
+  // trigger that never fired.
+  const parentImport = execution.steps.find((step) => step.id === "import-parent");
+  if (!execution.ok && execution.parentWasActive === true && parentImport?.outcome !== "skipped") {
+    hints.push(
+      parentImport?.outcome === "ok"
+        ? "The parent workflow was active before this deploy and is now INACTIVE: the import replaced it and the run stopped before its active state could be restored. Fix the failure and re-run with --yes, or activate it in n8n once it verifies."
+        : "The parent workflow was active before this deploy and may now be INACTIVE: the import was attempted and the run stopped before its active state could be restored.",
+    );
+  }
+  // Last, and on success too: activation is written to the database by a
+  // separate CLI process, so an n8n that was already running is still serving
+  // what it loaded at startup and its Schedule Trigger has not begun firing.
+  if (execution.restartRequired) hints.push(N8N_RESTART_NOTICE);
+  const hint = hints.length === 0 ? undefined : hints.join(" ");
+
+  const result = {
+    ok: execution.ok,
+    sessionId,
+    applied: true,
+    published: execution.published,
+    publishRequested: publish,
+    ...(execution.parentWasActive === undefined ? {} : { parentWasActive: execution.parentWasActive }),
+    parentActiveRestored: execution.parentActiveRestored,
+    restartRequired: execution.restartRequired,
+    ...(plan.projectId === undefined ? {} : { projectId: plan.projectId }),
+    ...workflows,
+    steps: execution.steps,
+    ...(execution.verification === undefined ? {} : { verification: execution.verification }),
+    ...(execution.failure === undefined ? {} : { failure: execution.failure }),
+    ...(hint === undefined ? {} : { hint }),
+  };
+  report(result as unknown as Record<string, unknown>, () =>
+    renderN8nDeployApply(plan, execution, hint),
+  );
+  if (!execution.ok) process.exitCode = 1;
+}
+
+// ---------------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------------
 
@@ -12165,6 +14468,21 @@ const HUMAN_DEFAULT_COMMANDS = new Set([
   "archive rollup",
   "prune run",
   "prune status",
+  // Maintenance-lock status/force-release recovery (issue #817): operator-
+  // facing status and preview/--yes mutation, human-readable by default.
+  "maintenance-lock status",
+  "maintenance-lock release",
+  // Review-dispute operator surface (issue #848): a read-only protocol view and
+  // the one §6.4 preview/--yes mutation. Both are operator-facing, so both are
+  // human-readable by default; --json gives the stable machine payload.
+  "dispute status",
+  "dispute reopen",
+  // Issue #849: the event-derived report. Read-only and operator-facing, so it
+  // follows the same human-by-default posture; --json is the stable payload.
+  "dispute metrics",
+  // Workflow deployment (issue #822): an operator-facing preview/--yes command
+  // run by hand during installation, never by the workflows themselves.
+  "n8n deploy",
 ]);
 
 export async function main(rawArgv: string[]): Promise<void> {
@@ -12221,6 +14539,23 @@ export async function main(rawArgv: string[]): Promise<void> {
     return;
   }
 
+  if (subcommand === "dispute") {
+    const action = argv[1];
+    if (action === "status") {
+      await runDisputeStatus(argv.slice(2));
+      return;
+    }
+    if (action === "reopen") {
+      await runDisputeReopen(argv.slice(2));
+      return;
+    }
+    if (action === "metrics") {
+      await runDisputeMetrics(argv.slice(2));
+      return;
+    }
+    die(`Unknown dispute action: ${action ?? "(none)"}. Expected: status | reopen | metrics`);
+  }
+
   if (subcommand === "task") {
     const action = argv[1];
     if (action === "clear-delay") {
@@ -12236,6 +14571,15 @@ export async function main(rawArgv: string[]): Promise<void> {
       return;
     }
     die(`Unknown task action: ${action ?? "(none)"}. Expected: clear-delay | cancel | reconcile-closed`);
+  }
+
+  if (subcommand === "n8n") {
+    const action = argv[1];
+    if (action === "deploy") {
+      await runN8nDeploy(argv.slice(2));
+      return;
+    }
+    die(`Unknown n8n action: ${action ?? "(none)"}. Expected: deploy`);
   }
 
   if (subcommand === "task-assign") {
@@ -12518,6 +14862,19 @@ export async function main(rawArgv: string[]): Promise<void> {
       return;
     }
     die(`Unknown prune action: ${action ?? "(none)"}. Expected: run | status`);
+  }
+
+  if (subcommand === "maintenance-lock") {
+    const action = argv[1];
+    if (action === "status") {
+      runMaintenanceLockStatus(argv.slice(2));
+      return;
+    }
+    if (action === "release") {
+      await runMaintenanceLockRelease(argv.slice(2));
+      return;
+    }
+    die(`Unknown maintenance-lock action: ${action ?? "(none)"}. Expected: status | release`);
   }
 
   die(`Unknown command: ${subcommand}. Run "admin help" to see available commands.`);

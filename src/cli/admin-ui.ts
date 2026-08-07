@@ -31,7 +31,7 @@ import { emit, die } from "./cli-io.js";
 import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
 import type { TaskStore } from "../core/task-store.js";
 import { isClaimExpired } from "../core/transitions.js";
-import type { AiTask, TaskStatus } from "../core/task.js";
+import type { AiTask, TaskEvent, TaskStatus } from "../core/task.js";
 import {
   DEFAULT_SESSIONS_PATH,
   JsonSessionRegistry,
@@ -43,6 +43,11 @@ import type { GhRunner } from "../providers/github/gh-runner.js";
 import { tokenizeArgs } from "./admin-command.js";
 import { IssueWorktreeLock } from "../handlers/worktree.js";
 import { hasUnresolvedToolRequest } from "../core/tool-request.js";
+// Issue #848: the UI renders the SAME projection the non-interactive commands
+// do, and routes every dispute mutation back through `admin dispute reopen`
+// rather than writing protocol state itself.
+import { REVIEW_DISPUTE_CONTEXT_KEY } from "../core/review-dispute-commit.js";
+import { disputeReopenArgv, summarizeDisputeStatus } from "../core/review-dispute-status.js";
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-testable without a TTY)
@@ -543,8 +548,93 @@ export function formatTaskLine(task: AiTask, now: string): string {
   return line;
 }
 
-/** Multi-line detail view for a selected task. */
-export function formatTaskDetail(task: AiTask, now: string, lockState?: WorktreeLockState): string {
+/**
+ * Whether a task carries review-dispute protocol state worth a UI action
+ * (issue #848). A task without a §10.1 block — every legacy task, and every task
+ * in a session with `reviewDispute.enabled: false` — answers false and the UI is
+ * unchanged for it.
+ */
+export function hasDisputeState(task: AiTask): boolean {
+  const block = task.context?.[REVIEW_DISPUTE_CONTEXT_KEY];
+  return typeof block === "object" && block !== null && !Array.isArray(block);
+}
+
+/** The non-interactive `admin dispute status` form for a task. */
+export function buildDisputeStatusArgv(task: AiTask, dbPath?: string, sessionsPath?: string): string[] {
+  const argv = [
+    "dispute",
+    "status",
+    "--session-id",
+    task.sessionId,
+    "--issue-number",
+    String(task.issueNumber),
+  ];
+  if (dbPath) argv.push("--db-path", dbPath);
+  if (sessionsPath) argv.push("--sessions-path", sessionsPath);
+  return argv;
+}
+
+/**
+ * The dispute block of the task detail view (issue #848).
+ *
+ * Rendered from {@link summarizeDisputeStatus} — the same projection `admin
+ * task-status` and `admin dispute status` render — so the UI cannot show a
+ * different lineage state, a different counter, or a different "next action"
+ * than the non-interactive commands do. It reads persisted context and bounded
+ * task events only; nothing here opens a run artifact.
+ */
+export function formatDisputeDetail(task: AiTask, events?: readonly TaskEvent[]): string[] {
+  const summary = summarizeDisputeStatus(task, events);
+  if (summary === null) return [];
+  const lines = [
+    "",
+    `Dispute:    ${summary.lineages.length} lineage(s)` +
+      (summary.reviewStructure ? `  review=${summary.reviewStructure}` : "") +
+      (summary.pendingReReview ? "  pendingReReview" : "") +
+      (summary.resolvedWithoutChanges ? "  resolvedWithoutChanges" : ""),
+  ];
+  for (const l of summary.lineages) {
+    const c = l.counters;
+    lines.push(
+      `  ${l.lineageId}  v${l.version}  ${l.state ?? "(unreadable state)"}` +
+        (l.outcome ? ` → ${l.outcome}` : "") +
+        `  ${l.severity ?? "?"}  ${l.affectedBoundary ?? "(no boundary)"}`,
+    );
+    lines.push(
+      `      reb=${c.rebuttals} recon=${c.reconsiderations} arb=${c.arbitrationPasses} ` +
+        `malformedArb=${c.malformedArbiterAttempts} evidence=${c.evidenceRoundsUsed}` +
+        (l.humanGate ? " humanGate" : "") +
+        (l.reopenRequested ? " reopenRequested" : ""),
+    );
+  }
+  const r = summary.routing;
+  lines.push(
+    r
+      ? `  routing: rule=${r.rule ?? "-"} outcome=${r.outcome ?? "-"} turn=${r.turn ?? "-"} ` +
+        `nextPhase=${r.nextPhase ?? "-"}` +
+        (r.undispatchedTurn ? `  undispatchedTurn=${r.undispatchedTurn}` : "")
+      : "  routing: (no recorded transition event)",
+  );
+  const action = summary.nextAction;
+  lines.push(`  next action: ${action.authorized ? action.action : `none (${action.reason})`}`);
+  lines.push(`    ${oneLine(action.description)}`);
+  return lines;
+}
+
+/**
+ * Multi-line detail view for a selected task.
+ *
+ * `events` is optional and only feeds the issue #848 dispute block: without it
+ * the lineage state and counters still render in full (they live in the task
+ * context), and only the §7.1 routing intent — an event-only fact — is reported
+ * as unavailable rather than guessed.
+ */
+export function formatTaskDetail(
+  task: AiTask,
+  now: string,
+  lockState?: WorktreeLockState,
+  events?: readonly TaskEvent[],
+): string {
   const c = taskColumns(task, now);
   const lines = [
     `Session:    ${c.session}`,
@@ -569,6 +659,7 @@ export function formatTaskDetail(task: AiTask, now: string, lockState?: Worktree
     lines.push(`Wt lock:    ${lockStr}`);
   }
   if (c.blocker) lines.push(`Blocker:    ${c.blocker}`);
+  lines.push(...formatDisputeDetail(task, events));
   return lines.join("\n");
 }
 
@@ -1142,6 +1233,7 @@ type MenuAction =
   | "cap-reset"
   | "tool-request"
   | "human-review"
+  | "dispute"
   | "lock-release"
   | "lock-force-release"
   | "status"
@@ -1363,6 +1455,72 @@ async function showHumanReviewReturnCommands(
 }
 
 /**
+ * Surface the review-dispute protocol state and the commands that may act on it
+ * (issue #848). Read-only: like the Tool Request and human-handoff views, this
+ * prints exact copy/paste commands and never mutates DB state itself, so every
+ * safeguard `admin dispute reopen` enforces — exact lineage/version CAS, the
+ * terminal-state gate, the claimed/running refusal, the preview default — stays
+ * in the loop.
+ *
+ * The detail rendered above this view already carries the lineage/counter state
+ * and the supported next action; what this adds is the exact command form, plus
+ * the reason there is no command for an escalated lineage.
+ */
+async function showDisputeCommands(
+  task: AiTask,
+  events: readonly TaskEvent[],
+  dbPath?: string,
+  sessionsPath?: string,
+): Promise<void> {
+  clear();
+  write(`Review dispute — ${task.sessionId} #${task.issueNumber}\n\n`);
+  const summary = summarizeDisputeStatus(task, events);
+  if (summary === null) {
+    write("This task carries no review-dispute state.\n");
+    await pause();
+    return;
+  }
+
+  write(formatDisputeDetail(task, events).join("\n").trimStart() + "\n\n");
+
+  write("Full state (same projection, non-interactive):\n");
+  write(`  ${formatAdminCommand(buildDisputeStatusArgv(task, dbPath, sessionsPath))}\n\n`);
+
+  if (summary.reopenEligibleLineageIds.length > 0) {
+    write(
+      "Flag a RESOLVED lineage for human attention (§6.4). This records a request and parks\n" +
+        "the task at ready_for_human; it does not overturn the resolution, move the lineage out\n" +
+        "of its terminal state, or reset any counter. Previews without --yes:\n",
+    );
+    for (const lineageId of summary.reopenEligibleLineageIds) {
+      const version = summary.lineages.find((l) => l.lineageId === lineageId)?.version ?? 1;
+      write(
+        `  ${formatAdminCommand(
+          disputeReopenArgv({
+            sessionId: task.sessionId,
+            issueNumber: task.issueNumber,
+            lineageId,
+            version,
+            dbPath,
+            // `dispute reopen` resolves the session for its §6.1 limits, so a UI
+            // started on a custom registry must hand that registry to the command
+            // it prints — the default one may not hold this session at all.
+            sessionsPath,
+          }),
+        )}\n`,
+      );
+    }
+    write("\n");
+  }
+
+  if (!summary.nextAction.authorized) {
+    write("No automated continuation is authorized:\n");
+    write(`  ${summary.nextAction.reason}: ${oneLine(summary.nextAction.description)}\n`);
+  }
+  await pause();
+}
+
+/**
  * The action menu for a task. A `ready_for_human` task whose handoff is a
  * review-loop cap is requeued via `recover-cap-handoff`, which clears
  * `reviewLoopCapReached`/`reviewCycles`. The generic `recover` path would
@@ -1389,6 +1547,13 @@ async function showHumanReviewReturnCommands(
  * expired `claimed`/`running` lease. For states it cannot move — e.g. `blocked`,
  * or a `claimed`/`running` task whose lease is still active — recover is a
  * documented no-op, so it is hidden rather than offering a dead-end action.
+ *
+ * Issue #848 adds one more action, and it is additive rather than exclusive: a
+ * task carrying review-dispute state gets a `dispute` entry ALONGSIDE whatever
+ * recovery action applies, because the protocol view answers a different
+ * question ("what does the debate hold, and may I act on it?") than the recovery
+ * actions do. It is a read-only command view, so offering it next to a recovery
+ * action cannot produce a conflicting mutation.
  */
 export function buildTaskMenuActions(
   task: AiTask,
@@ -1413,6 +1578,9 @@ export function buildTaskMenuActions(
     });
   } else if (isRecoverable(task, now)) {
     actions.push({ action: "recover", label: "Recover / requeue (admin recover)" });
+  }
+  if (hasDisputeState(task)) {
+    actions.push({ action: "dispute", label: "Review dispute state / actions (admin dispute)" });
   }
   // `held` and `stale` are mutually exclusive (IssueLockReader reports a lock as
   // `locked = !stale`). A stale lock (past its TTL) releases with `--yes`, but a
@@ -1464,8 +1632,16 @@ async function taskMenu(
 ): Promise<MenuAction> {
   const actions = buildTaskMenuActions(task, now, lockState);
 
+  // Issue #848: the §7.1 routing intent and the undispatched-turn stop reason are
+  // event-only facts, so the detail view needs the task's events to report them.
+  // Read only for a task that actually carries protocol state — a legacy task
+  // costs no extra query and renders exactly as before.
+  const disputeEvents = hasDisputeState(task)
+    ? await store.listEvents({ sessionId: task.sessionId, issueNumber: task.issueNumber })
+    : undefined;
+
   clear();
-  const header = formatTaskDetail(task, now, lockState) + "\n\n" + "Choose an action:";
+  const header = formatTaskDetail(task, now, lockState, disputeEvents) + "\n\n" + "Choose an action:";
   const idx = await selectMenu({
     header,
     items: actions,
@@ -1487,6 +1663,9 @@ async function taskMenu(
       return "back";
     case "human-review":
       await showHumanReviewReturnCommands(task, dbPath, sessionsPath);
+      return "back";
+    case "dispute":
+      await showDisputeCommands(task, disputeEvents ?? [], dbPath, sessionsPath);
       return "back";
     case "lock-release":
       await runStateChange(task, buildLockReleaseArgv(task));

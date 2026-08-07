@@ -128,6 +128,101 @@ export function issueWorktreePath(
 }
 
 /**
+ * Absolute path to the throwaway, per-RUN research checkout for one issue:
+ * `<root>/<session>/issue-<n>/research-<runId>` (issue #855).
+ *
+ * Deliberately a sibling of the durable `issue-<n>/repo` worktree rather than
+ * that path itself: research is read-only and detached at a base commit, so it
+ * must never occupy (or hold the branch of) the durable worktree a later
+ * implementation/review phase resumes. The `runId` segment makes the path unique
+ * per run, so a retry — or a research run overlapping a different phase's
+ * worktree — can never collide on an existing checkout.
+ *
+ * The `issue-<n>/` parent is shared with the durable worktree on purpose: the
+ * existing `admin worktree` scans key managed worktrees on the
+ * `<session>/issue-<n>` prefix, so a leaked research checkout (crashed run) is
+ * still listed, classified, and cleanable through the existing lifecycle rather
+ * than becoming invisible state. {@link classifyManagedWorktree} is what tells
+ * the two apart, so cleanup can treat this per-run checkout as disposable while
+ * still preserving the durable worktree of an in-flight issue.
+ */
+export function researchWorktreePath(
+  root: string,
+  sessionId: string,
+  issueNumber: number,
+  runId: string,
+): string {
+  return join(
+    sessionWorktreeDir(root, sessionId),
+    `issue-${issueNumber}`,
+    `research-${encodeSegment(runId)}`,
+  );
+}
+
+/**
+ * Stable, location-independent identifier for a per-run research checkout. This
+ * is the label recorded in research artifacts (never the absolute path), so a
+ * reader can tie a run to its checkout without a local path leaking into a
+ * public comment.
+ */
+export function researchWorktreeId(sessionId: string, issueNumber: number, runId: string): string {
+  return `${sessionId}/issue-${issueNumber}/research-${runId}`;
+}
+
+/**
+ * What a managed worktree directory is, derived from its path alone.
+ *
+ * `issue` is the durable `issue-<n>/repo` checkout a phase resumes; `research`
+ * is a throwaway per-run `issue-<n>/research-<runId>` checkout. The distinction
+ * drives cleanup policy: the durable checkout must be preserved while its task
+ * is in flight, whereas a research checkout belongs to exactly one finished
+ * process and can never be resumed (a retry gets a new run id).
+ */
+export type ManagedWorktreeClass =
+  | { kind: "issue"; issueNumber: number }
+  | { kind: "research"; issueNumber: number; runId: string };
+
+/**
+ * Classify a managed worktree from its path RELATIVE to
+ * {@link sessionWorktreeDir} (e.g. `issue-12/repo`, `issue-12/research-abc`), or
+ * return null when the path is not a recognized per-issue layout.
+ *
+ * Pure counterpart to {@link issueWorktreePath} / {@link researchWorktreePath}:
+ * admin commands walk `git worktree list` output, which yields absolute paths,
+ * and need to map each one back to the issue (and run) it belongs to WITHOUT
+ * re-deriving the layout regex at every call site.
+ *
+ * Anything under `issue-<n>/` that is not a `research-` sibling classifies as
+ * `issue`, which keeps the historical behavior of treating the whole `issue-<n>`
+ * subtree as that issue's durable worktree.
+ */
+export function classifyManagedWorktree(relativePath: string): ManagedWorktreeClass | null {
+  const matched = /^issue-(\d+)(?:\/|$)/.exec(relativePath);
+  if (!matched) return null;
+  const issueNumber = Number(matched[1]);
+  // The segment directly under `issue-<n>/`: "repo", "research-<runId>", or ""
+  // when the path is the bare `issue-<n>` directory.
+  const child = relativePath.slice(matched[0].length).split("/")[0];
+  const research = /^research-(.+)$/.exec(child);
+  if (!research) return { kind: "issue", issueNumber };
+  return { kind: "research", issueNumber, runId: decodeSegment(research[1]) };
+}
+
+/**
+ * Inverse of {@link encodeSegment}. A run id that needed no escaping round-trips
+ * unchanged; a malformed percent-sequence (which `encodeSegment` cannot produce,
+ * so it means the directory was not created by this workflow) is returned raw
+ * rather than throwing, since a classifier must never crash an admin scan.
+ */
+function decodeSegment(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
  * Replace any reference to the managed worktree root (and its sub-paths) with a
  * `<worktree>` placeholder so a local worktree path is never surfaced in a public
  * comment (issue #400 acceptance: "Public GitHub/Gitea comments never include

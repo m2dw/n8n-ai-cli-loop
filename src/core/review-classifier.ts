@@ -74,6 +74,18 @@ const HUMAN_INPUT_PATTERNS = [
   /manual\s+review\s+required/i,
 ];
 
+/**
+ * Structural evidence of a real Git merge conflict anywhere in the text.
+ *
+ * Exported so a caller that classifies only PART of a review run's output (issue
+ * #841 scopes the prose rules to the text outside the structured envelope) can
+ * still test the COMPLETE output for a conflict, which is the one signal no
+ * reviewer statement can argue with.
+ */
+export function hasConflictSignal(output: string): boolean {
+  return CONFLICT_PATTERNS.some((p) => p.test(output.trim()));
+}
+
 export function classifyReviewOutput(output: string): ClassificationDetail {
   const text = output.trim();
 
@@ -87,8 +99,7 @@ export function classifyReviewOutput(output: string): ClassificationDetail {
     };
   }
 
-  const hasConflictSignal = CONFLICT_PATTERNS.some((p) => p.test(text));
-  if (hasConflictSignal) {
+  if (hasConflictSignal(text)) {
     return {
       classification: "conflict",
       hasBlockingFindings: false,

@@ -8,6 +8,7 @@
   "scripts": {
     "build": "npm run build:lib && npm run build:parent-child-workflow && npm run build:n8n-node",
     "build:lib": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:n8n-node": "npm -w n8n-nodes-ai-cli-loop run build",
     "pretest": "npm run build",
     "test": "node --experimental-vm-modules node_modules/.bin/jest",

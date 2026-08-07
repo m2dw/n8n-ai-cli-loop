@@ -38,10 +38,28 @@ export interface EvidenceTransport {
    * no stdin prompt channel cannot be registered for evidence mode.
    */
   promptDelivery: "stdin";
+  /**
+   * §6.3.1 rule 7 (issue #813): the pinned `agy` CLI parses `--print` as a
+   * flag that MUST have a value — invoking it bare (`agy --print` with no
+   * operand) fails argument parsing before the process ever reads stdin
+   * ("flag needs an argument: -print"), regardless of what is written to the
+   * child's stdin. `stdinOperand` is the fixed, content-free value appended
+   * so the parser is satisfied while the prompt itself still arrives on
+   * stdin only — it is never the prompt, never agent-influenced, and does
+   * not grow with turn count or prompt size, so it does not reopen the
+   * ARG_MAX risk §6.3.1 exists to close.
+   *
+   * §6.3.1 rule 8 (issue #813 review): the runner only appends this operand
+   * from the second invocation onward. The first invocation carries the real
+   * base prompt positionally instead, so an `agy` build that reads the
+   * prompt only from the `--print` value (rather than stdin) still receives
+   * it — this field alone does not describe turn 0's argv.
+   */
+  stdinOperand: string;
 }
 
 export const EVIDENCE_TRANSPORTS: Record<string, EvidenceTransport> = {
-  gemini: { id: "antigravity-stdout-marker", agentId: "gemini", promptDelivery: "stdin" },
+  gemini: { id: "antigravity-stdout-marker", agentId: "gemini", promptDelivery: "stdin", stdinOperand: "-" },
 };
 
 /**

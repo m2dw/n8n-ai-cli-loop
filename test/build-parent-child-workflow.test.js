@@ -1,4 +1,5 @@
 import { jest } from '@jest/globals';
+import { createHash } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -7,14 +8,38 @@ import {
   buildChildWorkflow,
   buildPrivateNodeChildWorkflow,
   buildPrivateNodeParentWorkflow,
+  deriveParentWorkflowId,
+  deriveParentWorkflowName,
+  ensureSessionResolverBuilt,
+  loadSessionRefResolver,
+  parentArtifactFileName,
+  parseSessionRefs,
+  requireCanonicalSessionId,
+  resolveConfiguredSessionIds,
   resolveLocalCliBase,
+  resolveSessionIds,
   CHILD_WORKFLOW_ID,
+  CHILD_WORKFLOW_NAME,
+  CHILD_ARTIFACT_FILE_NAME,
+  LOCAL_WORKFLOW_ARTIFACT_DIR,
+  PARENT_WORKFLOW_ID_PREFIX,
   PRIVATE_NODE_CHILD_WORKFLOW_ID,
   PRIVATE_NODE_PARENT_WORKFLOW_ID,
   PRIVATE_NODE_TYPE,
   CANONICAL_CLI_BASE,
-  CANONICAL_SESSION_REF,
+  CANONICAL_SESSION_ID,
+  GENERIC_PARENT_WORKFLOW_ID,
+  GENERIC_PARENT_WORKFLOW_NAME,
 } from '../scripts/build-parent-child-workflow.mjs';
+
+// The tracked docs/ parent template stays generic review/onboarding output, so
+// it is built with the generic identity instead of the per-session derived one.
+const GENERIC_PARENT_OPTIONS = {
+  cliBase: CANONICAL_CLI_BASE,
+  sessionId: CANONICAL_SESSION_ID,
+  workflowId: GENERIC_PARENT_WORKFLOW_ID,
+  workflowName: GENERIC_PARENT_WORKFLOW_NAME,
+};
 
 const docsDir = resolve(dirname(fileURLToPath(import.meta.url)), '../docs');
 
@@ -27,20 +52,25 @@ const privateNodeParentPath = resolve(docsDir, 'n8n-thin-parent-workflow-private
 // Stability — checked-in docs/ JSONs are the canonical template (issue #391)
 //
 // The tracked docs/ files must match the generator output baked with
-// CANONICAL_CLI_BASE and CANONICAL_SESSION_REF so the committed JSON is stable
-// and environment-independent.  Local CLI_BASE / SESSION_REF never affect them —
-// that output goes to .n8n-artifacts/workflows/.
+// CANONICAL_CLI_BASE, CANONICAL_SESSION_ID, and the generic parent identity so
+// the committed JSON is stable and environment-independent.  Local CLI_BASE /
+// SESSION_REF never affect them — that output goes to .n8n-artifacts/workflows/.
 // ---------------------------------------------------------------------------
 
 test('checked-in parent workflow JSON matches canonical generator output', () => {
   const checkedIn = readFileSync(parentPath, 'utf8');
-  const generated =
-    JSON.stringify(
-      buildParentWorkflow({ cliBase: CANONICAL_CLI_BASE, sessionRef: CANONICAL_SESSION_REF }),
-      null,
-      2
-    ) + '\n';
+  const generated = JSON.stringify(buildParentWorkflow(GENERIC_PARENT_OPTIONS), null, 2) + '\n';
   expect(checkedIn).toBe(generated);
+});
+
+// The checked-in template is deliberately NOT a machine-specific deployment
+// artifact (issue #821): it keeps the generic identity so a reviewer reading
+// docs/ never sees one operator's session baked into the repo.
+test('checked-in parent workflow JSON keeps the generic identity, not a derived one', () => {
+  const checkedIn = JSON.parse(readFileSync(parentPath, 'utf8'));
+  expect(checkedIn.id).toBe(GENERIC_PARENT_WORKFLOW_ID);
+  expect(checkedIn.name).toBe(GENERIC_PARENT_WORKFLOW_NAME);
+  expect(checkedIn.id).not.toContain(PARENT_WORKFLOW_ID_PREFIX);
 });
 
 test('checked-in child workflow JSON matches canonical generator output', () => {
@@ -145,11 +175,17 @@ describe('buildParentWorkflow — Config node', () => {
     return assignments.find((a) => a.name === name);
   }
 
-  test('sessionRef defaults to ai-cli-loop', () => {
-    const a = assignment('sessionRef');
+  test('sessionId defaults to the canonical default session', () => {
+    const a = assignment('sessionId');
     expect(a).toBeDefined();
-    expect(a.value).toBe('ai-cli-loop');
+    expect(a.value).toBe(CANONICAL_SESSION_ID);
     expect(a.type).toBe('string');
+  });
+
+  // The deployed Config must hold the canonical identifier, not a sessionNo or
+  // alias an operator can repoint in sessions.json (issue #821).
+  test('no sessionRef field remains in Config', () => {
+    expect(assignment('sessionRef')).toBeUndefined();
   });
 
   test('has reference-only fields', () => {
@@ -188,6 +224,19 @@ describe('buildParentWorkflow — Create Context node', () => {
 
   test('requests JSON output explicitly with --json (issue #308)', () => {
     expect(cmd).toContain('context create --json');
+  });
+
+  // Config already holds the canonical sessionId (resolved at generation time),
+  // so the runtime call passes --session-id and never re-resolves a reference.
+  test('passes the Config sessionId with --session-id, not --session-ref', () => {
+    expect(cmd).toContain('--session-id');
+    expect(cmd).not.toContain('--session-ref');
+    expect(cmd).toContain('$("Config").first().json.sessionId');
+  });
+
+  test('single-quotes the sessionId and escapes embedded single quotes', () => {
+    expect(cmd).toContain(`--session-id '`);
+    expect(cmd).toContain(`.replace(/'/g, "'\\\\''")`);
   });
 
   test('does not contain a newline character', () => {
@@ -516,6 +565,19 @@ describe('buildChildWorkflow structure', () => {
 
   test('workflow id matches CHILD_WORKFLOW_ID', () => {
     expect(wf.id).toBe(CHILD_WORKFLOW_ID);
+  });
+
+  // Issue #822: `admin n8n deploy` verifies the imported child by ID *and*
+  // name, and locates its artifact by filename. Both come from these exports,
+  // so the generated workflow and the deploy command cannot drift apart.
+  test('workflow name matches CHILD_WORKFLOW_NAME', () => {
+    expect(wf.name).toBe(CHILD_WORKFLOW_NAME);
+    expect(CHILD_WORKFLOW_NAME).toBe('AI Dev Loop — Phase Runner (Child)');
+  });
+
+  test('the child artifact filename and local artifact directory are exported', () => {
+    expect(CHILD_ARTIFACT_FILE_NAME).toBe('n8n-thin-child-workflow.json');
+    expect(LOCAL_WORKFLOW_ARTIFACT_DIR).toBe('.n8n-artifacts/workflows');
   });
 
   test('each node has an id, name, type, and position', () => {
@@ -856,24 +918,35 @@ describe('canonical template vs local deployment cliBase', () => {
     if (saved !== undefined) process.env['CLI_BASE'] = saved;
   });
 
-  function sessionRefValue(wf) {
+  function sessionIdValue(wf) {
     const cfg = wf.nodes.find((n) => n.id === 'workflow-config');
-    return cfg.parameters.assignments.assignments.find((a) => a.name === 'sessionRef').value;
+    return cfg.parameters.assignments.assignments.find((a) => a.name === 'sessionId').value;
   }
 
-  // The docs/ template build passes sessionRef explicitly so the operator's
+  // The docs/ template build passes sessionId explicitly so the operator's
   // SESSION_REF / SESSION_ID never dirties the tracked Config node (issue #391).
-  test('explicit sessionRef option is baked into the Config node', () => {
-    const wf = buildParentWorkflow({ sessionRef: CANONICAL_SESSION_REF });
-    expect(sessionRefValue(wf)).toBe(CANONICAL_SESSION_REF);
+  test('explicit sessionId option is baked into the Config node', () => {
+    const wf = buildParentWorkflow({ sessionId: CANONICAL_SESSION_ID });
+    expect(sessionIdValue(wf)).toBe(CANONICAL_SESSION_ID);
   });
 
-  test('explicit sessionRef option overrides the no-arg default', () => {
-    const localRef = 'operator-local-session';
-    expect(sessionRefValue(buildParentWorkflow({ sessionRef: localRef }))).toBe(localRef);
-    expect(sessionRefValue(buildParentWorkflow({ sessionRef: localRef }))).not.toBe(
-      CANONICAL_SESSION_REF
+  test('explicit sessionId option overrides the no-arg default', () => {
+    const localId = 'operator-local-session';
+    expect(sessionIdValue(buildParentWorkflow({ sessionId: localId }))).toBe(localId);
+    expect(sessionIdValue(buildParentWorkflow({ sessionId: localId }))).not.toBe(
+      CANONICAL_SESSION_ID
     );
+  });
+
+  // SESSION_REF holds a mutable reference that only the CLI entrypoint may
+  // resolve; the pure builder must never pick it up from the environment.
+  test('SESSION_REF in the environment does not leak into the built Config node', () => {
+    const saved = process.env['SESSION_REF'];
+    process.env['SESSION_REF'] = 'some-operator-alias';
+    const value = sessionIdValue(buildParentWorkflow());
+    if (saved !== undefined) process.env['SESSION_REF'] = saved;
+    else delete process.env['SESSION_REF'];
+    expect(value).toBe(CANONICAL_SESSION_ID);
   });
 
   test('local deployment build bakes the resolved local CLI_BASE into commands', () => {
@@ -985,6 +1058,455 @@ describe('parent/child workflow ID consistency', () => {
 
   test('parent and child have distinct workflow IDs', () => {
     expect(parent.id).not.toBe(child.id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session-specific parent identity (issue #821)
+//
+// A multi-session deployment imports one parent per session and exactly one
+// shared child.  Parent identity must therefore be derived from the canonical
+// sessionId: deterministic (so regenerating does not churn the deployment),
+// collision-safe (so two sessions can never claim the same n8n workflow), and
+// human-readable (so an operator can tell the parents apart in the list).
+// ---------------------------------------------------------------------------
+
+describe('deriveParentWorkflowId', () => {
+  test('is deterministic for the same sessionId', () => {
+    expect(deriveParentWorkflowId('team-alpha')).toBe(deriveParentWorkflowId('team-alpha'));
+  });
+
+  test('is distinct for different sessionIds', () => {
+    expect(deriveParentWorkflowId('team-alpha')).not.toBe(deriveParentWorkflowId('team-beta'));
+  });
+
+  test('starts with the parent prefix and is a safe identifier', () => {
+    const id = deriveParentWorkflowId('Team Alpha/API');
+    expect(id.startsWith(PARENT_WORKFLOW_ID_PREFIX)).toBe(true);
+    expect(id).toMatch(/^[a-z0-9][a-z0-9-]*$/);
+  });
+
+  test('keeps a readable slug of the sessionId', () => {
+    expect(deriveParentWorkflowId('team-alpha')).toContain('team-alpha');
+  });
+
+  // Slugging is lossy, so the digest — not the slug — carries uniqueness.
+  test('sessionIds that slug identically still get distinct IDs', () => {
+    const a = deriveParentWorkflowId('team/api');
+    const b = deriveParentWorkflowId('team-api');
+    expect(a).not.toBe(b);
+    expect(a.startsWith(`${PARENT_WORKFLOW_ID_PREFIX}team-api-`)).toBe(true);
+    expect(b.startsWith(`${PARENT_WORKFLOW_ID_PREFIX}team-api-`)).toBe(true);
+  });
+
+  test('long sessionIds have a truncated slug but stay distinct', () => {
+    const long = 'a'.repeat(80);
+    const longer = `${long}b`;
+    // The readable half is capped; the ID as a whole is therefore bounded by the
+    // cap plus the prefix and the fixed-width digest, however long the sessionId.
+    expect(deriveParentWorkflowId(long).length).toBeLessThan(120);
+    expect(deriveParentWorkflowId(long)).not.toBe(deriveParentWorkflowId(longer));
+  });
+
+  // The digest is the whole of the collision safety — the slug is lossy and the
+  // artifact filename IS the workflow ID, so two sessions that share a digest
+  // claim one workflow and one file, and the second build silently overwrites
+  // the first.  A truncated digest made that reachable by search (a review found
+  // the pair below for an eight-character prefix); the full sha256 does not.
+  test('the ID carries the full sha256 of the sessionId, never a prefix of it', () => {
+    const full = createHash('sha256').update('team-alpha', 'utf8').digest('hex');
+    expect(full).toHaveLength(64);
+    expect(deriveParentWorkflowId('team-alpha')).toBe(
+      `${PARENT_WORKFLOW_ID_PREFIX}team-alpha-${full}`,
+    );
+  });
+
+  test('sessionIds that differ only in punctuation get distinct IDs and filenames', () => {
+    const a = 'team@@!@@!!!!@!@';
+    const b = 'team@@@@!@!@!!!@@@';
+    expect(deriveParentWorkflowId(a)).not.toBe(deriveParentWorkflowId(b));
+    expect(parentArtifactFileName(a)).not.toBe(parentArtifactFileName(b));
+    // Both slug to the same readable half, so only the digest tells them apart.
+    expect(deriveParentWorkflowId(a).replace(/-[0-9a-f]{64}$/, '')).toBe(
+      deriveParentWorkflowId(b).replace(/-[0-9a-f]{64}$/, ''),
+    );
+  });
+
+  // sessions.json accepts any non-empty sessionId, so a session named in a
+  // non-Latin script must still be deployable: the slug transcribes those code
+  // points instead of dropping them and leaving nothing to build an ID from.
+  test('derives a safe ID for a non-ASCII sessionId', () => {
+    const id = deriveParentWorkflowId('開発');
+    expect(id.startsWith(PARENT_WORKFLOW_ID_PREFIX)).toBe(true);
+    expect(id).toMatch(/^[a-z0-9][a-z0-9-]*$/);
+    expect(deriveParentWorkflowId('開発')).toBe(id);
+  });
+
+  test('distinct non-ASCII sessionIds get distinct IDs', () => {
+    expect(deriveParentWorkflowId('開発')).not.toBe(deriveParentWorkflowId('本番'));
+  });
+
+  test('a mixed-script sessionId keeps its ASCII half readable', () => {
+    expect(deriveParentWorkflowId('team-開発')).toContain('team-');
+  });
+
+  // The transcription must not perturb IDs that never needed it.
+  test('ASCII sessionIds are unaffected by non-ASCII transcription', () => {
+    expect(deriveParentWorkflowId('team-alpha')).toBe(
+      `${PARENT_WORKFLOW_ID_PREFIX}team-alpha-${createHash('sha256')
+        .update('team-alpha', 'utf8')
+        .digest('hex')}`,
+    );
+  });
+
+  // sessions.json accepts a sessionId made only of punctuation, so it resolves
+  // through the registry like any other and must still yield an artifact — the
+  // digest, not the slug, is what identifies it.
+  test('derives a safe ID for a sessionId with no slug-able characters', () => {
+    const id = deriveParentWorkflowId('--__--');
+    expect(id).toMatch(/^[a-z0-9][a-z0-9-]*$/);
+    expect(id.startsWith(PARENT_WORKFLOW_ID_PREFIX)).toBe(true);
+    expect(id).toBe(deriveParentWorkflowId('--__--'));
+  });
+
+  test('punctuation-only sessionIds that slug to nothing stay distinct', () => {
+    expect(deriveParentWorkflowId('--__--')).not.toBe(deriveParentWorkflowId('__--__'));
+  });
+
+  test('does not end with a hyphen when truncation lands on a separator', () => {
+    // The 32-char cut lands exactly on the separator here, so the slug would end
+    // with a hyphen and the ID would read "…a--<digest>" without the trim.
+    const id = deriveParentWorkflowId(`${'a'.repeat(31)}-tail`);
+    expect(id).toMatch(/^[a-z0-9][a-z0-9-]*$/);
+    expect(id).not.toContain('--');
+  });
+});
+
+describe('derived identifiers fail clearly on unsafe or empty input', () => {
+  test.each([
+    ['an empty sessionId', ''],
+    ['a whitespace-only sessionId', '   '],
+  ])('rejects %s', (_label, sessionId) => {
+    expect(() => deriveParentWorkflowId(sessionId)).toThrow(/non-empty string/);
+  });
+
+  test('rejects a non-string sessionId', () => {
+    expect(() => deriveParentWorkflowId(undefined)).toThrow(/non-empty string/);
+    expect(() => deriveParentWorkflowId(42)).toThrow(/non-empty string/);
+  });
+
+  test('rejects a sessionId containing a control character', () => {
+    expect(() => deriveParentWorkflowId('team\nalpha')).toThrow(/control characters/);
+  });
+
+  test('requireCanonicalSessionId returns the value unchanged when it is usable', () => {
+    expect(requireCanonicalSessionId('team-alpha')).toBe('team-alpha');
+  });
+
+  test('buildParentWorkflow refuses an empty sessionId', () => {
+    expect(() => buildParentWorkflow({ sessionId: '' })).toThrow(/non-empty string/);
+  });
+});
+
+// sessions.json validates a sessionId as "a non-empty, non-whitespace-only
+// string", so one padded with spaces is a legitimate registry entry that
+// resolveSessionRef will hand back verbatim.  The generator must accept exactly
+// what the registry accepts: refusing a padded sessionId would make a valid
+// session undeployable, and trimming it would point the Config node — and the
+// `--session-id` argument built from it — at a DIFFERENT session.
+describe('a padded sessionId stays deployable and keeps its exact value', () => {
+  const padded = ' padded ';
+
+  test('requireCanonicalSessionId returns it unchanged', () => {
+    expect(requireCanonicalSessionId(padded)).toBe(padded);
+  });
+
+  test('derives a safe, deterministic workflow ID for it', () => {
+    const id = deriveParentWorkflowId(padded);
+    expect(id).toMatch(/^[a-z0-9][a-z0-9-]*$/);
+    expect(id).toBe(deriveParentWorkflowId(padded));
+    expect(parentArtifactFileName(padded)).toMatch(/^[a-z0-9][a-z0-9-]*\.json$/);
+  });
+
+  // The padding is part of the identity, so it must not collapse onto the
+  // unpadded session — they are two registry entries and two deployments.
+  test('is a different session from its unpadded namesake', () => {
+    expect(deriveParentWorkflowId(padded)).not.toBe(deriveParentWorkflowId('padded'));
+    expect(parentArtifactFileName(padded)).not.toBe(parentArtifactFileName('padded'));
+    expect(deriveParentWorkflowName(padded)).not.toBe(deriveParentWorkflowName('padded'));
+  });
+
+  test('Config carries the padded sessionId byte-for-byte', () => {
+    const wf = buildParentWorkflow({ cliBase: CANONICAL_CLI_BASE, sessionId: padded });
+    const cfg = wf.nodes.find((n) => n.id === 'workflow-config');
+    expect(cfg.parameters.assignments.assignments.find((a) => a.name === 'sessionId').value).toBe(
+      padded,
+    );
+  });
+
+  test('resolveSessionIds accepts a padded sessionId from the registry', () => {
+    expect(resolveSessionIds(['alias'], () => padded)).toEqual([padded]);
+  });
+});
+
+describe('deriveParentWorkflowName', () => {
+  test('is human-readable and names the session', () => {
+    expect(deriveParentWorkflowName('team-alpha')).toBe('AI Dev Loop — Parent (team-alpha)');
+  });
+
+  test('is distinct for different sessions', () => {
+    expect(deriveParentWorkflowName('team-alpha')).not.toBe(deriveParentWorkflowName('team-beta'));
+  });
+
+  test('rejects an unusable sessionId', () => {
+    expect(() => deriveParentWorkflowName('')).toThrow(/non-empty string/);
+  });
+});
+
+describe('parentArtifactFileName', () => {
+  test('is named after the derived workflow ID', () => {
+    expect(parentArtifactFileName('team-alpha')).toBe(`${deriveParentWorkflowId('team-alpha')}.json`);
+  });
+
+  test('two sessions cannot overwrite each other artifact', () => {
+    expect(parentArtifactFileName('team-alpha')).not.toBe(parentArtifactFileName('team-beta'));
+  });
+
+  test('a non-ASCII sessionId still yields an ASCII filename', () => {
+    expect(parentArtifactFileName('開発')).toMatch(/^[a-z0-9][a-z0-9-]*\.json$/);
+  });
+});
+
+describe('multi-session parent generation', () => {
+  const alpha = buildParentWorkflow({ cliBase: CANONICAL_CLI_BASE, sessionId: 'team-alpha' });
+  const beta = buildParentWorkflow({ cliBase: CANONICAL_CLI_BASE, sessionId: 'team-beta' });
+
+  function sessionIdValue(wf) {
+    const cfg = wf.nodes.find((n) => n.id === 'workflow-config');
+    return cfg.parameters.assignments.assignments.find((a) => a.name === 'sessionId').value;
+  }
+
+  test('two configured sessions get distinct parent workflow IDs', () => {
+    expect(alpha.id).toBe(deriveParentWorkflowId('team-alpha'));
+    expect(beta.id).toBe(deriveParentWorkflowId('team-beta'));
+    expect(alpha.id).not.toBe(beta.id);
+  });
+
+  test('two configured sessions get distinct human-readable names', () => {
+    expect(alpha.name).toBe('AI Dev Loop — Parent (team-alpha)');
+    expect(beta.name).toBe('AI Dev Loop — Parent (team-beta)');
+    expect(alpha.name).not.toBe(beta.name);
+  });
+
+  test('each Config node holds its own canonical sessionId', () => {
+    expect(sessionIdValue(alpha)).toBe('team-alpha');
+    expect(sessionIdValue(beta)).toBe('team-beta');
+  });
+
+  test('both parents call the SAME shared child workflow ID', () => {
+    for (const wf of [alpha, beta]) {
+      const call = wf.nodes.find((n) => n.id === 'call-phase-runner');
+      expect(call.parameters.workflowId).toBe(CHILD_WORKFLOW_ID);
+    }
+  });
+
+  test('the parent-to-child payload still carries only contextId', () => {
+    for (const wf of [alpha, beta]) {
+      const call = wf.nodes.find((n) => n.id === 'call-phase-runner');
+      expect(Object.keys(call.parameters.workflowInputs.value)).toEqual(['contextId']);
+    }
+  });
+
+  test('repeated generation for the same session is byte-for-byte deterministic', () => {
+    const again = buildParentWorkflow({ cliBase: CANONICAL_CLI_BASE, sessionId: 'team-alpha' });
+    expect(JSON.stringify(again, null, 2)).toBe(JSON.stringify(alpha, null, 2));
+  });
+
+  test('a session-specific parent carries no absolute path other than its CLI base', () => {
+    const serialized = JSON.stringify(alpha);
+    expect(serialized).toContain(CANONICAL_CLI_BASE);
+    // No home/checkout path, no sessions.json path, no artifact/worktree root.
+    // The registry is named in the read-only Config hints as prose ("resolved
+    // from sessions.json by sessionId"), which is why this pins the absence of
+    // a sessions.json *path* rather than of the bare file name.
+    expect(serialized).not.toMatch(/\/(?:Users|home)\//);
+    expect(serialized).not.toMatch(/[\\/]sessions\.json/);
+    expect(serialized).not.toContain(process.cwd());
+  });
+
+  // The deployment artifact intentionally carries ONE absolute path — the CLI
+  // base it must invoke. Nothing else about the operator's machine (checkout
+  // path, sessions.json location, artifact root) may ride along with it.
+  test('a local deployment parent carries only the CLI base path', () => {
+    const localCliBase = '/ops/deployment-tree/dist/cli';
+    const wf = buildParentWorkflow({ cliBase: localCliBase, sessionId: 'team-alpha' });
+    const withoutCliBase = JSON.stringify(wf).split(localCliBase).join('');
+    expect(JSON.stringify(wf)).toContain(localCliBase);
+    // Any remaining multi-segment path would be a second absolute path. (The
+    // single-segment "/admin.js" left behind by the removal, and the "/'/g"
+    // of the escaping regex, are deliberately not matched by this pattern.)
+    expect(withoutCliBase).not.toMatch(/\/[\w.-]+\/[\w.-]+/);
+    expect(withoutCliBase).not.toContain(process.cwd());
+  });
+
+  test('the shared child is identical no matter which session is generated', () => {
+    const first = buildChildWorkflow({ cliBase: CANONICAL_CLI_BASE });
+    const second = buildChildWorkflow({ cliBase: CANONICAL_CLI_BASE });
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+    expect(first.id).toBe(CHILD_WORKFLOW_ID);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session reference resolution (issue #821)
+//
+// References (sessionNo, alias) are mutable, so they are resolved to canonical
+// sessionIds at GENERATION time.  The resolver itself lives in the compiled
+// registry; these tests inject a stub so they pin the generator's contract with
+// it (ordering, dedupe, failure reporting) without depending on dist/.
+// ---------------------------------------------------------------------------
+
+describe('parseSessionRefs', () => {
+  test('accepts a single reference', () => {
+    expect(parseSessionRefs('addon')).toEqual(['addon']);
+  });
+
+  test('splits and trims a comma-separated list', () => {
+    expect(parseSessionRefs(' addon , 2 ,tar ')).toEqual(['addon', '2', 'tar']);
+  });
+
+  test('drops empty entries from a trailing or doubled comma', () => {
+    expect(parseSessionRefs('addon,,tar,')).toEqual(['addon', 'tar']);
+  });
+
+  test('throws when the value contains no reference at all', () => {
+    expect(() => parseSessionRefs(' , ')).toThrow(/no session reference/);
+  });
+
+  // sessions.json accepts any non-empty string as a sessionId or alias, so a
+  // reference may legitimately contain the list separator itself, or the padding
+  // the splitter would otherwise trim.  Without an escape those sessions could
+  // not be named here at all: "team,a" read as two unknown references.
+  test('a backslash escapes a comma so it is part of the reference', () => {
+    expect(parseSessionRefs(String.raw`team\,a`)).toEqual(['team,a']);
+  });
+
+  test('an escaped comma does not stop the rest of the list from splitting', () => {
+    expect(parseSessionRefs(String.raw`team\,a,addon`)).toEqual(['team,a', 'addon']);
+  });
+
+  test('escaped whitespace is kept while unescaped whitespace is still trimmed', () => {
+    expect(parseSessionRefs(String.raw`\ padded\ , addon `)).toEqual([' padded ', 'addon']);
+  });
+
+  test('a doubled backslash is one literal backslash in the reference', () => {
+    expect(parseSessionRefs(String.raw`back\\slash`)).toEqual([String.raw`back\slash`]);
+  });
+
+  // A truncated escape is always a typo (a shell that ate the quoting, say);
+  // dropping it silently would resolve some other session.
+  test('rejects a value ending in a lone backslash', () => {
+    expect(() => parseSessionRefs('team\\')).toThrow(/lone backslash/);
+  });
+
+  // Escaping is opt-in: values that never use a backslash keep their old parse.
+  test('leaves unescaped values parsing exactly as before', () => {
+    expect(parseSessionRefs(' addon , 2 ,tar ')).toEqual(['addon', '2', 'tar']);
+    expect(parseSessionRefs('addon')).toEqual(['addon']);
+  });
+});
+
+describe('resolveSessionIds', () => {
+  const registry = { addon: 'team-alpha', 2: 'team-alpha', tar: 'team-beta' };
+  const resolveRef = (ref) => {
+    if (!(ref in registry)) throw new Error(`Unknown session reference: "${ref}".`);
+    return registry[ref];
+  };
+
+  test('resolves references to canonical sessionIds in order', () => {
+    expect(resolveSessionIds(['tar', 'addon'], resolveRef)).toEqual(['team-beta', 'team-alpha']);
+  });
+
+  // Two references naming one session must yield one parent, not two identical ones.
+  test('deduplicates references that resolve to the same session', () => {
+    expect(resolveSessionIds(['addon', '2'], resolveRef)).toEqual(['team-alpha']);
+  });
+
+  test('reports which reference could not be resolved', () => {
+    expect(() => resolveSessionIds(['nope'], resolveRef)).toThrow(/"nope"/);
+    expect(() => resolveSessionIds(['nope'], resolveRef)).toThrow(/Unknown session reference/);
+  });
+
+  test('rejects a resolver result that is not a usable sessionId', () => {
+    expect(() => resolveSessionIds(['addon'], () => '')).toThrow(/non-empty string/);
+  });
+});
+
+describe('resolveConfiguredSessionIds', () => {
+  test('falls back to the canonical default session when no reference is configured', async () => {
+    await expect(resolveConfiguredSessionIds({})).resolves.toEqual([CANONICAL_SESSION_ID]);
+  });
+
+  // The default must not need a session registry: `npm run build` has to work on
+  // a machine (or CI runner) with no sessions.json at all.
+  test('treats a blank SESSION_REF as unconfigured rather than failing the build', async () => {
+    await expect(resolveConfiguredSessionIds({ SESSION_REF: '   ' })).resolves.toEqual([
+      CANONICAL_SESSION_ID,
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session resolver availability — `build:parent-child-workflow` does not depend
+// on `build:lib`, and dist/ is gitignored, so a fresh checkout must compile the
+// resolver on demand instead of failing before any artifact is written.
+// ---------------------------------------------------------------------------
+
+describe('ensureSessionResolverBuilt', () => {
+  const missing = resolve(dirname(fileURLToPath(import.meta.url)), '../dist/__does-not-exist__.js');
+
+  test('compiles the library when the resolver module is missing', () => {
+    const compile = jest.fn(() => ({ status: 0 }));
+    // Compile "succeeds" but the module still is not there, so this also pins
+    // that a silent no-op compiler is reported rather than swallowed.
+    expect(() => ensureSessionResolverBuilt({ modulePath: missing, compile })).toThrow(
+      /still missing/,
+    );
+    expect(compile).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not compile when the resolver module is already built', () => {
+    const compile = jest.fn(() => ({ status: 0 }));
+    const present = fileURLToPath(import.meta.url);
+    expect(() => ensureSessionResolverBuilt({ modulePath: present, compile })).not.toThrow();
+    expect(compile).not.toHaveBeenCalled();
+  });
+
+  test('reports a failing compile with its exit status', () => {
+    expect(() =>
+      ensureSessionResolverBuilt({ modulePath: missing, compile: () => ({ status: 2 }) }),
+    ).toThrow(/exited with 2/);
+  });
+
+  test('reports a compiler that could not be spawned at all', () => {
+    expect(() =>
+      ensureSessionResolverBuilt({
+        modulePath: missing,
+        compile: () => ({ error: new Error('spawn ENOENT') }),
+      }),
+    ).toThrow(/spawn ENOENT/);
+  });
+});
+
+describe('loadSessionRefResolver', () => {
+  test('builds the resolver before importing it', async () => {
+    const ensureBuilt = jest.fn();
+    const resolveRef = await loadSessionRefResolver({ ensureBuilt });
+    expect(ensureBuilt).toHaveBeenCalledTimes(1);
+    expect(ensureBuilt.mock.calls[0][0].modulePath).toMatch(
+      /dist[/\\]registries[/\\]json-session-registry\.js$/,
+    );
+    expect(typeof resolveRef).toBe('function');
   });
 });
 
@@ -1290,7 +1812,7 @@ describe('buildPrivateNodeChildWorkflow — no Execute Command nodes after Slice
 test('checked-in private-node parent workflow JSON matches canonical generator output', () => {
   const checkedIn = readFileSync(privateNodeParentPath, 'utf8');
   const generated =
-    JSON.stringify(buildPrivateNodeParentWorkflow({ sessionRef: CANONICAL_SESSION_REF }), null, 2) +
+    JSON.stringify(buildPrivateNodeParentWorkflow({ sessionRef: CANONICAL_SESSION_ID }), null, 2) +
     '\n';
   expect(checkedIn).toBe(generated);
 });
@@ -1703,8 +2225,8 @@ describe('buildPrivateNodeParentWorkflow — Config node sessionRef', () => {
   });
 
   test('explicit sessionRef option is baked into the Config node', () => {
-    expect(sessionRefValue(buildPrivateNodeParentWorkflow({ sessionRef: CANONICAL_SESSION_REF }))).toBe(
-      CANONICAL_SESSION_REF
+    expect(sessionRefValue(buildPrivateNodeParentWorkflow({ sessionRef: CANONICAL_SESSION_ID }))).toBe(
+      CANONICAL_SESSION_ID
     );
   });
 

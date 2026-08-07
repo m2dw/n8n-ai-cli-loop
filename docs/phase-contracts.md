@@ -495,22 +495,23 @@ implementation.  They are evaluated at the start of each implementation run.
 | `complexity:low`  | sonnet | low    | $2     |
 | *(no label)*      | sonnet | high   | $5     |
 | `complexity:high` | opus   | high   | $10    |
-| `complexity:xhigh`| fable  | high   | $20    |
+| `complexity:xhigh`| fable  | xhigh  | $20    |
 
 When multiple complexity labels are present the strongest wins:
 `xhigh > high > low`.
 
-`complexity:xhigh` selects Claude Fable 5 (`fable`) at `high` effort (issue
-#748) — the strongest available implementation profile, not the literal
-`xhigh` effort tier applied to Opus 5. Opus 5 is a distilled model; effort
-above `high` degrades its implementation quality rather than improving it,
-so "strongest profile" means promoting the *model* to Fable 5 while keeping
-effort at `high`. The `xhigh` effort tier remains valid input elsewhere (an
-explicit `CLAUDE_EFFORT=xhigh` override, or a session `claude.
-complexityProfiles` override) — it is simply not what `complexity:xhigh`
-implies by default. See `docs/assignment-profiles.md` ("Where Cost Settings
-Fit") for the session-config override shape and a preflight command to
-confirm Fable 5 availability.
+`complexity:xhigh` selects Claude Fable 5 (`fable`) at `xhigh` effort (issue
+#857, a follow-up policy correction to #748) — the strongest available
+implementation profile, not a route back to Opus 5. Issue #748 moved
+`complexity:xhigh` off Opus 5 (a distilled model; effort above `high`
+degrades its implementation quality rather than improving it) onto Fable 5,
+but capped it at `high` effort, leaving the tier no stronger than
+`complexity:high`. Since Opus 5 at `high` and Fable 5 at `high` are judged
+roughly equivalent in implementation capability, `complexity:xhigh` now runs
+Fable 5 at its own `xhigh` effort tier so the tier is materially stronger
+than `complexity:high`. See `docs/assignment-profiles.md` ("Where Cost
+Settings Fit") for the session-config override shape and a preflight command
+to confirm Fable 5 availability.
 
 Environment variables (`CLAUDE_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_MAX_BUDGET_USD`)
 override complexity-label defaults when set; a session's
@@ -564,12 +565,12 @@ mirroring the implementation lane's `CODEX_EFFORT` precedence.
 `model_reasoning_effort` only accepts low/medium/high — `xhigh` is a Claude-only
 effort tier. Per issue #243 it is *not* silently downgraded to `high`: a
 `review:xhigh` label is simply not a recognized review label and has no effect
-(it falls through to the no-label case above, `high`). `xhigh` remains a valid
-Claude implementation effort value (via an explicit `CLAUDE_EFFORT=xhigh` or
-session override — `complexity:xhigh` itself now resolves to `high` effort on
-Fable 5, per issue #748). When no explicit `review:*` label is set,
-`complexity:xhigh` and `complexity:high` both derive the strongest
-Codex-supported review strength (`high`).
+(it falls through to the no-label case above, `high`). `xhigh` is a valid
+Claude implementation effort value — `complexity:xhigh` itself resolves to
+`xhigh` effort on Fable 5 (issue #857). When no explicit `review:*` label is
+set, `complexity:xhigh` and `complexity:high` both derive the strongest
+Codex-supported review strength (`high`), since Codex has no `xhigh`
+reasoning tier.
 
 ## Codex Model Selection (issue #609)
 
@@ -679,6 +680,14 @@ in the fix prompt. Fix mode also activates when task labels contain
 `status:needs-fix` (manual trigger), but in that case `reviewFeedback` must
 be present — fix mode will fail before running Claude if feedback is absent.
 
+The evidence-backed review-dispute protocol — structured finding lineage,
+per-finding dispositions (`fixed` / `review_disputed` / `blocked`), reviewer
+reconsideration, bounded arbitration, and human escalation — is specified in
+[review-dispute-contract.md](review-dispute-contract.md) (issue #835). It is
+an approved design, not yet implemented; until it lands (and whenever
+`session.reviewDispute.enabled` is off), a fix run that produces no diff
+fails exactly as described above.
+
 Operational note:
 
 Legacy run-id branches such as `ai/issue-37-1133` are not part of the long-term
@@ -728,7 +737,10 @@ Routing after review:
 
 - `success` → task becomes ready for human decision.
 - `needs_fix` → task is automatically requeued to implementation/fix mode.
-  Review output is captured as `reviewFeedback` in task context.
+  Review output is captured as `reviewFeedback` in task context. The
+  structured dispute/reconsideration/arbitration protocol layered on this
+  loop is specified in
+  [review-dispute-contract.md](review-dispute-contract.md).
 - `conflict` → the review handler returns `result: "conflict"`, which the runner
   routes to the `conflict_resolution` lane.  This applies to dependency-started
   PRs too: because every PR (dependency-started or not) targets the session base
@@ -762,6 +774,17 @@ Forbidden:
 - Creating branches or PRs.
 - Presenting uncertain claims as confirmed facts.
 
+Execution context (issue #855):
+
+- The agent runs in a per-run Issue worktree detached at the freshly fetched
+  `origin/<base>` commit — never in the shared canonical checkout, which may be
+  stale, dirty, or in use for unrelated work. See
+  docs/per-issue-worktrees.md §Research worktree.
+- Fetch, SHA resolution, or worktree creation failing stops the run *before* the
+  agent is invoked. There is no fallback to local repository state.
+- No `ai/issue-<n>` branch is created; the checkout is removed after the run and
+  run artifacts (written outside it) are preserved.
+
 Success criteria:
 
 - The output summarizes findings, options, recommendation, risks, and open
@@ -776,6 +799,10 @@ Required artifacts:
 - `research-prompt.md`
 - `research-output.md`
 - `research-result.json`
+- `research-workspace-failure.json` — only when the per-run research worktree
+  could not be prepared (issue #855): the failing stage
+  (`worktree-root` / `fetch-base` / `resolve-base` / `worktree-create`), the base
+  branch, the underlying git text (local-only), and `agentInvoked: false`.
 - `research-permission-denial.json` — only when the run is classified as a
   permission denial (see below).
 - `research-denial-diagnostic-<channel>.txt` — only alongside that artifact: a
@@ -789,6 +816,24 @@ Required artifacts:
   verbatim prompt/output captures of the evidence turn loop defined in
   [docs/research-evidence-contract.md](research-evidence-contract.md) §9. A
   disabled run writes none of these.
+- `research-workspace-settings.json` — only when the runner-owned Antigravity
+  workspace permission profile is enabled
+  (`session.research.antigravity.workspaceSettings.enabled`, issue #826): the
+  policy version, schema pin, content hash, rule counts, ignore mode, trust
+  status, the version the installed CLI reported, the state of the
+  runner-owned global permission overlay (issue #830), and the read-only tool
+  registration installed with it (issue #832) for the profile
+  regenerated before every headless invocation, or the
+  refusal reason when preparation failed closed. Specified in
+  [docs/antigravity-workspace-settings.md](antigravity-workspace-settings.md).
+- `research-tool-surface-violation.json` — only when a run that installed that
+  registration is still denied a command/process permission (issue #832): the
+  installed CLI offered a command-capable tool the registration does not name,
+  which is a compatibility finding about the build rather than an ordinary
+  denial. The record carries the policy identity, the CLI version, the exact
+  registration installed, and the operator's next step; the remedy is never to
+  grant command execution.
+  A disabled run writes nothing into the workspace and writes no such artifact.
 
 Input bound: the persisted GitHub Issue body interpolated into the research
 prompt is bounded at 32,768 characters (issue #803; raised from the original
@@ -803,6 +848,53 @@ for bodies beyond this bound are specified in
 [docs/research-evidence-contract.md](research-evidence-contract.md) (issue #805,
 `issue-body` evidence source) and implemented in its follow-up issue; the bound
 and its reporting above are unchanged by that design.
+
+### Antigravity print-mode timeout (issue #861)
+
+`agy --print` applies its own print-mode wait timeout — `agy --help` documents
+`--print-timeout` as defaulting to `5m0s`. A large but valid research task can
+exceed five minutes; when it does, the CLI exits non-zero after emitting only a
+partial response and the run is classified as `command-failure`, indistinguishable
+from a genuine agent error without cross-checking elapsed time against that
+default.
+
+The research handler always passes an explicit `--print-timeout <value>` to
+`agy --print`, so the run is never implicitly bound by Antigravity's own
+five-minute default:
+
+- **Configuration key:** `session.research.antigravity.printTimeout`, a string.
+- **Default:** `"15m"` (`ANTIGRAVITY_PRINT_TIMEOUT_DEFAULT`,
+  src/core/antigravity-print-timeout.ts) when the session does not configure one —
+  three times Antigravity's own CLI default.
+- **Accepted format:** one or more `<number><unit>` segments using `h`, `m`, or
+  `s`, e.g. `"15m"`, `"90s"`, `"1h30m"` — the same shape `agy --print-timeout`
+  itself accepts (Go's `time.ParseDuration`).
+- **Bounds:** rejected at session load (`json-session-registry.ts`) and again by
+  the handler before the value reaches command argv: empty, malformed (wrong
+  unit, extra characters, a repeated unit), zero, negative, and any duration
+  exceeding `ANTIGRAVITY_PRINT_TIMEOUT_MAX_MS` (60 minutes) all fail closed with
+  a descriptive error rather than silently falling back to a default or an
+  unbounded wait.
+- **Argv order:** `["--model", <model>, "--print-timeout", <value>, "--print"]`
+  when a model is configured, `["--print-timeout", <value>, "--print"]`
+  otherwise — model, then print-timeout, then `--print`, regardless of which of
+  the two optional inputs are configured.
+- **Recorded, not just applied:** `ResolvedResearchProfile` carries
+  `printTimeout` (the value passed to argv), `printTimeoutMs` (the same value in
+  milliseconds), and `printTimeoutSource` (`"cli-default"` or
+  `"session-config"`), so `research-context.json` (written before the agent is
+  invoked) and `research-result.json` both show the effective timeout without
+  opening the raw capture.
+- **No outer deadline undercuts it.** The research handler passes no `timeout`
+  option to the command runner, so nothing in this codebase can impose a
+  deadline shorter than the configured `--print-timeout` — the only timeout
+  governing a research invocation is the one named above.
+
+This is diagnosis-and-configuration only: it does not change quota/rate-limit
+classification, permission-denial classification, or any other research outcome
+in the table below. A run that still exceeds the configured `--print-timeout`
+classifies as `command-failure`, exactly like any other non-zero `agy --print`
+exit.
 
 ### Research outcome classification
 
@@ -855,6 +947,22 @@ is specified in [docs/research-evidence-contract.md](research-evidence-contract.
 (issue #805); it is an approved design whose implementation lands in a separate
 issue in the #802 decomposition, off by default, and it changes nothing
 described in this section until then.
+
+The bounded read-only workspace permission profile that keeps a headless run's
+own tool calls from being auto-denied is a separate, also opt-in layer specified
+in [docs/antigravity-workspace-settings.md](antigravity-workspace-settings.md)
+(issue #826, reconciled with the installed `agy` 1.1.9 by issue #830). It grants
+no write, command, child-process, or network capability,
+introduces no research outcome, and leaves the classification above and the
+evidence bounds unchanged; a run whose profile cannot be prepared — whose
+installed CLI is outside the reconciled version range, or whose
+prepared profile no longer matches the file the CLI would load at launch — fails
+closed before the agent is invoked. Its workspace-scoped rules are installed into
+the global CLI settings for the duration of the run and removed again on every
+exit path, leaving unrelated settings unchanged. Because the profile lets the agent read and
+search the workspace with its own tools, enabling it also withholds raw agent
+output from every published comment and notification, exactly as an interpolated
+Issue body and an enabled evidence channel already do.
 
 **Denial artifact and publication bounds.** `research-permission-denial.json`
 records the denial category (`deniedOperation`), the matched signal, the

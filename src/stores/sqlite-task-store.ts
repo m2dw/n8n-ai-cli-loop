@@ -20,7 +20,9 @@ import { ASSIGNMENT_CONTEXT_KEY } from "../core/assignment.js";
 import { hasUnresolvedToolRequest } from "../core/tool-request.js";
 import type { OutboxEffect, PhaseCompletionTransition, TaskStore } from "../core/task-store.js";
 import type { OutboxEnqueueInput } from "../core/outbox.js";
+import { sqliteBackendId } from "./sqlite-backend-id.js";
 import { migrateOutboxTable, migrateOutboxRetryColumns } from "./outbox-migration.js";
+import { isMaintenanceLockHeld } from "./maintenance-lock-guard.js";
 
 const DEFAULT_LEASE_MS = 30 * 60 * 1000;
 
@@ -83,6 +85,13 @@ CREATE TABLE IF NOT EXISTS events (
   created_at   TEXT NOT NULL
 );
 
+-- issue #849 review: every event read is scoped to one session, and usually to
+-- one task within it. Without this index each such read is a full scan of the
+-- events table, so a session-wide report over N tasks cost O(tasks x events).
+-- Created here (rather than in a migration function) because the schema is
+-- executed on every open, so an existing database picks it up too.
+CREATE INDEX IF NOT EXISTS idx_events_session_issue ON events(session_id, issue_number, id);
+
 CREATE TABLE IF NOT EXISTS outbox (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   idempotency_key   TEXT NOT NULL UNIQUE,
@@ -106,9 +115,10 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 -- atomically regardless of which store class opens the connection first —
 -- CREATE TABLE IF NOT EXISTS makes either construction order safe.
 CREATE TABLE IF NOT EXISTS maintenance_lock (
-  id          INTEGER PRIMARY KEY CHECK (id = 1),
-  holder      TEXT NOT NULL,
-  acquired_at TEXT NOT NULL
+  id              INTEGER PRIMARY KEY CHECK (id = 1),
+  holder          TEXT NOT NULL,
+  acquired_at     TEXT NOT NULL,
+  activity_exempt INTEGER NOT NULL DEFAULT 0
 );
 `;
 
@@ -144,10 +154,21 @@ function migrateTasksRevision(db: Database.Database): void {
 export class SqliteTaskStore implements TaskStore {
   readonly #db: Database.Database;
 
+  /**
+   * Identity of the database file this store writes to (issue #818 review
+   * follow-up). A caller holding this store and an outbox store compares the
+   * two ids to know whether its outbox effects are already covered by
+   * `completePhaseWithEffects`'s transaction or still need a separate write.
+   */
+  readonly backendId: string | undefined;
+
   constructor(dbPath?: string) {
     const resolved = dbPath ?? DEFAULT_DB_PATH;
     mkdirSync(join(resolved, ".."), { recursive: true });
     this.#db = new Database(resolved);
+    // After the file exists, so the path canonicalizes all the way down to it
+    // rather than stopping at the deepest ancestor that happened to exist yet.
+    this.backendId = sqliteBackendId(resolved);
     migrateOutboxTable(this.#db);
     this.#db.exec(SCHEMA);
     migrateOutboxRetryColumns(this.#db);
@@ -391,16 +412,84 @@ export class SqliteTaskStore implements TaskStore {
    * rows once this transaction commits. Any failure — a CAS conflict or a
    * thrown error while writing an effect — rolls back the whole transaction,
    * so the task never transitions without its effects (or vice versa).
+   *
+   * Refuses with `code: "maintenance_locked"` while a whole-file maintenance
+   * lock is held (issue #818), read inside this same transaction: this is an
+   * outbox *enqueue* entry point as much as `SqliteOutboxStore.enqueue` is, so
+   * a completion must not write effect rows into a file `prune`/`restore` is
+   * working on. Refusing the whole call — rather than committing the
+   * transition and skipping its effects — is what preserves the #701 contract
+   * under contention: nothing is written and the phase re-runs once maintenance
+   * releases the lock, instead of transitioning with silently dropped
+   * comments/labels/notifications. The refused task is left exactly as it was —
+   * still `running` under this run's claim — and it is the caller's job to hand
+   * that claim back (`runNextPhase` requeues it, issue #818 review follow-up).
+   * A live phase does not make this unreachable: `acquire()` refuses while a
+   * phase is running, but `skipActivityChecks` holders (`archive rollup`)
+   * deliberately do not, so a lock can land mid-phase with the lease still far
+   * from expiry.
    */
   async completePhaseWithEffects(
     transition: PhaseCompletionTransition,
     effects: OutboxEffect[],
   ): Promise<StoreResult<AiTask>> {
     const run = this.#db.transaction((): StoreResult<AiTask> => {
+      if (isMaintenanceLockHeld(this.#db)) return { ok: false, code: "maintenance_locked" };
       const result = this.#applyTransition(transition.key, transition.expected, transition.patch);
       if (!result.ok) return result;
 
       this.#insertEvent(transition.event);
+      // Issue #840: inside the SAME transaction as the transition above, so a
+      // refused CAS or a held maintenance lock rolls back the protocol block and
+      // the audit record of its move together.
+      for (const extra of transition.extraEvents ?? []) this.#insertEvent(extra);
+      for (const effect of effects) {
+        if (effect.kind === "enqueue") {
+          this.#insertOutboxEnqueue(effect.input);
+        } else {
+          this.#insertOutboxReplacePendingPrSummary(effect.input, effect.key);
+        }
+      }
+
+      return result;
+    });
+
+    return run.immediate();
+  }
+
+  /**
+   * Commit an arbitrary task transition together with the outbox effects that
+   * belong to it, in one transaction on this store's connection — the generic
+   * sibling of {@link completePhaseWithEffects} for operator-driven compound
+   * operations that are not phase completions (issue #818 review follow-up;
+   * `admin.ts`'s fix-mode requeue is the first caller).
+   *
+   * Such an operation used to transition the task and *then* enqueue its
+   * label/comment effects through a separate `SqliteOutboxStore` connection.
+   * Under a held maintenance lock that second step throws
+   * (`MaintenanceLockedError`) after the transition has already committed,
+   * leaving the human-handoff lane half-applied: the task requeued for a fix
+   * run, its lane labels never enqueued. Routing both through this method makes
+   * the pair atomic — the same all-or-nothing contract issue #701 gave phase
+   * completions — and refuses the whole thing with `code:
+   * "maintenance_locked"`, read inside this same transaction, so the operator's
+   * command is simply repeatable once maintenance releases the lock.
+   *
+   * Deliberately not on the `TaskStore` interface: it exists for callers that
+   * already hold a concrete `SqliteTaskStore` and need this file's own
+   * transaction, not as a new contract every store implementation must satisfy.
+   */
+  async transitionTaskWithEffects(
+    key: TaskKey,
+    expected: TaskExpected,
+    patch: TaskPatch,
+    effects: OutboxEffect[],
+  ): Promise<StoreResult<AiTask>> {
+    const run = this.#db.transaction((): StoreResult<AiTask> => {
+      if (isMaintenanceLockHeld(this.#db)) return { ok: false, code: "maintenance_locked" };
+      const result = this.#applyTransition(key, expected, patch);
+      if (!result.ok) return result;
+
       for (const effect of effects) {
         if (effect.kind === "enqueue") {
           this.#insertOutboxEnqueue(effect.input);
@@ -732,6 +821,14 @@ export class SqliteTaskStore implements TaskStore {
    * event, and every outbox effect it produced — in a single transaction on
    * this store's own connection (issue #608 review; mirrors
    * `completePhaseWithEffects`, issue #701). See {@link TaskStore.cancelTaskWithEffects}.
+   *
+   * Refuses with `code: "maintenance_locked"` while a maintenance lock is held
+   * (issue #818), for the same reason as `completePhaseWithEffects`: this
+   * commits an outbox effect (the operator-visible cancellation comment), and
+   * an all-or-nothing refusal keeps the operator's cancellation repeatable —
+   * the task is left untouched, so re-running it after maintenance releases
+   * the lock cancels cleanly rather than hitting `already_cancelled` with no
+   * comment ever enqueued.
    */
   async cancelTaskWithEffects(
     key: TaskKey,
@@ -742,6 +839,7 @@ export class SqliteTaskStore implements TaskStore {
     const now = options.now ?? new Date().toISOString();
 
     const run = this.#db.transaction((): StoreResult<AiTask> => {
+      if (isMaintenanceLockHeld(this.#db)) return { ok: false, code: "maintenance_locked" };
       const result = this.#applyCancel(key, options, now);
       if (!result.ok) return result;
 
@@ -811,6 +909,31 @@ export class SqliteTaskStore implements TaskStore {
         "SELECT * FROM events WHERE session_id = ? AND issue_number = ? ORDER BY id ASC",
       )
       .all(key.sessionId, key.issueNumber) as RawEvent[];
+    return rows.map(rawToEvent);
+  }
+
+  /**
+   * Every event of one type across a whole session, grouped by issue and oldest
+   * first within each issue (issue #849 review).
+   *
+   * Not part of {@link TaskStore}: it exists for read-only session-wide
+   * reporting (`admin dispute metrics`), which otherwise had to call
+   * {@link listEvents} once per task and re-read the events table each time.
+   * The type filter is applied in SQL because the reports that need this read
+   * exactly one event type, and a session's other events would otherwise be
+   * loaded only to be discarded.
+   *
+   * The ordering is `(issue_number, id)` rather than `id` on purpose: it is the
+   * order `idx_events_session_issue` already stores, so the query is one index
+   * range over the session with no sorting step, and the caller — which groups
+   * by task anyway — still sees each task's events in append order.
+   */
+  async listSessionEventsByType(sessionId: string, type: string): Promise<TaskEvent[]> {
+    const rows = this.#db
+      .prepare(
+        "SELECT * FROM events WHERE session_id = ? AND type = ? ORDER BY issue_number ASC, id ASC",
+      )
+      .all(sessionId, type) as RawEvent[];
     return rows.map(rawToEvent);
   }
 }

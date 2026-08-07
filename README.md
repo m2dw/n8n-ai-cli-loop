@@ -276,7 +276,7 @@ node /path/to/n8n-ai-cli-loop/dist/cli/github-intake.js \
 - `src/`: TypeScript library for state-store, atomic task transitions, and phase-dispatch logic
 - `docs/n8n-thin-parent-workflow.json`: tracked **parent template** — stable, environment-independent (canonical CLI path), for review and onboarding
 - `docs/n8n-thin-child-workflow.json`: tracked **child template** — stable, environment-independent (canonical CLI path), for review and onboarding
-- `.n8n-artifacts/workflows/`: gitignored **local deployment artifacts** generated with your machine's `CLI_BASE` — import these for a local deployment
+- `.n8n-artifacts/workflows/`: gitignored **local deployment artifacts** generated with your machine's `CLI_BASE` — one session-specific parent (`ai-dev-loop-parent-<slug>-<digest>.json`) plus the shared child; import these for a local deployment
 - `test/*.test.js`: workflow and CLI contract tests
 
 ## Parent/Child Workflow
@@ -317,16 +317,46 @@ npm run build:parent-child-workflow
 CLI_BASE=/your/path/dist/cli npm run build:parent-child-workflow
 ```
 
+For a local, same-host n8n the supported way to deploy is one command, which
+generates this session's artifacts, imports them in the required order, verifies
+what landed, and publishes only when explicitly asked. A parent that was already
+active is re-activated after the import, so re-deploying never takes a running
+session down:
+
+```sh
+node dist/cli/admin.js n8n deploy --session-ref my-project        # preview
+node dist/cli/admin.js n8n deploy --session-ref my-project --yes  # apply
+```
+
+The n8n CLI writes n8n's database, and n8n loads its workflows at startup — so
+**restart n8n after applying** if it was already running, or the imported
+workflows and the parent's active state are not yet in effect. The command says
+so whenever it wrote anything (`restartRequired` in `--json`).
+
+See [docs/install.md](docs/install.md#7-generate-and-import-the-n8n-workflows)
+for prerequisites and options. To import by hand instead:
+
 Import order matters — child first so n8n registers its stable ID before the parent
 resolves it. For a local deployment import from `.n8n-artifacts/workflows/`; the
 `docs/` copies (`docs/n8n-thin-child-workflow.json`, `docs/n8n-thin-parent-workflow.json`)
 are the same structure with the canonical placeholder path:
 
-1. Import the **child workflow** (`n8n-thin-child-workflow.json`, id: `ai-dev-loop-thin-phase-runner`)
-2. Import the **parent workflow** (`n8n-thin-parent-workflow.json`, id: `ai-dev-loop-thin-parent`)
+1. Import the **child workflow** (`n8n-thin-child-workflow.json`, id: `ai-dev-loop-thin-phase-runner`) — once, shared by every session
+2. Import the session's **parent workflow** (`ai-dev-loop-parent-<slug>-<digest>.json` locally, id: the same derived string; `n8n-thin-parent-workflow.json`, id: `ai-dev-loop-thin-parent`, for the generic `docs/` template)
 
 The parent's **Call Phase Runner** node references the child by its stable string ID
 (`ai-dev-loop-thin-phase-runner`).
+
+Each session gets its own parent: the workflow ID and name are derived from the
+canonical `sessionId` (resolved from `SESSION_REF` through `sessions.json` at
+generation time), and the Config node carries that canonical `sessionId`. The
+child is session-agnostic — it receives only `contextId` — so all parents share
+the one child workflow.
+
+```sh
+# One parent per session, all pointing at the same child:
+SESSION_REF=my-project,other-project npm run build:parent-child-workflow
+```
 
 Import guide, smoke-test checklist, and operational reference (sessions.json, SQLite inspection, artifact paths):
 👉 **[docs/parent-child-workflow.md](docs/parent-child-workflow.md)**

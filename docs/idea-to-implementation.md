@@ -17,8 +17,10 @@ for human review.
 > Applicable workflow import files. For a local deployment import the gitignored
 > copies generated under `.n8n-artifacts/workflows/` (baked with your `CLI_BASE`);
 > the `docs/` copies are the tracked, environment-independent template:
-> - `n8n-thin-child-workflow.json` (import first) — `docs/` template or `.n8n-artifacts/workflows/`
-> - `n8n-thin-parent-workflow.json` — `docs/` template or `.n8n-artifacts/workflows/`
+> - `n8n-thin-child-workflow.json` (import first, shared by every session) —
+>   `docs/` template or `.n8n-artifacts/workflows/`
+> - the session's parent — `.n8n-artifacts/workflows/ai-dev-loop-parent-<slug>-<digest>.json`,
+>   or the generic `docs/n8n-thin-parent-workflow.json` template
 >
 > For setup and smoke-test instructions, see
 > [docs/parent-child-workflow.md](parent-child-workflow.md).

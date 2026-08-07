@@ -81,7 +81,13 @@ const GENERIC_DENIAL_SIGNALS: string[] = [
  * would re-label unproductive runs as permission problems.
  */
 const AGENT_DENIAL_SIGNALS: Partial<Record<string, string[]>> = {
-  gemini: ["tool call denied", "not in the allowed tools"],
+  // "auto-denied" covers the Jetski (Antigravity/Gemini headless launcher)
+  // diagnostic for a tool permission it cannot prompt for non-interactively
+  // (issue #814): `... permission that headless mode cannot prompt for, so it
+  // was auto-denied.` States the refusal outcome unambiguously, unlike the
+  // surrounding help text ("Add an allow-rule ...") which merely mentions
+  // permissions and is deliberately not matched.
+  gemini: ["tool call denied", "not in the allowed tools", "auto-denied"],
 };
 
 // Operation tokens are matched against the denial's own evidence window only
@@ -97,8 +103,19 @@ const AGENT_DENIAL_SIGNALS: Partial<Record<string, string[]>> = {
 // `classifyOperation`), so a denied shell command keeps the actionable
 // `command` class instead of collapsing to `unspecified`.
 
+// Tier 1 also carries the *permission class* the Jetski headless launcher names
+// when it does not name the tool at all (issue #832): `a tool required the
+// "command" permission that headless mode cannot prompt for`. That sentence
+// states which class was refused as authoritatively as a tool identifier does,
+// and without it the class collapses to `unspecified` — which is precisely the
+// distinction an operator needs to tell "the read profile is wrong" from "the
+// agent reached for a shell". Both quotes are part of the token, so the
+// quoted-tool form (`"run_shell_command" permission`) is matched by the tool
+// identifier above rather than by this, and a bare word in prose cannot match it.
+
 /** Tier 1 — tool identifiers naming a denied read/search operation. */
 const READ_TOOL_TOKENS: string[] = [
+  "\"read\" permission",
   "read_file",
   "read_many_files",
   "readfile",
@@ -126,6 +143,7 @@ const READ_GENERIC_TOKENS: string[] = [
 
 /** Tier 1 — tool identifiers naming a denied command/process operation. */
 const COMMAND_TOOL_TOKENS: string[] = [
+  "\"command\" permission",
   "run_shell_command",
   "runshellcommand",
   "shell_command",

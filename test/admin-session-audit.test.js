@@ -984,12 +984,27 @@ describe('collectSessionAuditFacts — GitHub label completeness', () => {
     chmodSync(shim, 0o755);
   }
 
-  /** Collect facts with the fake `gh` first on PATH (repoRoot deliberately absent). */
+  /**
+   * Collect facts with the fake `gh` first on PATH (repoRoot deliberately absent).
+   *
+   * What is left of the run's budget becomes a real `execFileSync` timeout on the
+   * shim, so taking the production 60s default here makes every assertion below a
+   * race against process-spawn latency: under a loaded parallel run that bound has
+   * killed a shim mid-`cat` and turned an expected `ok` into a SIGTERM
+   * `unavailable`. None of these tests are about the bound — they are about what
+   * the audit makes of the shim's *answer* — so the default is a frozen clock with
+   * a budget wide enough to be unreachable. The bound is still real, and an
+   * unloaded shim still answers immediately; a test that does assert on the budget
+   * injects its own deadline.
+   */
   function collect(deps = {}) {
     const realPath = process.env.PATH;
     process.env.PATH = `${binDir}:${realPath}`;
     try {
-      return collectSessionAuditFacts(session({ repoRoot: join(tmpDir, 'nonexistent') }), false, deps);
+      return collectSessionAuditFacts(session({ repoRoot: join(tmpDir, 'nonexistent') }), false, {
+        deadline: createProbeDeadline(() => 0, 600_000),
+        ...deps,
+      });
     } finally {
       process.env.PATH = realPath;
     }
@@ -1035,15 +1050,25 @@ describe('collectSessionAuditFacts — GitHub label completeness', () => {
     // let the visibility read start another full-length wait: the documented bound
     // is per audit run, so an unresponsive GitHub ends the command in one budget,
     // not two. The clock is injected, so no real waiting happens here.
+    //
+    // What is *left* of the injected budget when a probe starts becomes a real
+    // `execFileSync` timeout on the fake `gh`, so the clock reads the same instant
+    // twice: the label probe is handed the whole budget, and only the third
+    // reading jumps past it. Sizing that first bound to the 60s production default
+    // instead turned the assertion into a race against process-spawn latency
+    // rather than a test of the shared budget — under a loaded parallel run both a
+    // 20s and a 60s bound have killed the shim mid-`cat` and reported the probe as
+    // unavailable. Nothing here asserts *which* bound the first probe gets, so a
+    // generous one costs the run nothing and leaves the signal-retry in `probe()`
+    // room to cover a shim that is merely slow rather than absent.
     fakeGh(ALL_LABELS);
-    let clock = 0;
-    const tick = () => {
-      const value = clock;
-      clock += 40_000;
-      return value;
-    };
-    const collected = collect({ deadline: createProbeDeadline(tick, 60_000) });
-    // First probe: 20s of budget left, so it still runs and succeeds.
+    // Clock readings in call order: deadline creation, label probe, visibility
+    // probe. The last reading repeats, so an extra read stays expired.
+    const readings = [0, 0, 600_000];
+    let reads = 0;
+    const tick = () => readings[Math.min(reads++, readings.length - 1)];
+    const collected = collect({ deadline: createProbeDeadline(tick, 180_000) });
+    // First probe: the whole budget is still on the clock, so it runs and succeeds.
     expect(collected.workItemLabels).toEqual({ status: 'ok', names: ALL_LABELS });
     // Second probe: budget spent — reported, not re-waited.
     expect(collected.workItemRepoVisibility.status).toBe('unavailable');
@@ -1072,5 +1097,40 @@ describe('collectSessionAuditFacts — GitHub label completeness', () => {
     const labels = check(payload, 'work-item-labels');
     expect(labels.status).toBe('error');
     expect(labels.detail).toContain('ai:blocked');
+  });
+
+  test('a probe that ends without a word is reported with a reason, not blank', () => {
+    // A child that writes to neither stream leaves `execFileSync` holding two
+    // empty strings, and reporting that verbatim put an `unavailable` lookup in
+    // front of the operator whose reason was the empty string — the one detail
+    // they can do nothing with. `gh` always explains itself on stderr, so this
+    // shape is the process being ended rather than answering.
+    const shim = join(binDir, 'gh');
+    writeFileSync(shim, '#!/bin/sh\nexit 3\n', 'utf8');
+    chmodSync(shim, 0o755);
+    // The deadline's remaining time becomes a real `execFileSync` timeout on the
+    // shim, and under a loaded parallel run the production 60s default has killed
+    // this instant `exit 3` mid-spawn and reported a SIGTERM where the exit
+    // status was the point. A frozen clock with a wide budget keeps the bound
+    // real but unreachable; the shim still returns immediately when unloaded.
+    const collected = collect({ deadline: createProbeDeadline(() => 0, 600_000) });
+    expect(collected.workItemLabels.status).toBe('unavailable');
+    expect(collected.workItemLabels.error).toMatch(/gh exited with status 3/);
+    expect(collected.workItemRepoVisibility.status).toBe('unavailable');
+    expect(collected.workItemRepoVisibility.error).toMatch(/gh exited with status 3/);
+    // ...and a reason, however it reads, is still a warning and never a silent
+    // "private" certification or a missing-label error.
+    const payload = buildSessionAudit(
+      session(),
+      facts({
+        workItemLabels: collected.workItemLabels,
+        workItemRepoVisibility: collected.workItemRepoVisibility,
+      }),
+      HEALTHY_ENV,
+      NOW,
+    );
+    expect(check(payload, 'work-item-labels').status).toBe('warning');
+    expect(check(payload, 'public-private-boundary').status).toBe('warning');
+    expect(payload.verdict).not.toBe('not-ready');
   });
 });

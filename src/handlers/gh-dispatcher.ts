@@ -1,4 +1,5 @@
 import { OUTBOX_CLAIM_STALE_MS, type OutboxEntry, type OutboxStore, type SlackNotificationPayload } from "../core/outbox.js";
+import { deriveScanCursorKey } from "../core/outbox-scan-cursor.js";
 import { sanitizeLegacyPrCommentBody } from "../core/outbox-visibility.js";
 
 /** Minimal fetch-compatible function type for Slack webhook dispatch (issue #465). */
@@ -78,6 +79,26 @@ export interface DispatchResult {
    * breakdown, not an additional bucket.
    */
   deadLettered: number;
+  /**
+   * Set when this run stopped because a whole-file maintenance lock is held
+   * (issue #818). An expected idle outcome, not a failure: no row was claimed,
+   * no external side effect was performed, and no cursor was advanced. The
+   * counters above report whatever was already dispatched before the lock
+   * appeared (zero when it was already held at run start). Omitted entirely on
+   * a normal run so existing consumers see an unchanged shape.
+   */
+  maintenanceLocked?: boolean;
+  /**
+   * Set when this run's persisted scan cursors were refused because an
+   * `admin outbox retry` rewound them after the scan started (issue #820 review
+   * follow-up). Not a failure and not contention: every row this run claimed was
+   * dispatched and counted above, only the scan extent was discarded because it
+   * was computed before a row was revived underneath it. The rewound cursors
+   * stand, so the next run re-scans that bounded span and finds the recovered
+   * row. Omitted entirely on a normal run so existing consumers see an unchanged
+   * shape.
+   */
+  cursorFenceStale?: boolean;
 }
 
 export interface DispatchOptions {
@@ -136,6 +157,16 @@ export interface DispatchOptions {
    * `scanLimit` defaulting to unbounded when `scanCursorKey` is unset, rather
    * than by a persisted cursor, since there is no non-matching content to
    * remember skipping past.
+   *
+   * The key is the *dispatch identity*: it must fold in the whole ownership
+   * scope `filter` is built from (session id plus the repository/provider
+   * tuple), not just the session id, so repointing a session's repository
+   * orphans the old cursor instead of reusing it under a different filter. The
+   * CLI builds it with `deriveOwnershipScanCursorKey`; the three persisted keys
+   * are derived from it by `deriveScanCursorKey`
+   * (`core/outbox-scan-cursor.ts`). The behavioral contract for all three
+   * cursors — roles, advancement rules, invariants — is
+   * `docs/outbox-scan-cursor-contract.md`.
    */
   scanCursorKey?: string;
   /**
@@ -200,6 +231,17 @@ export async function dispatchOutbox(
   runner: GhRunnerResolver,
   opts: DispatchOptions,
 ): Promise<DispatchResult> {
+  // Fail closed before ANY external side effect while maintenance is in
+  // progress (issue #818). This pre-check is the reporting path — it is what
+  // turns contention into a typed idle outcome instead of a silent zero-work
+  // run — while `claimForDispatch`'s in-transaction check is what actually
+  // makes the exclusion atomic against a lock acquired mid-run. Placed before
+  // the scan so a locked run also skips every cursor write (`setScanCursor` is
+  // itself an outbox-table mutation) and never resolves credentials.
+  if (await isMaintenanceLocked(outboxStore)) {
+    return { dispatched: 0, failed: 0, errors: [], deadLettered: 0, maintenanceLocked: true };
+  }
+
   const limit = opts.limit ?? 50;
   const now = opts.now ?? new Date().toISOString();
   // Apply due-time eligibility and the ownership filter *before* the limit. A
@@ -277,20 +319,24 @@ export async function dispatchOutbox(
   // many rows the zone still protects, so forward progress into a large
   // foreign backlog always accumulates across runs instead of being reset to
   // just past the last still-open row found.
+  //
+  // All three keys come from the single shared derivation in
+  // `core/outbox-scan-cursor.ts` (issue #819) — `floor` is `scanCursorKey`
+  // verbatim (so cursors persisted before that refactor keep resolving) and the
+  // other two are length-prefixed so no two distinct (identity, role) pairs can
+  // collide. See `docs/outbox-scan-cursor-contract.md` for the full contract.
   const floorKey = opts.scanCursorKey;
-  // Length-prefixed rather than a plain suffix: session ids are only
-  // validated as nonempty strings, so two valid sessions like `foo` and
-  // `foo::fwd` would otherwise collide — the former's zone-end cursor key
-  // would equal the latter's own floor cursor key, letting `foo::fwd` read
-  // an unrelated cursor and skip its own older pending rows permanently (P2
-  // review follow-up to issue #606). Prefixing with `floorKey`'s length
-  // makes the encoding injective per role: the id portion is unambiguously
-  // delimited by its own length, so no two distinct (sessionId, role) pairs
-  // can ever produce the same derived key. Still plain TEXT, so any tooling
-  // that inspects the cursor table directly reads an ordinary string.
-  const deriveCursorKey = (role: "fwd" | "bulk"): string => `${floorKey!.length}:${floorKey}:${role}`;
-  const zoneEndKey = floorKey ? deriveCursorKey("fwd") : undefined;
-  const bulkKey = floorKey ? deriveCursorKey("bulk") : undefined;
+  const zoneEndKey = floorKey ? deriveScanCursorKey(floorKey, "fwd") : undefined;
+  const bulkKey = floorKey ? deriveScanCursorKey(floorKey, "bulk") : undefined;
+  // Read *before* the three cursors below, never after (issue #820 review
+  // follow-up). This run persists the extent it computes from those reads only
+  // while this generation still holds, so a retry that rewinds the cursors
+  // mid-run is refused rather than overwritten. Reading the fence second would
+  // reopen exactly the hole it closes: a rewind landing between the cursor
+  // reads and the fence read would leave this run holding pre-rewind cursor
+  // values together with a post-rewind generation, and its writes would then
+  // pass the fence and re-strand the revived row.
+  const cursorFenceEpoch = floorKey ? await readScanCursorFence(outboxStore, floorKey) : undefined;
   const floorAfterId = floorKey ? await outboxStore.getScanCursor(floorKey) : undefined;
   const persistedZoneEndAfterId = zoneEndKey ? await outboxStore.getScanCursor(zoneEndKey) : undefined;
   const zoneEndAfterId =
@@ -457,6 +503,19 @@ export async function dispatchOutbox(
   // Ids resolved this run — sent, or dead-lettered — so no longer pending and
   // safe to skip past when persisting the cursors below.
   const resolvedIds = new Set<number>();
+  // Set when maintenance is acquired part-way through this drain (issue #818).
+  // Possible even though the run started unlocked: between two rows there is no
+  // active claim, so `acquire()`'s outbox-claim check passes and a maintenance
+  // pass can legitimately take the lock. From that point every
+  // `claimForDispatch` refuses (its own in-transaction check), so the loop
+  // stops here rather than spinning through the remaining rows.
+  let maintenanceLocked = false;
+  // Set when this run's cursor writes are refused because an `admin outbox
+  // retry` rewound this identity's cursors after the scan began (issue #820
+  // review follow-up). Unlike `maintenanceLocked` it never stops the dispatch
+  // loop — every row already claimed is still dispatched and reported — it only
+  // suppresses cursor persistence, whose computed values are now stale.
+  let cursorFenceStale = false;
   for (const entry of pending) {
     // Atomically claim the row immediately before its external side effect
     // (issue #607 review follow-up): `pending` was built from a `SELECT` scan
@@ -476,6 +535,15 @@ export async function dispatchOutbox(
     const claimedAt = opts.now ?? new Date().toISOString();
     const claimed = await outboxStore.claimForDispatch(entry.id, claimedAt);
     if (!claimed) {
+      // Distinguish "maintenance took the lock" from the ordinary
+      // cancelled/foreign-claim reasons (issue #818): the row is untouched and
+      // still pending either way, but only the former means every remaining
+      // row would refuse too — so stop the drain and report it, instead of
+      // walking the rest of `pending` issuing claims that cannot succeed.
+      if (await isMaintenanceLocked(outboxStore)) {
+        maintenanceLocked = true;
+        break;
+      }
       // A failed claim does NOT mean this row is resolved (P1 review
       // follow-up): it may be held by a concurrent dispatcher's still-active
       // claim, not a cancel. Folding it into `resolvedIds` unconditionally
@@ -581,7 +649,43 @@ export async function dispatchOutbox(
     }
   }
 
-  if (floorKey) {
+  // Cursor persistence is skipped entirely once maintenance holds the lock
+  // (issue #818): `setScanCursor` writes to this database, and the cursors
+  // computed from a drain that stopped mid-way would in any case describe a
+  // partial run. Leaving them untouched means the next (unlocked) run resumes
+  // exactly where the last complete run left off.
+  //
+  // This flag check is only the fast path. The lock can also be acquired after
+  // the final claim resolved but before the writes below run, in which case
+  // `maintenanceLocked` is still false here — so each cursor write is itself
+  // guarded in-transaction by the store (issue #818 review follow-up) and
+  // reports the refusal back through `persistCursor`, which flips the flag so
+  // the remaining cursor writes are skipped and the run reports contention.
+  //
+  // Every write is additionally fenced on the rewind generation read at scan
+  // start (issue #820 review follow-up). An `admin outbox retry` can commit
+  // while this run is blocked in an external call: it revives a row this run
+  // already scanned past (as dead-lettered, so `listPendingEntries` never
+  // returned it) and rewinds the cursors that would hide it. The values below
+  // were computed before that happened, so persisting them unconditionally
+  // would restore the pre-retry positions and re-strand the recovered row for
+  // good. A stale fence therefore stops cursor persistence for the rest of this
+  // run — like the maintenance case, no cursor advances and the next run
+  // resumes from the rewound position — but is reported separately, since it is
+  // an operator recovery rather than database contention.
+  const persistCursor = async (key: string, id: number): Promise<void> => {
+    const { persisted, fenceStale } = await outboxStore.setScanCursor(
+      key,
+      id,
+      floorKey !== undefined && cursorFenceEpoch !== undefined
+        ? { identityKey: floorKey, epoch: cursorFenceEpoch }
+        : undefined,
+    );
+    if (persisted) return;
+    if (fenceStale) cursorFenceStale = true;
+    else maintenanceLocked = true;
+  };
+  if (floorKey && !maintenanceLocked) {
     // `matchedCandidates` is already in ascending (scan) order. The smallest
     // still-open id becomes the next floor (Phase A / the zone walk protects
     // it); the largest becomes the next zone end whenever more than one row
@@ -597,9 +701,9 @@ export async function dispatchOutbox(
     // is the very first one) — leave the cursor unset rather than persisting
     // a redundant 0, matching `listPendingEntries`' `afterId ?? 0` default.
     if (nextFloor !== undefined && nextFloor > 0) {
-      await outboxStore.setScanCursor(floorKey, nextFloor);
+      await persistCursor(floorKey, nextFloor);
     }
-    if (zoneEndKey && (stillOpen.length > 1 || zoneWalkIncomplete)) {
+    if (!maintenanceLocked && !cursorFenceStale && zoneEndKey && (stillOpen.length > 1 || zoneWalkIncomplete)) {
       // Unlike `floorKey`/`bulkKey` (both `afterId`-style: "resume scanning
       // strictly after this id"), `zoneEndAfterId` is compared against the
       // zone walk's own cumulative cursor (also `afterId`-style) as an
@@ -622,21 +726,54 @@ export async function dispatchOutbox(
         ? Math.max(stillOpen[stillOpen.length - 1] ?? 0, zoneEndAfterId ?? 0)
         : stillOpen[stillOpen.length - 1];
       if (nextZoneEnd > 0) {
-        await outboxStore.setScanCursor(zoneEndKey, nextZoneEnd);
+        await persistCursor(zoneEndKey, nextZoneEnd);
       }
     }
-    if (bulkKey) {
+    if (!maintenanceLocked && !cursorFenceStale && bulkKey) {
       // Guarded to be monotonic: a run whose Phase B loop never executes (or
       // never crosses a foreign row) must not regress the bulk cursor behind
       // progress an earlier run already confirmed.
       const nextBulk = Math.max(scanExtentId ?? 0, persistedBulkAfterId ?? 0);
       if (nextBulk > 0) {
-        await outboxStore.setScanCursor(bulkKey, nextBulk);
+        await persistCursor(bulkKey, nextBulk);
       }
     }
   }
 
-  return { dispatched, failed, errors, deadLettered };
+  return {
+    dispatched,
+    failed,
+    errors,
+    deadLettered,
+    ...(maintenanceLocked ? { maintenanceLocked: true } : {}),
+    ...(cursorFenceStale ? { cursorFenceStale: true } : {}),
+  };
+}
+
+/**
+ * Whether the store reports a held whole-file maintenance lock (issue #818).
+ * A store without the capability (in-memory implementations, test fakes) has
+ * no such lock and is treated as unlocked. Read-only, and never a substitute
+ * for the store's own in-transaction guards — see
+ * {@link OutboxStore.claimForDispatch}.
+ */
+async function isMaintenanceLocked(outboxStore: OutboxStore): Promise<boolean> {
+  return outboxStore.isMaintenanceLocked ? await outboxStore.isMaintenanceLocked() : false;
+}
+
+/**
+ * The identity's current rewind generation (issue #820 review follow-up), or
+ * `undefined` when the store has no fence capability — in which case this run's
+ * cursor writes stay unfenced, exactly as before #820. `undefined` deliberately
+ * does not collapse to `0`: a store without the capability also has no retry
+ * that could bump it, whereas passing `0` to a store that *does* support fences
+ * would claim "no retry has ever rewound this identity" without having read it.
+ */
+async function readScanCursorFence(
+  outboxStore: OutboxStore,
+  identityKey: string,
+): Promise<number | undefined> {
+  return outboxStore.getScanCursorFence ? await outboxStore.getScanCursorFence(identityKey) : undefined;
 }
 
 /**

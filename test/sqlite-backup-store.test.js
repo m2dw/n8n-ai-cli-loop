@@ -309,6 +309,38 @@ describe('restoreBackup', () => {
     expect(unscoped.error).toMatch(/artifactDir/);
   });
 
+  test('refuses to complete when a task references a reviewArtifactDir that no longer exists under artifactRoot (issue #837 review)', async () => {
+    // `reviewArtifactDir` is the dedicated, never-overwritten reference to the
+    // review run that produced `review-findings.json`, carried forward across
+    // implementation retries. It must be validated the same as `artifactDir`.
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const runDir = join(artifactRoot, 'runs', 'review-run-1');
+    mkdirSync(runDir, { recursive: true });
+    await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'implementation', now: '2026-01-01T00:00:00.000Z' });
+    const raw = new Database(dbPath);
+    raw.prepare(`UPDATE tasks SET context = ? WHERE session_id = 's1' AND issue_number = 1`).run(
+      JSON.stringify({ reviewArtifactDir: runDir }),
+    );
+    raw.close();
+    const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');
+    store.close();
+
+    // The referenced directory is gone by restore time.
+    rmSync(runDir, { recursive: true, force: true });
+
+    const result = await restoreBackup(dbPath, backupResult.entry.id, backupDir, '2026-01-01T00:10:00.000Z', {
+      artifactRoot,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/reviewArtifactDir/);
+
+    // The live DB must be untouched — restore failed before the rename.
+    const stillLive = new SqliteTaskStore(dbPath);
+    const tasks = await stillLive.listSessionTasks('s1');
+    expect(tasks.map((t) => t.issueNumber)).toEqual([1]);
+    stillLive.close();
+  });
+
   test('preserves the live file it replaced via a hard link, not a rename, so dbPath is never briefly absent (issue #611 review)', async () => {
     await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'implementation', now: '2026-01-01T00:00:00.000Z' });
     const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');

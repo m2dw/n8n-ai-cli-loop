@@ -16,7 +16,11 @@
  */
 
 import { execFileSync } from "child_process";
-import { JsonSessionRegistry, DEFAULT_SESSIONS_PATH } from "../registries/json-session-registry.js";
+import {
+  JsonSessionRegistry,
+  DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
+} from "../registries/json-session-registry.js";
 import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
 import { SqliteOutboxStore } from "../stores/sqlite-outbox-store.js";
 import { SqliteContextStore } from "../stores/sqlite-context-store.js";
@@ -335,7 +339,7 @@ export async function runIntake(
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${args.sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, args.sessionsPath));
   }
 
   const workItemKind = session.workItemProvider?.provider ?? "github-issues";

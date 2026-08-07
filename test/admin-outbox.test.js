@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteOutboxStore } from '../dist/index.js';
 import { OUTBOX_MAX_ATTEMPTS } from '../dist/core/outbox.js';
+import { deriveOwnershipScanCursorKey, scanCursorKeysFor } from '../dist/core/outbox-scan-cursor.js';
 
 // Issue #607 — `admin outbox list|retry|cancel`: operator-supported inspection
 // and recovery of outbox delivery state, without raw SQLite editing.
@@ -387,6 +388,192 @@ describe('admin outbox retry', () => {
     expect(out.error).toContain(String(id));
     expect(out.error).toContain('addon-dev');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #820 — retrying a row the persisted scan cursors already passed must
+// rewind those cursors, or the "recovered" row stays invisible to every future
+// dispatch (`listPendingEntries` selects `id > afterId`). See
+// docs/outbox-scan-cursor-contract.md §13.
+// ---------------------------------------------------------------------------
+
+describe('admin outbox retry — scan cursor rewind (issue #820)', () => {
+  // The identity the session config resolves to, derived exactly as
+  // dispatch-outbox.ts derives it. Building it here from the session fields
+  // (not copying a literal out of the CLI) is what makes this a check that the
+  // CLI used the *config-derived* scope.
+  const IDENTITY = deriveOwnershipScanCursorKey({
+    sessionId: 'addon-dev',
+    githubOwner: 'm2dw',
+    githubName: 'some-repo',
+  });
+  const KEYS = scanCursorKeysFor(IDENTITY);
+
+  async function setCursors(afterId, keys = KEYS) {
+    const store = new SqliteOutboxStore(dbPath);
+    try {
+      for (const key of [keys.floor, keys.fwd, keys.bulk]) {
+        await store.setScanCursor(key, afterId);
+      }
+    } finally {
+      store.close();
+    }
+  }
+
+  async function readCursors(keys = KEYS) {
+    const store = new SqliteOutboxStore(dbPath);
+    try {
+      return {
+        floor: await store.getScanCursor(keys.floor),
+        fwd: await store.getScanCursor(keys.fwd),
+        bulk: await store.getScanCursor(keys.bulk),
+      };
+    } finally {
+      store.close();
+    }
+  }
+
+  test('preview reports the required rewind and the affected roles without mutating anything', async () => {
+    const id = await enqueue();
+    await makeDead(id);
+    await setCursors(id + 10);
+
+    const r = run(
+      'outbox', 'retry', '--session-id', 'addon-dev', '--id', String(id),
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+    );
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out.wouldRetry).toBe(true);
+    expect(out.cursorRewind.required).toBe(true);
+    expect(out.cursorRewind.roles).toEqual(['floor', 'fwd', 'bulk']);
+    expect(out.cursorRewind.targetAfterId).toBe(id - 1);
+    expect(out.hint).toContain('--yes');
+
+    // Non-mutating: neither the row nor a single cursor moved.
+    expect(await readCursors()).toEqual({ floor: id + 10, fwd: id + 10, bulk: id + 10 });
+    const store = new SqliteOutboxStore(dbPath);
+    const row = await store.getById(id);
+    store.close();
+    expect(row.deadLetterAt).toBeTruthy();
+  });
+
+  test('preview reports required: false when the cursors are already behind the row', async () => {
+    const id = await enqueue();
+    await makeDead(id);
+    await setCursors(id - 1);
+
+    const out = parse(run(
+      'outbox', 'retry', '--session-id', 'addon-dev', '--id', String(id),
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+    ));
+    expect(out.cursorRewind.required).toBe(false);
+    expect(out.cursorRewind.roles).toEqual([]);
+  });
+
+  test('preview reports only the cursor roles that actually exist', async () => {
+    const id = await enqueue();
+    await makeDead(id);
+    const store = new SqliteOutboxStore(dbPath);
+    try {
+      await store.setScanCursor(KEYS.bulk, id + 3);
+    } finally {
+      store.close();
+    }
+
+    const out = parse(run(
+      'outbox', 'retry', '--session-id', 'addon-dev', '--id', String(id),
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+    ));
+    expect(out.cursorRewind.required).toBe(true);
+    expect(out.cursorRewind.roles).toEqual(['bulk']);
+    expect(out.cursorRewind.cursors).toEqual({ bulk: id + 3 });
+  });
+
+  test('--yes rewinds the session identity cursors and reports the roles moved', async () => {
+    const id = await enqueue();
+    await makeDead(id);
+    await setCursors(id + 10);
+
+    const out = parse(run(
+      'outbox', 'retry', '--session-id', 'addon-dev', '--id', String(id), '--yes',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+    ));
+    expect(out.retried).toBe(true);
+    expect(out.cursorsRewound).toEqual(['floor', 'fwd', 'bulk']);
+    expect(await readCursors()).toEqual({ floor: id - 1, fwd: id - 1, bulk: id - 1 });
+  });
+
+  test('--yes never creates a cursor row that did not already exist', async () => {
+    const id = await enqueue();
+    await makeDead(id);
+
+    const out = parse(run(
+      'outbox', 'retry', '--session-id', 'addon-dev', '--id', String(id), '--yes',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+    ));
+    expect(out.retried).toBe(true);
+    expect(out.cursorsRewound).toEqual([]);
+    expect(await readCursors()).toEqual({ floor: undefined, fwd: undefined, bulk: undefined });
+  });
+
+  test('uses the config-derived scope: a Gitea work-item session rewinds its own cursors, not the GitHub-only ones', async () => {
+    // Repointing the session at a split-provider Gitea config changes the
+    // ownership tuple, hence the identity (§4.2/§4.6). The retry must follow
+    // the session's *current* config, so the GitHub-only identity's cursors —
+    // which no dispatch of this session will ever read — stay untouched.
+    writeSession({
+      workItemProvider: {
+        provider: 'gitea-issues',
+        auth: { mode: 'api-token', tokenEnv: 'GITEA_TOKEN' },
+        gitea: { baseUrl: 'https://gitea.example', owner: 'gt', repo: 'gt-repo' },
+      },
+    });
+    const giteaKeys = scanCursorKeysFor(deriveOwnershipScanCursorKey({
+      sessionId: 'addon-dev',
+      githubOwner: 'm2dw',
+      githubName: 'some-repo',
+      gitea: { owner: 'gt', repo: 'gt-repo', baseUrl: 'https://gitea.example' },
+    }));
+
+    const id = await enqueue();
+    await makeDead(id);
+    await setCursors(id + 10);
+    await setCursors(id + 10, giteaKeys);
+
+    const out = parse(run(
+      'outbox', 'retry', '--session-id', 'addon-dev', '--id', String(id), '--yes',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+    ));
+    expect(out.retried).toBe(true);
+    expect(out.cursorsRewound).toEqual(['floor', 'fwd', 'bulk']);
+    expect(await readCursors(giteaKeys)).toEqual({ floor: id - 1, fwd: id - 1, bulk: id - 1 });
+    // The GitHub-only identity is a different scope and must be left alone.
+    expect(await readCursors()).toEqual({ floor: id + 10, fwd: id + 10, bulk: id + 10 });
+  });
+
+  test('a repeated retry is idempotent and does not re-rewind a cursor a later dispatch advanced', async () => {
+    const id = await enqueue();
+    await makeDead(id);
+    await setCursors(id + 10);
+
+    expect(parse(run(
+      'outbox', 'retry', '--session-id', 'addon-dev', '--id', String(id), '--yes',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+    )).retried).toBe(true);
+
+    // A dispatch run afterwards legitimately advances the cursors again.
+    await setCursors(id + 10);
+
+    const second = parse(run(
+      'outbox', 'retry', '--session-id', 'addon-dev', '--id', String(id), '--yes',
+      '--sessions-path', sessionsPath, '--db-path', dbPath,
+    ));
+    expect(second.retried).toBe(false);
+    expect(second.reason).toBe('already_pending');
+    expect(second.cursorsRewound).toBeUndefined();
+    expect(await readCursors()).toEqual({ floor: id + 10, fwd: id + 10, bulk: id + 10 });
+  }, 30_000);
 });
 
 describe('admin outbox cancel', () => {

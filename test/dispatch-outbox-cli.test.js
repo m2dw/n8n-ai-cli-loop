@@ -11,6 +11,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteOutboxStore } from '../dist/stores/sqlite-outbox-store.js';
 import { SqliteContextStore } from '../dist/index.js';
+import { SqliteMaintenanceLock } from '../dist/stores/sqlite-maintenance-lock.js';
 import { main } from '../dist/cli/dispatch-outbox.js';
 
 const CLI = new URL('../dist/cli/dispatch-outbox.js', import.meta.url).pathname;
@@ -289,6 +290,103 @@ describe('dispatch-outbox — successful dispatch', () => {
     const out = JSON.parse(capturedOutput);
     expect(out.sessionId).toBe('addon-dev');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Maintenance-lock contention — an expected idle outcome (issue #818)
+// ---------------------------------------------------------------------------
+
+describe('dispatch-outbox — maintenance lock', () => {
+  // Seed one pending row and take the maintenance lock. The lock handle is
+  // returned so the caller can release it inside its own try/finally — an
+  // assertion failure must never leave a lock row (or an open connection)
+  // behind for the rest of the suite.
+  async function seedPendingRowAndLock() {
+    const store = new SqliteOutboxStore(dbPath);
+    await store.enqueue({ idempotencyKey: 'k1', topic: 'gh:comment', payload: COMMENT_PAYLOAD });
+    store.close();
+
+    const lock = new SqliteMaintenanceLock(dbPath);
+    const acquired = lock.acquire('prune:1234', '2026-01-01T00:00:00.000Z');
+    return { lock, acquired };
+  }
+
+  test('reports maintenance_locked without any side effect, and resumes once released', async () => {
+    const { lock, acquired } = await seedPendingRowAndLock();
+
+    // A runner that would fail the test if it were ever invoked: maintenance
+    // contention must fail closed *before* any external side effect.
+    let ran = false;
+    const forbiddenRunner = {
+      run: () => {
+        ran = true;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    };
+
+    let capturedOutput;
+    try {
+      expect(acquired).toEqual({ ok: true });
+      capturedOutput = await captureMainOutput(async () => {
+        await main(['--db-path', dbPath, '--sessions-path', sessionsPath, '--session-id', 'addon-dev'], forbiddenRunner);
+      });
+    } finally {
+      lock.release();
+      lock.close();
+    }
+
+    const out = JSON.parse(capturedOutput);
+    expect(out).toMatchObject({
+      ok: true,
+      outcome: 'maintenance_locked',
+      dispatched: 0,
+      failed: 0,
+      errors: [],
+      deadLettered: 0,
+      sessionId: 'addon-dev',
+    });
+    expect(ran).toBe(false);
+
+    // Releasing the lock restores normal processing of the very same row.
+    const store2 = new SqliteOutboxStore(dbPath);
+    expect(await store2.listPending()).toHaveLength(1);
+    store2.close();
+
+    const afterOutput = await captureMainOutput(async () => {
+      await main(['--db-path', dbPath, '--sessions-path', sessionsPath, '--session-id', 'addon-dev'], okRunner());
+    });
+    const after = JSON.parse(afterOutput);
+    expect(after).toMatchObject({ ok: true, dispatched: 1, failed: 0 });
+    expect(after.outcome).toBeUndefined();
+  });
+
+  // Split from the test above and given an explicit timeout because it spawns a
+  // real CLI process: the repo runs on jest's 5s default (no `testTimeout` in
+  // package.json), which a subprocess start-up can exceed on a loaded machine.
+  // Same convention as test/gh-dispatcher.test.js and the antigravity suites.
+  test('exits 0 as a real process while the lock is held', async () => {
+    const { lock, acquired } = await seedPendingRowAndLock();
+
+    let subprocess;
+    try {
+      expect(acquired).toEqual({ ok: true });
+      // Safe to use the default `gh` runner here precisely because the
+      // dispatcher must not reach it while the lock is held.
+      subprocess = runCli('--db-path', dbPath, '--sessions-path', sessionsPath, '--session-id', 'addon-dev');
+    } finally {
+      lock.release();
+      lock.close();
+    }
+
+    // Contention is an expected idle outcome, not a process failure.
+    expect(subprocess.code).toBe(0);
+    expect(JSON.parse(subprocess.stdout.trim())).toMatchObject({ ok: true, outcome: 'maintenance_locked' });
+
+    // Nothing was claimed or dispatched: the row is untouched and still pending.
+    const store = new SqliteOutboxStore(dbPath);
+    expect(await store.listPending()).toHaveLength(1);
+    store.close();
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------

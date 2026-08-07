@@ -28,6 +28,7 @@ import { join } from "path";
 import Database from "better-sqlite3";
 import {
   DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
   JsonSessionRegistry,
 } from "../registries/json-session-registry.js";
 import { DEFAULT_DB_PATH } from "../stores/sqlite-outbox-store.js";
@@ -2156,7 +2157,7 @@ async function resolveSession(
   }
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    return { error: `Unknown sessionId: ${sessionId} (not found in ${sessionsPath})` };
+    return { error: describeUnresolvedSessionId(registry, sessionId, sessionsPath) };
   }
   return {
     sessionId: session.sessionId,

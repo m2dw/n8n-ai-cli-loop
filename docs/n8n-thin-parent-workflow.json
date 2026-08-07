@@ -46,8 +46,8 @@
         "assignments": {
           "assignments": [
             {
-              "id": "cfg-session-ref",
-              "name": "sessionRef",
+              "id": "cfg-session-id",
+              "name": "sessionId",
               "value": "ai-cli-loop",
               "type": "string"
             },
@@ -84,7 +84,7 @@
         240
       ],
       "parameters": {
-        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/admin.js' context create --json --execution-id \" + $execution.id + \" --session-ref '\" + String($(\"Config\").first().json.sessionRef).replace(/'/g, \"'\\\\''\") + \"'\" }}"
+        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/admin.js' context create --json --execution-id \" + $execution.id + \" --session-id '\" + String($(\"Config\").first().json.sessionId).replace(/'/g, \"'\\\\''\") + \"'\" }}"
       },
       "typeVersion": 1
     },

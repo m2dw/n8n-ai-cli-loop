@@ -859,6 +859,63 @@ describe('SqliteTaskStore', () => {
       expect(await store.listSessionTasks('unknown-session')).toEqual([]);
     });
   });
+
+  // issue #849 review: a session-wide report used to call listEvents once per
+  // task, and the events table had no index at all — so every one of those
+  // calls scanned it. These pin both halves of the fix.
+  describe('session-wide event reads (issue #849 review)', () => {
+    async function seed(sessionId, issueNumber, type, createdAt) {
+      await store.appendEvent({ task: { sessionId, issueNumber }, type, createdAt });
+    }
+
+    test('listSessionEventsByType returns one type across the session, grouped by issue in append order', async () => {
+      await seed('addon-dev', 431, 'review.dispute.transition', '2026-06-06T00:00:02.000Z');
+      await seed('addon-dev', 430, 'phase.completed', '2026-06-06T00:00:03.000Z');
+      await seed('addon-dev', 430, 'review.dispute.transition', '2026-06-06T00:00:04.000Z');
+      await seed('addon-dev', 430, 'review.dispute.transition', '2026-06-06T00:00:05.000Z');
+      await seed('other-session', 430, 'review.dispute.transition', '2026-06-06T00:00:06.000Z');
+
+      const events = await store.listSessionEventsByType('addon-dev', 'review.dispute.transition');
+
+      expect(events.map((e) => [e.task.issueNumber, e.createdAt])).toEqual([
+        [430, '2026-06-06T00:00:04.000Z'],
+        [430, '2026-06-06T00:00:05.000Z'],
+        [431, '2026-06-06T00:00:02.000Z'],
+      ]);
+      expect(await store.listSessionEventsByType('addon-dev', 'no.such.event')).toEqual([]);
+      expect(await store.listSessionEventsByType('unknown-session', 'review.dispute.transition')).toEqual([]);
+    });
+
+    test('both event reads are index searches, not table scans', () => {
+      const raw = new Database(dbPath, { readonly: true });
+      try {
+        const plan = (sql, ...params) =>
+          raw.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params).map((r) => r.detail).join(' | ');
+
+        const perTask = plan(
+          'SELECT * FROM events WHERE session_id = ? AND issue_number = ? ORDER BY id ASC',
+          'addon-dev',
+          430,
+        );
+        const perSession = plan(
+          'SELECT * FROM events WHERE session_id = ? AND type = ? ORDER BY issue_number ASC, id ASC',
+          'addon-dev',
+          'review.dispute.transition',
+        );
+
+        for (const detail of [perTask, perSession]) {
+          expect(detail).toContain('idx_events_session_issue');
+          // `SCAN TABLE events` on older SQLite, `SCAN events` on newer.
+          expect(detail).not.toMatch(/SCAN (TABLE )?events/);
+          // The index already stores each query's ordering, so neither read
+          // pays for a sort over the session's whole event history.
+          expect(detail).not.toContain('TEMP B-TREE');
+        }
+      } finally {
+        raw.close();
+      }
+    });
+  });
 });
 
 // issue #677 review follow-up: `recoverHandoff` and GitHub intake already refuse
