@@ -1326,7 +1326,7 @@ describe('admin CLI — session-doctor subcommand', () => {
     const out = parse(r);
     for (const check of out.checks) {
       expect(typeof check.name).toBe('string');
-      expect(['repo', 'github', 'aiCli', 'storage', 'worktree']).toContain(check.category);
+      expect(['repo', 'github', 'aiCli', 'storage', 'worktree', 'registry']).toContain(check.category);
       expect(typeof check.ok).toBe('boolean');
     }
   });
@@ -1380,6 +1380,215 @@ describe('admin CLI — session-doctor subcommand', () => {
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'repoIsGit');
     expect(check.ok).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Review-dispute arbiter diagnostics (issue #839, contract §8.3)
+  // -------------------------------------------------------------------------
+
+  const ARBITER_CHECKS = ['arbiterConfig', 'arbiterCandidates', 'arbiterSelection'];
+
+  /**
+   * A doctor environment with the operator model/effort/budget overrides
+   * cleared, so a developer who exports CLAUDE_MODEL in their own shell does not
+   * change what these assertions see. Anything named in `extra` is kept.
+   */
+  function doctorEnv(extra = {}) {
+    const env = { ...process.env, PATH: `${tmpBin}:${process.env.PATH ?? ''}`, ...extra };
+    for (const key of [
+      'CLAUDE_MODEL', 'CLAUDE_EFFORT', 'CLAUDE_MAX_BUDGET_USD',
+      'CODEX_MODEL', 'CODEX_EFFORT', 'ANTIGRAVITY_BIN',
+    ]) {
+      if (!(key in extra)) delete env[key];
+    }
+    return env;
+  }
+
+  function doctorChecks(session, extraEnv = {}) {
+    writeSession(session);
+    const args = [CLI, 'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath];
+    let stdout;
+    try {
+      stdout = execFileSync(process.execPath, args, { encoding: 'utf8', env: doctorEnv(extraEnv) });
+    } catch (err) {
+      stdout = err.stdout ?? '';
+    }
+    return Object.fromEntries(JSON.parse(stdout.trim()).checks.map((c) => [c.name, c]));
+  }
+
+  test('no arbiter checks are emitted while the dispute protocol is disabled', () => {
+    for (const reviewDispute of [undefined, { enabled: false }, { arbiter: { providers: ['claude'] } }]) {
+      const checks = doctorChecks(reviewDispute === undefined ? {} : { reviewDispute });
+      for (const name of ARBITER_CHECKS) expect(checks[name]).toBeUndefined();
+    }
+  });
+
+  test('a valid cross-provider candidate reports the profile it would invoke', () => {
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'], minConfidence: 0.8 } },
+    });
+    expect(checks.arbiterConfig).toMatchObject({ category: 'aiCli', ok: true });
+    expect(checks.arbiterConfig.detail).toContain('minConfidence: 0.8');
+    expect(checks.arbiterCandidates.ok).toBe(true);
+    expect(checks.arbiterSelection.ok).toBe(true);
+    // Provider, model, effort — everything the invocation layer needs, and the
+    // parties it was proven independent of.
+    expect(checks.arbiterSelection.detail).toContain('claude/anthropic');
+    expect(checks.arbiterSelection.detail).toContain('model opus');
+    expect(checks.arbiterSelection.detail).toContain('effort high');
+    expect(checks.arbiterSelection.detail).toContain('implementation codex/openai, review codex/openai');
+    expect(checks.arbiterSelection.detail).toContain('sameProviderFallback: false');
+  });
+
+  test('an empty candidate list fails arbiterConfig with the row-19 consequence', () => {
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+      reviewDispute: { enabled: true, arbiter: { providers: [] } },
+    });
+    expect(checks.arbiterConfig.ok).toBe(false);
+    expect(checks.arbiterConfig.error).toMatch(/providers is empty/);
+    expect(checks.arbiterSelection.ok).toBe(false);
+    expect(checks.arbiterSelection.error).toMatch(/row 19/);
+  });
+
+  test('an unsupported arbiter agent id fails arbiterConfig at the config boundary', () => {
+    const checks = doctorChecks({
+      reviewDispute: { enabled: true, arbiter: { providers: ['anthropic'] } },
+    });
+    expect(checks.arbiterConfig.ok).toBe(false);
+    expect(checks.arbiterConfig.error).toMatch(/providers\[0\]/);
+    for (const name of ['arbiterCandidates', 'arbiterSelection']) {
+      expect(checks[name].ok).toBe(false);
+      expect(checks[name].error).toMatch(/^Skipped:/);
+    }
+  });
+
+  test('an agent with no arbiter invocation is reported as an unusable candidate', () => {
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['gemini'] } },
+    });
+    expect(checks.arbiterCandidates.ok).toBe(false);
+    expect(checks.arbiterCandidates.error).toMatch(/gemini\[0\]: unsupported-role/);
+    expect(checks.arbiterSelection.ok).toBe(false);
+  });
+
+  test('an unavailable candidate CLI is reported as such, not as a config problem', () => {
+    // A PATH without `claude` on it: the arbiter candidate cannot be invoked.
+    const binOnlyGh = join(tmpDir, 'bin-gh');
+    mkdirSync(binOnlyGh, { recursive: true });
+    for (const cmd of ['gh', 'codex']) {
+      writeFileSync(join(binOnlyGh, cmd), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    }
+    const checks = doctorChecks(
+      {
+        defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+        reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+      },
+      { PATH: binOnlyGh },
+    );
+    expect(checks.arbiterCandidates.ok).toBe(false);
+    expect(checks.arbiterCandidates.error).toMatch(/claude\[0\]: cli-unavailable/);
+  });
+
+  test('a provider overlap is a selection refusal, not an unusable candidate', () => {
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+    });
+    expect(checks.arbiterCandidates.ok).toBe(true);
+    expect(checks.arbiterSelection.ok).toBe(false);
+    expect(checks.arbiterSelection.error).toMatch(/claude\[0\]: same-provider-not-allowed/);
+  });
+
+  test('explicit same-provider fallback is reported, and says why it cannot be proven here', () => {
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'], allowSameProvider: true } },
+    });
+    expect(checks.arbiterConfig.detail).toContain('allowSameProvider: true');
+    expect(checks.arbiterSelection.ok).toBe(false);
+    expect(checks.arbiterSelection.error).toMatch(/same-provider-model-unknown/);
+    expect(checks.arbiterSelection.error).toMatch(/only known once the implementation and review runs exist/);
+  });
+
+  test('an invalid resolved profile is reported as a profile error', () => {
+    const checks = doctorChecks(
+      {
+        defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+        reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+      },
+      { CLAUDE_EFFORT: 'turbo' },
+    );
+    expect(checks.arbiterCandidates.ok).toBe(false);
+    expect(checks.arbiterCandidates.error).toMatch(/claude\[0\]: profile-error \(effort:invalid\)/);
+  });
+
+  test('the arbiter checks never re-probe a CLI the role checks already probed', () => {
+    const counter = join(tmpDir, 'claude-probes.log');
+    writeFileSync(join(tmpBin, 'claude'), `#!/bin/sh\necho run >> "${counter}"\nexit 0\n`, { mode: 0o755 });
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+      // Claude is named twice, and is also probed as the conflict-resolution
+      // agent by the role checks — one spawn, whatever the reporting.
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude', 'claude'] } },
+    });
+    expect(checks.arbiterSelection.ok).toBe(true);
+    expect(readFileSync(counter, 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+
+  // Issue #849 rollout regressions. The checks themselves are #839's and are
+  // deliberately NOT duplicated here; what these pin is that an ENABLED session
+  // gets an actionable, complete readiness answer out of them — which is the
+  // thing an operator turning the protocol on is relying on.
+
+  test('an enabled, healthy session reports usable implementation and review profiles', () => {
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+    });
+    // The role checks emit an entry only when the role is UNUSABLE, so their
+    // absence is the positive signal — asserted explicitly so a future change
+    // that starts failing them cannot pass this file silently.
+    expect(checks.implementationAgentCli).toBeUndefined();
+    expect(checks.reviewAgentCli).toBeUndefined();
+    // The agents behind those roles were really probed, and both answered.
+    expect(checks.codexCli.ok).toBe(true);
+    expect(checks.claudeCli.ok).toBe(true);
+    // …and all three arbiter checks pass, so an enabled session is ready.
+    for (const name of ARBITER_CHECKS) expect(checks[name].ok).toBe(true);
+  });
+
+  test('an unusable role skips the arbiter checks and says which one to fix first', () => {
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'not-an-agent', reviewAgent: 'codex' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+    });
+    expect(checks.implementationAgentCli.ok).toBe(false);
+    // The arbiter is measured AGAINST the two parties (§8.3), so with one of
+    // them unusable there is no question to answer — and the skip says so
+    // rather than reporting a second, derived failure.
+    expect(checks.arbiterConfig.ok).toBe(true);
+    for (const name of ['arbiterCandidates', 'arbiterSelection']) {
+      expect(checks[name].ok).toBe(false);
+      expect(checks[name].error).toMatch(/^Skipped: the session's default implementation\/review agents are unusable/);
+    }
+  });
+
+  test('when every arbitration would escalate, the remediation names both concrete fixes', () => {
+    const checks = doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+    });
+    expect(checks.arbiterSelection.ok).toBe(false);
+    const error = checks.arbiterSelection.error;
+    // The consequence, stated as a consequence…
+    expect(error).toMatch(/Every arbitration would escalate to a human/);
+    expect(error).toMatch(/§8\.3, §7 row 19/);
+    // …and the two things an operator can actually do about it.
+    expect(error).toMatch(/Add a candidate whose provider differs from both parties/);
+    expect(error).toMatch(/reviewDispute\.arbiter\.allowSameProvider/);
   });
 
   test('ghRepoAccess check includes detail with githubRepo', () => {

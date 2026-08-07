@@ -263,26 +263,26 @@ describe('labelsToComplexity', () => {
       .toEqual({ model: 'opus', effort: 'high', budget: '10' });
   });
 
-  test('complexity:xhigh -> fable / high / $20 (not opus / xhigh)', () => {
+  test('complexity:xhigh -> fable / xhigh / $20 (not opus)', () => {
     const result = labelsToComplexity(['agent:claude', 'status:needs-implementation', 'complexity:xhigh']);
-    expect(result).toEqual({ model: 'fable', effort: 'high', budget: '20' });
+    expect(result).toEqual({ model: 'fable', effort: 'xhigh', budget: '20' });
     expect(result).not.toEqual({ model: 'opus', effort: 'xhigh', budget: '20' });
   });
 
   test('complexity:xhigh beats complexity:high (xhigh wins)', () => {
     expect(labelsToComplexity(['complexity:high', 'complexity:xhigh']))
-      .toEqual({ model: 'fable', effort: 'high', budget: '20' });
+      .toEqual({ model: 'fable', effort: 'xhigh', budget: '20' });
   });
 
   test('all three complexity labels -> xhigh wins (xhigh > high > low)', () => {
     expect(labelsToComplexity(['complexity:low', 'complexity:high', 'complexity:xhigh']))
-      .toEqual({ model: 'fable', effort: 'high', budget: '20' });
+      .toEqual({ model: 'fable', effort: 'xhigh', budget: '20' });
   });
 
   test('session override retargets only the xhigh tier, other tiers unchanged', () => {
     const overrides = { xhigh: { model: 'claude-fable-5' } };
     expect(labelsToComplexity(['complexity:xhigh'], overrides))
-      .toEqual({ model: 'claude-fable-5', effort: 'high', budget: '20' });
+      .toEqual({ model: 'claude-fable-5', effort: 'xhigh', budget: '20' });
     expect(labelsToComplexity(['complexity:high'], overrides))
       .toEqual({ model: 'opus', effort: 'high', budget: '10' });
     expect(labelsToComplexity([], overrides))

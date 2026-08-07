@@ -1,12 +1,21 @@
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createResearchHandler } from '../dist/handlers/research.js';
+import { createResearchHandler as createResearchHandlerRaw } from '../dist/handlers/research.js';
+import { bothStreamsCommandRunner } from '../dist/handlers/command-runner.js';
+import { researchHandlerFactory } from './helpers/research-worktree-stub.js';
 import {
   EVIDENCE_REQUEST_MARKER,
   EVIDENCE_REQUEST_END_MARKER,
 } from '../dist/core/research-evidence-protocol.js';
+
+// Issue #855: research runs in a per-run detached worktree. The lifecycle is
+// stubbed here to hand back the fixture `repoRoot`, so the evidence resolver
+// still runs against the real git repository these tests build, and the
+// worktree's own fetch/create/cleanup behaviour stays covered by
+// test/research-worktree.test.js.
+const createResearchHandler = researchHandlerFactory(createResearchHandlerRaw);
 
 // ---------------------------------------------------------------------------
 // Fixtures — mirrors test/research-handler.test.js, plus a real git repository
@@ -94,6 +103,30 @@ function scriptedRunner(outputs) {
 
 const artifactDirPath = () => join(artifactRoot, 'runs', 'run-evidence-1');
 
+// Every case below that touches a real git repository or the real-contract
+// `agy` fixture spawns a handful of child processes synchronously (git
+// init/add/commit, `git ls-files`, `git cat-file` per served query, plus the
+// fixture shell itself). Jest's 5s default is wall-clock, so on a loaded
+// machine — the full suite runs many workers in parallel — those spawns can
+// exceed it and fail a passing test with a bare timeout. Give the
+// subprocess-backed cases an explicit budget, matching the existing precedent
+// in test/gh-dispatcher.test.js. Cases driven purely by `scriptedRunner`
+// against no git repository keep the default.
+//
+// The budget is deliberately far above the work these cases actually do. The
+// amount of work is bounded and small — the heaviest case spawns six children
+// (three for `initGitRepo`, one `git ls-files` snapshot, two fixture turns),
+// and the evidence loop cannot run away because `MAX_EVIDENCE_TURNS` caps it at
+// four turns whatever the fixture answers. What is unbounded is contention: a
+// full-suite run puts this file next to `admin-cli.test.js`, which spawns git
+// for several minutes on every worker, and per-spawn latency there is dominated
+// by other processes rather than by anything measured here. A 30s budget was
+// still exceeded that way (the file needed 98s of wall clock for ~60 spawns),
+// so the budget is sized for the worst contention rather than the work: a real
+// hang is caught by Jest's own suite-level failure, while a slow host is not
+// reported as a behavioural regression.
+const SPAWN_TIMEOUT_MS = 120000;
+
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'research-evidence-handler-'));
   repoRoot = join(tmpDir, 'repo');
@@ -117,7 +150,9 @@ describe('evidence disabled (default)', () => {
     expect(result.result).toBe('success');
     expect(runner.calls).toHaveLength(1);
     // Argv keeps today's shape: flags plus the positional prompt operand.
-    expect(runner.calls[0].args[0]).toBe('--print');
+    expect(runner.calls[0].args[0]).toBe('--print-timeout');
+    expect(runner.calls[0].args[1]).toBe('15m');
+    expect(runner.calls[0].args[2]).toBe('--print');
     expect(runner.calls[0].args[runner.calls[0].args.length - 1]).toContain('# Research Task');
     // The disabled run writes no evidence artifact of any kind (§2, case 47a).
     expect(existsSync(join(artifactDirPath(), 'research-issue-body.md'))).toBe(false);
@@ -127,6 +162,154 @@ describe('evidence disabled (default)', () => {
     expect(resultJson.evidence).toBeUndefined();
     expect(result.context.evidenceEnabled).toBeUndefined();
   });
+});
+
+// ---------------------------------------------------------------------------
+// Real-contract transport smoke fixture (issue #813)
+//
+// The scripted runner above never spawns a real process, so it could not
+// have caught PR #810's production bug: the installed `agy` CLI parses
+// `--print` with Go's `flag` package, which requires the flag to have a
+// value and fails argument parsing ("flag needs an argument: -print")
+// *before* the child process ever reads stdin. A bare `--print` therefore
+// fails deterministically regardless of what the runner writes to stdin.
+// This fixture is a real executable, spawned with the production
+// `bothStreamsCommandRunner`, that reproduces that exact parser contract, so
+// a regression back to argv `["--print"]` for evidence-enabled runs fails
+// this test the same way it fails against the real CLI.
+// ---------------------------------------------------------------------------
+
+function writeFakeAgy(binDir) {
+  const fakeAgy = join(binDir, 'fake-agy');
+  writeFileSync(fakeAgy, [
+    '#!/bin/sh',
+    '# Mimics the pinned agy CLI: --print is a Go flag.String and MUST have a',
+    '# value, or argument parsing fails before stdin is ever read (issue #813).',
+    'if [ "$1" = "--print" ] && [ -z "$2" ]; then',
+    '  echo "flag needs an argument: -print" >&2',
+    '  echo "Usage of agy:" >&2',
+    '  exit 2',
+    'fi',
+    'INPUT=$(cat)',
+    'case "$INPUT" in',
+    // Match the rendered evidence-response header ("## Repository Evidence
+    // (turn N of M)"), never the turn-0 channel-instructions heading ("##
+    // Repository Evidence Channel"), so turn 0 always asks and only a later
+    // turn that actually received a response answers with findings.
+    '  *"Repository Evidence (turn"*)',
+    '    echo "## Findings"',
+    '    echo',
+    '    echo "The committed evidence file records committed-json-evidence."',
+    '    ;;',
+    '  *)',
+    '    echo "Investigating."',
+    '    echo "<<<EVIDENCE_REQUEST>>>"',
+    '    echo \'{"queries":[{"id":"q1","op":"list"}]}\'',
+    '    echo "<<<END_EVIDENCE_REQUEST>>>"',
+    '    ;;',
+    'esac',
+    'exit 0',
+    '',
+  ].join('\n'), 'utf8');
+  chmodSync(fakeAgy, 0o755);
+  return fakeAgy;
+}
+
+// A second real-contract fixture (issue #813 review): some `agy` builds read
+// the prompt only from the value of `--print` and ignore stdin entirely
+// (documented in review.ts / implementation.ts as an existing compatibility
+// concern for this CLI). `writeFakeAgy` above only exercises flag parsing —
+// it always reads the real prompt from stdin — so it cannot catch a
+// regression where the positional operand stops carrying real content.
+function writeFakeAgyPositionalOnly(binDir) {
+  const fakeAgy = join(binDir, 'fake-agy-positional-only');
+  writeFileSync(fakeAgy, [
+    '#!/bin/sh',
+    '# Mimics an agy build whose --print value IS the entire prompt; stdin is',
+    '# drained but never consulted (issue #813 review). The prompt is always the',
+    '# LAST positional argument, after --print-timeout <value> --print (issue #861).',
+    'if [ "$1" = "--print" ] && [ -z "$2" ]; then',
+    '  echo "flag needs an argument: -print" >&2',
+    '  exit 2',
+    'fi',
+    'cat >/dev/null',
+    'eval "PROMPT_OPERAND=\\${$#}"',
+    'case "$PROMPT_OPERAND" in',
+    '  *"Research Task"*)',
+    '    echo "## Findings"',
+    '    echo',
+    '    echo "Read the real positional prompt."',
+    '    ;;',
+    '  *)',
+    '    echo "## Findings"',
+    '    echo',
+    '    echo "No real prompt content reached argv."',
+    '    ;;',
+    'esac',
+    'exit 0',
+    '',
+  ].join('\n'), 'utf8');
+  chmodSync(fakeAgy, 0o755);
+  return fakeAgy;
+}
+
+describe('real-contract transport smoke fixture (issue #813)', () => {
+  let fakeAgy;
+
+  beforeEach(() => {
+    fakeAgy = writeFakeAgy(tmpDir);
+  });
+
+  test('a real CLI whose --print requires a value fails argv ["--print"] with no operand', () => {
+    const result = bothStreamsCommandRunner.run(fakeAgy, ['--print'], { cwd: repoRoot, stdin: 'some prompt' });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain('flag needs an argument: -print');
+  }, SPAWN_TIMEOUT_MS);
+
+  test('the same CLI accepts --print with a value and reads the prompt from stdin', () => {
+    const result = bothStreamsCommandRunner.run(fakeAgy, ['--print', '-'], { cwd: repoRoot, stdin: 'some prompt' });
+    expect(result.exitCode).toBe(0);
+  }, SPAWN_TIMEOUT_MS);
+
+  test('evidence-enabled research reaches a real agy-shaped CLI end to end and returns non-empty findings', async () => {
+    initGitRepo();
+    process.env['ANTIGRAVITY_BIN'] = fakeAgy;
+    try {
+      const handler = createResearchHandler(CONTEXT(EVIDENCE_SESSION()), bothStreamsCommandRunner);
+      const result = await handler(makeTask());
+      expect(result.result).toBe('success');
+      expect(result.context.outcome).toBe('valid');
+      const resultJson = JSON.parse(readFileSync(join(artifactDirPath(), 'research-result.json'), 'utf8'));
+      // The model invocation succeeded (no command-failure / permission-denied)
+      // and produced non-empty findings via the evidence turn loop.
+      expect(resultJson.evidence.turns).toBeGreaterThanOrEqual(1);
+      expect(resultJson.evidence.enabled).toBe(true);
+      const manifest = JSON.parse(readFileSync(join(artifactDirPath(), 'research-evidence-manifest.json'), 'utf8'));
+      expect(manifest.outcome).toBe('valid');
+      expect(readFileSync(join(artifactDirPath(), 'research-output.md'), 'utf8')).toContain('## Findings');
+    } finally {
+      delete process.env['ANTIGRAVITY_BIN'];
+    }
+  }, SPAWN_TIMEOUT_MS);
+
+  test('a real CLI whose --print value IS the entire prompt, ignoring stdin, still receives the real prompt on the first invocation', async () => {
+    initGitRepo();
+    const fakeAgyPositionalOnly = writeFakeAgyPositionalOnly(tmpDir);
+    process.env['ANTIGRAVITY_BIN'] = fakeAgyPositionalOnly;
+    try {
+      const handler = createResearchHandler(CONTEXT(EVIDENCE_SESSION()), bothStreamsCommandRunner);
+      const result = await handler(makeTask());
+      expect(result.result).toBe('success');
+      expect(result.context.outcome).toBe('valid');
+      // Had the positional operand been the fixed placeholder instead of the
+      // real base prompt, this build would only ever have seen "-" and this
+      // assertion would fail (issue #813 review).
+      expect(readFileSync(join(artifactDirPath(), 'research-output.md'), 'utf8'))
+        .toContain('Read the real positional prompt.');
+    } finally {
+      delete process.env['ANTIGRAVITY_BIN'];
+    }
+  }, SPAWN_TIMEOUT_MS);
 });
 
 // ---------------------------------------------------------------------------
@@ -161,11 +344,20 @@ describe('evidence enabled', () => {
     expect(result.context.researchOutput).toBeUndefined();
     expect(runner.calls).toHaveLength(2);
 
-    // §6.3.1 (case 57a): stdin-only delivery — argv is exactly the profile
-    // flags, with no positional prompt operand, on every turn.
+    // §6.3.1 (case 57a): the prompt is delivered on stdin on every turn. Turn 0
+    // also carries the real base prompt positionally (issue #813 review: some
+    // `agy` builds read the prompt only from the positional `--print` value),
+    // bounded like the evidence-disabled path's own positional argument. From
+    // turn 1 onward the argv reverts to the profile flags plus the fixed,
+    // content-free stdinOperand (issue #813: the pinned `agy` CLI requires
+    // `--print` to have a value) — no positional PROMPT operand there.
+    expect(runner.calls[0].args[0]).toBe('--print-timeout');
+    expect(runner.calls[0].args[1]).toBe('15m');
+    expect(runner.calls[0].args[2]).toBe('--print');
+    expect(runner.calls[0].args[runner.calls[0].args.length - 1]).toContain('# Research Task');
+    expect(runner.calls[1].args).toEqual(['--print-timeout', '15m', '--print', '-']);
+    expect(runner.calls[1].args.join(' ').length).toBeLessThan(1024);
     for (const call of runner.calls) {
-      expect(call.args).toEqual(['--print']);
-      expect(call.args.join(' ').length).toBeLessThan(1024);
       expect(call.opts.stdin).toContain('# Research Task');
     }
     // No permission-widening flag anywhere (case 60, §8.7).
@@ -214,7 +406,7 @@ describe('evidence enabled', () => {
     });
     // The final capture holds the findings (fed from the last invocation).
     expect(readFileSync(join(dir, 'research-output.md'), 'utf8')).toContain('## Findings');
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('an invalid operator glob refuses the run at enable time, before any invocation (§4.6/§4.7)', async () => {
     initGitRepo();
@@ -230,7 +422,7 @@ describe('evidence enabled', () => {
       expect(result.error).not.toContain('/abs');
     }
     expect(runner.calls).toHaveLength(0);
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('with evidence disabled an invalid denyGlobs entry does not change behaviour (§12.2)', async () => {
     const runner = scriptedRunner([{ stdout: 'Findings.', stderr: '', exitCode: 0 }]);
@@ -250,7 +442,7 @@ describe('evidence enabled', () => {
     const resultJson = JSON.parse(readFileSync(join(artifactDirPath(), 'research-result.json'), 'utf8'));
     expect(resultJson.evidence.turns).toBe(0);
     expect(resultJson.evidence.invocations).toBe(1);
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('soft-denied reads inside the evidence channel produce structured denials, and the run still succeeds', async () => {
     initGitRepo();
@@ -282,7 +474,7 @@ describe('evidence enabled', () => {
     expect(turnRecord).not.toContain('SECRET');
     expect(runner.calls[1].opts.stdin).toContain('denied-sensitive');
     expect(runner.calls[1].opts.stdin).not.toContain('SECRET=x');
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('budget exhaustion with no findings fails with the fixed evidence outcome (case 51)', async () => {
     initGitRepo();
@@ -302,7 +494,7 @@ describe('evidence enabled', () => {
     expect(result.error).toContain('evidence/budget-exhausted');
     expect(result.error).not.toContain(tmpDir);
     expect(result.error).not.toContain('q1');
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('findings alongside a spent budget are accepted as valid (case 50)', async () => {
     initGitRepo();
@@ -317,7 +509,7 @@ describe('evidence enabled', () => {
     expect(result.context.outcome).toBe('valid');
     const resultJson = JSON.parse(readFileSync(join(artifactDirPath(), 'research-result.json'), 'utf8'));
     expect(resultJson.evidence.budgetExhausted).toBe(true);
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('two consecutive malformed request blocks with no findings end the run as evidence/protocol-error (case 41)', async () => {
     initGitRepo();
@@ -333,7 +525,7 @@ describe('evidence enabled', () => {
     expect(runner.calls).toHaveLength(2);
     // The single correction (§6.3) stated the expected form on turn 2's prompt.
     expect(runner.calls[1].opts.stdin).toContain('invalid-query');
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('snapshot failure (not a git repository) is evidence/unavailable with a content-free error (case 52)', async () => {
     // repoRoot exists but holds no git repository -> `git ls-files` fails.
@@ -347,7 +539,7 @@ describe('evidence enabled', () => {
     expect(result.error).toContain('evidence/unavailable');
     expect(result.error).not.toContain(tmpDir);
     expect(result.error).not.toContain(repoRoot);
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('non-zero exit on a turn short-circuits to command-failure with the withheld fixed-form error (case 53, §10.1)', async () => {
     initGitRepo();
@@ -362,7 +554,7 @@ describe('evidence enabled', () => {
     // No stderr interpolation on an evidence-enabled run, even with no body.
     expect(result.error).not.toContain('/secret/local/path');
     expect(result.error).toContain('Output withheld');
-  });
+  }, SPAWN_TIMEOUT_MS);
 
   test('oversized issue body is persisted verbatim and pageable through the issue-body source (case 62)', async () => {
     initGitRepo();
@@ -379,5 +571,5 @@ describe('evidence enabled', () => {
     // The served window came from the artifact, labelled as such.
     expect(runner.calls[1].opts.stdin).toContain('"contentSource":"artifact"');
     expect(runner.calls[1].opts.stdin).toContain('line one');
-  });
+  }, SPAWN_TIMEOUT_MS);
 });

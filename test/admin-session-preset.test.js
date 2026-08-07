@@ -335,3 +335,21 @@ test('session-doctor runs cleanly when the session omits the worktrees block', (
   const out = parse(r);
   expect(out.ok).toBe(true);
 });
+
+// ---------------------------------------------------------------------------
+// session-doctor tolerates non-object session entries (issue #823 review fix)
+// ---------------------------------------------------------------------------
+
+test('session-doctor finds the target session even when a null entry precedes it', () => {
+  initRepo();
+  const session = writeSession();
+  writeFileSync(sessionsPath, JSON.stringify({ sessions: [null, session] }), 'utf8');
+  const r = run(
+    '--json',
+    'session-doctor',
+    '--session-id', 'test-session',
+    '--sessions-path', sessionsPath,
+  );
+  const out = parse(r);
+  expect(out.ok).toBe(true);
+});

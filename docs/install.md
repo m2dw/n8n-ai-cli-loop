@@ -82,8 +82,16 @@ A local single-instance n8n is sufficient:
 
 ```sh
 npm install -g n8n     # if not already installed
+n8n --version          # the CLI must be runnable on this host
 n8n start              # default port 5678, runs in the foreground
 ```
+
+The supported deployment command (`admin n8n deploy`, step 7) drives this same
+**local n8n CLI v1** — it runs `n8n import:workflow`, `n8n list:workflow`, and
+`n8n update:workflow` against the database `n8n start` uses on this host. Run it
+on the n8n host, as the user that owns that database (the same `N8N_USER_FOLDER`
+/ `~/.n8n`). Deploying over the n8n REST API, or into a remote or containerized
+n8n from another machine, is not supported.
 
 ---
 
@@ -111,14 +119,15 @@ node dist/cli/run-one-phase.js --help
 
 ## 4. Deployment tree vs development tree
 
-The build writes two copies of each workflow JSON:
+The build writes a tracked template and a local deployment artifact for each
+workflow — plus one parent artifact per configured session:
 
 | Location | Purpose | CLI path baked in |
 |---|---|---|
 | `docs/n8n-thin-child-workflow.json` | **Tracked template** — commit-safe, environment-independent | `/opt/n8n-ai-cli-loop/dist/cli` (placeholder) |
-| `docs/n8n-thin-parent-workflow.json` | **Tracked template** | same placeholder |
-| `.n8n-artifacts/workflows/n8n-thin-child-workflow.json` | **Local deployment artifact** — gitignored | your machine's resolved path |
-| `.n8n-artifacts/workflows/n8n-thin-parent-workflow.json` | **Local deployment artifact** | same |
+| `docs/n8n-thin-parent-workflow.json` | **Tracked template** — generic identity, not session-specific | same placeholder |
+| `.n8n-artifacts/workflows/n8n-thin-child-workflow.json` | **Local deployment artifact** — gitignored; shared by every session | your machine's resolved path |
+| `.n8n-artifacts/workflows/ai-dev-loop-parent-<slug>-<digest>.json` | **Local deployment artifact** — one per session, named after its workflow ID | same |
 
 **Always import the files under `.n8n-artifacts/workflows/`** for a local
 deployment. They contain the correct `dist/cli` path for your checkout.
@@ -250,17 +259,184 @@ with code 1 and a clear error message before any work runs.
 
 ## 7. Generate and import the n8n workflows
 
-### Step 1 — Regenerate local artifacts (if needed)
+### The supported flow — `admin n8n deploy`
+
+One command generates this session's deployment artifacts and imports them into
+the local n8n in the order n8n needs them. It previews by default and imports
+nothing until you pass `--yes`:
+
+```sh
+# Preview: prints the plan, generates nothing, imports nothing, publishes nothing
+node dist/cli/admin.js n8n deploy --session-ref my-project
+
+# Apply
+node dist/cli/admin.js n8n deploy --session-ref my-project --yes
+```
+
+**Prerequisites**
+
+- n8n v1 installed on this host and runnable as `n8n` (see
+  [Prerequisites → n8n](#n8n)), or pass `--n8n-bin /path/to/n8n`.
+- `sessions.json` already contains the session (step 6). `--session-ref` accepts
+  a `sessionId`, a `sessionNo`, or an alias, and resolves it to the canonical
+  `sessionId` the parent workflow will drive. `--session-id` takes the canonical
+  value directly.
+- `npm run build` has been run at least once: the deployed workflows invoke
+  `dist/cli/*.js`, and the path baked into them is `<checkout>/dist/cli` (or
+  `CLI_BASE`, when set).
+
+**What it does, in order**
+
+| Step | Action |
+|---|---|
+| `generate` | Regenerates this session's artifacts under `.n8n-artifacts/workflows/`, so nothing stale can be imported |
+| `check-parent-active` | Without `--publish`: `n8n list:workflow --active=true`, to record whether the parent is already active *before* the import overwrites it |
+| `import-child` | `n8n import:workflow` for the **shared child** — first, because the parent references it by its stable ID |
+| `import-parent` | `n8n import:workflow` for this session's parent |
+| `verify-workflows` | `n8n list:workflow`: both IDs are registered, under the expected names, exactly once |
+| `verify-parent-config` | The parent artifact that was just imported declares the expected ID/name, its **Config** node holds the canonical `sessionId` you asked for, and its **Call Phase Runner** node calls the shared child |
+| `publish-parent` | Only with `--publish`: `n8n update:workflow --active=true` on the parent |
+| `restore-parent-active` | Without `--publish`: the same `update:workflow --active=true`, but only when `check-parent-active` found the parent already active |
+
+**Options**
+
+| Flag | Meaning |
+|---|---|
+| `--session-ref <ref>` / `--session-id <id>` | The session to deploy a parent workflow for (required) |
+| `--yes` | Apply. Without it nothing is generated, imported, or published |
+| `--publish` | Activate the parent once verification passes. Requires `--yes` |
+| `--project-id <id>` | Import both workflows into a specific n8n project |
+| `--n8n-bin <path>` | Path to the n8n binary (default: `n8n` from `PATH`) |
+| `--lock-dir <path>` | Directory holding the deployment locks (default: `~/.local/state/n8n-ai-cli-loop/locks`) |
+| `--sessions-path <path>` | Alternate `sessions.json` |
+| `--json` | Machine-readable output instead of the human-readable default |
+
+**Re-running is safe.** Both workflows carry stable IDs — the shared
+`ai-dev-loop-thin-phase-runner` for the child, and a `sessionId`-derived ID for
+the parent — and importing an ID that already exists **updates** that workflow
+instead of creating a second copy. Deploying the same session twice therefore
+converges rather than accumulating duplicates; if a duplicate under a *different*
+ID is ever found, verification fails and says which ID to remove.
+
+**A re-deploy never deactivates a running parent.** `import:workflow` upserts the
+whole workflow record, and the generated artifact carries `active: false` — so an
+import on its own would stop the Schedule Trigger of a session that was live. The
+deploy therefore records the parent's activation before importing and restores it
+afterwards: a parent that was active stays active, and this command only ever
+turns activation *on* (via `--publish`, or by restoring what it found). To take a
+parent out of service, deactivate it in the n8n UI or run
+`n8n update:workflow --id <parent-id> --active=false` yourself. (A running n8n
+does not observe the import at all until it restarts — see *Restart n8n after
+applying* below — so the restore is what makes the next restart come back up in
+the state you were already in.)
+
+**One deploy per parent workflow at a time.** The activation the deploy restores
+is read *before* the import that overwrites it, so two deploys of the same
+session must not interleave: a `--publish` run landing in that window would be
+undone by the other run's `active: false` artifact, with both reporting success.
+An apply therefore takes a lock scoped to the parent workflow ID (under
+`--lock-dir`, defaulting to the same lock directory as the repo and worktree
+locks) and holds it from the activation check through the restore. A second
+deploy of the same session is refused outright — it generates, imports, and
+publishes nothing, and says which process holds the lock. A crashed deploy's lock
+expires on its own after the length of one deploy plus a margin for process and
+scheduling overhead, so a slow but healthy deploy is never taken over midway, and
+a dead one is cleared in about 25 minutes. Activation changed from the n8n UI
+while a deploy is running is outside any lock this command can take.
+
+**One deploy at a time through the shared child, too.** Deploys of *different*
+sessions overlap freely except for the one thing they share: there is a single
+child workflow and a single child artifact per install, and generation rewrites
+that artifact with this run's `CLI_BASE` baked into it. A second lock — scoped to
+the child workflow ID, in the same `--lock-dir` — is therefore held from
+generation through the child import, so a run always imports the child it just
+wrote rather than one another session rewrote underneath it (or one caught
+half-written, which fails the import). It is released as soon as the child is
+imported, so the longer part of a deploy — verification, publication, restore —
+never blocks another session. A deploy refused on this lock, like one refused on
+the parent lock, generates, imports, and publishes nothing; re-run it once the
+other deploy finishes.
+
+Because that child is shared, `CLI_BASE` is an **install-wide** setting, not a
+per-session one: whichever value the most recent deploy used is the one every
+session's parent then calls through. Deploying two sessions from the same install
+with different `CLI_BASE` values is not supported — give each installation its
+own n8n, or deploy them all from one checkout.
+
+One exception, by design: if the run fails at or after the parent import, the
+restore step is skipped along with everything else, so a previously active parent
+is left **inactive** rather than re-activated with content that just failed
+verification. The output says so explicitly (`parentWasActive` in `--json`); fix
+the failure and re-run.
+
+**Verification gates publication.** A failed generate, import, or verification
+step stops the run before `publish-parent` and exits non-zero, so a parent whose
+Config points at the wrong session is never activated. Nothing is published
+unless you pass `--publish`, and `--publish` without `--yes` is rejected.
+
+**Restart n8n after applying.** The deploy drives the n8n CLI, which writes n8n's
+database from a separate process — and n8n loads its workflows, and starts its
+triggers, at startup. An n8n that was already running therefore keeps serving
+what it loaded: the imported workflow content is not live, and a parent marked
+active by `publish-parent` or `restore-parent-active` does **not** begin firing
+its Schedule Trigger. Stop and restart n8n (however you run it — foreground
+`n8n start`, systemd, pm2, a container) once the deploy succeeds:
+
+```sh
+node dist/cli/admin.js n8n deploy --session-ref my-project --yes --publish
+# then, on the n8n host:
+#   stop the running n8n, and start it again — e.g. Ctrl-C, then `n8n start`
+```
+
+The command says so on every run that wrote anything, in both output modes
+(`restartRequired: true` in `--json`) — including a run that failed partway
+through an import it had started. A run whose n8n binary never started at all
+(no `n8n` on `PATH`, a wrong `--n8n-bin`) wrote nothing and reports
+`restartRequired: false`. Deploying while n8n is stopped needs no restart beyond
+starting it.
+
+**Output.** Human-readable by default, `--json` for automation (see
+[`admin-cli-contract.md`](admin-cli-contract.md)). Local filesystem paths are
+redacted as `<path>` in both modes, so the output is safe to paste into an issue;
+the workflow IDs, names, and artifact filenames are all preserved.
+
+Once the deploy succeeds, continue to [step 8](#8-configure-the-parent-workflow)
+to confirm the Config node, then activate the Schedule Trigger when you are ready
+(or deploy again with `--publish`).
+
+### Alternative — generate and import by hand
+
+Use this when you need to inspect the artifacts before importing, or when n8n
+runs somewhere the CLI on this host cannot reach.
+
+#### Step 1 — Regenerate local artifacts (if needed)
 
 `npm run build` already ran this. To re-run alone:
 
 ```sh
 npm run build:parent-child-workflow
-# Writes .n8n-artifacts/workflows/n8n-thin-child-workflow.json
-# Writes .n8n-artifacts/workflows/n8n-thin-parent-workflow.json
+# Writes .n8n-artifacts/workflows/n8n-thin-child-workflow.json          (shared child)
+# Writes .n8n-artifacts/workflows/ai-dev-loop-parent-<slug>-<digest>.json (one per session)
+
+# Build the parent for a specific session (a sessionId, sessionNo, or alias —
+# resolved through sessions.json to the canonical sessionId):
+SESSION_REF=my-project npm run build:parent-child-workflow
+
+# …or for several sessions at once:
+SESSION_REF=my-project,other-project npm run build:parent-child-workflow
 ```
 
-### Step 2 — Import: child workflow first
+With `SESSION_REF` unset the build generates a single parent for the default
+session `ai-cli-loop` and does not read `sessions.json` at all. The parent
+workflow ID and name are derived from the canonical `sessionId`, so each session
+gets its own workflow in n8n and regenerating the same session is deterministic.
+The child is shared: one file, one import, no matter how many sessions you run.
+
+Resolving `SESSION_REF` needs the compiled session registry. On a fresh checkout
+(where `dist/` does not exist yet) the workflow-only command compiles the library
+itself before resolving, so it works without a separate `npm run build`.
+
+#### Step 2 — Import: child workflow first
 
 > **Order matters.** The parent's **Call Phase Runner** node references the
 > child by its stable string ID (`ai-dev-loop-thin-phase-runner`). Importing the
@@ -271,18 +447,25 @@ npm run build:parent-child-workflow
 3. Select `.n8n-artifacts/workflows/n8n-thin-child-workflow.json`.
 4. Save the workflow. Confirm its ID is `ai-dev-loop-thin-phase-runner`.
 
-### Step 3 — Import: parent workflow
+#### Step 3 — Import: parent workflow
 
-5. Import `.n8n-artifacts/workflows/n8n-thin-parent-workflow.json`.
-6. Save the workflow. Confirm its ID is `ai-dev-loop-thin-parent`.
+5. Import the session's parent artifact,
+   `.n8n-artifacts/workflows/ai-dev-loop-parent-<slug>-<digest>.json`.
+6. Save the workflow. Confirm its ID matches the artifact filename.
 7. **Do not activate** the Schedule Trigger yet.
+8. Running more than one session? Repeat steps 5–7 for each session's parent
+   artifact. The child stays imported once.
 
 ---
 
 ## 8. Configure the parent workflow
 
-Open the **Config** (Set) node in the parent workflow and set **`sessionRef`**
-to a value that identifies your session:
+The **Config** (Set) node already holds the canonical **`sessionId`** the
+artifact was generated for, so there is normally nothing to change. Open it to
+confirm the session is the one you expect.
+
+`SESSION_REF` accepts any of these at generation time; each is resolved to the
+canonical `sessionId` before it is written into the workflow:
 
 | Value type | Example | Resolves via |
 |---|---|---|
@@ -290,10 +473,24 @@ to a value that identifies your session:
 | Numeric `sessionNo` | `1` | session number |
 | String alias | `proj` | alias list |
 
-`sessionRef` is the only field you edit in the parent workflow. The Config node
-resolves it to the canonical `sessionId` at runtime via `admin context create`
-and stores the session identity internally — neither `sessionRef` nor
-`sessionId` is embedded in the child workflow nodes.
+Entries are separated by commas and each one is trimmed. A reference that itself
+contains a comma — or that begins or ends with a space, both of which
+`sessions.json` allows — is written with a backslash before the character that
+must be taken literally:
+
+```sh
+# One session whose sessionId is literally "team,a"
+SESSION_REF='team\,a' npm run build:parent-child-workflow
+```
+
+`\\` means a literal backslash; a value ending in a lone backslash is rejected
+as a truncated escape.
+
+Because resolution happens when the artifact is generated, a later edit to
+`sessionNo` or `aliases` in `sessions.json` cannot silently repoint an imported
+workflow at a different session. Editing `sessionId` in the Config node
+repoints this parent deliberately; nothing else in the parent or child needs to
+change, since the child receives only `contextId`.
 
 > **Do not edit the child workflow nodes.** The CLI path and command expressions
 > are generator-time constants. Re-run `npm run build:parent-child-workflow`
@@ -341,7 +538,9 @@ research agent CLI is available.
 - [ ] Research agent CLI is available (`agy --version` or `echo $ANTIGRAVITY_BIN`)
 - [ ] n8n is running
 - [ ] Child workflow imported with ID `ai-dev-loop-thin-phase-runner`
-- [ ] Parent workflow imported with ID `ai-dev-loop-thin-parent`
+- [ ] Parent workflow imported with the ID its artifact filename states —
+      `ai-dev-loop-parent-<slug>-<digest>` for the session under test (the
+      generic `ai-dev-loop-thin-parent` ID belongs to the `docs/` template only)
 - [ ] Parent workflow **not yet activated** (Schedule Trigger off)
 
 ### Step 1 — Dry-run intake

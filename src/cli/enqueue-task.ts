@@ -15,7 +15,11 @@
  * Writes one JSON object to stdout.
  */
 
-import { JsonSessionRegistry, DEFAULT_SESSIONS_PATH } from "../registries/json-session-registry.js";
+import {
+  JsonSessionRegistry,
+  DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
+} from "../registries/json-session-registry.js";
 import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
 import { ASSIGNMENT_CONTEXT_KEY, resolveAssignment } from "../core/assignment.js";
 import type { ResolvedAssignment } from "../core/assignment.js";
@@ -152,7 +156,7 @@ async function main(): Promise<void> {
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   // Apply session defaults for missing agents.

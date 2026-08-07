@@ -22,6 +22,23 @@ export class MemoryTaskStore implements TaskStore {
   readonly #events: TaskEvent[] = [];
   readonly #outboxEntries = new Map<string, { topic: string; payload: unknown; createdAt: string }>();
 
+  /**
+   * The outbox rows this store has retained, in insertion order (issue #848).
+   *
+   * A read-only view, and the reason it exists: `completePhaseWithEffects`
+   * already commits effects here exactly as the SQLite store does, but with the
+   * map private there was no way to OBSERVE that — so "both stores behave
+   * equivalently" could only be asserted against SQLite. This makes the
+   * in-memory double's outbox as inspectable as the real table, which is what
+   * lets the same test table drive both implementations.
+   */
+  listOutboxEffects(): { idempotencyKey: string; topic: string; payload: unknown; createdAt: string }[] {
+    return [...this.#outboxEntries.entries()].map(([idempotencyKey, entry]) => ({
+      idempotencyKey,
+      ...entry,
+    }));
+  }
+
   async enqueueTask(input: EnqueueTaskInput): Promise<StoreResult<AiTask>> {
     const now = input.now ?? new Date().toISOString();
     const key = taskMapKey(input);
@@ -371,6 +388,10 @@ export class MemoryTaskStore implements TaskStore {
     if (!result.ok) return result;
 
     await this.appendEvent(transition.event);
+    // Issue #840: same transaction, same ordering as the SQLite store — the
+    // completion's own event first, then the events that describe what the
+    // patch it just committed did.
+    for (const extra of transition.extraEvents ?? []) await this.appendEvent(extra);
     for (const effect of effects) this.#applyOutboxEffect(effect);
     return result;
   }

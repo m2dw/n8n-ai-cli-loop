@@ -1,7 +1,13 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { JsonSessionRegistry, resolveSessionRef } from '../dist/index.js';
+import {
+  JsonSessionRegistry,
+  resolveSessionRef,
+  SessionReferenceError,
+  SessionRegistryFatalError,
+} from '../dist/index.js';
+import { resolvePublicationPolicy } from '../dist/core/research-publication.js';
 
 const SESSION_A = {
   sessionId: 'addon-dev',
@@ -30,6 +36,38 @@ let jsonPath;
 
 function writeSessions(...sessions) {
   writeFileSync(jsonPath, JSON.stringify({ sessions }), 'utf8');
+}
+
+/**
+ * Construct a registry over the sessions.json just written and assert that the
+ * entry at `index` (default 0 — every helper call site in this file writes a
+ * single offending entry) was quarantined as `invalid_entry` with a message
+ * matching `pattern`, rather than the whole registry failing to construct
+ * (issue #823). Returns the diagnostic message so callers can also assert on
+ * what it does NOT contain (e.g. a secret value).
+ */
+function expectInvalidEntry(pattern, { index = 0 } = {}) {
+  const registry = new JsonSessionRegistry(jsonPath);
+  const diagnostics = registry.getDiagnostics();
+  const match = diagnostics.find((d) => d.kind === 'invalid_entry' && d.indices.includes(index));
+  expect(match).toBeDefined();
+  expect(match.message).toMatch(pattern);
+  return match.message;
+}
+
+/**
+ * Construct a registry over the sessions.json just written and assert that
+ * some `ambiguous_reference` diagnostic matches `pattern` and quarantines
+ * exactly entries [0, 1] (every collision test in this file writes exactly two
+ * colliding entries). Returns the diagnostic message.
+ */
+function expectAmbiguous(pattern) {
+  const registry = new JsonSessionRegistry(jsonPath);
+  const diagnostics = registry.getDiagnostics();
+  const match = diagnostics.find((d) => d.kind === 'ambiguous_reference' && pattern.test(d.message));
+  expect(match).toBeDefined();
+  expect([...match.indices].sort((a, b) => a - b)).toEqual([0, 1]);
+  return match.message;
 }
 
 beforeEach(() => {
@@ -116,27 +154,27 @@ describe('JsonSessionRegistry', () => {
 
   test('rejects legacy worktrees.enabled with an actionable error (issue #731)', () => {
     writeSessions({ ...SESSION_A, worktrees: { enabled: false } });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/worktrees\.enabled is no longer supported/);
+    expectInvalidEntry(/worktrees\.enabled is no longer supported/);
   });
 
   test('rejects legacy worktrees.enabled: true too', () => {
     writeSessions({ ...SESSION_A, worktrees: { enabled: true, root: '/custom/worktree/root' } });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/worktrees\.enabled is no longer supported/);
+    expectInvalidEntry(/worktrees\.enabled is no longer supported/);
   });
 
   test('rejects relative repoRoot', () => {
     writeSessions({ ...SESSION_A, repoRoot: 'relative/path' });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/absolute/);
+    expectInvalidEntry(/absolute/);
   });
 
-  test('rejects duplicate sessionId', () => {
+  test('quarantines both entries on a duplicate sessionId (issue #823)', () => {
     writeSessions(SESSION_A, { ...SESSION_B, sessionId: SESSION_A.sessionId });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/Duplicate sessionId/);
+    expectAmbiguous(new RegExp(`Ambiguous session reference "${SESSION_A.sessionId}"`));
   });
 
-  test('rejects duplicate repoKey', () => {
+  test('quarantines both entries on a duplicate repoKey (issue #823)', () => {
     writeSessions(SESSION_A, { ...SESSION_B, repoKey: SESSION_A.repoKey });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/Duplicate repoKey/);
+    expectAmbiguous(new RegExp(`Ambiguous repoKey reference "${SESSION_A.repoKey}"`));
   });
 
   test('rejects missing sessions.json with explicit error', () => {
@@ -147,7 +185,7 @@ describe('JsonSessionRegistry', () => {
 
   test('rejects githubRepo not in owner/name format', () => {
     writeSessions({ ...SESSION_A, githubRepo: 'nodomain' });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/owner\/name/);
+    expectInvalidEntry(/owner\/name/);
   });
 
   test('accepts optional baseBranch and exposes it on resolved session', async () => {
@@ -166,7 +204,7 @@ describe('JsonSessionRegistry', () => {
 
   test('rejects empty string baseBranch', () => {
     writeSessions({ ...SESSION_A, baseBranch: '' });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/baseBranch/);
+    expectInvalidEntry(/baseBranch/);
   });
 
   test('listSessions returns independent copies (no aliasing)', async () => {
@@ -176,6 +214,104 @@ describe('JsonSessionRegistry', () => {
     s1.defaults.implementationAgent = 'gemini';
     const [s2] = await registry.listSessions();
     expect(s2.defaults.implementationAgent).toBe('claude');
+  });
+
+  describe('reviewDispute configuration (docs/review-dispute-contract.md §6.1)', () => {
+    test('is absent by default', async () => {
+      writeSessions(SESSION_A);
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.reviewDispute).toBeUndefined();
+    });
+
+    test('accepts an enabled protocol with lowered limits and an arbiter policy', async () => {
+      writeSessions({
+        ...SESSION_A,
+        reviewDispute: {
+          enabled: true,
+          limits: { maxVersionsPerLineage: 1, maxReconsiderationsPerLineage: 0, maxEvidenceRoundsPerLineage: 0 },
+          arbiter: { providers: ['gemini'], minConfidence: 0.8 },
+        },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.reviewDispute).toEqual({
+        enabled: true,
+        limits: { maxVersionsPerLineage: 1, maxReconsiderationsPerLineage: 0, maxEvidenceRoundsPerLineage: 0 },
+        arbiter: { providers: ['gemini'], minConfidence: 0.8 },
+      });
+    });
+
+    test('returned sessions do not alias the stored limits or arbiter providers', async () => {
+      writeSessions({
+        ...SESSION_A,
+        reviewDispute: {
+          enabled: true,
+          limits: { maxVersionsPerLineage: 1 },
+          arbiter: { providers: ['gemini'] },
+        },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+
+      const byId = await registry.getSessionById('addon-dev');
+      byId.reviewDispute.limits.maxVersionsPerLineage = 99;
+      byId.reviewDispute.arbiter.providers.push('claude');
+
+      const byRepoKey = await registry.getSessionByRepoKey('thunderbird-auth-results-filter');
+      expect(byRepoKey.reviewDispute.limits.maxVersionsPerLineage).toBe(1);
+      expect(byRepoKey.reviewDispute.arbiter.providers).toEqual(['gemini']);
+
+      byRepoKey.reviewDispute.limits.maxVersionsPerLineage = 42;
+      byRepoKey.reviewDispute.arbiter.providers.length = 0;
+
+      const [listed] = await registry.listSessions();
+      expect(listed.reviewDispute.limits.maxVersionsPerLineage).toBe(1);
+      expect(listed.reviewDispute.arbiter.providers).toEqual(['gemini']);
+    });
+
+    test('rejects at session load a limit that would leave a state with no next action', () => {
+      // §6.1: fail closed — the protocol never starts half-enabled. A session
+      // that wants it off says `enabled: false`.
+      for (const key of [
+        'maxRebuttalsPerVersion',
+        'maxVersionsPerLineage',
+        'maxArbitrationPassesPerLineage',
+        'maxMalformedArbiterAttemptsPerLineage',
+      ]) {
+        writeSessions({ ...SESSION_A, reviewDispute: { enabled: true, limits: { [key]: 0 } } });
+        expectInvalidEntry(/must not be lower than 1/);
+      }
+    });
+
+    test('rejects a raised limit, an unknown limit, and a bad arbiter threshold', () => {
+      writeSessions({ ...SESSION_A, reviewDispute: { limits: { maxVersionsPerLineage: 3 } } });
+      expectInvalidEntry(/may only be lowered/);
+
+      writeSessions({ ...SESSION_A, reviewDispute: { limits: { maxDebateRounds: 5 } } });
+      expectInvalidEntry(/is not a review-dispute limit/);
+
+      writeSessions({ ...SESSION_A, reviewDispute: { arbiter: { minConfidence: 2 } } });
+      expectInvalidEntry(/minConfidence must be within \[0, 1\]/);
+
+      writeSessions({ ...SESSION_A, reviewDispute: { arbiter: { model: 'x' } } });
+      expectInvalidEntry(/is not a known arbiter setting/);
+
+      writeSessions({ ...SESSION_A, reviewDispute: { enabled: 'yes' } });
+      expectInvalidEntry(/enabled must be a boolean/);
+    });
+
+    test('rejects an unknown top-level review-dispute key instead of silently disabling', () => {
+      // A misspelled `enabled` would otherwise resolve to "protocol off" —
+      // the safeguards would be configured and inert.
+      writeSessions({ ...SESSION_A, reviewDispute: { enable: true } });
+      expectInvalidEntry(/reviewDispute\.enable is not a known review-dispute setting/);
+
+      writeSessions({
+        ...SESSION_A,
+        reviewDispute: { enabled: true, limit: { maxVersionsPerLineage: 1 } },
+      });
+      expectInvalidEntry(/reviewDispute\.limit is not a known review-dispute setting/);
+    });
   });
 
   describe('dependencySync configuration', () => {
@@ -228,33 +364,33 @@ describe('JsonSessionRegistry', () => {
 
     test('still validates execution fields that ARE supplied on a disabled block', () => {
       writeSessions({ ...SESSION_A, dependencySync: { enabled: false, triggerPaths: [123] } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/triggerPaths\[0\] must be a non-empty string/);
+      expectInvalidEntry(/triggerPaths\[0\] must be a non-empty string/);
     });
 
     test('rejects non-boolean enabled', () => {
       writeSessions({ ...SESSION_A, dependencySync: { ...DEP_SYNC, enabled: 'yes' } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/dependencySync.enabled must be a boolean/);
+      expectInvalidEntry(/dependencySync.enabled must be a boolean/);
     });
 
     test('rejects empty triggerPaths', () => {
       writeSessions({ ...SESSION_A, dependencySync: { ...DEP_SYNC, triggerPaths: [] } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/triggerPaths must be a non-empty array/);
+      expectInvalidEntry(/triggerPaths must be a non-empty array/);
     });
 
     test('rejects missing command', () => {
       const { command, ...withoutCommand } = DEP_SYNC;
       writeSessions({ ...SESSION_A, dependencySync: withoutCommand });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/dependencySync.command must be a non-empty string/);
+      expectInvalidEntry(/dependencySync.command must be a non-empty string/);
     });
 
     test('rejects non-integer timeoutMs', () => {
       writeSessions({ ...SESSION_A, dependencySync: { ...DEP_SYNC, timeoutMs: 0 } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/timeoutMs must be a positive integer/);
+      expectInvalidEntry(/timeoutMs must be a positive integer/);
     });
 
     test('rejects non-string entries in expectedOutputs', () => {
       writeSessions({ ...SESSION_A, dependencySync: { ...DEP_SYNC, expectedOutputs: [123] } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/expectedOutputs\[0\] must be a non-empty string/);
+      expectInvalidEntry(/expectedOutputs\[0\] must be a non-empty string/);
     });
 
     test('resolved dependencySync arrays are independent copies (no aliasing)', async () => {
@@ -322,33 +458,33 @@ describe('JsonSessionRegistry', () => {
 
     test('still validates execution fields that ARE supplied on a disabled block', () => {
       writeSessions({ ...SESSION_A, environmentPrepare: { enabled: false, cacheKeyFiles: [123] } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/cacheKeyFiles\[0\] must be a non-empty string/);
+      expectInvalidEntry(/cacheKeyFiles\[0\] must be a non-empty string/);
     });
 
     test('rejects non-boolean enabled', () => {
       writeSessions({ ...SESSION_A, environmentPrepare: { ...ENV_PREPARE, enabled: 'yes' } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/environmentPrepare.enabled must be a boolean/);
+      expectInvalidEntry(/environmentPrepare.enabled must be a boolean/);
     });
 
     test('rejects missing command when enabled', () => {
       const { command, ...withoutCommand } = ENV_PREPARE;
       writeSessions({ ...SESSION_A, environmentPrepare: withoutCommand });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/environmentPrepare.command must be a non-empty string/);
+      expectInvalidEntry(/environmentPrepare.command must be a non-empty string/);
     });
 
     test('rejects non-boolean allowLifecycleScripts', () => {
       writeSessions({ ...SESSION_A, environmentPrepare: { ...ENV_PREPARE, allowLifecycleScripts: 'yes' } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/allowLifecycleScripts must be a boolean/);
+      expectInvalidEntry(/allowLifecycleScripts must be a boolean/);
     });
 
     test('rejects non-integer timeoutMs', () => {
       writeSessions({ ...SESSION_A, environmentPrepare: { ...ENV_PREPARE, timeoutMs: 0 } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/timeoutMs must be a positive integer/);
+      expectInvalidEntry(/timeoutMs must be a positive integer/);
     });
 
     test('rejects non-string entries in cacheKeyFiles', () => {
       writeSessions({ ...SESSION_A, environmentPrepare: { ...ENV_PREPARE, cacheKeyFiles: [123] } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/cacheKeyFiles\[0\] must be a non-empty string/);
+      expectInvalidEntry(/cacheKeyFiles\[0\] must be a non-empty string/);
     });
 
     test('resolved environmentPrepare cacheKeyFiles is an independent copy (no aliasing)', async () => {
@@ -392,17 +528,17 @@ describe('JsonSessionRegistry', () => {
 
     test('rejects non-boolean enabled', () => {
       writeSessions({ ...SESSION_A, codex: { contextMode: { enabled: 'yes', config: ['context_mode=on'] } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/contextMode.enabled must be a boolean/);
+      expectInvalidEntry(/contextMode.enabled must be a boolean/);
     });
 
     test('rejects enabled block with no invocation form', () => {
       writeSessions({ ...SESSION_A, codex: { contextMode: { enabled: true } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/no invocation form is configured/);
+      expectInvalidEntry(/no invocation form is configured/);
     });
 
     test('rejects a config entry that is not key=value', () => {
       writeSessions({ ...SESSION_A, codex: { contextMode: { enabled: true, config: ['bogus'] } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/config\[0\] must be a key=value override/);
+      expectInvalidEntry(/config\[0\] must be a key=value override/);
     });
 
     test('resolved codex config arrays are independent copies (no aliasing)', async () => {
@@ -432,12 +568,12 @@ describe('JsonSessionRegistry', () => {
 
     test('rejects a non-string model', () => {
       writeSessions({ ...SESSION_A, codex: { model: 42 } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/model must be a non-empty string/);
+      expectInvalidEntry(/model must be a non-empty string/);
     });
 
     test('rejects an empty-string model', () => {
       writeSessions({ ...SESSION_A, codex: { model: '   ' } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/model must be a non-empty string/);
+      expectInvalidEntry(/model must be a non-empty string/);
     });
 
     test('coexists with contextMode in the same block', async () => {
@@ -482,22 +618,22 @@ describe('JsonSessionRegistry', () => {
 
     test('rejects research.antigravity.model that is an empty string', () => {
       writeSessions({ ...SESSION_A, research: { antigravity: { model: '' } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.antigravity\.model must be a non-empty string/);
+      expectInvalidEntry(/research\.antigravity\.model must be a non-empty string/);
     });
 
     test('rejects research.antigravity.model that is not a string', () => {
       writeSessions({ ...SESSION_A, research: { antigravity: { model: 42 } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.antigravity\.model must be a non-empty string/);
+      expectInvalidEntry(/research\.antigravity\.model must be a non-empty string/);
     });
 
     test('rejects research.antigravity that is not an object', () => {
       writeSessions({ ...SESSION_A, research: { antigravity: 'Gemini 3.1 Pro (Low)' } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.antigravity must be an object/);
+      expectInvalidEntry(/research\.antigravity must be an object/);
     });
 
     test('rejects research that is not an object', () => {
       writeSessions({ ...SESSION_A, research: 'Gemini 3.1 Pro (Low)' });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research must be an object/);
+      expectInvalidEntry(/research must be an object/);
     });
 
     test('resolved research config is an independent copy (no aliasing)', async () => {
@@ -507,6 +643,85 @@ describe('JsonSessionRegistry', () => {
       s1.research.antigravity.model = 'mutated';
       const s2 = await registry.getSessionById('addon-dev');
       expect(s2.research.antigravity.model).toBe('Gemini 3.1 Pro (Low)');
+    });
+  });
+
+  describe('research.antigravity.printTimeout configuration (issue #861)', () => {
+    test('accepts a research.antigravity.printTimeout config', async () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '20m' } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research).toEqual({ antigravity: { printTimeout: '20m' } });
+    });
+
+    test('accepts model and printTimeout together', async () => {
+      writeSessions({
+        ...SESSION_A,
+        research: { antigravity: { model: 'Gemini 3.1 Pro (Low)', printTimeout: '30m' } },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research).toEqual({
+        antigravity: { model: 'Gemini 3.1 Pro (Low)', printTimeout: '30m' },
+      });
+    });
+
+    test('accepts a compound duration (minutes and seconds)', async () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '45m20s' } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research.antigravity.printTimeout).toBe('45m20s');
+    });
+
+    test('accepts exactly the 60-minute bound', async () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '1h' } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research.antigravity.printTimeout).toBe('1h');
+    });
+
+    test('rejects an empty string', () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '' } } });
+      expectInvalidEntry(/research\.antigravity\.printTimeout must be a non-empty string/);
+    });
+
+    test('rejects a malformed duration', () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: 'fifteen minutes' } } });
+      expectInvalidEntry(/research\.antigravity\.printTimeout is not a valid duration/);
+    });
+
+    test('rejects a value with no recognized unit', () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '900' } } });
+      expectInvalidEntry(/research\.antigravity\.printTimeout is not a valid duration/);
+    });
+
+    test('rejects a zero duration', () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '0m' } } });
+      expectInvalidEntry(/research\.antigravity\.printTimeout must be greater than zero/);
+    });
+
+    test('rejects a negative duration', () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '-15m' } } });
+      expectInvalidEntry(/research\.antigravity\.printTimeout is not a valid duration/);
+    });
+
+    test('rejects an excessively large duration', () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '10h' } } });
+      expectInvalidEntry(/research\.antigravity\.printTimeout must not exceed 60 minutes/);
+    });
+
+    test('rejects a non-string value', () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: 900 } } });
+      expectInvalidEntry(/research\.antigravity\.printTimeout must be a non-empty string/);
+    });
+
+    test('resolved research config is an independent copy (no aliasing)', async () => {
+      writeSessions({ ...SESSION_A, research: { antigravity: { printTimeout: '20m' } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const s1 = await registry.getSessionById('addon-dev');
+      s1.research.antigravity.printTimeout = 'mutated';
+      const s2 = await registry.getSessionById('addon-dev');
+      expect(s2.research.antigravity.printTimeout).toBe('20m');
     });
   });
 
@@ -544,27 +759,27 @@ describe('JsonSessionRegistry', () => {
 
     test('rejects research.evidence that is not an object', () => {
       writeSessions({ ...SESSION_A, research: { evidence: true } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence must be an object/);
+      expectInvalidEntry(/research\.evidence must be an object/);
     });
 
     test('rejects research.evidence.enabled that is not a boolean', () => {
       writeSessions({ ...SESSION_A, research: { evidence: { enabled: 'yes' } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence\.enabled must be a boolean/);
+      expectInvalidEntry(/research\.evidence\.enabled must be a boolean/);
     });
 
     test('rejects research.evidence.denyGlobs that is not an array of strings', () => {
       writeSessions({ ...SESSION_A, research: { evidence: { denyGlobs: 'secrets/**' } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence\.denyGlobs must be an array of strings/);
+      expectInvalidEntry(/research\.evidence\.denyGlobs must be an array of strings/);
     });
 
     test('rejects research.evidence.generatedGlobs entries that are not strings', () => {
       writeSessions({ ...SESSION_A, research: { evidence: { generatedGlobs: [42] } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence\.generatedGlobs\[0\] must be a non-empty string/);
+      expectInvalidEntry(/research\.evidence\.generatedGlobs\[0\] must be a non-empty string/);
     });
 
     test('rejects research.evidence.maxTurns that is not a positive integer', () => {
       writeSessions({ ...SESSION_A, research: { evidence: { maxTurns: 0 } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/research\.evidence\.maxTurns must be a positive integer/);
+      expectInvalidEntry(/research\.evidence\.maxTurns must be a positive integer/);
     });
 
     test('resolved evidence config is an independent copy (no aliasing)', async () => {
@@ -575,6 +790,97 @@ describe('JsonSessionRegistry', () => {
       s1.research.evidence.denyGlobs.push('mutated/**');
       const s2 = await registry.getSessionById('addon-dev');
       expect(s2.research.evidence).toEqual({ enabled: true, denyGlobs: ['secrets/**'] });
+    });
+  });
+
+  describe('research publication configuration (issue #834)', () => {
+    test('preserves a full research.publication block', async () => {
+      writeSessions({
+        ...SESSION_A,
+        research: { publication: { mode: 'sanitized_summary', maxChars: 8000 } },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research).toEqual({
+        publication: { mode: 'sanitized_summary', maxChars: 8000 },
+      });
+    });
+
+    test('a configured sanitized_summary session actually resolves out of local_only', async () => {
+      writeSessions({ ...SESSION_A, research: { publication: { mode: 'sanitized_summary' } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(resolvePublicationPolicy(session.research?.publication).mode).toBe('sanitized_summary');
+    });
+
+    test('publication survives alongside the other research blocks', async () => {
+      writeSessions({
+        ...SESSION_A,
+        research: {
+          antigravity: { model: 'Gemini 3.1 Pro (Low)' },
+          evidence: { enabled: true },
+          publication: { mode: 'sanitized_summary' },
+        },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research).toEqual({
+        antigravity: { model: 'Gemini 3.1 Pro (Low)' },
+        evidence: { enabled: true },
+        publication: { mode: 'sanitized_summary' },
+      });
+    });
+
+    test('accepts an empty research.publication block', async () => {
+      writeSessions({ ...SESSION_A, research: { publication: {} } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research).toEqual({ publication: {} });
+    });
+
+    test('rejects research.publication that is not an object', () => {
+      writeSessions({ ...SESSION_A, research: { publication: 'sanitized_summary' } });
+      expectInvalidEntry(/research\.publication must be an object/);
+    });
+
+    test('rejects an unrecognized research.publication.mode rather than silently withholding', () => {
+      writeSessions({ ...SESSION_A, research: { publication: { mode: 'sanitised_summary' } } });
+      expectInvalidEntry(/research\.publication\.mode must be one of: local_only, sanitized_summary/);
+    });
+
+    test('preserves the untrusted-inputs acknowledgment', async () => {
+      writeSessions({
+        ...SESSION_A,
+        research: { publication: { mode: 'sanitized_summary', allowUntrustedInputs: true } },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.research).toEqual({
+        publication: { mode: 'sanitized_summary', allowUntrustedInputs: true },
+      });
+      expect(resolvePublicationPolicy(session.research.publication).allowUntrustedInputs).toBe(true);
+    });
+
+    test('rejects a non-boolean allowUntrustedInputs rather than coercing it', () => {
+      // `"false"` is truthy; a coerced acknowledgment would publish reports from
+      // runs the operator meant to keep local.
+      writeSessions({ ...SESSION_A, research: { publication: { allowUntrustedInputs: 'false' } } });
+      expectInvalidEntry(/research\.publication\.allowUntrustedInputs must be a boolean/);
+    });
+
+    test('rejects research.publication.maxChars that is not a positive integer', () => {
+      writeSessions({ ...SESSION_A, research: { publication: { mode: 'sanitized_summary', maxChars: 0 } } });
+      expectInvalidEntry(/research\.publication\.maxChars must be a positive integer/);
+    });
+
+    test('resolved publication config is an independent copy (no aliasing)', async () => {
+      writeSessions({ ...SESSION_A, research: { publication: { mode: 'sanitized_summary', maxChars: 8000 } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const s1 = await registry.getSessionById('addon-dev');
+      s1.research.publication.mode = 'local_only';
+      s1.research.publication.maxChars = 1;
+      const s2 = await registry.getSessionById('addon-dev');
+      expect(s2.research.publication).toEqual({ mode: 'sanitized_summary', maxChars: 8000 });
     });
   });
 
@@ -620,17 +926,17 @@ describe('JsonSessionRegistry', () => {
 
     test('rejects claude.complexityProfiles.xhigh.model that is an empty string', () => {
       writeSessions({ ...SESSION_A, claude: { complexityProfiles: { xhigh: { model: '' } } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/claude\.complexityProfiles\.xhigh\.model must be a non-empty string/);
+      expectInvalidEntry(/claude\.complexityProfiles\.xhigh\.model must be a non-empty string/);
     });
 
     test('rejects claude.complexityProfiles.xhigh that is not an object', () => {
       writeSessions({ ...SESSION_A, claude: { complexityProfiles: { xhigh: 'fable' } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/claude\.complexityProfiles\.xhigh must be an object/);
+      expectInvalidEntry(/claude\.complexityProfiles\.xhigh must be an object/);
     });
 
     test('rejects claude that is not an object', () => {
       writeSessions({ ...SESSION_A, claude: 'fable' });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/claude must be an object/);
+      expectInvalidEntry(/claude must be an object/);
     });
 
     test('resolved claude config is an independent copy (no aliasing)', async () => {
@@ -707,7 +1013,7 @@ describe('JsonSessionRegistry', () => {
       });
       // `*Key` references are not yet wired to a runtime resolver for github-app
       // auth, so the validator rejects them in favor of the `*Env` form.
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/appIdKey is not supported yet/);
+      expectInvalidEntry(/appIdKey is not supported yet/);
     });
 
     test('parses api-token auth referencing secrets by credential key', async () => {
@@ -740,7 +1046,7 @@ describe('JsonSessionRegistry', () => {
           },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/tokenEnv and .*tokenKey are mutually exclusive/);
+      expectInvalidEntry(/tokenEnv and .*tokenKey are mutually exclusive/);
     });
 
     test('rejects credential key that is not a valid reference', () => {
@@ -754,7 +1060,7 @@ describe('JsonSessionRegistry', () => {
           },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/tokenKey must be a credential key reference/);
+      expectInvalidEntry(/tokenKey must be a credential key reference/);
     });
 
     test('parses a gitea-issues work-item provider with non-secret connection config', async () => {
@@ -822,10 +1128,8 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenKey: 'n8n-ai/gitea/api-token' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /tokenKey is not supported yet for the gitea-issues provider/,
-      );
-      expect(() => new JsonSessionRegistry(jsonPath)).not.toThrow(/n8n-ai\/gitea\/api-token/);
+      const message = expectInvalidEntry(/tokenKey is not supported yet for the gitea-issues provider/);
+      expect(message).not.toMatch(/n8n-ai\/gitea\/api-token/);
     });
 
     test('gitea config is an independent copy (no aliasing)', async () => {
@@ -852,9 +1156,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenEnv: 'N8N_AI_GITEA_API_TOKEN' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /gitea is required for the gitea-issues provider/,
-      );
+      expectInvalidEntry(/gitea is required for the gitea-issues provider/);
     });
 
     test('rejects a gitea-issues provider that does not use api-token auth', () => {
@@ -866,9 +1168,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'gh' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /auth\.mode must be "api-token" for the gitea-issues provider/,
-      );
+      expectInvalidEntry(/auth\.mode must be "api-token" for the gitea-issues provider/);
     });
 
     test('rejects a gitea block on a non-gitea provider', () => {
@@ -880,9 +1180,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'gh' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /gitea is only valid for the gitea-issues provider/,
-      );
+      expectInvalidEntry(/gitea is only valid for the gitea-issues provider/);
     });
 
     test('rejects a raw token inlined in gitea-issues auth', () => {
@@ -895,13 +1193,7 @@ describe('JsonSessionRegistry', () => {
         },
       });
       // The raw key is rejected, and the error must not echo the token value.
-      let message = '';
-      try {
-        new JsonSessionRegistry(jsonPath);
-      } catch (err) {
-        message = err instanceof Error ? err.message : String(err);
-      }
-      expect(message).toMatch(/token must not be set/);
+      const message = expectInvalidEntry(/token must not be set/);
       expect(message).not.toMatch(/g1tea-r4w-t0ken/);
     });
 
@@ -918,13 +1210,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenEnv: 'N8N_AI_GITEA_API_TOKEN' },
         },
       });
-      let message = '';
-      try {
-        new JsonSessionRegistry(jsonPath);
-      } catch (err) {
-        message = err instanceof Error ? err.message : String(err);
-      }
-      expect(message).toMatch(/must not embed credentials/);
+      const message = expectInvalidEntry(/must not embed credentials/);
       expect(message).not.toMatch(/s3cr3t-p4ss/);
     });
 
@@ -937,7 +1223,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenEnv: 'N8N_AI_GITEA_API_TOKEN' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/baseUrl must be an http\(s\) URL/);
+      expectInvalidEntry(/baseUrl must be an http\(s\) URL/);
     });
 
     test('rejects a gitea apiPath that is not an absolute path', () => {
@@ -954,7 +1240,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenEnv: 'N8N_AI_GITEA_API_TOKEN' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/apiPath must be an absolute path/);
+      expectInvalidEntry(/apiPath must be an absolute path/);
     });
 
     test('rejects an unknown gitea labelMapping strategy', () => {
@@ -971,7 +1257,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenEnv: 'N8N_AI_GITEA_API_TOKEN' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/labelMapping must be one of/);
+      expectInvalidEntry(/labelMapping must be one of/);
     });
 
     test('parses a gitea repo-host provider with non-secret connection config', async () => {
@@ -1037,7 +1323,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenKey: 'n8n-ai/gitea/api-token' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/tokenKey is not supported yet/);
+      expectInvalidEntry(/tokenKey is not supported yet/);
     });
 
     test('gitea repo-host config is an independent copy (no aliasing)', async () => {
@@ -1064,9 +1350,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenEnv: 'N8N_AI_GITEA_API_TOKEN' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /gitea is required for the gitea provider/,
-      );
+      expectInvalidEntry(/gitea is required for the gitea provider/);
     });
 
     test('rejects a gitea repo-host provider that does not use api-token auth', () => {
@@ -1078,9 +1362,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'gh' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /auth\.mode must be "api-token" for the gitea provider/,
-      );
+      expectInvalidEntry(/auth\.mode must be "api-token" for the gitea provider/);
     });
 
     test('rejects a gitea block on a non-gitea repo-host provider', () => {
@@ -1092,9 +1374,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'gh' },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /gitea is only valid for the gitea provider/,
-      );
+      expectInvalidEntry(/gitea is only valid for the gitea provider/);
     });
 
     test('rejects a gitea repo-host baseUrl that embeds credentials without echoing them', () => {
@@ -1110,13 +1390,7 @@ describe('JsonSessionRegistry', () => {
           auth: { mode: 'api-token', tokenEnv: 'N8N_AI_GITEA_API_TOKEN' },
         },
       });
-      let message = '';
-      try {
-        new JsonSessionRegistry(jsonPath);
-      } catch (err) {
-        message = err instanceof Error ? err.message : String(err);
-      }
-      expect(message).toMatch(/must not embed credentials/);
+      const message = expectInvalidEntry(/must not embed credentials/);
       expect(message).not.toMatch(/s3cr3t-p4ss/);
     });
 
@@ -1133,7 +1407,7 @@ describe('JsonSessionRegistry', () => {
           },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/installationIdKey is not supported yet/);
+      expectInvalidEntry(/installationIdKey is not supported yet/);
     });
 
     test('rejects unknown work-item provider', () => {
@@ -1141,7 +1415,7 @@ describe('JsonSessionRegistry', () => {
         ...SESSION_A,
         workItemProvider: { provider: 'trello', auth: { mode: 'gh' } },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/workItemProvider\.provider must be one of/);
+      expectInvalidEntry(/workItemProvider\.provider must be one of/);
     });
 
     test('rejects unknown repo-host provider', () => {
@@ -1149,7 +1423,7 @@ describe('JsonSessionRegistry', () => {
         ...SESSION_A,
         repoHostProvider: { provider: 'gitlab', auth: { mode: 'gh' } },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/repoHostProvider\.provider must be one of/);
+      expectInvalidEntry(/repoHostProvider\.provider must be one of/);
     });
 
     test('rejects unknown auth mode', () => {
@@ -1157,7 +1431,7 @@ describe('JsonSessionRegistry', () => {
         ...SESSION_A,
         workItemProvider: { provider: 'github-issues', auth: { mode: 'oauth' } },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/auth\.mode must be one of/);
+      expectInvalidEntry(/auth\.mode must be one of/);
     });
 
     test('rejects github-app auth missing required env fields', () => {
@@ -1165,7 +1439,7 @@ describe('JsonSessionRegistry', () => {
         ...SESSION_A,
         repoHostProvider: { provider: 'github', auth: { mode: 'github-app', appIdEnv: 'APP_ID' } },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/installationIdEnv/);
+      expectInvalidEntry(/installationIdEnv/);
     });
 
     test('rejects inlined raw secret material in auth', () => {
@@ -1182,7 +1456,7 @@ describe('JsonSessionRegistry', () => {
           },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/privateKey must not be set/);
+      expectInvalidEntry(/privateKey must not be set/);
     });
 
     test('rejects env field that is not a valid environment variable name', () => {
@@ -1198,7 +1472,7 @@ describe('JsonSessionRegistry', () => {
           },
         },
       });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/appIdEnv must be an environment variable name/);
+      expectInvalidEntry(/appIdEnv must be an environment variable name/);
     });
 
     test('provider config is an independent copy (no aliasing)', async () => {
@@ -1279,45 +1553,43 @@ describe('JsonSessionRegistry', () => {
 
     test('rejects non-integer sessionNo', () => {
       writeSessions({ ...SESSION_A, sessionNo: 1.5 });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/sessionNo must be a positive integer/);
+      expectInvalidEntry(/sessionNo must be a positive integer/);
     });
 
     test('rejects sessionNo less than 1', () => {
       writeSessions({ ...SESSION_A, sessionNo: 0 });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/sessionNo must be a positive integer/);
+      expectInvalidEntry(/sessionNo must be a positive integer/);
     });
 
     test('rejects aliases that are not an array', () => {
       writeSessions({ ...SESSION_A, aliases: 'addon' });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/aliases must be an array/);
+      expectInvalidEntry(/aliases must be an array/);
     });
 
     test('rejects empty-string alias', () => {
       writeSessions({ ...SESSION_A, aliases: [''] });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/aliases\[0\]/);
+      expectInvalidEntry(/aliases\[0\]/);
     });
 
-    test('rejects duplicate sessionNo across sessions', () => {
+    test('quarantines both entries on a duplicate sessionNo across sessions (issue #823)', () => {
       writeSessions({ ...A, sessionNo: 2, aliases: undefined }, { ...B, sessionNo: 2, aliases: undefined });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/Ambiguous session reference "2".*sessionNo/s);
+      expectAmbiguous(/Ambiguous session reference "2".*sessionNo/s);
     });
 
-    test('rejects duplicate alias across sessions', () => {
+    test('quarantines both entries on a duplicate alias across sessions (issue #823)', () => {
       writeSessions({ ...A, aliases: ['dup'] }, { ...B, aliases: ['dup'] });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/Ambiguous session reference "dup".*alias/s);
+      expectAmbiguous(/Ambiguous session reference "dup".*alias/s);
     });
 
-    test('rejects an alias that collides with another sessionId', () => {
+    test('quarantines both entries when an alias collides with another sessionId (issue #823)', () => {
       writeSessions(A, { ...B, aliases: ['thunderbird-auth-results'] });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /Ambiguous session reference "thunderbird-auth-results".*sessionId/s,
-      );
+      expectAmbiguous(/Ambiguous session reference "thunderbird-auth-results".*sessionId/s);
     });
 
-    test('rejects a numeric alias that collides with another sessionNo', () => {
+    test('quarantines both entries when a numeric alias collides with another sessionNo (issue #823)', () => {
       // B.sessionNo is 1; giving A the alias "1" makes the reference "1" ambiguous.
       writeSessions({ ...A, aliases: ['1'] }, B);
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/Ambiguous session reference "1"/);
+      expectAmbiguous(/Ambiguous session reference "1"/);
     });
 
     test('an alias equal to the session\'s own sessionId is harmless', async () => {
@@ -1361,12 +1633,12 @@ describe('JsonSessionRegistry', () => {
 
     test('rejects a missing enabled field', () => {
       writeSessions({ ...SESSION_A, reportOnly: {} });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/reportOnly.enabled must be a boolean/);
+      expectInvalidEntry(/reportOnly.enabled must be a boolean/);
     });
 
     test('rejects non-boolean enabled', () => {
       writeSessions({ ...SESSION_A, reportOnly: { enabled: 'yes' } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/reportOnly.enabled must be a boolean/);
+      expectInvalidEntry(/reportOnly.enabled must be a boolean/);
     });
 
     test('resolved reportOnly is an independent copy (no aliasing)', async () => {
@@ -1401,16 +1673,12 @@ describe('JsonSessionRegistry', () => {
       // An acknowledgement exists to record WHY a finding is accepted; a blank
       // one would silently suppress the finding with no rationale.
       writeSessions({ ...SESSION_A, audit: { acknowledge: { 'verification-commands': '' } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /audit\.acknowledge\.verification-commands must be a non-empty string/,
-      );
+      expectInvalidEntry(/audit\.acknowledge\.verification-commands must be a non-empty string/);
     });
 
     test('rejects a non-string acknowledgement reason', () => {
       writeSessions({ ...SESSION_A, audit: { acknowledge: { 'verification-commands': true } } });
-      expect(() => new JsonSessionRegistry(jsonPath)).toThrow(
-        /audit\.acknowledge\.verification-commands must be a non-empty string/,
-      );
+      expectInvalidEntry(/audit\.acknowledge\.verification-commands must be a non-empty string/);
     });
 
     test('resolved audit block is an independent copy (no aliasing)', async () => {
@@ -1421,5 +1689,182 @@ describe('JsonSessionRegistry', () => {
       const s2 = await registry.getSessionById('addon-dev');
       expect(s2.audit.acknowledge).toEqual({ 'verification-commands': 'why' });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Registry-level isolation and diagnostics (issue #823)
+//
+// One malformed or ambiguous entry must not prevent the rest of the registry
+// from loading. Only invalid JSON and an invalid top-level shape stay fatal.
+// ---------------------------------------------------------------------------
+
+describe('registry isolation and diagnostics (issue #823)', () => {
+  test('a registry with one valid and one invalid entry still loads the valid session', async () => {
+    writeSessions(SESSION_A, { ...SESSION_B, githubRepo: 'nodomain' });
+    const registry = new JsonSessionRegistry(jsonPath);
+
+    const sessions = await registry.listSessions();
+    expect(sessions.map((s) => s.sessionId)).toEqual(['addon-dev']);
+
+    const diagnostics = registry.getDiagnostics();
+    expect(diagnostics).toEqual([
+      expect.objectContaining({ kind: 'invalid_entry', indices: [1], sessionIds: ['workflow-dev'] }),
+    ]);
+    expect(diagnostics[0].message).toMatch(/owner\/name/);
+  });
+
+  test('an entry with no usable safe identifier is quarantined with sessionIds: [undefined]', () => {
+    writeSessions(SESSION_A, { repoRoot: 42 });
+    const registry = new JsonSessionRegistry(jsonPath);
+    const diagnostics = registry.getDiagnostics();
+    expect(diagnostics).toEqual([
+      expect.objectContaining({ kind: 'invalid_entry', indices: [1], sessionIds: [undefined] }),
+    ]);
+  });
+
+  test('a non-object entry (e.g. a bare string) is quarantined rather than crashing the load', async () => {
+    writeSessions(SESSION_A, 'not-a-session-object');
+    const registry = new JsonSessionRegistry(jsonPath);
+    expect((await registry.listSessions()).map((s) => s.sessionId)).toEqual(['addon-dev']);
+    expect(registry.getDiagnostics()).toEqual([
+      expect.objectContaining({ kind: 'invalid_entry', indices: [1], sessionIds: [undefined] }),
+    ]);
+  });
+
+  test('a clean registry has no diagnostics', async () => {
+    writeSessions(SESSION_A, SESSION_B);
+    const registry = new JsonSessionRegistry(jsonPath);
+    expect(registry.getDiagnostics()).toEqual([]);
+    expect(await registry.listSessions()).toHaveLength(2);
+  });
+
+  test('getDiagnostics returns independent copies (no aliasing)', () => {
+    writeSessions({ ...SESSION_A, githubRepo: 'nodomain' });
+    const registry = new JsonSessionRegistry(jsonPath);
+    const d1 = registry.getDiagnostics();
+    d1[0].indices.push(99);
+    d1[0].message = 'mutated';
+    const d2 = registry.getDiagnostics();
+    expect(d2[0].indices).toEqual([0]);
+    expect(d2[0].message).not.toBe('mutated');
+  });
+
+  test('every collision axis (sessionId, repoKey, sessionNo, alias) quarantines both entries and excludes them from listSessions', async () => {
+    const A = { ...SESSION_A, sessionId: 'thunderbird-auth-results', sessionNo: 2, aliases: ['addon'] };
+    const B = { ...SESSION_B, sessionId: 'workflow-dev', sessionNo: 1, aliases: ['wf'] };
+
+    writeSessions(A, { ...B, sessionId: A.sessionId });
+    expect(await new JsonSessionRegistry(jsonPath).listSessions()).toEqual([]);
+
+    writeSessions(A, { ...B, repoKey: A.repoKey });
+    expect(await new JsonSessionRegistry(jsonPath).listSessions()).toEqual([]);
+
+    writeSessions({ ...A, sessionNo: 2 }, { ...B, sessionNo: 2 });
+    expect(await new JsonSessionRegistry(jsonPath).listSessions()).toEqual([]);
+
+    writeSessions({ ...A, aliases: ['dup'] }, { ...B, aliases: ['dup'] });
+    expect(await new JsonSessionRegistry(jsonPath).listSessions()).toEqual([]);
+  });
+
+  test('a session unrelated to a collision elsewhere in the file still loads', async () => {
+    writeSessions(SESSION_A, { ...SESSION_B, sessionId: SESSION_A.sessionId }, {
+      ...SESSION_B,
+      sessionId: 'third-session',
+      repoKey: 'third-repo',
+    });
+    const registry = new JsonSessionRegistry(jsonPath);
+    const sessions = await registry.listSessions();
+    expect(sessions.map((s) => s.sessionId)).toEqual(['third-session']);
+    const diagnostics = registry.getDiagnostics();
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].kind).toBe('ambiguous_reference');
+    expect([...diagnostics[0].indices].sort()).toEqual([0, 1]);
+  });
+
+  test('invalid JSON syntax is fatal to the whole registry', () => {
+    writeFileSync(jsonPath, '{ not valid json', 'utf8');
+    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(SessionRegistryFatalError);
+  });
+
+  test('a top-level document that is not an object is fatal', () => {
+    writeFileSync(jsonPath, '[]', 'utf8');
+    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(SessionRegistryFatalError);
+  });
+
+  test('a missing sessions array is fatal', () => {
+    writeFileSync(jsonPath, JSON.stringify({ notSessions: [] }), 'utf8');
+    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/sessions array/);
+  });
+
+  async function resolveSessionRefError(registry, ref) {
+    try {
+      await registry.resolveSessionRef(ref);
+      throw new Error(`expected resolveSessionRef(${JSON.stringify(ref)}) to throw`);
+    } catch (err) {
+      return err;
+    }
+  }
+
+  test('resolveSessionRef throws SessionReferenceError with kind invalid_entry for a quarantined entry sessionId', async () => {
+    writeSessions({ ...SESSION_A, githubRepo: 'nodomain' });
+    const registry = new JsonSessionRegistry(jsonPath);
+    const err = await resolveSessionRefError(registry, 'addon-dev');
+    expect(err).toBeInstanceOf(SessionReferenceError);
+    expect(err.kind).toBe('invalid_entry');
+  });
+
+  test('resolveSessionRef throws SessionReferenceError with kind ambiguous_reference for a colliding sessionId', async () => {
+    writeSessions(SESSION_A, { ...SESSION_B, sessionId: SESSION_A.sessionId });
+    const registry = new JsonSessionRegistry(jsonPath);
+    const err = await resolveSessionRefError(registry, SESSION_A.sessionId);
+    expect(err).toBeInstanceOf(SessionReferenceError);
+    expect(err.kind).toBe('ambiguous_reference');
+  });
+
+  test('resolveSessionRef throws SessionReferenceError with kind ambiguous_reference for a non-colliding sessionId of an entry quarantined by a sessionNo collision', async () => {
+    writeSessions({ ...SESSION_A, sessionNo: 1 }, { ...SESSION_B, sessionNo: 1 });
+    const registry = new JsonSessionRegistry(jsonPath);
+
+    const bySessionNo = await resolveSessionRefError(registry, '1');
+    expect(bySessionNo.kind).toBe('ambiguous_reference');
+
+    const byA = await resolveSessionRefError(registry, SESSION_A.sessionId);
+    expect(byA.kind).toBe('ambiguous_reference');
+
+    const byB = await resolveSessionRefError(registry, SESSION_B.sessionId);
+    expect(byB.kind).toBe('ambiguous_reference');
+  });
+
+  test('resolveSessionRef throws SessionReferenceError with kind unknown_reference for a reference matching nothing', async () => {
+    writeSessions(SESSION_A);
+    const registry = new JsonSessionRegistry(jsonPath);
+    const err = await resolveSessionRefError(registry, 'nope');
+    expect(err).toBeInstanceOf(SessionReferenceError);
+    expect(err.kind).toBe('unknown_reference');
+  });
+
+  test('standalone resolveSessionRef also throws SessionReferenceError with a diagnostic kind', () => {
+    writeSessions({ ...SESSION_A, githubRepo: 'nodomain' });
+    expect(() => resolveSessionRef(jsonPath, 'addon-dev')).toThrow(SessionReferenceError);
+    try {
+      resolveSessionRef(jsonPath, 'addon-dev');
+      throw new Error('expected resolveSessionRef to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SessionReferenceError);
+      expect(err.kind).toBe('invalid_entry');
+    }
+  });
+
+  test('getSessionById returns undefined (not a throw) for a quarantined invalid entry', async () => {
+    writeSessions({ ...SESSION_A, githubRepo: 'nodomain' });
+    const registry = new JsonSessionRegistry(jsonPath);
+    expect(await registry.getSessionById('addon-dev')).toBeUndefined();
+  });
+
+  test('getSessionByRepoKey returns undefined for both entries in a repoKey collision', async () => {
+    writeSessions(SESSION_A, { ...SESSION_B, repoKey: SESSION_A.repoKey });
+    const registry = new JsonSessionRegistry(jsonPath);
+    expect(await registry.getSessionByRepoKey(SESSION_A.repoKey)).toBeUndefined();
   });
 });

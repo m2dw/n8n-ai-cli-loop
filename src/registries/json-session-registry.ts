@@ -3,8 +3,11 @@ import { homedir } from "os";
 import { isAbsolute, join, resolve } from "path";
 import type { AgentId } from "../core/task.js";
 import { DEFAULT_FLOW } from "../core/assignment.js";
+import { parseAntigravityPrintTimeout } from "../core/antigravity-print-timeout.js";
+import { REVIEW_DISPUTE_LIMIT_KEYS, resolveReviewDisputeSettings } from "../core/review-dispute.js";
 import type {
   AntigravityResearchConfig,
+  AntigravityWorkspaceSettingsSessionConfig,
   AssignmentProfile,
   ClaudeComplexityProfileOverride,
   ClaudeComplexityProfilesConfig,
@@ -24,7 +27,11 @@ import type {
   ReportOnlyConfig,
   ResearchConfig,
   ResearchEvidenceConfig,
+  ResearchPublicationConfig,
   ResolvedSession,
+  ReviewDisputeArbiterConfig,
+  ReviewDisputeConfig,
+  ReviewDisputeLimitsConfig,
   SessionAuditConfig,
   SessionConfig,
   SessionRegistry,
@@ -42,6 +49,11 @@ export const DEFAULT_SESSIONS_PATH = join(
 );
 
 const AGENTS = new Set<AgentId>(["claude", "codex", "gemini"]);
+
+const RESEARCH_PUBLICATION_MODES = new Set<NonNullable<ResearchPublicationConfig["mode"]>>([
+  "local_only",
+  "sanitized_summary",
+]);
 
 const WORK_ITEM_PROVIDERS = new Set<WorkItemProviderKind>([
   "github-issues",
@@ -91,16 +103,64 @@ interface RawSessionsFile {
   sessions?: unknown;
 }
 
+/**
+ * A problem found while loading the registry that did NOT prevent the rest of
+ * the file from loading (issue #823). `invalid_entry` covers one entry that
+ * independently failed validation; `ambiguous_reference` covers two or more
+ * entries that share a sessionId / repoKey / sessionNo / alias — every entry
+ * that participates in a collision is quarantined, never an arbitrary winner.
+ * `indices`/`sessionIds` are parallel arrays (one element per quarantined
+ * entry); `sessionIds` entries are `undefined` when the entry had no usable
+ * safe identifier. `message` never echoes raw secret values — the underlying
+ * validators only ever report field paths and non-secret references.
+ */
+export type SessionRegistryDiagnosticKind = "invalid_entry" | "ambiguous_reference";
+
+export interface SessionRegistryDiagnostic {
+  kind: SessionRegistryDiagnosticKind;
+  indices: number[];
+  sessionIds: Array<string | undefined>;
+  message: string;
+}
+
+/** Thrown by the registry constructor for a failure that invalidates the whole file: invalid JSON or an invalid top-level shape. Unaffected by per-entry validation (issue #823). */
+export class SessionRegistryFatalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionRegistryFatalError";
+  }
+}
+
+export type SessionReferenceErrorKind = "invalid_entry" | "ambiguous_reference" | "unknown_reference";
+
+/** Thrown by `resolveSessionRef` when a reference cannot be resolved. `kind` lets callers distinguish a reference that named a quarantined (invalid/ambiguous) entry from one that never matched anything (issue #823). */
+export class SessionReferenceError extends Error {
+  readonly kind: SessionReferenceErrorKind;
+  readonly diagnostic?: SessionRegistryDiagnostic;
+
+  constructor(message: string, kind: SessionReferenceErrorKind, diagnostic?: SessionRegistryDiagnostic) {
+    super(message);
+    this.name = "SessionReferenceError";
+    this.kind = kind;
+    this.diagnostic = diagnostic;
+  }
+}
+
 export class JsonSessionRegistry implements SessionRegistry {
   readonly #sessionsById: Map<string, ResolvedSession>;
   readonly #sessionsByRepoKey: Map<string, ResolvedSession>;
   readonly #refIndex: Map<string, RefEntry>;
+  readonly #quarantinedRefIndex: Map<string, SessionRegistryDiagnostic>;
+  readonly #diagnostics: SessionRegistryDiagnostic[];
 
   constructor(readonly path = DEFAULT_SESSIONS_PATH) {
-    const { byId, byRepoKey, refIndex } = indexSessions(loadSessions(path));
+    const loaded = loadSessions(path);
+    const { byId, byRepoKey, refIndex } = indexSessions(loaded.sessions);
     this.#sessionsById = byId;
     this.#sessionsByRepoKey = byRepoKey;
     this.#refIndex = refIndex;
+    this.#quarantinedRefIndex = loaded.quarantinedRefIndex;
+    this.#diagnostics = loaded.diagnostics;
   }
 
   async getSessionById(sessionId: string): Promise<ResolvedSession | undefined> {
@@ -116,29 +176,65 @@ export class JsonSessionRegistry implements SessionRegistry {
   }
 
   async resolveSessionRef(ref: string): Promise<string> {
-    return resolveRefFromIndex(this.#refIndex, ref);
+    return resolveRefFromIndex(this.#refIndex, this.#quarantinedRefIndex, ref);
+  }
+
+  /**
+   * Diagnostics recorded while loading the registry (issue #823): entries
+   * excluded for failing independent validation, or for participating in a
+   * sessionId / repoKey / sessionNo / alias collision. A registry with
+   * diagnostics still loads every other valid, unambiguous session —
+   * `admin session-doctor` / `admin status` surface this list so a single bad
+   * entry elsewhere in the file is never silently invisible.
+   */
+  getDiagnostics(): SessionRegistryDiagnostic[] {
+    return this.#diagnostics.map((d) => ({ ...d, indices: [...d.indices], sessionIds: [...d.sessionIds] }));
   }
 }
 
 /**
  * Resolve a user-facing session reference to the canonical `sessionId` by
  * loading and validating the sessions file at `sessionsPath`. This is the shared
- * resolver used by CLI commands that accept `--session-ref`. It applies the same
- * collision validation as constructing a registry, so an ambiguous registry
- * fails closed here too. Throws if the reference is unknown.
+ * resolver used by CLI commands that accept `--session-ref`. A reference that
+ * names an invalid or ambiguous entry throws a {@link SessionReferenceError}
+ * carrying that entry's diagnostic rather than a generic unknown-reference
+ * error (issue #823). Throws if the reference is unknown.
  */
 export function resolveSessionRef(sessionsPath: string, ref: string): string {
-  const { refIndex } = indexSessions(loadSessions(sessionsPath));
-  return resolveRefFromIndex(refIndex, ref);
+  const loaded = loadSessions(sessionsPath);
+  const { refIndex } = indexSessions(loaded.sessions);
+  return resolveRefFromIndex(refIndex, loaded.quarantinedRefIndex, ref);
+}
+
+/**
+ * Describe why `sessionId` did not resolve via `registry.getSessionById` /
+ * `getSessionByRepoKey`, for the many CLI commands that die with a generic
+ * "Unknown sessionId" message on a missing session. When `sessionId` names an
+ * entry the registry quarantined (invalid or ambiguous — see
+ * {@link SessionRegistryDiagnostic}), returns that diagnostic's message
+ * instead: the entry IS present in `sessionsPath`, it just failed to load
+ * (issue #823), which is a meaningfully different problem for an operator to
+ * act on than a typo'd or nonexistent sessionId.
+ */
+export function describeUnresolvedSessionId(
+  registry: { getDiagnostics(): SessionRegistryDiagnostic[] },
+  sessionId: string,
+  sessionsPath: string,
+): string {
+  const diagnostic = registry.getDiagnostics().find((d) => d.sessionIds.includes(sessionId));
+  if (diagnostic) {
+    return `Session "${sessionId}" did not load from the session registry (${sessionsPath}): ${diagnostic.message}`;
+  }
+  return `Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`;
 }
 
 // ---------------------------------------------------------------------------
 // Session reference index
 //
 // A single map keys every user-facing reference (sessionId, sessionNo, alias)
-// to the canonical sessionId. Building it validates the issue's rules in one
-// pass: any reference that would resolve to two different sessions is rejected
-// at construction time, so resolution is always unambiguous and fails closed.
+// to the canonical sessionId, built ONLY from sessions that survived
+// validation and collision detection (see detectIdentityCollisions below), so
+// it is always unambiguous.
 // ---------------------------------------------------------------------------
 
 type RefKind = "sessionId" | "sessionNo" | "alias";
@@ -157,85 +253,249 @@ interface SessionIndex {
 function indexSessions(sessions: ResolvedSession[]): SessionIndex {
   const byId = new Map<string, ResolvedSession>();
   const byRepoKey = new Map<string, ResolvedSession>();
+  const refIndex = new Map<string, RefEntry>();
   for (const session of sessions) {
-    if (byId.has(session.sessionId)) {
-      throw new Error(`Duplicate sessionId in session registry: ${session.sessionId}`);
-    }
-    if (byRepoKey.has(session.repoKey)) {
-      throw new Error(`Duplicate repoKey in session registry: ${session.repoKey}`);
-    }
     byId.set(session.sessionId, session);
     byRepoKey.set(session.repoKey, session);
-  }
-  return { byId, byRepoKey, refIndex: buildSessionRefIndex(sessions) };
-}
-
-function describeRef(key: string, entry: RefEntry): string {
-  switch (entry.kind) {
-    case "sessionId":
-      return `sessionId "${entry.sessionId}"`;
-    case "sessionNo":
-      return `sessionNo ${key} (session "${entry.sessionId}")`;
-    case "alias":
-      return `alias "${key}" (session "${entry.sessionId}")`;
-  }
-}
-
-function buildSessionRefIndex(sessions: ResolvedSession[]): Map<string, RefEntry> {
-  const index = new Map<string, RefEntry>();
-
-  const register = (key: string, entry: RefEntry): void => {
-    const existing = index.get(key);
-    if (existing) {
-      // The same session referencing itself through more than one form that
-      // collapses to the same key (e.g. an alias equal to its own sessionId) is
-      // harmless — both resolve to the same canonical sessionId.
-      if (existing.sessionId === entry.sessionId) return;
-      throw new Error(
-        `Ambiguous session reference "${key}": ${describeRef(key, existing)} and ${describeRef(key, entry)} ` +
-          `both resolve to it. Session references (sessionId, sessionNo, aliases) must be unique across the registry.`,
-      );
-    }
-    index.set(key, entry);
-  };
-
-  // Register sessionIds first so an alias or sessionNo that collides with
-  // another session's id is reported against the id.
-  for (const session of sessions) {
-    register(session.sessionId, { sessionId: session.sessionId, kind: "sessionId" });
+    refIndex.set(session.sessionId, { sessionId: session.sessionId, kind: "sessionId" });
   }
   for (const session of sessions) {
     if (session.sessionNo !== undefined) {
-      register(String(session.sessionNo), { sessionId: session.sessionId, kind: "sessionNo" });
+      refIndex.set(String(session.sessionNo), { sessionId: session.sessionId, kind: "sessionNo" });
     }
     for (const alias of session.aliases ?? []) {
-      register(alias, { sessionId: session.sessionId, kind: "alias" });
+      refIndex.set(alias, { sessionId: session.sessionId, kind: "alias" });
     }
   }
-  return index;
+  return { byId, byRepoKey, refIndex };
 }
 
-function resolveRefFromIndex(index: Map<string, RefEntry>, ref: string): string {
+function resolveRefFromIndex(
+  index: Map<string, RefEntry>,
+  quarantinedIndex: Map<string, SessionRegistryDiagnostic>,
+  ref: string,
+): string {
   const entry = index.get(ref);
-  if (!entry) {
-    throw new Error(
-      `Unknown session reference: "${ref}". It does not match any sessionId, sessionNo, or alias in the session registry.`,
+  if (entry) return entry.sessionId;
+
+  const diagnostic = quarantinedIndex.get(ref);
+  if (diagnostic) {
+    throw new SessionReferenceError(
+      `Session reference "${ref}" cannot be resolved: ${diagnostic.message}`,
+      diagnostic.kind,
+      diagnostic,
     );
   }
-  return entry.sessionId;
+
+  throw new SessionReferenceError(
+    `Unknown session reference: "${ref}". It does not match any sessionId, sessionNo, or alias in the session registry.`,
+    "unknown_reference",
+  );
 }
 
-function loadSessions(path: string): ResolvedSession[] {
+// ---------------------------------------------------------------------------
+// Per-entry loading (issue #823)
+//
+// A malformed or colliding entry must not prevent the rest of the registry
+// from loading. Only invalid JSON and an invalid top-level shape are fatal
+// (SessionRegistryFatalError, thrown below); every other problem is recorded
+// as a diagnostic and the offending entry is excluded ("quarantined").
+//
+// Collision detection (collectIdentityRegistrations + groupCollisions) runs
+// BEFORE full per-entry validation, over a lenient "shallow identity" read of
+// the raw JSON. This
+// matters: if entry #0 and entry #1 both declare sessionId "x" and entry #1 is
+// ALSO invalid for an unrelated reason, entry #0 must not "win" the shared id
+// just because #1 happened to fail validation first — both are quarantined as
+// ambiguous, and neither reaches full validation.
+// ---------------------------------------------------------------------------
+
+interface ShallowIdentity {
+  sessionId?: string;
+  repoKey?: string;
+  sessionNo?: string;
+  aliases: string[];
+}
+
+/** Extract identity-bearing fields from a raw (unvalidated) entry, ignoring any field with the wrong shape rather than throwing — full validation reports type errors. */
+function shallowIdentity(raw: unknown): ShallowIdentity {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { aliases: [] };
+  const obj = raw as Record<string, unknown>;
+  const sessionId = typeof obj.sessionId === "string" && obj.sessionId.trim() !== "" ? obj.sessionId : undefined;
+  const repoKey = typeof obj.repoKey === "string" && obj.repoKey.trim() !== "" ? obj.repoKey : undefined;
+  const sessionNo =
+    typeof obj.sessionNo === "number" && Number.isInteger(obj.sessionNo) && obj.sessionNo >= 1
+      ? String(obj.sessionNo)
+      : undefined;
+  const aliases = Array.isArray(obj.aliases)
+    ? obj.aliases.filter((a): a is string => typeof a === "string" && a.trim() !== "")
+    : [];
+  return { sessionId, repoKey, sessionNo, aliases };
+}
+
+type IdentityKind = "sessionId" | "sessionNo" | "alias" | "repoKey";
+
+interface IdentityRegistration {
+  index: number;
+  sessionId?: string;
+  kind: IdentityKind;
+  key: string;
+}
+
+function collectIdentityRegistrations(identities: ShallowIdentity[]): {
+  refRegs: IdentityRegistration[];
+  repoKeyRegs: IdentityRegistration[];
+} {
+  const refRegs: IdentityRegistration[] = [];
+  const repoKeyRegs: IdentityRegistration[] = [];
+  identities.forEach((identity, index) => {
+    if (identity.sessionId !== undefined) {
+      refRegs.push({ index, sessionId: identity.sessionId, kind: "sessionId", key: identity.sessionId });
+    }
+    if (identity.sessionNo !== undefined) {
+      refRegs.push({ index, sessionId: identity.sessionId, kind: "sessionNo", key: identity.sessionNo });
+    }
+    for (const alias of identity.aliases) {
+      refRegs.push({ index, sessionId: identity.sessionId, kind: "alias", key: alias });
+    }
+    if (identity.repoKey !== undefined) {
+      repoKeyRegs.push({ index, sessionId: identity.sessionId, kind: "repoKey", key: identity.repoKey });
+    }
+  });
+  return { refRegs, repoKeyRegs };
+}
+
+/** Group registrations by key, keeping only keys claimed by more than one distinct entry index. A key claimed twice by the SAME entry (e.g. an alias equal to its own sessionId) is harmless, not a collision. */
+function groupCollisions(regs: IdentityRegistration[]): Map<string, IdentityRegistration[]> {
+  const byKey = new Map<string, IdentityRegistration[]>();
+  for (const reg of regs) {
+    const group = byKey.get(reg.key);
+    if (group) group.push(reg);
+    else byKey.set(reg.key, [reg]);
+  }
+  for (const [key, group] of [...byKey]) {
+    if (new Set(group.map((r) => r.index)).size <= 1) byKey.delete(key);
+  }
+  return byKey;
+}
+
+function describeIdentityRef(kind: IdentityKind, key: string, reg: IdentityRegistration): string {
+  const sessionLabel = reg.sessionId ? `session "${reg.sessionId}"` : `sessions[${reg.index}]`;
+  switch (kind) {
+    case "sessionId":
+      return `sessionId "${key}" (sessions[${reg.index}])`;
+    case "sessionNo":
+      return `sessionNo ${key} (${sessionLabel})`;
+    case "alias":
+      return `alias "${key}" (${sessionLabel})`;
+    case "repoKey":
+      return `repoKey "${key}" (${sessionLabel})`;
+  }
+}
+
+function collisionDiagnostic(namespace: string, key: string, group: IdentityRegistration[]): SessionRegistryDiagnostic {
+  const distinct = new Map<number, IdentityRegistration>();
+  for (const reg of group) if (!distinct.has(reg.index)) distinct.set(reg.index, reg);
+  const entries = [...distinct.values()].sort((a, b) => a.index - b.index);
+  return {
+    kind: "ambiguous_reference",
+    indices: entries.map((r) => r.index),
+    sessionIds: entries.map((r) => r.sessionId),
+    message:
+      `Ambiguous ${namespace} reference "${key}": ` +
+      group.map((reg) => describeIdentityRef(reg.kind, key, reg)).join(" and ") +
+      ` both resolve to it. Session references (sessionId, sessionNo, aliases) and repoKey must each be unique ` +
+      `across the registry; every conflicting entry is excluded rather than an arbitrary winner being chosen.`,
+  };
+}
+
+interface LoadedSessions {
+  sessions: ResolvedSession[];
+  diagnostics: SessionRegistryDiagnostic[];
+  quarantinedRefIndex: Map<string, SessionRegistryDiagnostic>;
+}
+
+function parseRawSessionsFile(path: string): unknown[] {
   if (!existsSync(path)) {
-    throw new Error(`Session registry file does not exist: ${path}`);
+    throw new SessionRegistryFatalError(`Session registry file does not exist: ${path}`);
   }
 
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as RawSessionsFile;
-  if (!Array.isArray(parsed.sessions)) {
-    throw new Error("Session registry must contain a sessions array");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new SessionRegistryFatalError(
+      `Failed to parse session registry file (${path}): ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
-  return parsed.sessions.map((session, index) => resolveSession(validateSession(session, index)));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new SessionRegistryFatalError(`Session registry (${path}) must be a JSON object with a "sessions" array`);
+  }
+  const sessions = (parsed as RawSessionsFile).sessions;
+  if (!Array.isArray(sessions)) {
+    throw new SessionRegistryFatalError("Session registry must contain a sessions array");
+  }
+  return sessions;
+}
+
+function loadSessions(path: string): LoadedSessions {
+  const raw = parseRawSessionsFile(path);
+
+  const identities = raw.map((entry) => shallowIdentity(entry));
+  const { refRegs, repoKeyRegs } = collectIdentityRegistrations(identities);
+  const refCollisions = groupCollisions(refRegs);
+  const repoKeyCollisions = groupCollisions(repoKeyRegs);
+
+  const diagnostics: SessionRegistryDiagnostic[] = [];
+  const quarantinedRefIndex = new Map<string, SessionRegistryDiagnostic>();
+  const quarantined = new Set<number>();
+
+  for (const [key, group] of refCollisions) {
+    const diagnostic = collisionDiagnostic("session", key, group);
+    diagnostics.push(diagnostic);
+    for (const reg of group) {
+      quarantined.add(reg.index);
+      const identity = identities[reg.index];
+      for (const refKey of [identity.sessionId, identity.sessionNo, ...identity.aliases]) {
+        if (refKey !== undefined) quarantinedRefIndex.set(refKey, diagnostic);
+      }
+    }
+  }
+  for (const [key, group] of repoKeyCollisions) {
+    const diagnostic = collisionDiagnostic("repoKey", key, group);
+    diagnostics.push(diagnostic);
+    for (const reg of group) {
+      quarantined.add(reg.index);
+      const identity = identities[reg.index];
+      for (const refKey of [identity.sessionId, identity.sessionNo, ...identity.aliases]) {
+        if (refKey !== undefined) quarantinedRefIndex.set(refKey, diagnostic);
+      }
+    }
+  }
+
+  const sessions: ResolvedSession[] = [];
+  raw.forEach((entry, index) => {
+    if (quarantined.has(index)) return;
+    try {
+      sessions.push(resolveSession(validateSession(entry, index)));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const diagnostic: SessionRegistryDiagnostic = {
+        kind: "invalid_entry",
+        indices: [index],
+        sessionIds: [identities[index].sessionId],
+        message,
+      };
+      diagnostics.push(diagnostic);
+      const identity = identities[index];
+      for (const key of [identity.sessionId, identity.sessionNo, ...identity.aliases]) {
+        if (key !== undefined) quarantinedRefIndex.set(key, diagnostic);
+      }
+    }
+  });
+
+  return { sessions, diagnostics, quarantinedRefIndex };
 }
 
 function validateSession(value: unknown, index: number): SessionConfig {
@@ -310,6 +570,13 @@ function validateSession(value: unknown, index: number): SessionConfig {
       }
       config.reviewLoop.maxCycles = maxCycles;
     }
+  }
+
+  if (session.reviewDispute !== undefined) {
+    config.reviewDispute = validateReviewDisputeConfig(
+      session.reviewDispute,
+      `sessions[${index}].reviewDispute`,
+    );
   }
 
   if (session.conflictResolutionLoop !== undefined) {
@@ -413,6 +680,7 @@ function resolveSession(config: SessionConfig): ResolvedSession {
     ...(config.codex ? { codex: cloneCodexConfig(config.codex) } : {}),
     ...(config.claude ? { claude: cloneClaudeConfig(config.claude) } : {}),
     ...(config.research ? { research: cloneResearchConfig(config.research) } : {}),
+    ...(config.reviewDispute ? { reviewDispute: cloneReviewDisputeConfig(config.reviewDispute) } : {}),
     artifactRoot: resolve(config.repoRoot, config.artifactDir),
     githubOwner,
     githubName,
@@ -432,6 +700,21 @@ function resolveSession(config: SessionConfig): ResolvedSession {
     // above masks an omission. Outbox dispatch needs this to honor an explicit
     // `github`/`gh` repo-host config that is byte-identical to the default.
     repoHostProviderConfigured: config.repoHostProvider !== undefined,
+  };
+}
+
+function cloneReviewDisputeConfig(config: ReviewDisputeConfig): ReviewDisputeConfig {
+  return {
+    ...config,
+    ...(config.limits ? { limits: { ...config.limits } } : {}),
+    ...(config.arbiter
+      ? {
+          arbiter: {
+            ...config.arbiter,
+            ...(config.arbiter.providers ? { providers: [...config.arbiter.providers] } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -730,6 +1013,95 @@ function cloneClaudeConfig(config: ClaudeConfig): ClaudeConfig {
   return { complexityProfiles: cloned };
 }
 
+/**
+ * Review-dispute protocol config (docs/review-dispute-contract.md §6.1, §8.3).
+ *
+ * The per-lineage limits are checked by the contract module itself, so the
+ * normative table has exactly one home: a limit that would leave a protocol
+ * state without a next action — a rebuttal, version, arbitration-pass, or
+ * malformed-arbiter budget of 0 — stops session load rather than being clamped
+ * to the default. Fail closed: the protocol never starts half-enabled.
+ *
+ * Unknown keys are rejected at every level, including the top: `enable: true`
+ * would otherwise build an empty config and leave the protocol silently
+ * disabled, which is the same "configured but inert" failure the nested limit
+ * and arbiter checks exist to surface.
+ */
+function validateReviewDisputeConfig(value: unknown, path: string): ReviewDisputeConfig {
+  const obj = record(value, path);
+  const config: ReviewDisputeConfig = {};
+  const allowedTop = ["enabled", "limits", "arbiter"];
+  for (const key of Object.keys(obj)) {
+    if (!allowedTop.includes(key)) {
+      throw new Error(
+        `${path}.${key} is not a known review-dispute setting; expected one of: ${allowedTop.join(", ")}`,
+      );
+    }
+  }
+  if (obj.enabled !== undefined) {
+    if (typeof obj.enabled !== "boolean") {
+      throw new Error(`${path}.enabled must be a boolean`);
+    }
+    config.enabled = obj.enabled;
+  }
+  if (obj.limits !== undefined) {
+    const raw = record(obj.limits, `${path}.limits`);
+    const limits: ReviewDisputeLimitsConfig = {};
+    for (const key of Object.keys(raw)) {
+      if (!(REVIEW_DISPUTE_LIMIT_KEYS as readonly string[]).includes(key)) {
+        throw new Error(
+          `${path}.limits.${key} is not a review-dispute limit; expected one of: `
+          + `${REVIEW_DISPUTE_LIMIT_KEYS.join(", ")}`,
+        );
+      }
+    }
+    for (const key of REVIEW_DISPUTE_LIMIT_KEYS) {
+      const configured = raw[key];
+      if (configured === undefined) continue;
+      if (typeof configured !== "number" || !Number.isInteger(configured)) {
+        throw new Error(`${path}.limits.${key} must be an integer`);
+      }
+      limits[key] = configured;
+    }
+    config.limits = limits;
+  }
+  if (obj.arbiter !== undefined) {
+    const raw = record(obj.arbiter, `${path}.arbiter`);
+    const allowed = ["providers", "allowSameProvider", "minConfidence"];
+    for (const key of Object.keys(raw)) {
+      if (!allowed.includes(key)) {
+        throw new Error(`${path}.arbiter.${key} is not a known arbiter setting; expected one of: ${allowed.join(", ")}`);
+      }
+    }
+    const arbiter: ReviewDisputeArbiterConfig = {};
+    if (raw.providers !== undefined) {
+      if (!Array.isArray(raw.providers) || raw.providers.some((p) => typeof p !== "string" || p.trim() === "")) {
+        throw new Error(`${path}.arbiter.providers must be an array of non-empty agent ids`);
+      }
+      arbiter.providers = raw.providers as string[];
+    }
+    if (raw.allowSameProvider !== undefined) {
+      if (typeof raw.allowSameProvider !== "boolean") {
+        throw new Error(`${path}.arbiter.allowSameProvider must be a boolean`);
+      }
+      arbiter.allowSameProvider = raw.allowSameProvider;
+    }
+    if (raw.minConfidence !== undefined) {
+      if (typeof raw.minConfidence !== "number" || !Number.isFinite(raw.minConfidence)) {
+        throw new Error(`${path}.arbiter.minConfidence must be a finite number`);
+      }
+      arbiter.minConfidence = raw.minConfidence;
+    }
+    config.arbiter = arbiter;
+  }
+  // One authority for the value rules; the registry only reports what it says.
+  const resolved = resolveReviewDisputeSettings(config, path);
+  if (!resolved.ok) {
+    throw new Error(resolved.errors.map((error) => error.message).join("; "));
+  }
+  return config;
+}
+
 function validateResearchConfig(value: unknown, path: string): ResearchConfig {
   const obj = record(value, path);
   const config: ResearchConfig = {};
@@ -738,6 +1110,45 @@ function validateResearchConfig(value: unknown, path: string): ResearchConfig {
   }
   if (obj.evidence !== undefined) {
     config.evidence = validateResearchEvidenceConfig(obj.evidence, `${path}.evidence`);
+  }
+  if (obj.publication !== undefined) {
+    config.publication = validateResearchPublicationConfig(obj.publication, `${path}.publication`);
+  }
+  return config;
+}
+
+/**
+ * Publication policy (issue #834). An unrecognized `mode` is rejected here
+ * rather than silently resolved to `local_only`: a typo in `sessions.json`
+ * would otherwise present as "publication is configured but nothing is ever
+ * published", which is exactly the failure this validator exists to surface.
+ * `resolvePublicationPolicy` keeps its own defensive fallback for sessions that
+ * do not come through this registry.
+ */
+function validateResearchPublicationConfig(value: unknown, path: string): ResearchPublicationConfig {
+  const obj = record(value, path);
+  const config: ResearchPublicationConfig = {};
+  if (obj.mode !== undefined) {
+    const mode = requiredString(obj.mode, `${path}.mode`) as NonNullable<ResearchPublicationConfig["mode"]>;
+    if (!RESEARCH_PUBLICATION_MODES.has(mode)) {
+      throw new Error(`${path}.mode must be one of: ${[...RESEARCH_PUBLICATION_MODES].join(", ")}`);
+    }
+    config.mode = mode;
+  }
+  if (obj.maxChars !== undefined) {
+    if (typeof obj.maxChars !== "number" || !Number.isInteger(obj.maxChars) || obj.maxChars < 1) {
+      throw new Error(`${path}.maxChars must be a positive integer`);
+    }
+    config.maxChars = obj.maxChars;
+  }
+  // The untrusted-provenance acknowledgment (§5.1). Typed strictly rather than
+  // coerced: `"false"` or `1` in sessions.json must be a load-time error, not a
+  // silently-enabled publication channel for untrusted runs.
+  if (obj.allowUntrustedInputs !== undefined) {
+    if (typeof obj.allowUntrustedInputs !== "boolean") {
+      throw new Error(`${path}.allowUntrustedInputs must be a boolean`);
+    }
+    config.allowUntrustedInputs = obj.allowUntrustedInputs;
   }
   return config;
 }
@@ -773,13 +1184,59 @@ function validateAntigravityResearchConfig(value: unknown, path: string): Antigr
     const model = requiredString(obj.model, `${path}.model`);
     config.model = model;
   }
+  if (obj.printTimeout !== undefined) {
+    const printTimeout = requiredString(obj.printTimeout, `${path}.printTimeout`);
+    try {
+      config.printTimeout = parseAntigravityPrintTimeout(printTimeout).raw;
+    } catch (err) {
+      throw new Error(`${path}.printTimeout ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (obj.workspaceSettings !== undefined) {
+    config.workspaceSettings = validateAntigravityWorkspaceSettingsConfig(
+      obj.workspaceSettings,
+      `${path}.workspaceSettings`,
+    );
+  }
+  return config;
+}
+
+function validateAntigravityWorkspaceSettingsConfig(
+  value: unknown,
+  path: string,
+): AntigravityWorkspaceSettingsSessionConfig {
+  const obj = record(value, path);
+  const config: AntigravityWorkspaceSettingsSessionConfig = {};
+  for (const key of ["enabled", "registerTrust"] as const) {
+    if (obj[key] !== undefined) {
+      if (typeof obj[key] !== "boolean") {
+        throw new Error(`${path}.${key} must be a boolean`);
+      }
+      config[key] = obj[key] as boolean;
+    }
+  }
+  if (obj.globalSettingsPath !== undefined) {
+    const globalSettingsPath = requiredString(obj.globalSettingsPath, `${path}.globalSettingsPath`);
+    if (!isAbsolute(globalSettingsPath)) {
+      throw new Error(`${path}.globalSettingsPath must be an absolute path`);
+    }
+    config.globalSettingsPath = globalSettingsPath;
+  }
   return config;
 }
 
 function cloneResearchConfig(config: ResearchConfig): ResearchConfig {
   return {
-    ...(config.antigravity ? { antigravity: { ...config.antigravity } } : {}),
+    ...(config.antigravity ? { antigravity: cloneAntigravityResearchConfig(config.antigravity) } : {}),
     ...(config.evidence ? { evidence: cloneResearchEvidenceConfig(config.evidence) } : {}),
+    ...(config.publication ? { publication: { ...config.publication } } : {}),
+  };
+}
+
+function cloneAntigravityResearchConfig(config: AntigravityResearchConfig): AntigravityResearchConfig {
+  return {
+    ...config,
+    ...(config.workspaceSettings ? { workspaceSettings: { ...config.workspaceSettings } } : {}),
   };
 }
 
@@ -1074,6 +1531,7 @@ function cloneSession(session: ResolvedSession | undefined): ResolvedSession | u
     ...(session.codex ? { codex: cloneCodexConfig(session.codex) } : {}),
     ...(session.claude ? { claude: cloneClaudeConfig(session.claude) } : {}),
     ...(session.research ? { research: cloneResearchConfig(session.research) } : {}),
+    ...(session.reviewDispute ? { reviewDispute: cloneReviewDisputeConfig(session.reviewDispute) } : {}),
     ...(session.baseBranch !== undefined ? { baseBranch: session.baseBranch } : {}),
     ...(session.assignmentProfiles ? { assignmentProfiles: cloneAssignmentProfiles(session.assignmentProfiles) } : {}),
     ...(session.flowRules ? { flowRules: cloneFlowRules(session.flowRules) } : {}),

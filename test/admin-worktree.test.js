@@ -1,8 +1,14 @@
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
-import { resolveIssueWorktree, issueWorktreePath, canonicalizePath } from '../dist/index.js';
+import { dirname, join } from 'path';
+import {
+  resolveIssueWorktree,
+  issueWorktreePath,
+  researchWorktreePath,
+  canonicalizePath,
+  IssueWorktreeLock,
+} from '../dist/index.js';
 import { sessionRedactionPaths } from '../dist/core/outbox-effects.js';
 import { sanitizeBody } from '../dist/core/text-sanitize.js';
 
@@ -70,6 +76,20 @@ function createIssueWorktree(issueNumber) {
     baseRef: 'main',
     worktreeRoot,
   });
+}
+
+/**
+ * Materialize the detached per-run research checkout a crashed research run
+ * leaves behind (issue #855). Built with plain git rather than through
+ * `prepareResearchWorkspace` so the fixture needs no `origin` remote — what
+ * matters here is only that a `research-<runId>` directory occupies the path.
+ */
+function createResearchWorktree(issueNumber, runId) {
+  const path = researchWorktreePath(worktreeRoot, 'addon-dev', issueNumber, runId);
+  mkdirSync(dirname(path), { recursive: true });
+  const head = git(['rev-parse', 'HEAD'], repoRoot).trim();
+  git(['worktree', 'add', '--detach', path, head], repoRoot);
+  return canonicalizePath(path);
 }
 
 describe('admin worktree list', () => {
@@ -173,6 +193,105 @@ describe('admin worktree prune', () => {
     const r = run('worktree', 'bogus', '--session-id', 'addon-dev');
     expect(r.code).toBe(1);
   });
+});
+
+// ---------------------------------------------------------------------------
+// `worktree prune --research` (issue #855): the targeted route for a research
+// run killed before its own cleanup ran. The plain prune above cannot reach it
+// — it addresses exactly `issue-<n>/repo` — and a retry allocates a new run id,
+// so it creates a new path instead of reclaiming the abandoned one.
+// ---------------------------------------------------------------------------
+
+describe('admin worktree prune --research', () => {
+  let lockDir;
+
+  beforeEach(() => {
+    lockDir = join(tmpDir, 'state', 'worktree-locks');
+  });
+
+  function pruneResearch(issueNumber, ...extra) {
+    return run(
+      'worktree', 'prune',
+      '--session-id', 'addon-dev',
+      '--issue-number', String(issueNumber),
+      '--research',
+      '--lock-dir', lockDir,
+      '--sessions-path', sessionsPath,
+      ...extra,
+    );
+  }
+
+  test('previews by default, then removes leaked research checkouts with --yes', () => {
+    const first = createResearchWorktree(301, 'run-a');
+    const second = createResearchWorktree(301, 'run-b');
+    const durable = createIssueWorktree(301);
+
+    const preview = pruneResearch(301);
+    expect(preview.code).toBe(0);
+    const previewOut = JSON.parse(preview.stdout.trim());
+    expect(previewOut.research).toBe(true);
+    expect(previewOut.dryRun).toBe(true);
+    expect(previewOut.removed).toEqual([]);
+    expect(previewOut.wouldRemove.map((w) => w.runId).sort()).toEqual(['run-a', 'run-b']);
+    expect(existsSync(first)).toBe(true);
+
+    const removed = pruneResearch(301, '--yes');
+    expect(removed.code).toBe(0);
+    const removedOut = JSON.parse(removed.stdout.trim());
+    expect(removedOut.ok).toBe(true);
+    expect(removedOut.removed.map((w) => w.runId).sort()).toEqual(['run-a', 'run-b']);
+    expect(existsSync(first)).toBe(false);
+    expect(existsSync(second)).toBe(false);
+
+    // The issue's durable worktree is a different checkout and must survive.
+    expect(existsSync(durable.path)).toBe(true);
+  }, 30_000);
+
+  test('removes a leaked checkout holding agent scratch (always forces)', () => {
+    const research = createResearchWorktree(302, 'run-dirty');
+    writeFileSync(join(research, 'scratch.txt'), 'agent scratch\n');
+
+    const r = pruneResearch(302, '--yes');
+    expect(r.code).toBe(0);
+    expect(existsSync(research)).toBe(false);
+  }, 30_000);
+
+  test('refuses a live issue lock unless --force', () => {
+    const research = createResearchWorktree(303, 'run-live');
+    const lock = new IssueWorktreeLock(lockDir);
+    lock.acquire('owner-ctx', 'addon-dev', 303);
+
+    const refused = pruneResearch(303, '--yes');
+    expect(refused.code).toBe(0);
+    const refusedOut = JSON.parse(refused.stdout.trim());
+    expect(refusedOut.removed).toEqual([]);
+    expect(refusedOut.skipped[0].reason).toMatch(/locked/);
+    expect(existsSync(research)).toBe(true);
+
+    const forced = pruneResearch(303, '--yes', '--force');
+    expect(forced.code).toBe(0);
+    expect(existsSync(research)).toBe(false);
+  }, 30_000);
+
+  test('no leaked research checkout is a safe no-op (exit 0)', () => {
+    createIssueWorktree(304); // only the durable worktree exists
+    const r = pruneResearch(304, '--yes');
+    expect(r.code).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    expect(out.examined).toBe(0);
+    expect(out.removed).toEqual([]);
+    expect(out.reason).toBe('not_found');
+  }, 30_000);
+
+  test('does not touch another issue\'s research checkout', () => {
+    const mine = createResearchWorktree(305, 'run-mine');
+    const other = createResearchWorktree(306, 'run-other');
+
+    const r = pruneResearch(305, '--yes');
+    expect(r.code).toBe(0);
+    expect(existsSync(mine)).toBe(false);
+    expect(existsSync(other)).toBe(true);
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------

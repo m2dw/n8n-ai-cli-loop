@@ -179,12 +179,15 @@ nor its effort is ever influenced by an assignment profile — profiles
 continue to select only the agent (issue #694 decision 5, below).
 
 `complexity:xhigh` implementation work resolves to Claude Fable 5
-(`--model fable`) at `--effort high` (issue #748) — the strongest available
-implementation profile. Opus 5 is a distilled model; effort above `high`
-degrades its implementation quality rather than improving it, so `xhigh`
-means "select the strongest profile" (Fable 5 / high), not "pass the literal
-`xhigh` effort value to Opus 5". `complexity:high` and `complexity:low` are
-unchanged.
+(`--model fable`) at `--effort xhigh` (issue #857, a follow-up policy
+correction to #748) — the strongest available implementation profile. Issue
+#748 moved `complexity:xhigh` off Opus 5 (a distilled model; effort above
+`high` degrades its implementation quality rather than improving it) onto
+Fable 5, but capped it at `high` effort, leaving `xhigh` no stronger than
+`complexity:high`. Since Opus 5 at `high` and Fable 5 at `high` are judged
+roughly equivalent, `complexity:xhigh` now runs Fable 5 at its own `xhigh`
+effort so the tier is materially stronger than `complexity:high`.
+`complexity:high` and `complexity:low` are unchanged.
 
 #### Overriding the complexity → model mapping (`session.claude`)
 
@@ -212,11 +215,11 @@ session `claude.complexityProfiles` override > built-in default**.
 #### Preflight: confirming Fable 5 is available
 
 Before relying on `complexity:xhigh`, confirm the installed Claude CLI
-recognizes the `fable` model alias and accepts `--effort high` for the
+recognizes the `fable` model alias and accepts `--effort xhigh` for the
 authenticated account:
 
 ```sh
-claude --model fable --effort high -p "respond with OK"
+claude --model fable --effort xhigh -p "respond with OK"
 ```
 
 A successful run prints a short reply and exits 0. If Fable 5 is

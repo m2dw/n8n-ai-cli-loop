@@ -1,10 +1,11 @@
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import {
   resolveIssueWorktree,
   issueWorktreePath,
+  researchWorktreePath,
   canonicalizePath,
   SqliteTaskStore,
   IssueWorktreeLock,
@@ -79,6 +80,20 @@ function createIssueWorktree(issueNumber) {
     baseRef: 'main',
     worktreeRoot,
   });
+}
+
+/**
+ * Materialize a leaked per-run research checkout: a detached worktree at the
+ * `issue-<n>/research-<runId>` path, exactly what `prepareResearchWorkspace`
+ * creates and what a killed research process leaves behind. Created with plain
+ * git rather than through the handler so the fixture needs no `origin` remote.
+ */
+function createResearchWorktree(issueNumber, runId) {
+  const path = researchWorktreePath(worktreeRoot, 'addon-dev', issueNumber, runId);
+  mkdirSync(dirname(path), { recursive: true });
+  const head = git(['rev-parse', 'HEAD'], repoRoot).trim();
+  git(['worktree', 'add', '--detach', path, head], repoRoot);
+  return canonicalizePath(path);
 }
 
 async function enqueue(issueNumber, status) {
@@ -206,6 +221,71 @@ describe('admin worktree cleanup', () => {
     expect(item.reason).toMatch(/locked/);
     expect(existsSync(wt.path)).toBe(true);
   });
+
+  // -------------------------------------------------------------------------
+  // Leaked per-run research checkouts (issue #855). A research run that is
+  // killed between `git worktree add` and its own cleanup leaves a
+  // `research-<runId>` directory that nothing else can reclaim: a retry gets a
+  // new run id, so it creates a new path. These pin that such a checkout is
+  // reachable by cleanup even while its issue's task is still active, and that
+  // the live issue lock is still the interlock protecting a run in flight.
+  // -------------------------------------------------------------------------
+
+  test('removes a leaked research checkout even while the issue task is active', async () => {
+    const research = createResearchWorktree(808, 'run-855-crashed');
+    await enqueue(808, 'running');
+    const durable = createIssueWorktree(808);
+
+    const r = cleanup('--yes');
+    expect(r.code).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+
+    const removed = out.removed.find((i) => i.path === research);
+    expect(removed).toBeDefined();
+    expect(removed.kind).toBe('research');
+    expect(removed.runId).toBe('run-855-crashed');
+    expect(removed.classification).toBe('research-leaked');
+    expect(existsSync(research)).toBe(false);
+
+    // The durable worktree of the same in-flight issue must be untouched: the
+    // per-run checkout is disposable, the issue's own worktree is not.
+    const skipped = out.skipped.find((i) => i.path === canonicalizePath(durable.path));
+    expect(skipped.classification).toBe('active');
+    expect(existsSync(durable.path)).toBe(true);
+  }, 30_000);
+
+  test('removes a leaked research checkout with agent scratch without --force', async () => {
+    // A crashed run's checkout is normally dirty (agent scratch). The dirty
+    // guard protects branch work; a detached read-only research checkout has
+    // none, so it must not force the operator into a second --force run.
+    const research = createResearchWorktree(818, 'run-855-dirty');
+    writeFileSync(join(research, 'scratch.txt'), 'agent scratch\n');
+    await enqueue(818, 'queued');
+
+    const r = cleanup('--yes');
+    expect(r.code).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    const removed = out.removed.find((i) => i.path === research);
+    expect(removed).toBeDefined();
+    expect(removed.dirty).toBe(true); // reported honestly, but does not gate
+    expect(existsSync(research)).toBe(false);
+  }, 30_000);
+
+  test('skips a leaked research checkout while the issue lock is live', async () => {
+    const research = createResearchWorktree(828, 'run-855-inflight');
+    await enqueue(828, 'running');
+    const lock = new IssueWorktreeLock(lockDir);
+    lock.acquire('owner-ctx', 'addon-dev', 828);
+
+    const r = cleanup('--yes');
+    expect(r.code).toBe(0);
+    const out = JSON.parse(r.stdout.trim());
+    expect(out.removed).toEqual([]);
+    const item = out.skipped.find((i) => i.path === research);
+    expect(item.lockHeld).toBe(true);
+    expect(item.reason).toMatch(/locked/);
+    expect(existsSync(research)).toBe(true);
+  }, 30_000);
 
   test('fails the command when a remove candidate cannot be removed', () => {
     // Orphaned (no task row) and clean, so it classifies as a remove candidate.

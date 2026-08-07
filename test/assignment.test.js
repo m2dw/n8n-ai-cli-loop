@@ -249,6 +249,16 @@ describe('JsonSessionRegistry assignment validation', () => {
   const write = (fields) =>
     writeFileSync(jsonPath, JSON.stringify({ sessions: [{ ...BASE, ...fields }] }), 'utf8');
 
+  // A single malformed entry is quarantined rather than failing registry
+  // construction (issue #823) — assert the diagnostic instead of a throw.
+  function expectInvalidEntry(pattern) {
+    const registry = new JsonSessionRegistry(jsonPath);
+    const diagnostics = registry.getDiagnostics();
+    const match = diagnostics.find((d) => d.kind === 'invalid_entry' && d.indices.includes(0));
+    expect(match).toBeDefined();
+    expect(match.message).toMatch(pattern);
+  }
+
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'assignment-test-'));
     jsonPath = join(tmpDir, 'sessions.json');
@@ -292,12 +302,12 @@ describe('JsonSessionRegistry assignment validation', () => {
 
   test('rejects an unknown agent id', () => {
     write({ assignmentProfiles: { code: { implementation: 'not-an-agent', review: 'codex' } } });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/must be one of/);
+    expectInvalidEntry(/must be one of/);
   });
 
   test('rejects a profile missing the required review role', () => {
     write({ assignmentProfiles: { code: { implementation: 'claude' } } });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/review/);
+    expectInvalidEntry(/review/);
   });
 
   test('rejects a flow rule referencing an undefined profile', () => {
@@ -308,7 +318,7 @@ describe('JsonSessionRegistry assignment validation', () => {
         { flow: 'code', default: true },
       ],
     });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/no entry in assignmentProfiles/);
+    expectInvalidEntry(/no entry in assignmentProfiles/);
   });
 
   test('rejects zero default flow rules', () => {
@@ -316,7 +326,7 @@ describe('JsonSessionRegistry assignment validation', () => {
       assignmentProfiles: { code: { implementation: 'claude', review: 'codex' } },
       flowRules: [{ flow: 'code', labels: ['documentation'] }],
     });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/exactly one rule with "default": true/);
+    expectInvalidEntry(/exactly one rule with "default": true/);
   });
 
   test('rejects multiple default flow rules', () => {
@@ -327,7 +337,7 @@ describe('JsonSessionRegistry assignment validation', () => {
         { flow: 'code', default: true },
       ],
     });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/exactly one rule with "default": true/);
+    expectInvalidEntry(/exactly one rule with "default": true/);
   });
 
   test('rejects a defaultFlow that disagrees with the default rule', () => {
@@ -339,7 +349,7 @@ describe('JsonSessionRegistry assignment validation', () => {
       flowRules: [{ flow: 'code', default: true }],
       defaultFlow: 'docs',
     });
-    expect(() => new JsonSessionRegistry(jsonPath)).toThrow(/must agree with the default flow rule/);
+    expectInvalidEntry(/must agree with the default flow rule/);
   });
 
   test('a session without assignment config leaves the fields undefined', async () => {

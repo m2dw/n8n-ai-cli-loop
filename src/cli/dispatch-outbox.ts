@@ -8,8 +8,10 @@
  *     --db-path "/path/to/dev_loop.db"
  *
  * Exit codes:
- *   0 — normal: empty outbox, full success, or partial GitHub failures
- *       (failures stay retryable and are reported in JSON)
+ *   0 — normal: empty outbox, full success, partial GitHub failures
+ *       (failures stay retryable and are reported in JSON), or a held
+ *       maintenance lock (`outcome: "maintenance_locked"`, issue #818 — no
+ *       row claimed, no external side effect, everything stays pending)
  *   1 — setup error: bad args, unknown session, missing sessions file,
  *       invalid limit
  *
@@ -17,10 +19,15 @@
  */
 
 import { statSync } from "fs";
-import { JsonSessionRegistry, DEFAULT_SESSIONS_PATH } from "../registries/json-session-registry.js";
+import {
+  JsonSessionRegistry,
+  DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
+} from "../registries/json-session-registry.js";
 import { SqliteOutboxStore, DEFAULT_DB_PATH } from "../stores/sqlite-outbox-store.js";
 import { SqliteContextStore } from "../stores/sqlite-context-store.js";
 import { dispatchOutbox, defaultGhRunner, defaultOutboxProviderFactory } from "../handlers/gh-dispatcher.js";
+import { deriveOwnershipScanCursorKey } from "../core/outbox-scan-cursor.js";
 import type { GhRunner, OutboxProviderFactory } from "../handlers/gh-dispatcher.js";
 import { GiteaRepoHostProvider } from "../providers/gitea/gitea-repo-host-provider.js";
 import { defaultGiteaClientBuilder } from "../providers/repo-host-factory.js";
@@ -208,7 +215,7 @@ export async function main(
 
     const session = await registry.getSessionById(sessionId);
     if (!session) {
-      die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+      die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
     }
     // Explicit --cwd wins; otherwise fall back to the session's repoRoot.
     if (!cwd) cwd = session.repoRoot;
@@ -226,19 +233,16 @@ export async function main(
       if (gitea && owner === gitea.owner && repo === gitea.repo) return true;
       return false;
     };
-    // JSON.stringify of an array of primitive strings/null is injective — each
-    // distinct (sessionId, githubOwner, githubName, giteaOwner, giteaRepo,
-    // giteaBaseUrl) tuple produces a distinct key — so no extra delimiter
-    // escaping is needed to keep two differently-scoped sessions (or the same
-    // session before/after a repo config change) from colliding on one cursor.
-    scanCursorKey = JSON.stringify([
+    // Derived by the one shared, injective derivation (issue #819) rather than
+    // built inline here, so the ownership scope the CLI computes and the three
+    // per-role keys the dispatcher reads/writes can never drift apart. See
+    // `docs/outbox-scan-cursor-contract.md`.
+    scanCursorKey = deriveOwnershipScanCursorKey({
       sessionId,
       githubOwner,
       githubName,
-      gitea?.owner ?? null,
-      gitea?.repo ?? null,
-      gitea?.baseUrl ?? null,
-    ]);
+      ...(gitea ? { gitea: { owner: gitea.owner, repo: gitea.repo, baseUrl: gitea.baseUrl } } : {}),
+    });
     // Wire the session's configured provider auth (GitHub App when set) into the
     // dispatcher runners so outbox side effects run as the App; `gh` mode returns
     // the injected runner unchanged. The runner refreshes its token per
@@ -466,6 +470,21 @@ export async function main(
 
     emit({
       ok: true,
+      // Maintenance contention is an expected idle outcome, not a failure
+      // (issue #818): exit 0 with a typed `outcome` so n8n treats a
+      // prune/restore window like an empty outbox rather than a crashed step.
+      // Nothing external happened — no comment, label, provider request, or
+      // Slack post — and every row stays pending for the next run. Emitted
+      // only on contention so a normal drain's JSON shape is unchanged.
+      ...(result.maintenanceLocked ? { outcome: "maintenance_locked" } : {}),
+      // Reported so an operator can see why this run's scan progress was not
+      // persisted (issue #820 review follow-up): an `admin outbox retry` rewound
+      // this identity's cursors mid-run, so the extent computed before that
+      // recovery was discarded rather than written back over it. Everything
+      // dispatched is still counted below; the next run simply re-scans the
+      // re-opened span. Emitted only when it happened, so a normal drain's JSON
+      // shape is unchanged.
+      ...(result.cursorFenceStale ? { cursorFenceStale: true } : {}),
       dispatched: result.dispatched,
       failed: result.failed,
       errors: result.errors,

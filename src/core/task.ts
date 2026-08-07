@@ -128,7 +128,15 @@ export type StoreResultCode =
   // #608). Distinct from `conflict` (a task that reached a DIFFERENT terminal
   // status — done/failed — and so can never be cancelled) so callers can
   // treat a repeat cancellation as an informative no-op rather than an error.
-  | "already_cancelled";
+  | "already_cancelled"
+  // A whole-file maintenance lock (`prune`/`restore`/`archive rollup`) is held
+  // on the store's database, so a write that would enqueue outbox effects
+  // alongside its task transition — `completePhaseWithEffects`,
+  // `cancelTaskWithEffects` — was refused in full (issue #818). Distinct from
+  // `conflict`: nothing about the task itself is wrong and nothing was
+  // mutated; the identical call succeeds once maintenance releases the lock,
+  // so callers surface it as retryable contention rather than a failure.
+  | "maintenance_locked";
 
 export type StoreResult<T> =
   | { ok: true; value: T; reactivated?: boolean }

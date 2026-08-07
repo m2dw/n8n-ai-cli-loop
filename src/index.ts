@@ -177,7 +177,19 @@ export type {
   IssueL3Interventions,
   L3AggregationResult,
 } from "./core/l3-intervention-aggregation.js";
-export { DEFAULT_SESSIONS_PATH, JsonSessionRegistry, resolveSessionRef } from "./registries/json-session-registry.js";
+export {
+  DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
+  JsonSessionRegistry,
+  resolveSessionRef,
+  SessionReferenceError,
+  SessionRegistryFatalError,
+} from "./registries/json-session-registry.js";
+export type {
+  SessionReferenceErrorKind,
+  SessionRegistryDiagnostic,
+  SessionRegistryDiagnosticKind,
+} from "./registries/json-session-registry.js";
 export type {
   BlockedByEntry,
   DependencyChecker,
@@ -250,9 +262,13 @@ export {
   resolveWorktreeRoot,
   issueWorktreeId,
   issueWorktreePath,
+  researchWorktreeId,
+  researchWorktreePath,
   sessionWorktreeDir,
+  classifyManagedWorktree,
   redactWorktreePaths,
 } from "./core/worktree-paths.js";
+export type { ManagedWorktreeClass } from "./core/worktree-paths.js";
 export {
   parseWorktreeList,
   canonicalizePath,
@@ -270,6 +286,21 @@ export type {
   ResolveIssueWorktreeResult,
   ResolvedIssueWorktree,
 } from "./handlers/worktree.js";
+export {
+  prepareResearchWorkspace,
+  releaseResearchWorkspace,
+  defaultResearchWorktreeRuntime,
+  publicResearchWorkspaceMessage,
+} from "./handlers/research-worktree.js";
+export type {
+  ResearchWorkspace,
+  ResearchWorkspaceStage,
+  ResearchWorktreeRuntime,
+  PrepareResearchWorkspaceInput,
+  PrepareResearchWorkspaceResult,
+  ReleaseResearchWorkspaceInput,
+  ReleaseResearchWorkspaceResult,
+} from "./handlers/research-worktree.js";
 export { resolveWorktreeExecutionContext } from "./handlers/worktree-context.js";
 export type {
   WorktreeExecutionContextInput,

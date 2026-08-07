@@ -1,3 +1,4 @@
+import { jest } from '@jest/globals';
 import { execFileSync } from 'child_process';
 import { generateKeyPairSync } from 'crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'fs';
@@ -7,6 +8,11 @@ import { SqliteTaskStore, SqliteOutboxStore, SqliteContextStore, JsonSessionRegi
 import { createPhaseHandlers } from '../dist/cli/run-one-phase.js';
 
 const CLI = new URL('../dist/cli/run-one-phase.js', import.meta.url).pathname;
+
+// The fixture now builds a real repository with a real `origin` and research
+// materializes a worktree from it (issue #855), so each case spawns more
+// subprocesses than the 5s default comfortably covers under the parallel run.
+jest.setTimeout(30_000);
 
 const SESSION = {
   sessionId: 'addon-dev',
@@ -25,12 +31,17 @@ let dbPath;
 let repoRoot;
 let artifactRoot;
 let fakeAgyPath;
+let worktreeRoot;
+
+function git(args, cwd) {
+  return execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, encoding: 'utf8' });
+}
 
 function run(...args) {
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], {
       encoding: 'utf8',
-      env: { ...process.env, ANTIGRAVITY_BIN: fakeAgyPath },
+      env: { ...process.env, ANTIGRAVITY_BIN: fakeAgyPath, N8N_AI_WORKTREE_ROOT: worktreeRoot },
     });
     return { code: 0, stdout };
   } catch (err) {
@@ -44,7 +55,7 @@ function run(...args) {
 // ANTIGRAVITY_BIN-overridden binary's stderr cannot be shown to originate
 // from the vetted CLI, so it is withheld from automatic retry classification).
 function runWithAgyOnPath(binDir, ...args) {
-  const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}` };
+  const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}`, N8N_AI_WORKTREE_ROOT: worktreeRoot };
   delete env.ANTIGRAVITY_BIN;
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env });
@@ -64,6 +75,21 @@ beforeEach(() => {
   dbPath = join(tmpDir, 'dev_loop.db');
   repoRoot = join(tmpDir, 'repo');
   artifactRoot = join(tmpDir, 'artifacts');
+  worktreeRoot = join(tmpDir, 'state', 'worktrees');
+
+  // A real repository with a real `origin` (issue #855): the research phase now
+  // fetches the base branch and creates a detached per-run worktree from the
+  // resolved commit before invoking the agent, so an end-to-end CLI run needs a
+  // fetchable remote. `N8N_AI_WORKTREE_ROOT` (set in `run`/`runWithAgyOnPath`)
+  // keeps those worktrees inside the test's temporary directory.
+  const originPath = join(tmpDir, 'origin.git');
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', originPath]);
+  execFileSync('git', ['init', '-q', '-b', 'main', repoRoot]);
+  writeFileSync(join(repoRoot, 'README.md'), '# repo\n', 'utf8');
+  git(['add', '-A'], repoRoot);
+  git(['commit', '-q', '-m', 'initial'], repoRoot);
+  git(['remote', 'add', 'origin', originPath], repoRoot);
+  git(['push', '-q', 'origin', 'main'], repoRoot);
 
   // Fake agy: exits 0 and prints a stub research output.
   fakeAgyPath = join(tmpDir, 'fake-agy');

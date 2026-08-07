@@ -18,7 +18,17 @@ This document supersedes the remaining part of #612 not already closed by
 chain. **Note (issue #731):** the `quarantine status`/`quarantine clear`
 subcommands and their marker-file machinery discussed below (§2, §8.1) have
 been deleted along with `worktrees.enabled` — those references are historical
-and no longer describe a live boundary violation. It complements:
+and no longer describe a live boundary violation. **Note (issue #823):**
+`SessionRegistry`'s construction is no longer "whole-file-eager-validating"
+in the sense §3.2/§3.3 below describe — a malformed or ambiguous entry
+elsewhere in `sessions.json` is quarantined (excluded, reported via
+`getDiagnostics()`) rather than failing the whole registry. The *target*
+session's own malformed/missing fields still make `getSessionById` return
+`undefined` (same as before), so §3.2/§3.3's core conclusion — keep paths B
+and C on their own tolerant read path(s), off `SessionRegistry` — is
+unaffected: `SessionRegistry` still requires the full schema on the
+requested session, which paths B/C's callers still don't need. Read those
+sections' "any entry in the file" framing as historical. It complements:
 
 - [`admin-command-registry-contract.md`](admin-command-registry-contract.md)
   (#708) — dispatch/registry mechanics: which token routes to which handler.

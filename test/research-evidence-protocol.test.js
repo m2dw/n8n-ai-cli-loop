@@ -172,8 +172,19 @@ describe('transport registry', () => {
       id: 'antigravity-stdout-marker',
       agentId: 'gemini',
       promptDelivery: 'stdin',
+      stdinOperand: '-',
     });
     expect(evidenceTransportForAgent('gemini')).toBeDefined();
+  });
+
+  // issue #813: the pinned `agy` CLI parses `--print` as requiring a value —
+  // a bare `--print` fails argument parsing before stdin is ever read. The
+  // registry carries a fixed, content-free operand so the parser is
+  // satisfied while the prompt still arrives on stdin only.
+  test('carries a fixed, content-free stdinOperand to satisfy a CLI whose flag requires a value (#813)', () => {
+    expect(EVIDENCE_TRANSPORTS.gemini.stdinOperand).toBe('-');
+    expect(typeof EVIDENCE_TRANSPORTS.gemini.stdinOperand).toBe('string');
+    expect(EVIDENCE_TRANSPORTS.gemini.stdinOperand.length).toBeLessThan(8);
   });
 
   test('an agent without a registered transport is refused at enable time (rule 5)', () => {

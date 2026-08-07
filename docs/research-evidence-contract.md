@@ -1111,15 +1111,20 @@ bytes are already on stdin, which has no such limit.
 Therefore, when evidence is enabled:
 
 1. The prompt is delivered on **stdin only**. The argv is exactly the resolved
-   profile's flags (`["--print"]`, or `["--model", <model>, "--print"]`) with **no
-   positional prompt argument** appended. Stdin is the channel the handler
-   already writes on every invocation, so the expected change is the removal of a
-   redundant copy rather than the addition of a new capability — confirmed by
-   rule 6 before the implementation relies on it.
+   profile's flags (`["--print-timeout", <value>, "--print"]`, or
+   `["--model", <model>, "--print-timeout", <value>, "--print"]` — issue #861)
+   plus, only when the registered transport declares one, a fixed `stdinOperand` —
+   with **no positional prompt argument** appended. Stdin is the channel the
+   handler already writes on every invocation, so the expected change is the
+   removal of a redundant copy rather than the addition of a new capability —
+   confirmed by rule 6 before the implementation relies on it.
 2. The argv is therefore O(flags) — a few dozen bytes — on every turn, and it
    cannot grow with the number of turns, the size of a served file, or anything
    else an agent controls. No agent-influenced quantity reaches `execve`'s
-   argument area at all.
+   argument area at all. `stdinOperand`, when present, is a fixed constant
+   declared by the transport, never derived from the prompt, a query, or any
+   other agent-influenced value, so it does not reopen the ARG_MAX risk this
+   rule exists to close.
 3. `PROMPT_MAX_BYTES` (§5) still bounds the stdin payload, because "stdin has no
    `ARG_MAX`" is not the same as "stdin is unbounded" — an unbounded prompt is a
    memory and token problem even when the kernel accepts it.
@@ -1141,6 +1146,47 @@ Therefore, when evidence is enabled:
    another delivery whose argv is O(1) in prompt size — a prompt file plus the
    CLI's file-input flag — and MUST NOT fall back to appending the prompt to
    argv, because that fallback is the failure this rule exists to prevent.
+7. **Resolved (issue #813): the operand is mandatory.** Production verification
+   against the installed `agy` found that `--print` is parsed as a Go
+   `flag.String` that MUST have a value — a bare `--print` fails argument
+   parsing with `flag needs an argument: -print` *before* the child process
+   ever reads stdin, so no stdin content, however correct, can recover a run
+   invoked that way. This is not the argv-bounded file delivery rule 6
+   anticipates as the fallback, because the prompt still fits the requirement
+   that motivated stdin delivery in the first place (an unbounded, growing
+   payload) — the CLI's parser just requires *some* value to be present before
+   it will start. The transport therefore declares a fixed, content-free
+   `stdinOperand` (`"-"` for `antigravity-stdout-marker`, the conventional
+   "read from stdin instead" sentinel) that the runner appends after the
+   resolved flags on every evidence-enabled invocation **from turn 1 onward**
+   (rule 8 below carries the first invocation's positional argument
+   differently). The operand is never the prompt, is not derived from it, and
+   does not grow with turn count or prompt size, so it satisfies rule 2
+   exactly like an empty argv would; only the actual prompt bytes are ever
+   written to stdin on those turns. `promptDelivery` stays `"stdin"` because
+   the prompt itself is unaffected — the operand exists solely to satisfy the
+   CLI's argument parser, not to carry any part of the prompt.
+8. **Resolved (issue #813 review): turn 0 carries the real prompt
+   positionally.** `stdinOperand` satisfies a CLI that requires `--print` to
+   have *some* value, but production `agy` builds are also documented
+   elsewhere in this codebase (`review.ts`, `implementation.ts`) to read the
+   prompt **only** from that value and ignore stdin entirely. A fixed
+   placeholder on every turn would silently replace the whole prompt with
+   `"-"` for such a build — an exit-0 run with irrelevant or empty findings,
+   not a diagnosable failure. The first invocation (turn 0) therefore carries
+   the real base prompt as the positional argument instead of
+   `stdinOperand`, identical in shape to the evidence-disabled path's
+   argv-plus-stdin form and bounded the same way (the base prompt, including
+   any interpolated Issue body, is capped well under `ARG_MAX` before
+   evidence is ever enabled — see `buildPrompt`'s body cap). It carries no
+   agent-influenced content, because no evidence has been requested yet, so
+   it does not reopen the risk rule 2 exists to close. From the second
+   invocation onward the prompt has grown with repository-evidence content
+   and the positional argument reverts to `stdinOperand`, exactly as rules 1–7
+   describe. A build that only reads the positional argument therefore still
+   receives the real prompt on turn 0 — enough to produce findings even if it
+   cannot participate in a multi-turn evidence exchange — while a build that
+   reads stdin (rule 7) is unaffected on every turn.
 
 ---
 
@@ -1258,12 +1304,24 @@ The evidence boundary MUST NOT:
 6. **Create a scratch script or any executable artifact.** Nothing written by
    this mechanism is executable, and nothing invokes an artifact directory path
    as a program.
-7. **Widen agent permissions.** The implementation MUST NOT pass
+7. **Widen agent permissions.** The evidence boundary MUST NOT pass
    `--dangerously-skip-permissions`, MUST NOT add or expand a tool allowlist,
    MUST NOT set an auto-approve or non-interactive-approval flag, and MUST NOT
    pre-seed a permission store. The prompt instead tells the agent to use the
    evidence channel *instead of* tools. A repository-wide guard test asserts
    these flags are absent from the research invocation.
+
+   Scope note (issue #826): this rule governs the evidence boundary — the
+   resolver, the transport, and the turn loop. It is not a prohibition on the
+   separate, runner-owned workspace permission profile specified in
+   docs/antigravity-workspace-settings.md, which is bounded, regenerated before
+   every invocation, and never merged with repository-provided settings. That
+   layer still passes no flag of any kind, still sets no auto-approve
+   (`autoAccept` is always `false`), and cannot widen anything in this document:
+   the resolver remains the authoritative bound on what repository content is
+   served into the prompt and what may be published (§10.1). See
+   docs/antigravity-workspace-settings.md §5 and §10 for the boundaries
+   permission rules cannot express and what therefore stays here.
 8. **Escape the evidence root**, follow a symlink, read an untracked or ignored
    file, or read a path denied by the floor in §4.7 — including via the
    `issue-body` source, whose only readable path is the single runner-written
@@ -1459,6 +1517,14 @@ implementation MUST:
 The two conditions are **ORed**: `bodyIncluded` keeps its independent effect for
 runs with evidence disabled, and neither condition may be narrowed.
 
+Issue #826 adds a third condition on the same OR — the runner-owned Antigravity
+workspace permission profile
+(`session.research.antigravity.workspaceSettings.enabled`), which lets the agent
+read and search the workspace with its own tools rather than through this
+channel. See docs/antigravity-workspace-settings.md §5. It is additive here: it
+never narrows either condition above, and enabling evidence still withholds
+regardless of it.
+
 The gate is **enablement, not "were any bytes actually served"**. A run can
 serve bytes and then fail, a turn artifact can be missing, and the publication
 path cannot cheaply or reliably prove that nothing reached the agent — so
@@ -1514,7 +1580,7 @@ Accepted costs, stated plainly:
 |---|---|
 | `--dangerously-skip-permissions` | Grants writes, arbitrary commands, network, and child processes at once — the exact set #802 ruled out. It also destroys auditability: nothing records what was accessed. A read-only need must not be met with an unbounded grant. |
 | Broad permission grant / pre-approved tool policy | Same unbounded capability with extra steps. The grant would be *in the agent CLI's* policy, so the runner could neither bound nor record it, and a CLI upgrade could change its meaning silently. |
-| Vendor tool-profile allowlist as the boundary (`--allowed-tools read_file,glob,grep`) | The enforcer would be the vendor CLI. No per-run bounds, no denial accounting, no symlink or deny-glob policy, no tracked-set guarantee, and the flag's existence and semantics are an Antigravity implementation detail — precisely the permanent coupling #805 must avoid. Acceptable later as *defense in depth* under this contract, never as the contract. |
+| Vendor tool-profile allowlist as the boundary (`--allowed-tools read_file,glob,grep`) | The enforcer would be the vendor CLI. No per-run bounds, no denial accounting, no symlink or deny-glob policy, no tracked-set guarantee, and the flag's existence and semantics are an Antigravity implementation detail — precisely the permanent coupling #805 must avoid. Acceptable later as *defense in depth* under this contract, never as the contract. Issue #826 takes exactly that option, as a runner-generated workspace settings file rather than a flag — see docs/antigravity-workspace-settings.md. |
 | Allowlisted shell (`run_shell_command` limited to `rg` / `cat` / `ls`) | Requires granting process execution, then defending an argv/shell-metacharacter surface fed by untrusted work-item text. Argument allowlisting for `rg` alone (`--pre`, `-e`, config files, `--hostname-bin`) is a losing position. |
 | Runner-owned helper **binary** the agent invokes as a child process | Still requires granting `run_shell_command`, so denial mode 1 returns, and the helper's argv becomes the injection surface. It also puts the boundary in a program the agent can call at will, with no per-run budget the runner can enforce. In-process resolution gets the same capability with none of that. |
 | Static precomputed bundle only (no agent-driven queries) | Cannot answer a question nobody anticipated. Small enough to fit a prompt means too small to be useful; large enough to be useful blows the prompt bound. A deterministic seed extracted from the work-item body would additionally let untrusted text steer what gets read. |
@@ -1651,6 +1717,11 @@ Ordered slices. Each is independently reviewable and leaves the tree green.
   check that refuses to enable evidence mode for a transport that cannot accept
   the prompt outside argv. The union exists so the requirement is expressed in the
   type rather than as a comment.
+- `EvidenceTransport.stdinOperand: string` (issue #813, §6.3.1 rule 7): a fixed,
+  content-free value the handler appends to argv after the resolved flags on
+  every evidence-enabled invocation, so a CLI whose flag parser requires
+  `--print` to have a value does not fail before stdin is ever read. Ships
+  `"-"` for `antigravity-stdout-marker`.
 
 ### S3 — Runner-side sources
 
@@ -1684,10 +1755,12 @@ Ordered slices. Each is independently reviewable and leaves the tree green.
   prompt growth, and `research-issue-body.md` — the last written only on this
   branch, so a disabled run writes no new file of any kind (§2).
 - When enabled: prompt delivery becomes stdin-only per §6.3.1 — the positional
-  prompt argument is dropped from the `runner.run` call, and the `PROMPT_MAX_BYTES`
-  pre-invocation check plus `promptCapReached` reporting are added. The disabled
-  branch keeps the existing `[...cmdSpec.args, prompt]` form, so the two argv
-  shapes are decided in one place and the default path is provably unchanged.
+  prompt argument is dropped from the `runner.run` call and replaced with the
+  transport's fixed `stdinOperand` (issue #813, §6.3.1 rule 7), and the
+  `PROMPT_MAX_BYTES` pre-invocation check plus `promptCapReached` reporting are
+  added. The disabled branch keeps the existing `[...cmdSpec.args, prompt]`
+  form, so the two argv shapes are decided in one place and the default path
+  is provably unchanged.
 - The `issue-body` source per §4.0: source dispatch before the path gate, so a
   body read never enters the tracked-file check.
 - Outcome mapping and precedence per §7.2; existing quota and #804 denial
@@ -1861,12 +1934,13 @@ pattern used across `test/`) containing at least:
 | 55 | Soft denial on the final turn with empty stdout | `permission-denied/*` unchanged (#804). |
 | 56 | Soft denial plus usable findings | `valid`; the denial is recorded, not fatal. |
 | 57 | Prompt growth | Turn *n*'s prompt contains every earlier evidence section; `research-prompt-turn-<n>.md` matches the invocation exactly. |
-| 57a | Prompt delivery audit, evidence **enabled** | Every invocation's argv is exactly the resolved profile's flags — no positional prompt argument — and the whole prompt arrives on stdin (§6.3.1). The test asserts the total argv byte length stays under 1 KiB on every turn, including the last. |
+| 57a | Prompt delivery audit, evidence **enabled** | The whole prompt arrives on stdin on every invocation. Turn 0's argv carries the real base prompt positionally (§6.3.1 rule 8); every invocation from turn 1 onward is exactly the resolved profile's flags plus the transport's fixed `stdinOperand` — no positional prompt argument — and the test asserts the total argv byte length for those later invocations stays under 1 KiB, including the last. |
 | 57b | Three consecutive turns each serving close to `EVIDENCE_BYTES_PER_TURN` | The run completes; no invocation fails with `E2BIG`. The test pins the final prompt at well over 256 KiB while the argv stays flag-sized, which is exactly the case an argv-delivered prompt would fail on darwin. |
 | 57c | Accumulated prompt that would exceed `PROMPT_MAX_BYTES` (bounds lowered in the test) | The runner does **not** invoke the agent again: findings from the last stdout are accepted if non-empty, otherwise `evidence/budget-exhausted`; the manifest records `promptCapReached: true`. The invocation count is asserted, so the cap is proven to be checked *before* the spawn. |
 | 57d | Evidence **disabled** argv audit | The invocation is byte-identical to today's, prompt positional argument included — the stdin-only change is scoped to the enabled branch (§6.3.1 rule 4, §12.2). |
 | 57e | Transport registry check | A transport declaring anything other than `promptDelivery: "stdin"` is refused for evidence mode at registration/enable time rather than failing at `execve`. |
-| 57f | Operand-free acceptance check | A recorded acceptance step (documented in the follow-up Issue, not a CI test) proves the pinned `agy` version reads the prompt from stdin with no positional operand. If it does not, 57a–57d are re-pinned against the O(1)-argv file delivery of §6.3.1 rule 6; appending the prompt to argv is not an acceptable outcome either way. |
+| 57f | Operand acceptance check (resolved, issue #813) | Production verification against the installed `agy` found the operand-free form does not work: `--print` fails argument parsing (`flag needs an argument: -print`) before stdin is read. A real-contract fixture (a spawned executable reproducing that exact parser behavior, not the scripted fake runner) asserts argv `["--print"]` fails and argv `["--print", "-"]` succeeds, so a regression back to the operand-free form fails this case the same way it fails against the real CLI. Appending the prompt to argv remains unacceptable either way (rule 6). |
+| 57g | Positional-only operand check (issue #813 review) | A second real-contract fixture reproduces an `agy` build that reads the prompt only from the `--print` value and ignores stdin entirely (documented separately for `review.ts`/`implementation.ts`). It asserts the run still returns findings built from the real prompt, proving turn 0 carries the real prompt positionally (rule 8) rather than the fixed `stdinOperand` — a gap case 57f's fixture, which always reads stdin, cannot cover. |
 | 58 | Public text audit | For every failure outcome, `result.error` contains no path, filename, pattern, content, hash, or absolute path. |
 | 59 | Artifact path audit | Structured metadata (`research-evidence-manifest.json`, `research-evidence-turn-<n>.json`, `result.evidence`) and every rendered `<!-- begin:evidence-response -->` section contain no absolute filesystem path. The verbatim captures (`research-prompt-turn-<n>.md`, `research-turn-<n>-output.md`) are asserted byte-identical to what was sent and received — absolute paths included — and are asserted *not* to be read by any publication path (§9, §10). |
 | 60 | Invocation flag audit | The research argv contains no `--dangerously-skip-permissions`, no tool-allowlist flag, and no auto-approve flag. |

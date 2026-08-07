@@ -47,7 +47,11 @@ import {
   type GiteaHttpRequest,
   type GiteaHttpResponse,
 } from "../providers/gitea/gitea-client.js";
-import { DEFAULT_SESSIONS_PATH, JsonSessionRegistry } from "../registries/json-session-registry.js";
+import {
+  DEFAULT_SESSIONS_PATH,
+  describeUnresolvedSessionId,
+  JsonSessionRegistry,
+} from "../registries/json-session-registry.js";
 import { resolveSessionSelector, tokenizeArgs } from "./admin-command.js";
 import { die, report } from "./cli-io.js";
 import type { OutputMode } from "./cli-io.js";
@@ -78,13 +82,18 @@ export function parseSessionAuditArgs(argv: string[]): SessionAuditArgs | { erro
 // Read-only fact collection
 // ---------------------------------------------------------------------------
 
-/** Run a read-only command, returning its trimmed stdout or the failure text. */
-function probe(
+/**
+ * One attempt at a read-only command, returning its trimmed stdout or the
+ * failure text. `mute` marks a child that was *signalled* away with neither an
+ * answer nor a reason — see {@link probe}, which is what decides what to do
+ * about that.
+ */
+function probeOnce(
   cmd: string,
   args: string[],
   cwd: string | undefined,
   timeoutMs: number,
-): { ok: boolean; output: string } {
+): { ok: boolean; output: string; mute: boolean } {
   try {
     const stdout = execFileSync(cmd, args, {
       cwd,
@@ -101,11 +110,75 @@ function probe(
       // one has already spent the budget.
       timeout: timeoutMs,
     }) as string;
-    return { ok: true, output: stdout.trim() };
+    return { ok: true, output: stdout.trim(), mute: false };
   } catch (err: unknown) {
-    const e = err as { stdout?: string; stderr?: string };
-    return { ok: false, output: (e.stderr ?? e.stdout ?? String(err)).slice(0, 300).trim() };
+    const e = err as {
+      stdout?: string | null;
+      stderr?: string | null;
+      signal?: string | null;
+      status?: number | null;
+    };
+    // A spawn-level failure (no such command, not executable) carries `null` on
+    // both streams, so `String(err)` still names it. An *empty string* is the
+    // different case handled below: the child ran and said nothing.
+    const captured = (e.stderr ?? e.stdout ?? String(err)).slice(0, 300).trim();
+    if (captured) return { ok: false, output: captured, mute: false };
+    // Neither stream carried a byte. That is never how `gh` reports a real
+    // failure — it explains itself on stderr — and reporting it verbatim would
+    // put an `unavailable` lookup in front of the operator with the empty string
+    // as its reason, which is the one detail they can do nothing with. Say what
+    // the failure does carry instead.
+    //
+    // Only a *signalled* end is `mute`: the child never reached its own exit, so
+    // nothing about the run is settled and {@link probe} may look again. A child
+    // that chose an exit status has already answered — silently, but
+    // deterministically — and re-running it can only replace that answer with a
+    // worse one (a retry caught by machine-level pressure would report a signal
+    // where the reproducible reason was the status).
+    const killedBySignal = Boolean(e.signal);
+    const how = killedBySignal
+      ? `was killed by ${e.signal}`
+      : `exited with status ${e.status ?? "unknown"}`;
+    return {
+      ok: false,
+      output: `${cmd} ${how} without writing any diagnostic (probe bound ${timeoutMs}ms)`,
+      mute: killedBySignal,
+    };
   }
+}
+
+/**
+ * Run a read-only command, returning its trimmed stdout or the failure text.
+ *
+ * `timeoutMs` bounds the whole call, retry included: it is what is left of the
+ * run's shared tracker-probe budget (see {@link ghProbe}), so this must never
+ * cost more wall clock than it was handed.
+ */
+function probe(
+  cmd: string,
+  args: string[],
+  cwd: string | undefined,
+  timeoutMs: number,
+): { ok: boolean; output: string } {
+  const startedAt = Date.now();
+  const first = probeOnce(cmd, args, cwd, timeoutMs);
+  if (!first.mute) return { ok: first.ok, output: first.output };
+  // The child was signalled away with neither an answer nor a reason, which has
+  // two very different causes. One is the probe bound itself expiring — the tracker is
+  // genuinely unresponsive, and re-waiting it is exactly what the shared budget
+  // exists to prevent. The other is the process being killed out from under the
+  // audit (machine-level pressure, or an endpoint agent inspecting a binary on
+  // first execution); that is transient, and left alone it surfaces as a
+  // tracker finding the operator cannot reproduce.
+  //
+  // The clock tells them apart: only an attempt that ended *before* its bound
+  // can have been ended by something other than that bound. Retrying inside the
+  // time that attempt left over keeps the caller's budget covering the whole
+  // call, so the second probe of a run still cannot re-wait the first one's.
+  const left = timeoutMs - (Date.now() - startedAt);
+  if (left <= 0) return { ok: false, output: first.output };
+  const second = probeOnce(cmd, args, cwd, left);
+  return { ok: second.ok, output: second.output };
 }
 
 /**
@@ -576,7 +649,7 @@ export async function runSessionAudit(argv: string[]): Promise<void> {
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   const facts = collectSessionAuditFacts(session, offline);

@@ -38,9 +38,37 @@ export interface PhaseCompletionTransition {
   expected: TaskExpected;
   patch: TaskPatch;
   event: TaskEvent;
+  /**
+   * Further bounded events belonging to the SAME completion, committed in the
+   * same transaction and in the order given, immediately after `event` (issue
+   * #840). The review-dispute transition layer is the one producer today: its
+   * §10.3 audit event describes the protocol block that the completion's own
+   * patch writes, so the two must land together or not at all — a separate
+   * `appendEvent` would leave the block moved with no record of why, or a record
+   * of a move that the CAS refused.
+   *
+   * Optional and normally absent; a completion with no extra events behaves
+   * exactly as it did before.
+   */
+  extraEvents?: TaskEvent[];
 }
 
 export interface TaskStore {
+  /**
+   * Opaque identity of the durable backend this store writes to (issue #818
+   * review follow-up). Two stores reporting the same defined value write to the
+   * same database file and therefore share one transaction domain: effects
+   * committed through {@link completePhaseWithEffects} are already visible —
+   * and already maintenance-guarded — through the paired {@link OutboxStore}.
+   *
+   * Optional, and `undefined` for any store with no shareable durable backend
+   * (in-memory stores, fakes, per-connection `:memory:` databases). `undefined`
+   * on either side means "assume nothing is shared", which is the safe default:
+   * the caller performs its own outbox write instead of relying on a
+   * transaction that does not exist.
+   */
+  readonly backendId?: string | undefined;
+
   enqueueTask(input: EnqueueTaskInput): Promise<StoreResult<AiTask>>;
   getTask(key: TaskKey): Promise<AiTask | undefined>;
   claimNextTask(request: ClaimNextTaskRequest): Promise<AiTask | undefined>;
@@ -60,6 +88,12 @@ export interface TaskStore {
    * no transition without its effects, and no effect without its transition —
    * rather than transitioning the task and separately, best-effort, enqueueing
    * its side effects.
+   *
+   * An implementation whose backend has a whole-file maintenance lock must
+   * refuse the entire call with `code: "maintenance_locked"` while that lock is
+   * held (issue #818) — this is an outbox enqueue path, and a refusal is
+   * all-or-nothing for the same reason the commit is. The lock read must happen
+   * inside this same transaction, not as a pre-check.
    */
   completePhaseWithEffects(
     transition: PhaseCompletionTransition,
@@ -159,6 +193,11 @@ export interface TaskStore {
    * transition commits leaves the task permanently `cancelled` with no
    * event or comment, and retrying cannot repair the gap because a repeat
    * call observes `already_cancelled` and no-ops.
+   *
+   * Refuses with `code: "maintenance_locked"` under a held maintenance lock,
+   * exactly as `completePhaseWithEffects` does (issue #818): refusing in full
+   * leaves the task untouched, so the operator's cancellation stays repeatable
+   * once the lock clears instead of landing without its comment.
    */
   cancelTaskWithEffects(
     key: TaskKey,

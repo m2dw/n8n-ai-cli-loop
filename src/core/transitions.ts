@@ -1,5 +1,5 @@
 import type { AiTask, TaskPatch, TaskPhase, TaskStatus } from "./task.js";
-import { ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "../handlers/artifact-dir.js";
+import { ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "./artifact-dir-contract.js";
 
 export function leaseExpiry(now: string, leaseMs: number): string {
   return new Date(Date.parse(now) + leaseMs).toISOString();

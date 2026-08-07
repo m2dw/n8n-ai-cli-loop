@@ -1,8 +1,12 @@
-import { mkdtempSync, rmSync, readFileSync, existsSync, lstatSync, writeFileSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, lstatSync, symlinkSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createReviewHandler as _createReviewHandler } from '../dist/handlers/review.js';
 import { SqliteTaskStore, runNextPhase } from '../dist/index.js';
+import {
+  REVIEW_FINDINGS_END_MARKER,
+  REVIEW_FINDINGS_MARKER,
+} from '../dist/core/review-finding-envelope.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -5126,5 +5130,749 @@ describe('review handler — issue-required verification', () => {
     const result = await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
     expect(result.result).toBe('success');
     expect(result.context?.issueRequiredVerifications).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structured finding envelope (issue #841)
+//
+// The protocol is gated behind `session.reviewDispute.enabled`. Every existing
+// test above runs with it absent, so those assertions are themselves the
+// compatibility proof: with the gate off, the review lane is unchanged.
+// ---------------------------------------------------------------------------
+
+describe('review handler — structured finding envelope (issue #841)', () => {
+  function envelope(body) {
+    return `${REVIEW_FINDINGS_MARKER}\n${JSON.stringify(body)}\n${REVIEW_FINDINGS_END_MARKER}`;
+  }
+
+  const FINDING = {
+    version: 1,
+    severity: 'P1',
+    violatedContract: 'Acceptance criterion: the fix must reject an unauthenticated caller',
+    preconditions: 'A request arrives with no session cookie',
+    failureScenario: 'The handler returns 200 and the caller reads another tenant rate-limit state',
+    affectedBoundary: 'src/handlers/review.ts',
+    requiredOutcome: 'An unauthenticated request must be rejected with 401 before any state read',
+    evidenceRefs: [{ kind: 'file', path: 'src/handlers/review.ts', startLine: 10, endLine: 20 }],
+  };
+
+  // Claude review call order (see the Claude describe block above), plus the
+  // `git ls-files -s` evidence capture this Issue adds — issued lazily, so only a
+  // run that actually resolves an evidence reference consumes that step.
+  function claudeRunner(reviewOutput, tail = []) {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff (classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff (prompt)
+      { stdout: reviewOutput, stderr: '', exitCode: 0 },    // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+      ...tail,
+    ]);
+  }
+
+  /** One tracked regular file, in `git ls-files -s` format. */
+  const LS_FILES = {
+    stdout: '100644 0000000000000000000000000000000000000000 0\tsrc/handlers/review.ts\n',
+    stderr: '',
+    exitCode: 0,
+  };
+
+  // A `file` reference names lines INSIDE a document, so the resolver reads the
+  // reviewed checkout — the per-issue worktree — to check them: the cited path has
+  // to exist there, with the cited range inside it. 40 lines covers FINDING's 10–20.
+  beforeEach(() => {
+    mkdirSync(join(worktreePath(), 'src', 'handlers'), { recursive: true });
+    writeFileSync(
+      join(worktreePath(), 'src', 'handlers', 'review.ts'),
+      `${Array.from({ length: 40 }, (_, i) => `// line ${i + 1}`).join('\n')}\n`,
+      'utf8',
+    );
+  });
+
+  function claudeContext({ enabled = true, ...overrides } = {}) {
+    return CONTEXT({
+      session: SESSION({
+        defaults: { implementationAgent: 'claude', reviewAgent: 'claude', researchAgent: 'gemini' },
+        ...(enabled ? { reviewDispute: { enabled: true } } : {}),
+      }),
+      ...overrides,
+    });
+  }
+
+  const claudeTask = (overrides = {}) => makeTask({ reviewAgent: 'claude', ...overrides });
+
+  const promptText = () => readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
+
+  // -------------------------------------------------------------------------
+  // Gate and prompt
+  // -------------------------------------------------------------------------
+
+  test('with the protocol off, the brief carries no output contract and no findings state is written', async () => {
+    const result = await createReviewHandler(claudeContext({ enabled: false }), claudeRunner('No blocking issues.'))(claudeTask());
+    expect(result.result).toBe('success');
+    expect(promptText()).not.toContain(REVIEW_FINDINGS_MARKER);
+    expect(result.context?.reviewFindings).toBeUndefined();
+    expect(result.context?.reviewDispute).toBeUndefined();
+  });
+
+  test('with the protocol on, the brief carries the output contract', async () => {
+    await createReviewHandler(claudeContext(), claudeRunner(envelope({ version: 1, status: 'success' })))(claudeTask());
+    const prompt = promptText();
+    expect(prompt).toContain(REVIEW_FINDINGS_MARKER);
+    expect(prompt).toContain(REVIEW_FINDINGS_END_MARKER);
+    expect(prompt).toContain('Structured Finding Output (required)');
+  });
+
+  test('a review agent that cannot emit the schema takes the explicit compatibility path', async () => {
+    // Codex composes its own review report from a `--title` brief, so it is never
+    // asked for an envelope and its absence is a configuration fact, not a
+    // malformed-output diagnostic. Routing stays exactly today's.
+    const context = CONTEXT({ session: SESSION({ reviewDispute: { enabled: true } }) });
+    const result = await createReviewHandler(context, happyRunner())(makeTask());
+    expect(result.result).toBe('success');
+    expect(promptText()).not.toContain(REVIEW_FINDINGS_MARKER);
+    expect(result.context?.reviewFindings).toMatchObject({
+      mode: 'unsupported',
+      agentId: 'codex',
+      compatibility: 'prompt-not-agent-authored',
+    });
+    expect(result.context?.reviewDispute).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // Invalid protocol configuration
+  // -------------------------------------------------------------------------
+
+  function invalidDisputeContext(reviewDispute) {
+    return CONTEXT({
+      session: SESSION({
+        defaults: { implementationAgent: 'claude', reviewAgent: 'claude', researchAgent: 'gemini' },
+        reviewDispute,
+      }),
+    });
+  }
+
+  test('an invalid review-dispute configuration fails the review before the agent is invoked', async () => {
+    // Session load rejects an invalid `reviewDispute` block (§6.1), so reaching
+    // one here means a hand-built session. It must not degrade to legacy review:
+    // an invalid limit would otherwise bypass structured-finding enforcement.
+    const runner = claudeRunner(envelope({ version: 1, status: 'success' }));
+    const result = await createReviewHandler(
+      invalidDisputeContext({ enabled: true, limits: { maxVersionsPerLineage: 0 } }),
+      runner,
+    )(claudeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toContain('session.reviewDispute');
+    expect(result.error).toContain('reviewDispute.limits.maxVersionsPerLineage');
+    expect(result.context.reviewDisputeConfigError).toEqual({
+      paths: ['reviewDispute.limits.maxVersionsPerLineage'],
+      codes: ['below-minimum'],
+    });
+    // Nothing structured was produced, so nothing structured is persisted.
+    expect(result.context.reviewFindings).toBeUndefined();
+    expect(result.context.reviewDispute).toBeUndefined();
+    expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-result.json'), 'utf8'),
+    );
+    expect(artifact).toMatchObject({ success: false, step: 'review-dispute-config:invalid' });
+  });
+
+  test('an invalid configuration fails closed even when the protocol is switched off', async () => {
+    // `enabled: false` does not make a malformed block benign — a review that
+    // passed under it would be a clean success produced by an unresolvable
+    // configuration.
+    const result = await createReviewHandler(
+      invalidDisputeContext({ enabled: false, limits: { maxRebuttalsPerVersion: 9 } }),
+      claudeRunner('No blocking issues.'),
+    )(claudeTask());
+    expect(result.result).toBe('failed');
+    expect(result.context.reviewDisputeConfigError.codes).toEqual(['above-default']);
+  });
+
+  // -------------------------------------------------------------------------
+  // Admitted envelopes
+  // -------------------------------------------------------------------------
+
+  test('a findings envelope routes to needs_fix and persists one open version-1 lineage', async () => {
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.reviewFindings).toMatchObject({
+      mode: 'admitted', status: 'findings', admitted: 1, reviewStructure: 'structured',
+    });
+    const lineages = Object.values(result.context.reviewDispute.lineages);
+    expect(lineages).toHaveLength(1);
+    expect(lineages[0]).toMatchObject({
+      state: 'open', version: 1, severity: 'P1', humanGate: false, affectedBoundary: 'src/handlers/review.ts',
+    });
+    expect(result.context.reviewDispute.version).toBe(1);
+  });
+
+  test('the classifier alone would have passed that review — the envelope is what blocks it', async () => {
+    // The severity policy is unchanged, but `"severity": "P1"` inside JSON is not
+    // the `[P1]` marker the prose classifier looks for. Without the envelope the
+    // same output reads as a clean pass, which is exactly the gap this closes.
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const off = await createReviewHandler(claudeContext({ enabled: false }), claudeRunner(output))(claudeTask());
+    expect(off.result).toBe('success');
+    const on = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(on.result).toBe('needs_fix');
+  });
+
+  test('the raw review output stays local while only bounded state reaches task context', async () => {
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    const dir = join(artifactRoot, 'runs', 'run-review-1');
+    // Complete raw output, and the full §10.2 finding records, are artifacts.
+    expect(readFileSync(join(dir, 'review-output.md'), 'utf8')).toContain(REVIEW_FINDINGS_MARKER);
+    const artifact = JSON.parse(readFileSync(join(dir, 'review-findings.json'), 'utf8'));
+    expect(artifact.findings[0].failureScenario).toBe(FINDING.failureScenario);
+    expect(artifact.findings[0].reviewerMeta.reviewRunId).toBe('run-review-1');
+    // The persisted block carries literals and counters only — no prose, no
+    // evidence, no reviewer metadata.
+    const lineage = Object.values(result.context.reviewDispute.lineages)[0];
+    expect(Object.keys(lineage).sort()).toEqual(
+      ['affectedBoundary', 'counters', 'humanGate', 'lineageId', 'rebuttedVersions', 'severity', 'state', 'version'],
+    );
+  });
+
+  test('multiple findings persist one lineage each', async () => {
+    const second = {
+      ...FINDING,
+      severity: 'P2',
+      violatedContract: 'Acceptance criterion: the retry budget must be bounded',
+      failureScenario: 'A transient failure retries forever and the worker never yields',
+      affectedBoundary: 'src/handlers/review.ts#retry',
+    };
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING, second] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(Object.keys(result.context.reviewDispute.lineages)).toHaveLength(2);
+    expect(result.context.reviewFindings.admitted).toBe(2);
+  });
+
+  test('a success envelope passes and records a fully structured review with no lineages', async () => {
+    const result = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'success' })),
+    )(claudeTask());
+    expect(result.result).toBe('success');
+    expect(result.context.reviewDispute.lineages).toEqual({});
+    expect(result.context.reviewDispute.reviewStructure).toBe('structured');
+  });
+
+  test('a blocked envelope escalates to a human', async () => {
+    const result = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'blocked', blockedReason: 'insufficient_context' })),
+    )(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewFindings).toMatchObject({ status: 'blocked', blockedReason: 'insufficient_context' });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fail-closed paths
+  // -------------------------------------------------------------------------
+
+  test('an invalid envelope persists no lineage and never passes as a clean review', async () => {
+    const result = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(`${REVIEW_FINDINGS_MARKER}\n{"version":1,"status":"findings"\n${REVIEW_FINDINGS_END_MARKER}`),
+    )(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewDispute).toBeUndefined();
+    expect(result.context.reviewFindings).toMatchObject({ mode: 'rejected' });
+    expect(result.context.reviewFindings.rejection.reason).toBe('unparseable');
+  });
+
+  test('a duplicated finding id rejects the whole set rather than persisting part of it', async () => {
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING, { ...FINDING }] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewDispute).toBeUndefined();
+    expect(result.context.reviewFindings.rejection.reason).toBe('duplicate-version');
+  });
+
+  test('an unresolvable evidence reference rejects the finding', async () => {
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    // `git ls-files` lists a different file, so the reference resolves to nothing.
+    const emptyIndex = { stdout: '100644 0000 0\tsrc/other.ts\n', stderr: '', exitCode: 0 };
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [emptyIndex]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewFindings.rejection.reason).toBe('unresolvable-evidence');
+  });
+
+  test('a reference to lines the tracked file does not have is refused', async () => {
+    // The path is tracked and really on disk; lines 200–210 are not. Tracking is
+    // only half the reference, so the range is checked against the file itself
+    // rather than admitted because the path checked out.
+    const output = envelope({
+      version: 1,
+      status: 'findings',
+      findings: [
+        { ...FINDING, evidenceRefs: [{ kind: 'file', path: 'src/handlers/review.ts', startLine: 200, endLine: 210 }] },
+      ],
+    });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewDispute).toBeUndefined();
+    expect(result.context.reviewFindings.rejection.reason).toBe('unresolvable-evidence');
+  });
+
+  test('a reference to a document section the file does not carry is refused', async () => {
+    mkdirSync(join(worktreePath(), 'docs'), { recursive: true });
+    writeFileSync(join(worktreePath(), 'docs', 'review-dispute-contract.md'), '# Contract\n\n## §2.1 Findings\n', 'utf8');
+    const lsFiles = {
+      stdout:
+        '100644 0000000000000000000000000000000000000000 0\tdocs/review-dispute-contract.md\n',
+      stderr: '',
+      exitCode: 0,
+    };
+    const docRef = (section) => ({
+      version: 1,
+      status: 'findings',
+      findings: [
+        { ...FINDING, evidenceRefs: [{ kind: 'doc_section', path: 'docs/review-dispute-contract.md', section }] },
+      ],
+    });
+
+    const invented = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope(docRef('§9.9 Invented section')), [lsFiles]),
+    )(claudeTask());
+    expect(invented.result).toBe('blocked');
+    expect(invented.context.reviewFindings.rejection.reason).toBe('unresolvable-evidence');
+
+    const real = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope(docRef('§2.1 Findings')), [lsFiles]),
+    )(claudeTask());
+    expect(real.result).toBe('needs_fix');
+    expect(real.context.reviewFindings).toMatchObject({ mode: 'admitted', admitted: 1 });
+  });
+
+  test('a submodule gitlink is not tracked file evidence', async () => {
+    // `git ls-files -s` reports a submodule directory with mode 160000. Its content
+    // is not in this checkout's index at all, so a finding cannot cite it as file or
+    // document evidence. Readable content is planted at the path so the ONLY reason
+    // this reference fails is the index mode: drop the mode filter and it resolves.
+    mkdirSync(join(worktreePath(), 'vendor'), { recursive: true });
+    writeFileSync(join(worktreePath(), 'vendor', 'dep'), 'one\ntwo\nthree\n', 'utf8');
+    const output = envelope({
+      version: 1,
+      status: 'findings',
+      findings: [{ ...FINDING, evidenceRefs: [{ kind: 'file', path: 'vendor/dep', startLine: 1, endLine: 2 }] }],
+    });
+    const lsFiles = {
+      stdout:
+        '100644 0000000000000000000000000000000000000000 0\tsrc/handlers/review.ts\n' +
+        '160000 1111111111111111111111111111111111111111 0\tvendor/dep\n',
+      stderr: '',
+      exitCode: 0,
+    };
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [lsFiles]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewDispute).toBeUndefined();
+    expect(result.context.reviewFindings.rejection.reason).toBe('unresolvable-evidence');
+  });
+
+  test('a symlink is not tracked file evidence', async () => {
+    // Same isolation as the gitlink above: the content is readable, so mode 120000
+    // is the only thing standing between this reference and admission.
+    writeFileSync(join(worktreePath(), 'link.ts'), 'one\ntwo\nthree\n', 'utf8');
+    const output = envelope({
+      version: 1,
+      status: 'findings',
+      findings: [{ ...FINDING, evidenceRefs: [{ kind: 'file', path: 'link.ts', startLine: 1, endLine: 2 }] }],
+    });
+    const lsFiles = {
+      stdout: '120000 2222222222222222222222222222222222222222 0\tlink.ts\n',
+      stderr: '',
+      exitCode: 0,
+    };
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [lsFiles]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewFindings.rejection.reason).toBe('unresolvable-evidence');
+  });
+
+  // The index capture and the evidence read are two moments. Between them a
+  // verification command — or anything else touching the worktree — can swap a
+  // tracked regular file for a link out of the checkout. The mode filter saw
+  // 100644 and cannot see that, so the read has to refuse it on its own.
+  test('a tracked path swapped for a symlink after the index capture is not evidence', async () => {
+    const outside = join(tmpDir, 'outside-review.ts');
+    writeFileSync(outside, `${Array.from({ length: 40 }, (_, i) => `// line ${i + 1}`).join('\n')}\n`, 'utf8');
+    const cited = join(worktreePath(), 'src', 'handlers', 'review.ts');
+    rmSync(cited);
+    symlinkSync(outside, cited);
+    // The link target carries lines 10–20, so following it would ADMIT the finding:
+    // refusing to follow is the only thing standing between it and admission.
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewFindings.rejection.reason).toBe('unresolvable-evidence');
+  });
+
+  test('a tracked path reached through a symlinked parent directory is not evidence', async () => {
+    // Same swap one level up: the cited file itself is a regular file, but only
+    // because a parent component now points out of the checkout.
+    const outsideDir = join(tmpDir, 'outside-handlers');
+    mkdirSync(outsideDir, { recursive: true });
+    writeFileSync(
+      join(outsideDir, 'review.ts'),
+      `${Array.from({ length: 40 }, (_, i) => `// line ${i + 1}`).join('\n')}\n`,
+      'utf8',
+    );
+    const handlers = join(worktreePath(), 'src', 'handlers');
+    rmSync(handlers, { recursive: true });
+    symlinkSync(outsideDir, handlers, 'dir');
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewFindings.rejection.reason).toBe('unresolvable-evidence');
+  });
+
+  test('a finding whose evidence is only a test name is refused, artifact and lineage alike', async () => {
+    // Nothing in this run can tell a real test name from an invented one, so the
+    // reference does not resolve. The finding must not become an open lineage
+    // routed to needs_fix on evidence nobody verified.
+    const output = envelope({
+      version: 1,
+      status: 'findings',
+      findings: [{ ...FINDING, evidenceRefs: [{ kind: 'test', name: 'rate limiting rejects an anonymous caller' }] }],
+    });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewDispute).toBeUndefined();
+    expect(result.context.reviewFindings.rejection.reason).toBe('unresolvable-evidence');
+    expect(existsSync(join(artifactRoot, 'runs', 'run-review-1', 'review-findings.json'))).toBe(false);
+  });
+
+  test('the brief asks only for evidence forms this run can verify', async () => {
+    await createReviewHandler(claudeContext(), claudeRunner(envelope({ version: 1, status: 'success' })))(claudeTask());
+    const withoutBody = promptText();
+    expect(withoutBody).toContain('"kind": "file"');
+    // No issue body was captured, so a quote has nothing to resolve against.
+    expect(withoutBody).not.toContain('"kind": "issue_quote"');
+    // No run can resolve a test reference yet (#842 owns that resolver).
+    expect(withoutBody).not.toContain('"kind": "test"');
+
+    await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'success' })),
+    )(claudeTask({ context: { ...makeTask().context, body: 'The handler MUST reject an anonymous caller.' } }));
+    expect(promptText()).toContain('"kind": "issue_quote"');
+  });
+
+  test('the persisted lineages and the artifact backing them are written as a pair', async () => {
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-findings.json'), 'utf8'),
+    );
+    // Every persisted lineage has its full record on disk. Serialization happens
+    // during admission, so there is no path where one exists without the other.
+    expect(artifact.findings.map((f) => f.lineageId).sort()).toEqual(
+      Object.keys(result.context.reviewDispute.lineages).sort(),
+    );
+  });
+
+  test('a rejected envelope does not override a classifier verdict that already blocks', async () => {
+    const output = `[P1] Missing null check\n${REVIEW_FINDINGS_MARKER}\n{ not json\n${REVIEW_FINDINGS_END_MARKER}`;
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output))(claudeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context.reviewFindings).toMatchObject({ mode: 'rejected' });
+    expect(result.context.reviewDispute).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // Subsequent reviews of the same task (issue #841 review, P1)
+  //
+  // Task context is merged SHALLOWLY, so the block a review writes replaces the
+  // stored one wholesale. A task re-enters review after every implementation
+  // fix, so a block built from this run's findings alone would erase the
+  // lineages the previous review opened — including on a plain `success`
+  // envelope, whose own lineage map is empty.
+  // -------------------------------------------------------------------------
+
+  test('a later success envelope keeps the lineage an earlier review opened', async () => {
+    const first = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'findings', findings: [FINDING] }), [LS_FILES]),
+    )(claudeTask());
+    expect(first.result).toBe('needs_fix');
+    const opened = Object.keys(first.context.reviewDispute.lineages);
+    expect(opened).toHaveLength(1);
+
+    // The implementation fix ran; this review of the same task passes cleanly.
+    const second = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'success' })),
+    )(claudeTask({ context: { ...makeTask().context, reviewDispute: first.context.reviewDispute } }));
+
+    expect(second.result).toBe('success');
+    // The open lineage survives for the #840 state machine to transition; this
+    // Issue neither closes nor rewrites it.
+    expect(Object.keys(second.context.reviewDispute.lineages)).toEqual(opened);
+    expect(second.context.reviewDispute.lineages[opened[0]]).toMatchObject({ state: 'open', version: 1 });
+    expect(second.context.reviewFindings.retainedLineages).toBe(1);
+    // The review's own structure is still this run's.
+    expect(second.context.reviewDispute.reviewStructure).toBe('structured');
+  });
+
+  test('a re-emitted finding attaches to its persisted lineage rather than resetting it', async () => {
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const first = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    const [lineageId] = Object.keys(first.context.reviewDispute.lineages);
+    // A field only the persisted record can carry, so re-minting it as a fresh
+    // version-1 lineage would be visible.
+    const prior = {
+      ...first.context.reviewDispute,
+      lineages: { [lineageId]: { ...first.context.reviewDispute.lineages[lineageId], humanGate: true } },
+    };
+
+    const second = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(
+      claudeTask({ context: { ...makeTask().context, reviewDispute: prior } }),
+    );
+
+    // §2.2: the re-raise attaches to the live lineage instead of opening a second
+    // debate about the same defect, and the record already on file wins — resetting
+    // whatever state #840 wrote on it would be a transition this Issue does not own.
+    expect(second.result).toBe('needs_fix');
+    expect(Object.keys(second.context.reviewDispute.lineages)).toEqual([lineageId]);
+    expect(second.context.reviewDispute.lineages[lineageId].humanGate).toBe(true);
+    expect(second.context.reviewFindings).toMatchObject({
+      admitted: 0,
+      attachedLineages: [lineageId],
+      retainedLineages: 1,
+    });
+  });
+
+  test('a re-review is shown the open lineage ids, and an echoed one attaches', async () => {
+    // The loop this closes (issue #841 review, P1): a reviewer that follows the
+    // contract and echoes an id it was shown must not have its whole envelope
+    // rejected as `unknown-lineage`.
+    const first = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'findings', findings: [FINDING] }), [LS_FILES]),
+    )(claudeTask());
+    const [lineageId] = Object.keys(first.context.reviewDispute.lineages);
+
+    const second = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(
+        envelope({ version: 1, status: 'findings', findings: [{ ...FINDING, lineageId }] }),
+        [LS_FILES],
+      ),
+    )(claudeTask({ context: { ...makeTask().context, reviewDispute: first.context.reviewDispute } }));
+
+    // The brief named the id the reviewer echoed.
+    expect(promptText()).toContain(lineageId);
+    expect(second.result).toBe('needs_fix');
+    expect(second.context.reviewFindings).toMatchObject({ mode: 'admitted', attachedLineages: [lineageId] });
+    expect(Object.keys(second.context.reviewDispute.lineages)).toEqual([lineageId]);
+  });
+
+  test('the first review of a task is shown no lineage ids at all', async () => {
+    await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'success' })),
+    )(claudeTask());
+    expect(promptText()).toContain('Do not set `lineageId`, `humanGate`, or `reviewerMeta`');
+    expect(promptText()).not.toContain('still open');
+  });
+
+  test('an unreadable persisted block fails the review closed instead of being overwritten', async () => {
+    const result = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'success' })),
+    )(claudeTask({ context: { ...makeTask().context, reviewDispute: { version: 1, lineages: 'not-a-map' } } }));
+
+    // Nothing new is written over a block that cannot be validated, and a review
+    // whose findings state could not be carried never passes as clean.
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewDispute).toBeUndefined();
+    expect(result.context.reviewFindings).toMatchObject({ mode: 'rejected' });
+  });
+
+  // -------------------------------------------------------------------------
+  // Envelope content is not reviewer prose (issue #841 review, P2)
+  // -------------------------------------------------------------------------
+
+  test('a finding that quotes a human-escalation phrase still routes to the fix lane', async () => {
+    // The §13 prose rules read free-form reviewer text. A finding that QUOTES
+    // user-facing wording is not the reviewer asking for a human, so the
+    // classifier is given the residual prose rather than the envelope's JSON.
+    const quoting = {
+      ...FINDING,
+      requiredOutcome: 'The banner must read "manual review required" before the request is dropped',
+    };
+    const result = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'findings', findings: [quoting] }), [LS_FILES]),
+    )(claudeTask());
+
+    expect(result.result).toBe('needs_fix');
+    expect(result.context.reviewFindings).toMatchObject({ mode: 'admitted', admitted: 1 });
+  });
+
+  test('a conflict marker outside the envelope still wins over an admitted envelope', async () => {
+    // Scoping the prose rules to the residual must not lose Git's own evidence:
+    // the conflict check still reads the complete output.
+    const output = `<<<<<<< HEAD\nlocal\n=======\ntheirs\n>>>>>>> main\n${envelope({ version: 1, status: 'success' })}`;
+    const runner = claudeRunner(output, [{ stdout: '', stderr: '', exitCode: 0 }]); // worktree remove
+    const result = await createReviewHandler(claudeContext(), runner)(claudeTask());
+    expect(result.result).toBe('conflict');
+    expect(result.context.hasConflictSignal).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Existing outcomes stay compatible
+  // -------------------------------------------------------------------------
+
+  test('legacy reviewer output keeps the existing needs_fix routing and opens no lineage', async () => {
+    const result = await createReviewHandler(
+      claudeContext(),
+      claudeRunner('[P2] Missing input validation in the new handler'),
+    )(claudeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context.reviewFindings).toMatchObject({ mode: 'legacy', reviewStructure: 'legacy' });
+    expect(result.context.reviewDispute).toBeUndefined();
+    expect(result.context.reviewFeedback).toContain('[P2]');
+  });
+
+  test('a prose finding alongside an envelope keeps its blocking force and marks the review mixed', async () => {
+    const output = `[P1] The retry loop is unbounded\n${envelope({ version: 1, status: 'success' })}`;
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output))(claudeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context.reviewDispute.reviewStructure).toBe('mixed');
+  });
+
+  test('an explicit request for human judgment is not overruled by the findings', async () => {
+    const output = `Human review required for the auth change.\n${envelope({ version: 1, status: 'findings', findings: [FINDING] })}`;
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewFindings.admitted).toBe(1);
+  });
+
+  test('a merge conflict still routes to the conflict lane regardless of the envelope', async () => {
+    const output = `CONFLICT (content): Merge conflict in src/auth.ts\n${envelope({ version: 1, status: 'findings', findings: [FINDING] })}`;
+    // The envelope is still parsed (the evidence capture runs), but a structural
+    // conflict signal is evidence no envelope can argue with, so it wins.
+    const runner = claudeRunner(output, [LS_FILES, { stdout: '', stderr: '', exitCode: 0 }]); // ls-files, worktree remove
+    const result = await createReviewHandler(claudeContext(), runner)(claudeTask());
+    expect(result.result).toBe('conflict');
+    expect(result.context?.hasConflictSignal).toBe(true);
+  });
+
+  test('the conflict handoff carries the admitted findings it already wrote to disk', async () => {
+    // Routing to conflict_resolution does not un-admit an envelope that validated.
+    // Task context is taken from this result, so a conflict handoff that dropped
+    // the lineages would leave `review-findings.json` on disk with nothing
+    // persisted pointing at it.
+    const output = `CONFLICT (content): Merge conflict in src/auth.ts\n${envelope({ version: 1, status: 'findings', findings: [FINDING] })}`;
+    const runner = claudeRunner(output, [LS_FILES, { stdout: '', stderr: '', exitCode: 0 }]); // ls-files, worktree remove
+    const result = await createReviewHandler(claudeContext(), runner)(claudeTask());
+    expect(result.result).toBe('conflict');
+    expect(result.context.reviewFindings).toMatchObject({ mode: 'admitted', status: 'findings', admitted: 1 });
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-findings.json'), 'utf8'),
+    );
+    expect(artifact.findings.map((f) => f.lineageId).sort()).toEqual(
+      Object.keys(result.context.reviewDispute.lineages).sort(),
+    );
+    expect(Object.values(result.context.reviewDispute.lineages)[0]).toMatchObject({ state: 'open', version: 1 });
+  });
+
+  test('the failed synthetic-worktree cleanup handoff carries the findings it already wrote', async () => {
+    // A PR-url-only review runs in a SYNTHETIC `ai/pr-<n>` worktree, which is
+    // released before the fix handoff. When that release fails, the handoff
+    // returns straight from the release helper — before the `needs_fix` context
+    // exists — so it has to carry the findings state itself, or the admitted
+    // `review-findings.json` is stranded with nothing persisted pointing at it
+    // (issue #841 review, P2).
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main (refresh review base)
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic per-PR name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (preflight) — clean
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff (classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new code', stderr: '', exitCode: 0 }, // git diff (prompt)
+      { stdout: envelope({ version: 1, status: 'findings', findings: [FINDING] }), stderr: '', exitCode: 0 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (post-review) — clean
+      LS_FILES,                                                 // git ls-files -s (evidence index)
+      { stdout: '', stderr: 'fatal: cannot remove working tree', exitCode: 1 }, // git worktree remove (FAILS)
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const task = claudeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:claude', 'status:needs-review'],
+        // no `branch` recorded — the review materializes the synthetic `ai/pr-99`
+      },
+    });
+
+    const result = await createReviewHandler(claudeContext(), runner, resolver.resolve, fakeLock())(task);
+
+    expect(result.result).toBe('blocked');
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // The artifact was written before the cleanup attempt…
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-findings.json'), 'utf8'),
+    );
+    // …and the human handoff carries the lineages that back it.
+    expect(result.context.reviewFindings).toMatchObject({ mode: 'admitted', status: 'findings', admitted: 1 });
+    expect(artifact.findings.map((f) => f.lineageId).sort()).toEqual(
+      Object.keys(result.context.reviewDispute.lineages).sort(),
+    );
+  });
+
+  test('a failing review agent still fails the run before any envelope handling', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '0', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'claude crashed', exitCode: 1 }, // claude -p
+      { stdout: '', stderr: '', exitCode: 0 },              // git status (post-review)
+    ]);
+    const result = await createReviewHandler(claudeContext(), runner)(claudeTask());
+    expect(result.result).toBe('failed');
+    expect(result.context?.reviewFindings).toBeUndefined();
+  });
+
+  test('a verification failure still blocks before the review agent runs', async () => {
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '0', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+new', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'test failure', exitCode: 1 },  // npm test fails
+    ]);
+    const result = await createReviewHandler(claudeContext(), runner)(claudeTask());
+    expect(result.result).not.toBe('success');
+    expect(result.context?.reviewFindings).toBeUndefined();
   });
 });

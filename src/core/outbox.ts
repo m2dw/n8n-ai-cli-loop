@@ -21,6 +21,8 @@
 
 import type { WorkItemProviderKind, RepoHostProviderKind } from "./session.js";
 import type { WorkItemTransition } from "../providers/types.js";
+import type { OutboxEffect } from "./task-store.js";
+import type { OutboxScanCursorFence, OutboxScanCursorRole } from "./outbox-scan-cursor.js";
 
 // ---------------------------------------------------------------------------
 // Legacy GitHub-specific payload types
@@ -223,8 +225,39 @@ export interface OutboxEnqueueInput {
 
 export interface OutboxStore {
   /**
+   * Opaque identity of the durable backend this store writes to (issue #818
+   * review follow-up); see {@link TaskStore.backendId}. A caller holding a task
+   * store and an outbox store compares the two ids to know whether a phase
+   * completion's effects are committed transactionally with its task
+   * transition (equal, defined ids) or need a separate, deliberately-ordered
+   * write (anything else).
+   */
+  readonly backendId?: string | undefined;
+
+  /**
+   * Whether a whole-file maintenance lock is currently held (issue #818).
+   * Optional: only the SQLite-backed store has such a lock, and only callers
+   * that need to *report* contention (`dispatchOutbox`'s fail-closed
+   * pre-check, the `admin outbox retry/cancel` previews) consult it — the
+   * mutating methods below enforce the lock themselves, atomically, inside
+   * their own transactions. An implementation without one (in-memory stores,
+   * the phase-runner's effect collector, test fakes) simply omits it and is
+   * treated as unlocked.
+   */
+  isMaintenanceLocked?(): Promise<boolean>;
+
+  /**
    * Insert a new outbox entry unless the idempotency key already exists.
    * Returns `{ enqueued: true }` on insert, `{ enqueued: false }` on duplicate.
+   *
+   * Throws `MaintenanceLockedError` (stores/maintenance-lock-guard.ts) when a
+   * maintenance lock is held (issue #818): a refusal must never be reported
+   * through `{ enqueued: false }`, which already means "duplicate key — safe
+   * no-op" and is ignored by nearly every caller. Silently reusing it would
+   * drop a real side effect and report success; throwing keeps the effect
+   * un-persisted, fails the caller loudly, and lets the work be retried once
+   * maintenance releases the lock. Implementations that check the lock must
+   * read it inside the same transaction as the insert.
    */
   enqueue(input: OutboxEnqueueInput): Promise<{ enqueued: boolean }>;
 
@@ -237,11 +270,41 @@ export interface OutboxStore {
    *
    * Returns `{ enqueued: true }` when inserted, `{ enqueued: false }` when the
    * idempotency key already exists (same-run duplicate — safe no-op).
+   *
+   * Throws `MaintenanceLockedError` while a maintenance lock is held, for the
+   * same reason (and with the same in-transaction requirement) as
+   * {@link enqueue} — more so here, since this path also *deletes* pending
+   * rows a concurrent maintenance pass may already have accounted for.
    */
   replacePendingPrSummary(
     input: OutboxEnqueueInput,
     key: { owner: string; repo: string; prNumber: number; marker: string },
   ): Promise<{ enqueued: boolean }>;
+
+  /**
+   * Write a whole set of completion effects in ONE transaction — every
+   * {@link OutboxEffect} inserted (and, for a PR summary, its pending rows
+   * superseded) together, with the maintenance-lock read inside that same
+   * transaction (issue #818 review follow-up).
+   *
+   * Optional: only a store with real transactions can offer it. `runNextPhase`
+   * uses it for the supported `store`/`outboxStore` pairing that does NOT share
+   * a backend, where the effects cannot ride the task store's
+   * `completePhaseWithEffects` transaction. Writing them one {@link enqueue} at
+   * a time there means a lock acquired part-way through the set leaves the
+   * earlier rows behind while the completion is handed back as retryable — and
+   * once maintenance releases, the dispatcher publishes a completion comment or
+   * a status label for a phase that never committed and is about to re-run.
+   * All-or-nothing removes that state: either the whole set is durable or none
+   * of it is.
+   *
+   * Throws `MaintenanceLockedError` (stores/maintenance-lock-guard.ts) while a
+   * lock is held, having written nothing — same typed refusal, and same
+   * in-transaction requirement, as {@link enqueue}. A store that omits this
+   * makes the caller fall back to per-effect writes, where a partially written
+   * set is treated as non-retryable instead.
+   */
+  enqueueEffects?(effects: OutboxEffect[]): Promise<void>;
 
   /**
    * Return entries that have not been sent and have not been dead-lettered yet,
@@ -310,7 +373,10 @@ export interface OutboxStore {
   /**
    * Return the persisted scan cursor for `key` (issue #606 review follow-up),
    * or `undefined` if none has been recorded yet. `key` scopes the cursor to a
-   * single dispatch identity (e.g. a session id) — see {@link setScanCursor}.
+   * single dispatch identity *and role* — the dispatcher keeps three cursors
+   * per identity (`floor`, `fwd`, `bulk`), whose keys are derived by
+   * `core/outbox-scan-cursor.ts` and whose behavior is specified in
+   * `docs/outbox-scan-cursor-contract.md`. See {@link setScanCursor}.
    */
   getScanCursor(key: string): Promise<number | undefined>;
 
@@ -329,8 +395,47 @@ export interface OutboxStore {
    * *not* match its filter — never past a row that matched (dispatched, or
    * still delayed/capped-by-`limit` and left pending) — so a row this key
    * owns, due or delayed, can never be skipped (issue #606 review follow-up).
+   *
+   * Returns `{ persisted: false }` without writing anything while a whole-file
+   * maintenance lock is held (issue #818 review follow-up). This is a write to
+   * the maintained database like any other outbox mutation, and the lock can be
+   * acquired *after* a drain's last claim resolved but before its cursors are
+   * persisted — so the check must be read inside the same transaction as the
+   * upsert rather than pre-checked by the caller. A refusal is non-destructive:
+   * the cursor keeps the last complete run's value, so the next unlocked run
+   * resumes exactly where that run left off. Callers treat it as contention
+   * (`dispatchOutbox` stops persisting the remaining cursors and reports
+   * `maintenanceLocked`).
+   *
+   * `fence`, when supplied (issue #820 review follow-up), makes the write
+   * conditional on the identity's rewind generation still being the one the
+   * caller observed at scan start — see {@link OutboxScanCursorFence} for why
+   * ordering the rewind alone is not enough. A stale token returns
+   * `{ persisted: false, fenceStale: true }` and writes nothing, which is
+   * distinct from the maintenance refusal above (`{ persisted: false }`) so a
+   * caller can tell "a retry moved this identity's cursors under me" from "the
+   * database is under maintenance". An unfenced call keeps the pre-#820
+   * unconditional upsert behavior, which is what stores without fence support
+   * get.
    */
-  setScanCursor(key: string, id: number): Promise<void>;
+  setScanCursor(
+    key: string,
+    id: number,
+    fence?: OutboxScanCursorFence,
+  ): Promise<{ persisted: boolean; fenceStale?: true }>;
+
+  /**
+   * Current rewind generation of a dispatch identity (issue #820 review
+   * follow-up), or `0` when no retry has ever rewound it. Read at scan start —
+   * *before* the cursors themselves, so a rewind landing between the two reads
+   * is caught rather than hidden — and passed back to {@link setScanCursor} as
+   * the fence for every cursor the run persists.
+   *
+   * Optional, like {@link isMaintenanceLocked}: a store without the capability
+   * (in-memory stores, the phase-runner's effect collector, test fakes) simply
+   * leaves its cursor writes unfenced, exactly as before #820.
+   */
+  getScanCursorFence?(identityKey: string): Promise<number>;
 
   /**
    * Return a single entry by id, in any delivery state (pending, delayed, sent,
@@ -362,7 +467,11 @@ export interface OutboxStore {
    * concurrent {@link cancelEntry} won the race and cancelled the row first
    * (`"already_cancelled"`, issue #607 review follow-up), or some other
    * concurrent write changed the row between the eligibility check and the
-   * commit (`"concurrent_update"` — safe to retry the call).
+   * commit (`"concurrent_update"` — safe to retry the call), or a whole-file
+   * maintenance lock is held (`"maintenance_locked"`, issue #818: reviving a
+   * dead-lettered/cancelled row back into the pending bucket is exactly the
+   * mutation a prune batch's selection must not race — checked in the same
+   * transaction as the compare-and-swap).
    *
    * Implemented as a compare-and-swap, not a blind read-then-write: the
    * `UPDATE` pins `nextAttemptAt`/`deadLetterAt`/`cancelledAt` to the exact
@@ -373,8 +482,30 @@ export interface OutboxStore {
    * commits concurrently — otherwise the cancel would have already been
    * reported to the operator as successful while the row silently became
    * dispatchable again.
+   *
+   * `opts.cursorIdentityKey`, when supplied (issue #820), additionally rewinds
+   * that dispatch identity's persisted scan cursors **in the same transaction
+   * as the compare-and-swap**. Recovering a row older than a cursor would
+   * otherwise strand it: the row is pending again but sits below the `id >
+   * afterId` window every future scan for that identity looks at. Each of the
+   * identity's three existing cursors whose `after_id >= id` is set to `id -
+   * 1`; a cursor row that does not exist is left absent, never created (see
+   * `planScanCursorRewind` in `core/outbox-scan-cursor.ts` and
+   * `docs/outbox-scan-cursor-contract.md` §13). Atomicity is the point: a
+   * revived row with un-rewound cursors is exactly the stranded state this
+   * exists to prevent, so the two writes must commit or fail together. When the
+   * compare-and-swap loses its race — or the maintenance guard refuses — no
+   * cursor is touched. The roles actually rewound are reported as
+   * `cursorsRewound` (present only when `cursorIdentityKey` was supplied);
+   * `[]` means the cursors were already behind the row and nothing needed
+   * moving. Callers derive the key with `deriveOwnershipScanCursorKey` so the
+   * scope the CLI resolves and the keys the dispatcher reads cannot drift.
    */
-  retryEntry(id: number, now?: string): Promise<{ retried: boolean; reason?: string }>;
+  retryEntry(
+    id: number,
+    now?: string,
+    opts?: { cursorIdentityKey?: string },
+  ): Promise<{ retried: boolean; reason?: string; cursorsRewound?: OutboxScanCursorRole[] }>;
 
   /**
    * Permanently exclude a row from dispatch selection by operator decision
@@ -385,7 +516,9 @@ export interface OutboxStore {
    * or a dispatch attempt currently holds the row's claim (`"dispatch_in_progress"`,
    * issue #607 review follow-up — see {@link claimForDispatch}): that attempt
    * may already have performed the external side effect, so cancellation
-   * cannot be reported as successful while it is in flight.
+   * cannot be reported as successful while it is in flight — or a whole-file
+   * maintenance lock is held (`"maintenance_locked"`, issue #818: checked in
+   * the same transaction as the cancelling update).
    *
    * Implemented as a single atomic `UPDATE ... WHERE` (not a read-then-write)
    * so a concurrent {@link claimForDispatch} and `cancelEntry` call can never
@@ -411,6 +544,14 @@ export interface OutboxStore {
    * delayed it, between the dispatcher's scan and this claim attempt) — the
    * caller must skip dispatching that row rather than performing its external
    * side effect.
+   *
+   * Also returns `false`, without mutating anything, while a whole-file
+   * maintenance lock is held (issue #818), read inside the same transaction as
+   * the claiming update. This is the fail-closed point for dispatch: no row is
+   * ever claimed — and therefore no external side effect ever performed —
+   * while maintenance is in progress. `acquire()` symmetrically refuses while
+   * any non-stale claim exists, so a claim and an acquisition can never both
+   * succeed; whichever transaction commits first wins.
    *
    * The caller is responsible for clearing `claimedAt` once the attempt
    * resolves (folded into `markSent`/`markFailed`), so a claim never outlives

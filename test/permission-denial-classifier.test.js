@@ -120,6 +120,81 @@ describe('classifyPermissionDenial — detection', () => {
     expect(result.operation).toBe('command');
     expect(result.source).toBe('structured');
   });
+
+  // issue #814: reproduced by yoda-form-js#449 — the current Jetski
+  // (Antigravity/Gemini headless launcher) diagnostic for an auto-denied
+  // repository read was previously unrecognized and fell through to the
+  // generic `empty-output` classification.
+  test('the current Jetski auto-denied read_file diagnostic classifies as read', () => {
+    const result = classifyPermissionDenial(
+      diagnostic(
+        'jetski: no output produced — a tool required the "read_file" permission that headless '
+        + 'mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow '
+        + 'in settings.json (e.g. read_file(<target>)). Alternatively, re-run with '
+        + '--dangerously-skip-permissions to auto-approve all tools.',
+      ),
+    );
+    expect(result.isPermissionDenied).toBe(true);
+    expect(result.operation).toBe('read');
+    expect(result.signal).toBe('auto-denied');
+    expect(result.evidence).toEqual([
+      { channel: 'text', line: 1, signal: 'auto-denied', operation: 'read', operationTokens: ['read_file'] },
+    ]);
+    // Quoted `read_file` is normalized to the fixed vocabulary — the record
+    // carries the token literal, never the surrounding quotes, prompt text,
+    // or the diagnostic's own help-text sentences.
+    const serialized = JSON.stringify(result.evidence);
+    expect(serialized).not.toContain('jetski');
+    expect(serialized).not.toContain('settings.json');
+    expect(serialized).not.toContain('dangerously-skip-permissions');
+    expect(serialized).not.toContain('<target>');
+  });
+
+  // issue #832: the same launcher names the permission *class* rather than the
+  // tool when the refusal is not tool-specific — the exact form the post-#830
+  // acceptance run produced. Without it the actionable class collapses to
+  // `unspecified`, which reads as "look at the read profile" for a run that
+  // actually reached for a shell.
+  test('the Jetski auto-denied command-class diagnostic classifies as command', () => {
+    const result = classifyPermissionDenial(
+      diagnostic(
+        'jetski: no output produced - a tool required the "command" permission that headless mode '
+        + 'cannot prompt for, so it was auto-denied.',
+      ),
+    );
+    expect(result.isPermissionDenied).toBe(true);
+    expect(result.operation).toBe('command');
+    expect(result.evidence[0].operationTokens).toEqual(['"command" permission']);
+    expect(JSON.stringify(result.evidence)).not.toContain('jetski');
+  });
+
+  test('the quoted class token does not match a quoted tool name that ends in the same word', () => {
+    // `"run_shell_command" permission` is the tool identifier's case, not the
+    // class token's: both quotes belong to the token, so the two forms cannot
+    // be confused into a double match.
+    const result = classifyPermissionDenial(
+      diagnostic('a tool required the "run_shell_command" permission ... so it was auto-denied.'),
+    );
+    expect(result.operation).toBe('command');
+    expect(result.evidence[0].operationTokens).toEqual(['run_shell_command']);
+  });
+
+  test('the read class is named the same way', () => {
+    const result = classifyPermissionDenial(
+      diagnostic('a tool required the "read" permission ... so it was auto-denied.'),
+    );
+    expect(result.operation).toBe('read');
+    expect(result.evidence[0].operationTokens).toEqual(['"read" permission']);
+  });
+
+  test('unrelated empty-output diagnostic chatter mentioning permissions in passing is not a denial', () => {
+    // Help text that merely mentions "permission" without stating a refusal
+    // (no signal phrase from the fixed list) must not be relabeled.
+    const result = classifyPermissionDenial(
+      diagnostic('jetski: add an allow-rule under permissions.allow in settings.json to grant tool access.'),
+    );
+    expect(result.isPermissionDenied).toBe(false);
+  });
 });
 
 describe('classifyPermissionDenial — provenance', () => {

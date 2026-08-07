@@ -6,10 +6,12 @@ import type { AgentFailureKind } from "./agent-diagnostics.js";
 import type { RunLedgerEntryInput, RunLedgerOutcome, SessionPauseState } from "./session-control.js";
 import { extractRunMetadata } from "./session-control.js";
 import { applyTaskPatch, leaseExpiry, nextPhaseAfter } from "./transitions.js";
-import { enqueueHandlerCommentEffect, enqueueStatusLabelEffects, enqueueQuotaDelayCommentEffect, enqueueSlackNotificationEffect, enqueuePrSummaryEffect, enqueueHumanGateSummaryEffect } from "./outbox-effects.js";
+import { enqueueHandlerCommentEffect, enqueueStatusLabelEffects, enqueueQuotaDelayCommentEffect, enqueueSlackNotificationEffect, enqueuePrSummaryEffect, enqueueHumanGateSummaryEffect, enqueueDisputeOutcomeEffects } from "./outbox-effects.js";
 import { readResolvedAssignment } from "./assignment.js";
 import type { ResolvedAssignment } from "./assignment.js";
 import { resolveQuotaRetryDelayMs } from "./quota-classifier.js";
+import type { DisputeTransitionApplication } from "./review-dispute-transition.js";
+import { disputeContextPatch, disputeTransitionEvent, routedPhaseCompletion } from "./review-dispute-commit.js";
 
 /**
  * `OutboxStore` adapter that records every `enqueue`/`replacePendingPrSummary`
@@ -60,7 +62,7 @@ export class OutboxEffectCollector implements OutboxStore {
     throw new Error("OutboxEffectCollector does not support getScanCursor");
   }
 
-  async setScanCursor(): Promise<void> {
+  async setScanCursor(): Promise<{ persisted: boolean }> {
     throw new Error("OutboxEffectCollector does not support setScanCursor");
   }
 
@@ -121,7 +123,25 @@ export interface PhaseHandlerContext {
 }
 
 export type PhaseHandlerResult =
-  | { result: "success" | "needs_fix" | "conflict" | "blocked" | "tool_request"; context?: Record<string, unknown>; message?: string }
+  | {
+      result: "success" | "needs_fix" | "conflict" | "blocked" | "tool_request";
+      context?: Record<string, unknown>;
+      message?: string;
+      /**
+       * An already-approved review-dispute transition this run applied (issue
+       * #840), carried OUTSIDE `context` because it is not task context: the
+       * runner folds its §10.1 block and its one §10.3 audit event into the same
+       * `completePhaseWithEffects` transaction as the completion itself, and
+       * lets its §7.1 routing override where the task goes next.
+       *
+       * A handler computes it only on a path that really delivered (a failed,
+       * delayed, or handed-off run moves no lineage), and only from the typed
+       * predecessor decisions — the runner never parses agent output. Absent for
+       * every phase and every task with no structured lineage, which is what
+       * keeps the legacy free-form review path unchanged (§13).
+       */
+      disputeTransition?: DisputeTransitionApplication;
+    }
   // A quota/rate-limit exhaustion (issue #25). Not a task failure: the phase is
   // released back to `queued` with a future `notBefore` so the normal schedule
   // retries it once the quota window resets. `retryAfterMs` lets a handler
@@ -220,7 +240,25 @@ export type PhaseRunOutcome =
   // issue's worktree lock, so the phase did not run. The claim was released back
   // to `queued` (the handler never ran) and the normal schedule retries once the
   // holder finishes. This serializes the SAME issue without failing the task.
-  | { status: "lock_contended"; task: AiTask; ownerContextId?: string };
+  | { status: "lock_contended"; task: AiTask; ownerContextId?: string }
+  // Whole-file maintenance contention (issue #818): a `prune`/`restore`/
+  // `archive rollup` pass holds a maintenance lock — on the task store, whose
+  // `completePhaseWithEffects` then refuses the completion in full, or (review
+  // follow-up) on a separately-backed outbox store, whose effect write is
+  // attempted before the completion so the effects are never stranded behind a
+  // committed transition. Either way the phase completion — which commits the
+  // task transition and its outbox effects in one transaction (issue #701) —
+  // did not happen, and nothing was written.
+  //
+  // The claim is handed back: `task` is the requeued (`queued`, unowned,
+  // pre-claim attempt count) row, so the phase re-runs on the next tick rather
+  // than waiting out this run's lease — a `skipActivityChecks` holder such as
+  // `archive rollup` can take the lock while the phase is legitimately live, so
+  // that lease may be a full 30 minutes from expiry. `claimNextTask` is itself
+  // maintenance-guarded (issue #611), so the re-run cannot begin until the lock
+  // clears. Reported distinctly from `claim_lost` because nothing about the
+  // claim is actually wrong — this is retryable contention, not a lost race.
+  | { status: "maintenance_locked"; task?: AiTask };
 
 export interface RunNextPhaseOptions {
   store: TaskStore;
@@ -422,8 +460,12 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
 
   const key = { sessionId: claimed.sessionId, issueNumber: claimed.issueNumber };
 
+  // Pre-claim attempt count, kept so a run this process discards wholesale (a
+  // pause, or a maintenance-refused completion — issue #818) can hand the task
+  // back exactly as it found it rather than burning a retry.
+  const priorAttempts = claimed.attempts[claimed.phase] ?? 0;
   const attempts = {
-    [claimed.phase]: (claimed.attempts[claimed.phase] ?? 0) + 1,
+    [claimed.phase]: priorAttempts + 1,
   };
   const running = await store.transitionTask(
     key,
@@ -452,7 +494,7 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
         { status: "running", phase: claimed.phase, ownerRunId: request.runId },
         {
           status: "queued",
-          attempts: { [claimed.phase]: claimed.attempts[claimed.phase] ?? 0 },
+          attempts: { [claimed.phase]: priorAttempts },
           ownerRunId: undefined,
           leaseExpiresAt: undefined,
           now,
@@ -775,13 +817,48 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
   // Merge the handler's own context patch with any bookkeeping patch from
   // nextPhaseAfter (e.g. the content_review needs_fix cycle counter) so neither
   // clobbers the other.
-  const contextPatch =
+  const baseContextPatch =
     result.context || ("contextPatch" in transition && transition.contextPatch)
       ? { ...result.context, ...("contextPatch" in transition ? transition.contextPatch : undefined) }
       : undefined;
+
+  // Issue #840: the review-dispute transition this run applied, folded into THIS
+  // completion rather than committed on its own. The handler already computed it
+  // from the typed predecessor decisions (#843/#844/#845/#847) against the block
+  // the task currently holds; what is left is durability, and doing that in a
+  // second transaction would let the protocol block move without the completion
+  // that produced it — or the reverse.
+  //
+  // Three things ride along, all from the core transition layer so a later
+  // public/admin surface reads the same state instead of rebuilding it:
+  //
+  //  - the §10.1 block wins over whatever the handler's own context carried, so
+  //    the committed block and the event describing it cannot disagree;
+  //  - §7.1 routing overrides the ordinary `nextPhaseAfter` destination when it
+  //    names one (rules 1 and 2), parks the task for a human when rule 2 selects
+  //    a turn this runner cannot dispatch — the reconsideration, evidence, and
+  //    arbitration runs, none of which an ordinary review run may finish — and
+  //    defers to it only for rules 3/4;
+  //  - the one bounded §10.3 audit event is appended in the same transaction.
+  //
+  // A replayed delivery folds in NOTHING but the routing: the application is
+  // byte-identical to the block already on file, no counter moves, and no second
+  // audit event is appended — while the retried run still routes exactly as its
+  // first delivery did.
+  // A `delayed` run never reaches here (it returned above), so `failed` is the
+  // only outcome left that must not fold a transition in.
+  const disputeApplication: DisputeTransitionApplication | undefined =
+    result.result === "failed" ? undefined : result.disputeTransition;
+  const contextPatch = disputeApplication
+    ? disputeContextPatch(disputeApplication, baseContextPatch)
+    : baseContextPatch;
+  const routed = disputeApplication
+    ? routedPhaseCompletion(disputeApplication.routing, transition, running.value.phase)
+    : transition;
+
   const patch = {
-    status: transition.status,
-    phase: transition.phase,
+    status: routed.status,
+    phase: routed.phase,
     ownerRunId: undefined,
     leaseExpiresAt: undefined,
     context: contextPatch,
@@ -796,6 +873,10 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     data: { phase: running.value.phase, result: result.result, ...(contextId !== undefined ? { contextId } : {}) },
     createdAt: now,
   };
+  const extraEvents: TaskEvent[] =
+    disputeApplication && !disputeApplication.replayed
+      ? [disputeTransitionEvent({ key, application: disputeApplication, runId: request.runId, now })]
+      : [];
 
   // Build every GitHub side effect for this completion up front — via a
   // collector standing in for the real outbox store — instead of writing them
@@ -822,7 +903,7 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
       effectCollector, session, preview, running.value.phase, result, request.runId, now, durationMs,
     );
     await enqueueStatusLabelEffects(
-      effectCollector, session, preview, transition.status, transition.phase, request.runId, now,
+      effectCollector, session, preview, routed.status, routed.phase, request.runId, now,
       running.value.phase, result,
     );
     await enqueuePrSummaryEffect(
@@ -831,10 +912,115 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     await enqueueHumanGateSummaryEffect(
       effectCollector, session, running.value, running.value.phase, result, request.runId, now, durationMs,
     );
-    if (transition.status === "ready_for_human" || transition.status === "failed") {
+    // Issue #848: the §11 comment for a lineage this run resolved or escalated,
+    // collected into the SAME transaction as the §10.1 block and the §10.3 event
+    // that produced it. `preview` rather than `running.value` so the PR-first
+    // routing reads the PR this completion is persisting, and `disputeApplication`
+    // rather than a re-read of the block so the published outcome is the one the
+    // transition layer actually applied. A replayed delivery, a non-terminal
+    // transition, and a task-level §9 handoff each contribute nothing — the
+    // builder's own gates, not this call site's.
+    const completionPrUrl = result.context?.["prUrl"];
+    await enqueueDisputeOutcomeEffects(
+      effectCollector, session, preview, disputeApplication, now,
+      typeof completionPrUrl === "string" ? completionPrUrl : undefined,
+    );
+    if (routed.status === "ready_for_human" || routed.status === "failed") {
       await enqueueSlackNotificationEffect(
         effectCollector, session, preview, running.value.phase, result, request.runId, now,
       );
+    }
+  }
+
+  // `completePhaseWithEffects` commits the transition, the event, and every
+  // effect in ONE transaction — but only over the backend `store` itself writes
+  // to. The public API still accepts a `store`/`outboxStore` pair that does NOT
+  // share a backend (a MemoryTaskStore alongside a real SqliteOutboxStore, or
+  // any other OutboxStore implementation), and that pairing has no cross-store
+  // transaction to lean on: the effects have to be written to `outboxStore`
+  // separately, so SOME failure interleaving is unavoidable and the only real
+  // choice is which side of it fails.
+  //
+  // Writing them BEFORE the transition is that choice (issue #818 review
+  // follow-up). The previous ordering — commit, then replay behind a pre-check
+  // — left the unrecoverable direction exposed: a maintenance lock acquired
+  // between the pre-check and the replay made every enqueue throw *after* the
+  // task had already completed, so the run reported success while its
+  // comments/labels/notifications were gone for good, with no way to replay
+  // them from a task that is no longer at that phase. No read can close that
+  // gap, only ordering can. Enqueuing first inverts it: the refusal lands while
+  // nothing has transitioned, so the claim is handed back and the phase re-runs
+  // intact. The residual exposure is effects that outlive a transition which
+  // then fails its CAS — recoverable by construction, since every effect is
+  // idempotency-keyed and the re-run re-derives the same ones.
+  //
+  // The write is all-or-nothing wherever the store can make it so: `enqueueEffects`
+  // (issue #818 review follow-up) puts the whole set in ONE transaction behind one
+  // in-transaction lock read. Writing effect-by-effect instead lets a lock acquired
+  // part-way through leave the earlier rows durable while this run reports
+  // retryable contention — and once maintenance releases, the dispatcher publishes
+  // a completion comment or status label for a phase that never committed and is
+  // about to re-run, possibly to a different result. `written` tracks that case for
+  // the stores that cannot batch: a partially written set is NOT safely retryable,
+  // so it falls through to the best-effort branch below, which commits the
+  // completion the already-durable rows announce and records the gap.
+  //
+  // A shared backend takes none of this: `backendId` equality proves the
+  // transaction below already covers these effects atomically (and refuses them
+  // atomically under a lock), so writing them here would put rows in the outbox
+  // ahead of — and independently of — the very transition they belong to,
+  // exactly the divergence #701 exists to prevent.
+  const outboxSharesStoreBackend =
+    outboxStore !== undefined && store.backendId !== undefined && store.backendId === outboxStore.backendId;
+  let separateOutboxError: unknown;
+  if (outboxStore && !outboxSharesStoreBackend && effectCollector.effects.length > 0) {
+    let written = 0;
+    try {
+      if (outboxStore.enqueueEffects) {
+        await outboxStore.enqueueEffects(effectCollector.effects);
+        written = effectCollector.effects.length;
+      } else {
+        for (const effect of effectCollector.effects) {
+          if (effect.kind === "enqueue") {
+            await outboxStore.enqueue(effect.input);
+          } else {
+            await outboxStore.replacePendingPrSummary(effect.input, effect.key);
+          }
+          written += 1;
+        }
+      }
+    } catch (outboxErr) {
+      // A held maintenance lock is retryable contention, not a phase failure:
+      // nothing has transitioned yet, so hand the claim back and report it as
+      // its own outcome. Matched on the typed `code` carried by
+      // MaintenanceLockedError (stores/maintenance-lock-guard.ts) rather than by
+      // importing it, since core must not depend on the store layer.
+      //
+      // `written === 0` is what makes that honest — the refusal has to have left
+      // the outbox exactly as it found it. A refusal that landed mid-set (only
+      // possible on a store without `enqueueEffects`) already put effects in the
+      // outbox for this completion, so re-running the phase is no longer the
+      // clean retry this outcome advertises; that case takes the best-effort
+      // branch instead.
+      if (isMaintenanceLockedError(outboxErr) && written === 0) {
+        return {
+          status: "maintenance_locked",
+          task: await requeueClaimForMaintenance(store, key, running.value, request.runId, priorAttempts, now),
+        };
+      }
+      // Anything else — including a maintenance refusal that arrived with part
+      // of the set already durable — keeps the long-standing best-effort
+      // treatment: the completion still commits and the failure is recorded as
+      // an event below. For the partial-set case that is the safer direction:
+      // committing makes the rows already in the outbox belong to a phase that
+      // really did complete, whereas handing the claim back would have them
+      // announce a completion that never happened.
+      // A `store`/`outboxStore` pair with no shared backend is also the shape a
+      // caller uses to pass a deliberately inert sink (the outbox rows then come
+      // from the task store's own transaction), so an unrecognized error here is
+      // not evidence the effects were lost — unlike the maintenance refusal,
+      // which is a definitive "this write will not happen".
+      separateOutboxError = outboxErr;
     }
   }
 
@@ -844,9 +1030,22 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
       expected: { status: "running", phase: running.value.phase, ownerRunId: request.runId },
       patch,
       event: completionEvent,
+      ...(extraEvents.length > 0 ? { extraEvents } : {}),
     },
     effectCollector.effects,
   );
+  // A maintenance lock refuses the whole completion (issue #818) — transition,
+  // event, and every outbox effect — rather than committing the transition and
+  // dropping the effects. Surface it as its own retryable outcome: reporting
+  // `claim_lost` here would tell the operator a concurrent run took the task
+  // over, when in fact nothing was written and the same phase re-runs intact
+  // once maintenance releases the lock.
+  if (!completed.ok && completed.code === "maintenance_locked") {
+    return {
+      status: "maintenance_locked",
+      task: await requeueClaimForMaintenance(store, key, running.value, request.runId, priorAttempts, now),
+    };
+  }
   if (!completed.ok) return { status: "claim_lost", task: completed.current };
 
   // Record the completed run in the cost/result ledger (issue #531) — AFTER
@@ -858,41 +1057,24 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     options, store, key, running.value, result.result, result.context, durationMs, request.runId, now,
   );
 
-  // `completePhaseWithEffects` only guarantees the effects land wherever
-  // `store` itself keeps its outbox rows — the same SQLite file for
-  // SqliteTaskStore, or its own in-memory map for MemoryTaskStore. The public
-  // API still accepts a `store`/`outboxStore` pair that do NOT share a
-  // backend (e.g. a MemoryTaskStore alongside a real SqliteOutboxStore, or any
-  // other OutboxStore implementation), and that combination has no
-  // cross-store transaction to lean on. Replaying the same effects into
-  // `outboxStore` here keeps that contract working: every effect is
-  // idempotency-keyed, so replaying it against a store that already has these
-  // rows (the shared-backend case above) is a harmless no-op, while a
-  // genuinely separate outboxStore actually receives them instead of silently
-  // losing them.
-  if (outboxStore && effectCollector.effects.length > 0) {
+  // A non-maintenance failure from the separately-backed effect write above is
+  // recorded once the completion has committed, so the gap it may have left is
+  // diagnosable from the task's event log (and counted as an infra reason by
+  // `issue-plan-history`). Logged here rather than at the catch site because
+  // until this point the completion could still have been refused, in which
+  // case there would be no gap to report.
+  if (separateOutboxError !== undefined) {
     try {
-      for (const effect of effectCollector.effects) {
-        if (effect.kind === "enqueue") {
-          await outboxStore.enqueue(effect.input);
-        } else {
-          await outboxStore.replacePendingPrSummary(effect.input, effect.key);
-        }
-      }
-    } catch (outboxErr) {
-      const errMsg = outboxErr instanceof Error ? outboxErr.message : String(outboxErr);
-      try {
-        await store.appendEvent({
-          task: key,
-          type: "outbox.enqueue.failed",
-          runId: request.runId,
-          message: errMsg,
-          data: { phase: running.value.phase, result: result.result },
-          createdAt: now,
-        });
-      } catch {
-        // swallow — the completion itself already committed; this logging is best-effort
-      }
+      await store.appendEvent({
+        task: key,
+        type: "outbox.enqueue.failed",
+        runId: request.runId,
+        message: separateOutboxError instanceof Error ? separateOutboxError.message : String(separateOutboxError),
+        data: { phase: running.value.phase, result: result.result },
+        createdAt: now,
+      });
+    } catch {
+      // swallow — the completion itself already committed; this logging is best-effort
     }
   }
 
@@ -912,6 +1094,93 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
         // swallow — the lock TTL/admin recovery is the backstop for a leaked lock
       }
     }
+  }
+}
+
+/**
+ * Whether an error is the typed refusal a held maintenance lock raises (issue
+ * #818). Matched structurally on `code` rather than by importing
+ * `MaintenanceLockedError`, since core must not depend on the store layer.
+ */
+function isMaintenanceLockedError(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "maintenance_locked";
+}
+
+/**
+ * Return a maintenance-refused completion's claim to the pool (issue #818
+ * review follow-up).
+ *
+ * A `maintenance_locked` completion writes nothing, so the phase must re-run —
+ * but the task is still `running`, owned by this run, with a fresh lease
+ * (30 minutes by default). Leaving it that way strands it: the lock can be
+ * acquired by a `skipActivityChecks` holder such as `archive rollup` while this
+ * phase is legitimately live, and once maintenance releases, no tick can claim
+ * the task again until that lease expires — the opposite of the retryable
+ * behavior this outcome advertises. Requeueing it here makes the re-run
+ * immediate. It cannot start *during* maintenance either: `claimNextTask` has
+ * been maintenance-guarded since issue #611, so the task simply sits `queued`
+ * and unclaimable until the lock clears.
+ *
+ * The requeue itself goes through `completePhaseWithEffects` (with no effects)
+ * rather than a bare `transitionTask` (issue #818 review follow-up): that is
+ * the one transition on the `TaskStore` interface which reads the maintenance
+ * lock inside its own transaction. A plain `transitionTask` is unguarded, so
+ * when the refusal came from the task store's OWN database — a handler that
+ * outlived its lease meeting a `restore` at completion — this requeue would
+ * write into a file maintenance is replacing: the write is lost with the file,
+ * and the exclusion the lock exists to provide is broken in the process. Under
+ * that lock the guarded call is refused too, so the task is deliberately left
+ * `running` and recovery falls to the post-maintenance mechanisms that already
+ * own it (lease expiry, `admin task recover`). When the lock is on a *different*
+ * database than the task store (the separate-backend pairing), nothing refuses
+ * the requeue and the re-run is immediate as intended.
+ *
+ * The attempt count is rolled back to its pre-claim value for the same reason
+ * the pause path rolls it back: the entire run was discarded by an operator
+ * maintenance window, so it must not consume the phase's retry budget.
+ *
+ * Best-effort and CAS-guarded on this run still owning the task in this phase:
+ * if the requeue is refused (maintenance, or a concurrent takeover) or the
+ * store itself throws, the outcome is still `maintenance_locked` and the
+ * pre-existing lease-expiry recovery remains the backstop. Reports the requeued
+ * task when it commits so the caller sees the state that actually landed.
+ */
+async function requeueClaimForMaintenance(
+  store: TaskStore,
+  key: TaskKey,
+  running: AiTask,
+  runId: string,
+  priorAttempts: number,
+  now: string,
+): Promise<AiTask> {
+  try {
+    const requeued = await store.completePhaseWithEffects(
+      {
+        key,
+        expected: { status: "running", phase: running.phase, ownerRunId: runId },
+        patch: {
+          status: "queued",
+          attempts: { [running.phase]: priorAttempts },
+          ownerRunId: undefined,
+          leaseExpiresAt: undefined,
+          now,
+        },
+        event: {
+          task: key,
+          type: "phase.maintenance_requeued",
+          runId,
+          message: "Phase completion refused by a held maintenance lock; claim returned to the queue.",
+          data: { phase: running.phase },
+          createdAt: now,
+        },
+      },
+      [],
+    );
+    return requeued.ok ? requeued.value : (requeued.current ?? running);
+  } catch {
+    // swallow — reporting the contention matters more than the requeue, and a
+    // task left `running` is still recovered by the normal lease-expiry path
+    return running;
   }
 }
 

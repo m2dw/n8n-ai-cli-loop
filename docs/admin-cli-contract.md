@@ -147,6 +147,27 @@ These print text by default and JSON with `--json`:
 - `list-stuck`
 - `recover`
 - `recover-cap-handoff`
+- `dispute status` (review-dispute protocol state for one task; read-only)
+- `dispute reopen` (the §6.4 reopen request; previews by default, applies with
+  `--yes`)
+- `dispute metrics` (session-scoped review-dispute counts derived from the
+  persisted `review.dispute.transition` events; read-only, offline, and never
+  a quality gate — see [review-dispute-operations.md](review-dispute-operations.md))
+- `n8n deploy` (generates one session's workflow artifacts and imports them into
+  a local n8n; previews by default, applies with `--yes`, publishes only with an
+  explicit `--publish`, and restores an already active parent after the import so
+  a re-deploy never deactivates one. An apply serializes on two locks: one scoped
+  to the parent workflow and held for the whole run, so two deploys of the same
+  session cannot lose each other's activation decision, and one scoped to the
+  shared child workflow and held across generation and the child import, so two
+  deploys of *different* sessions cannot import each other's child artifact. A run
+  refused on either reports `ok: false` with a `failure` that carries no `step`,
+  since nothing ran. Any run that started a command writing
+  the n8n database reports `restartRequired: true`: a running n8n must be
+  restarted before what was imported — including the parent's active state —
+  takes effect. A run whose n8n binary never started reports
+  `restartRequired: false`. See
+  [install.md](install.md#7-generate-and-import-the-n8n-workflows))
 
 Examples:
 

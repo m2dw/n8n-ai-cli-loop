@@ -6,6 +6,15 @@ export function runArtifactDir(artifactRoot: string, runId: string): string {
 }
 
 /**
+ * Re-exported from `core/artifact-dir-contract.ts`, which owns the contract
+ * (issue #883): `core/transitions.ts` needs this key without depending at
+ * runtime on this Execution-layer module, so the constant is declared in
+ * `core/` and this module — and every other existing consumer that imports
+ * it from here — re-exports it unchanged.
+ */
+export { ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "../core/artifact-dir-contract.js";
+
+/**
  * Centralized list of `task.context` fields that name a
  * `<artifactRoot>/runs/<run-id>/` directory (docs/retention-backup-contract.md
  * §8 point 5). A retention/prune pass must only ever treat these fields as
@@ -18,19 +27,12 @@ export const ARTIFACT_DIR_CONTEXT_FIELDS = [
   "draftArtifactDir",
   "researchArtifactDir",
   "reviewRunArtifactDir",
+  // The dedicated, never-overwritten reference to the review run that
+  // produced `review-findings.json`, carried forward across implementation
+  // retries (issue #837 review, P2) — must be validated/tracked the same as
+  // every other artifact-directory reference above.
+  "reviewArtifactDir",
 ] as const;
-
-/**
- * Context key a handler sets to `true` alongside `artifactDir` (issue #611
- * review) whenever it returns before ever reaching its own `mkdirSync` /
- * `isSafeArtifactDirAfterRun` sequence — an admission, repo-host-resolve, or
- * agent-assignment failure, for instance. In every one of those states
- * `artifactDir` names a path that was never created, so restore's
- * artifact-reference validation (`sqlite-backup-store.ts`) must skip that
- * field instead of rejecting the snapshot for a directory that never existed
- * in the first place.
- */
-export const ARTIFACT_DIR_PENDING_CONTEXT_FIELD = "artifactDirPending";
 
 function isPathWithinRoot(root: string, dir: string): boolean {
   if (dir === root) return true;

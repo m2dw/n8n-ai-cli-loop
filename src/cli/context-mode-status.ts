@@ -41,7 +41,11 @@ import {
   providerForAgent,
   type CodexContextModeResolution,
 } from "../handlers/codex-context-mode.js";
-import { DEFAULT_SESSIONS_PATH, JsonSessionRegistry } from "../registries/json-session-registry.js";
+import {
+  DEFAULT_SESSIONS_PATH,
+  JsonSessionRegistry,
+  describeUnresolvedSessionId,
+} from "../registries/json-session-registry.js";
 import { tokenizeArgs, resolveSessionSelector } from "./admin-command.js";
 import { report, die } from "./cli-io.js";
 import type { OutputMode } from "./cli-io.js";
@@ -502,7 +506,7 @@ export async function runContextModeStatus(argv: string[]): Promise<void> {
 
   const session = await registry.getSessionById(sessionId);
   if (!session) {
-    die(`Unknown sessionId: ${sessionId} (not found in ${sessionsPath})`);
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
   let payload: ContextModeStatusPayload;

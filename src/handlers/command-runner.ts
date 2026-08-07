@@ -4,12 +4,32 @@ export interface CommandRunResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * A RUNNER-synthesized diagnostic for a spawn-level failure (timeout, buffer
+   * overflow, `ENOENT`) — bytes the child process never wrote.
+   *
+   * A runner that sets this MUST also have appended it VERBATIM to the end of
+   * `stderr`, so every caller that only reads `stderr` keeps seeing the
+   * diagnostic exactly as before. It exists for the callers that promise to
+   * persist only child-authored output — the reviewer-reconsideration raw
+   * transcript (issue #838, contract §10.2) may hold the agent's bytes and
+   * nothing else — which strip precisely this suffix rather than guessing which
+   * trailing bytes the child did not write.
+   */
+  spawnError?: string;
 }
 
 export interface CommandRunOptions {
   cwd: string;
   /** When provided, written to the process stdin. */
   stdin?: string;
+  /**
+   * The child's environment. Defaults to the runner's own (see {@link spawnEnv});
+   * supply it only to run a command under a DIFFERENT environment than this
+   * process's — e.g. the isolated, credential-stripped env the read-only
+   * reviewer-reconsideration invocation spawns its agent with (issue #838).
+   */
+  env?: NodeJS.ProcessEnv;
   /** Maximum time in milliseconds the command is allowed to run. */
   timeout?: number;
   /** Maximum bytes allowed in the combined stdout+stderr buffer. */
@@ -38,7 +58,7 @@ export const defaultCommandRunner: CommandRunner = {
     try {
       const stdout = execFileSync(cmd, args, {
         cwd: opts.cwd,
-        env: spawnEnv(),
+        env: opts.env ?? spawnEnv(),
         encoding: "utf8",
         input: opts.stdin,
         stdio: opts.stdin !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
@@ -69,7 +89,7 @@ export const bothStreamsCommandRunner: CommandRunner = {
   run(cmd, args, opts) {
     const result = spawnSync(cmd, args, {
       cwd: opts.cwd,
-      env: spawnEnv(),
+      env: opts.env ?? spawnEnv(),
       encoding: "utf8",
       input: opts.stdin,
       stdio: opts.stdin !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
@@ -78,12 +98,16 @@ export const bothStreamsCommandRunner: CommandRunner = {
     });
     // A spawn-level failure (e.g. timeout, buffer overflow, ENOENT) surfaces via
     // `error`; report it as nonzero with the message on stderr so callers don't
-    // mistake it for a clean success.
+    // mistake it for a clean success. It is also reported separately, as the
+    // suffix it is, for callers that must not attribute it to the child (see
+    // {@link CommandRunResult.spawnError}).
     if (result.error) {
+      const spawnError = String(result.error);
       return {
         stdout: result.stdout ?? "",
-        stderr: (result.stderr ? result.stderr : "") + String(result.error),
+        stderr: (result.stderr ? result.stderr : "") + spawnError,
         exitCode: typeof result.status === "number" ? result.status : 1,
+        spawnError,
       };
     }
     return {
