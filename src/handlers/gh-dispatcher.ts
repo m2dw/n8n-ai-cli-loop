@@ -197,6 +197,33 @@ export interface DispatchOptions {
    * supply webhook URLs without mutating the process environment.
    */
   env?: Record<string, string | undefined>;
+  /**
+   * Called once for each row this run dead-letters — the point at which an
+   * effect stops being "not delivered yet" and becomes "will never be delivered"
+   * (issue #936).
+   *
+   * The dispatcher owns rows, not tasks: it cannot know that the comment it just
+   * gave up on was the only public trace of a terminal handoff, and the task
+   * that raised the handoff committed long before. This seam lets the CLI
+   * composition root append that audit record (see
+   * `recordRefinementHandoffCommentUndeliverable`) without pulling a task store
+   * into the dispatcher itself. Left undefined by callers that have no task
+   * store, in which case a dead letter is recorded on the outbox row alone,
+   * exactly as before.
+   *
+   * A throw from the hook never fails the row — the dead-letter already
+   * committed, and no later run will select the row again, so failing the
+   * dispatch here would change nothing except the exit code — but it is
+   * reported in `errors` rather than swallowed.
+   *
+   * The hook is therefore the FAST path, not the durable one (P2 review
+   * follow-up): a transient failure here (a busy SQLite file) would otherwise
+   * lose the audit record permanently. The composition root re-derives the same
+   * fact from the dead-lettered rows themselves on every later run — see
+   * `repairRefinementHandoffCommentUndeliverable` — so a hook that fails is a
+   * deferral, not a loss.
+   */
+  onDeadLettered?: (entry: OutboxEntry) => Promise<void>;
 }
 
 /**
@@ -597,9 +624,25 @@ export async function dispatchOutbox(
         })
         .catch(() => {});
     }, OUTBOX_CLAIM_RENEW_MS);
+    // The synchronous half of the same fence (P2 review follow-up to issue
+    // #936). The timer above cannot fire while a `gh` call is in flight: the
+    // default runner is `spawnSync`, which blocks the event loop for the whole
+    // call, so a claim can silently go stale DURING a dispatch no matter how
+    // short the renew interval is. A row whose delivery is capped at one
+    // external effect (`dedupeMarker`) therefore re-asserts ownership here, in
+    // the gap between the marker read and the POST — a point where the loop is
+    // free — rather than trusting the timer. Success also advances the lease to
+    // `now`, so the POST that follows starts with a full `OUTBOX_CLAIM_STALE_MS`
+    // window rather than whatever remained after the read.
+    const holdsClaim = async (): Promise<boolean> => {
+      const renewedAt = await outboxStore.renewClaim(entry.id, claimToken);
+      if (renewedAt === undefined) return false;
+      claimToken = renewedAt;
+      return true;
+    };
     let result: Awaited<ReturnType<typeof dispatchEntry>>;
     try {
-      result = await dispatchEntry(entry, entryRunner, opts.cwd, providers, fetchImpl, env);
+      result = await dispatchEntry(entry, entryRunner, opts.cwd, providers, fetchImpl, env, holdsClaim);
     } catch (err) {
       result = { ok: false, error: err instanceof Error ? err.message : String(err) };
     } finally {
@@ -645,6 +688,16 @@ export async function dispatchOutbox(
       if (rowDeadLettered) {
         deadLettered++;
         resolvedIds.add(entry.id);
+        if (opts.onDeadLettered) {
+          try {
+            await opts.onDeadLettered(entry);
+          } catch (err) {
+            errors.push({
+              id: entry.id,
+              error: `dead-letter record failed: ${err instanceof Error ? err.message : String(err)}`,
+            });
+          }
+        }
       }
     }
   }
@@ -840,6 +893,73 @@ function isEntryDue(entry: OutboxEntry, now: string): boolean {
 // Per-entry dispatch
 // ---------------------------------------------------------------------------
 
+/**
+ * The delivery-side idempotency check for a comment row that carries a
+ * `dedupeMarker` (issue #936).
+ *
+ * Returns the row's OUTCOME when the dispatch is already settled — `{ ok: true }`
+ * when the tracker already carries a comment with this marker (a previous
+ * attempt's POST landed and then lost its claim before `markSent`, so this row
+ * is complete and posting again would duplicate it), or the read failure when
+ * the history cannot be scanned. Returns `undefined` when the row should be
+ * dispatched normally: no marker on the payload (every comment whose contract
+ * tolerates a repeat), or a provider without the capability.
+ *
+ * A read failure is deliberately returned as a retryable failure rather than
+ * being ignored: the check is a precondition, and treating "could not read" as
+ * "not there" would post the duplicate this exists to prevent. The row stays
+ * pending, retries on its own budget, and — if it never succeeds — dead-letters
+ * visibly like any other undeliverable effect.
+ */
+function alreadyDelivered(
+  provider: WorkItemProvider,
+  issueNumber: number,
+  marker: string | undefined,
+): { ok: true } | { ok: false; error: string } | undefined {
+  if (marker === undefined || marker.length === 0) return undefined;
+  if (!provider.hasItemCommentWithMarker) return undefined;
+  const found = provider.hasItemCommentWithMarker(issueNumber, marker);
+  if (!found.ok) return { ok: false, error: found.error };
+  return found.value ? { ok: true } : undefined;
+}
+
+/**
+ * Re-assert this attempt's claim in the gap between {@link alreadyDelivered}'s
+ * history read and the POST it guards (P2 review follow-up to issue #936).
+ *
+ * The read and the POST are two separate calls, so "absent" is only ever a
+ * statement about the past. If the claim lease expired during the read — the
+ * default `gh` runner is `spawnSync`, which blocks the event loop and so blocks
+ * the renewal timer for the whole call — a second dispatcher can reclaim the
+ * row, read the same absent history, and post: two dispatchers, two comments,
+ * for a delivery §16 caps at one.
+ *
+ * Renewing here closes that: `renewClaim` is a compare-and-swap on the claim
+ * this attempt holds, so it fails exactly when someone else has taken the row,
+ * and the attempt that lost stops before its POST rather than after it. It does
+ * not make read-and-post atomic — nothing available at this layer can, since
+ * the provider offers no conditional create — but it narrows the window from
+ * "the read plus the POST outran whatever was left of the lease" to "the POST
+ * alone outran a full, just-renewed lease".
+ *
+ * Returns a retryable failure when the claim is gone, and `undefined` (proceed)
+ * when it is held, when the row carries no marker (an ordinary comment pays no
+ * extra write), or when the caller supplied no fence.
+ */
+async function claimStillHeld(
+  marker: string | undefined,
+  fence: (() => Promise<boolean>) | undefined,
+): Promise<{ ok: false; error: string } | undefined> {
+  if (marker === undefined || marker.length === 0) return undefined;
+  if (!fence) return undefined;
+  if (await fence()) return undefined;
+  return {
+    ok: false,
+    error:
+      "outbox claim lost before posting a dedupe-marked comment; another dispatcher now owns this row",
+  };
+}
+
 async function dispatchEntry(
   entry: OutboxEntry,
   runner: GhRunner | undefined,
@@ -847,6 +967,12 @@ async function dispatchEntry(
   providers: OutboxProviderFactory,
   fetchImpl: FetchFn,
   env: Record<string, string | undefined>,
+  /**
+   * Re-asserts (and extends) this attempt's outbox claim. Supplied by the
+   * dispatch loop; see {@link claimStillHeld}. Optional so a caller without a
+   * claim to fence — there is none today — keeps the previous behavior.
+   */
+  claimFence?: () => Promise<boolean>,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const { payload } = entry;
   const repo = `${payload.owner}/${payload.repo}`;
@@ -867,6 +993,10 @@ async function dispatchEntry(
       const body = isLegacyPrCommentEntry(entry)
         ? sanitizeLegacyPrCommentBody(payload.body)
         : payload.body;
+      const settled = alreadyDelivered(provider, payload.issueNumber, payload.dedupeMarker);
+      if (settled) return settled;
+      const lost = await claimStillHeld(payload.dedupeMarker, claimFence);
+      if (lost) return lost;
       return provider.commentItem(payload.issueNumber, body);
     }
     case "gh:label:add": {
@@ -885,6 +1015,10 @@ async function dispatchEntry(
     case "workitem:comment": {
       const provider = providers.workItem(payload.provider, repo, cwd, runner!);
       if (!provider) return unsupportedProvider("work-item", payload.provider);
+      const settled = alreadyDelivered(provider, payload.issueNumber, payload.dedupeMarker);
+      if (settled) return settled;
+      const lost = await claimStillHeld(payload.dedupeMarker, claimFence);
+      if (lost) return lost;
       return provider.commentItem(payload.issueNumber, payload.body);
     }
     case "workitem:transition": {

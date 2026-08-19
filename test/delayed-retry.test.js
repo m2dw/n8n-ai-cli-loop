@@ -452,6 +452,23 @@ describe('runNextPhase — category-appropriate delay wording (issue #672)', () 
     const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
     expect(body).toContain('Agent quota/rate-limit delay');
   });
+
+  test('a transient_verification delay never attributes a quota condition to the agent (#897)', async () => {
+    await enqueueImpl();
+    const { enqueued, store: outboxStore } = makeOutbox();
+    // The agent never ran: a verification command failed on an indeterminate CLI
+    // probe. Wording this with the quota copy would put a statement the agent
+    // never made into a public comment.
+    const handler = async () => ({ result: 'delayed', context: {}, delayKind: 'transient_verification' });
+    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+
+    const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
+    expect(body).toContain('Transient verification delay');
+    expect(body).toMatch(/indeterminate CLI availability probe/);
+    expect(body).toMatch(/condition of the machine, not of this change/);
+    expect(body).not.toMatch(/quota/i);
+    expect(body).not.toMatch(/rate-limit/i);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,18 @@
 referenced throughout this plan have been deleted along with
 `worktrees.enabled` — those references are historical.
 
+**Note (issue #783):** this plan does **not** produce a programmatically
+callable operation seam, and nothing should be scheduled on the assumption
+that it will. Every slice relocates a `runXxx(argv: string[]): Promise<void>`
+handler that keeps its own option parsing, its process-global output mode, and
+its `die()`/`process.exit` failure path (§4, §8); P1–P4 are store and
+CLI-registry ports. A non-terminal adapter (ChatOps, a GitHub App) needs the
+per-operation core/shell split specified in
+`docs/operation-dispatch-port-contract.md` §11.2 instead. That split is
+orthogonal to this plan in both directions — it adds no `P5`, reorders no
+slice, and can be done to a handler before or after that handler moves out of
+`admin.ts` — so neither effort blocks the other.
+
 This document is the final integration specification for decomposing
 `src/cli/admin.ts` (10,574 lines) and `src/cli/admin-ui.ts` (1,900 lines) into
 resource-oriented modules (issue #712). It consolidates, sequences, and

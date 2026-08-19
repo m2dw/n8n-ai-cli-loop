@@ -232,7 +232,8 @@ closed (nonzero exit) on:
 - **Personal absolute paths** — macOS-style user directories, Linux home
   directories, and Windows user directories.
 - **Credentials** — private key blocks, GitHub/npm/Slack tokens, AWS access
-  key IDs, and quoted secret/API-key-shaped assignments.
+  key IDs, JWT-shaped values, and quoted secret/API-key-shaped assignments
+  (see [Value classification and suppression](#value-classification-and-suppression-issue-971)).
 - **Internal-only repository identifiers** — the private repository's name,
   which carries an `-ai` suffix the public mirror's name does not, and must
   never appear literally in exported output.
@@ -252,6 +253,65 @@ closed (nonzero exit) on:
 apply there) since this repository's own tests deliberately contain
 realistic-looking placeholder paths, keys, and tokens as fixture data —
 see [Limitations](#limitations-for-productionization).
+
+### Value classification and suppression (issue #971)
+
+The known-format credential rules — private key blocks, `ghp_`/`npm_`/`xox`
+prefixes, AWS access key IDs, JWT-shaped values — are unconditional regex
+matches and stay fail-closed. Nothing below can exempt them.
+
+Only the one *heuristic* rule, `credential-generic-assignment` ("a
+`token`/`secret`/`api_key`-ish identifier assigned a quoted 16+ character
+value"), goes through a second step. That rule produced false positives on
+ordinary readable literals whose identifier merely happens to contain a
+credential keyword, e.g.:
+
+```js
+const REFINEMENT_HANDOFF_KEY_TOKEN = "refinement-handoff";
+```
+
+`isReadableSemanticValue` classifies the *captured value* — not the
+surrounding code — using deterministic signals: overall and per-segment
+length, character-class diversity, separators and word boundaries, per-segment
+vowel ratio and consonant-run length, and (for values long enough for the
+estimate to be meaningful) normalized Shannon entropy. A value is exempt only
+when every signal says it is a confidently readable semantic literal:
+lowercase ASCII words joined by `-`/`_`, two or three of them, word-shaped,
+not hex-alphabet-only. One uppercase letter, one digit, one base64 character,
+a single unseparated blob, or a fourth segment is enough to keep it a
+credential. **Ambiguous values are credentials by default** — word-list
+passphrases in particular stay reported.
+
+This is deliberately not a JavaScript-aware check. There is no lexer, no
+scope tracking, and no brace/string/comment/regex-literal parsing: the scanner
+reads lines of text and classifies captured values, so it behaves identically
+in `.ts`, `.md`, `.yml`, or anything else it walks.
+
+For a reviewed false positive that stays ambiguous, use the explicit
+suppression marker on the line immediately above:
+
+```
+copybara-allow-next-line: <rule-id> <finding-key> -- <reason>
+```
+
+```js
+// copybara-allow-next-line: credential-generic-assignment DEMO_HANDOFF_TOKEN -- reviewed 2026-08-19, documentation fixture, not live credential material
+const DEMO_HANDOFF_TOKEN = "correct-horse-battery-staple";
+```
+
+- `<rule-id>` must be a rule that opts into suppression (today only
+  `credential-generic-assignment`); naming any other rule does nothing.
+- `<finding-key>` is the assigned identifier, so the marker never restates the
+  value it exempts.
+- `<reason>` is free text after `--` (or an em dash) and must be non-empty; a
+  marker without one does not parse and suppresses nothing.
+
+The marker is written in whatever comment syntax the file already uses — it is
+matched out of the raw preceding line, with no language awareness — and it is
+scoped to one finding: it must name both the rule and the key, it applies to
+the next line only, and on a line carrying two assignments it exempts just the
+one whose identifier it names. There is no file-level, block-level, or
+line-level form, and no per-file allowlist.
 
 Run it standalone against any directory: `node scripts/copybara-validate.mjs <dir>`.
 It is also run automatically as the last stage of `copybara-export.mjs`.
@@ -333,6 +393,14 @@ This maps to the Verification checklist in issue #767:
 - **Credential detection is pattern-based**, matching known token shapes and
   a conservative "quoted secret-looking assignment" heuristic. It will not
   catch novel or obfuscated secret formats.
+- **The value classifier is a heuristic on one heuristic rule.** A random
+  lowercase-only value with no digits, no uppercase, word-shaped segments,
+  and exactly two or three of them would be exempted from
+  `credential-generic-assignment`. Real credential generators emit
+  base64/hex/mixed-case alphabets, and the known-format rules are unaffected
+  either way, but this is a defense-in-depth net rather than a proof that
+  every exempted value is safe — see
+  [Value classification and suppression](#value-classification-and-suppression-issue-971).
 - **This prototype's own test suite cannot exercise the real jar** (no Java
   in the authoring sandbox), so `test/copybara-export.test.js` injects a
   stub command runner that simulates a successful/failing `java -jar`

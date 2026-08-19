@@ -1,8 +1,11 @@
 # Constrained Read-Only Repository Evidence Contract (Headless Research)
 
-Status: **approved design, not yet implemented.** Issue #805 defines this
-contract. No production research behavior changes in #805; the implementation
-lands in the follow-up Issue (#806) behind an off-by-default session switch.
+Status: **approved design, implemented (issue #806), default-off.** Issue
+#805 defines this contract; no production research behavior changed in #805
+itself. The resolver it specifies now ships in `src/core/research-evidence-protocol.ts`,
+wired into the research handler behind `session.research.evidence.enabled`
+(default `false`). See [feature-status.md](feature-status.md) for the
+operator-facing availability summary.
 
 ## 0. Purpose
 

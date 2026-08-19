@@ -14,14 +14,34 @@ import type {
   TaskKey,
   TaskPatch,
   TaskPhase,
+  TaskStatus,
 } from "../core/task.js";
 import { applyTaskPatch, isClaimExpired, isRunnable, leaseExpiry, priorityRank } from "../core/transitions.js";
 import { ASSIGNMENT_CONTEXT_KEY } from "../core/assignment.js";
 import { hasUnresolvedToolRequest } from "../core/tool-request.js";
 import type { OutboxEffect, PhaseCompletionTransition, TaskStore } from "../core/task-store.js";
 import type { OutboxEnqueueInput } from "../core/outbox.js";
+import type {
+  ChainPrefixFreezeStore,
+  FreezeChainPrefixInput,
+  FreezeChainPrefixResult,
+  FrozenPrefixSnapshot,
+} from "../core/chain-frozen-prefix.js";
+import { validateFrozenPrefixSnapshot } from "../core/chain-frozen-prefix.js";
+import type {
+  ChainIntakeEnqueueStore,
+  EnqueueTaskWithChainFreezeResult,
+} from "../core/chain-intake.js";
 import { sqliteBackendId } from "./sqlite-backend-id.js";
 import { migrateOutboxTable, migrateOutboxRetryColumns } from "./outbox-migration.js";
+import { migrateChainRegistrySchema } from "./chain-registry-migration.js";
+import {
+  INSERT_FROZEN_PREFIX,
+  SELECT_FROZEN_PREFIX,
+  frozenPrefixInsertValues,
+  rowToFrozenPrefix,
+  type FrozenPrefixRow,
+} from "./frozen-prefix-rows.js";
 import { isMaintenanceLockHeld } from "./maintenance-lock-guard.js";
 
 const DEFAULT_LEASE_MS = 30 * 60 * 1000;
@@ -151,7 +171,7 @@ function migrateTasksRevision(db: Database.Database): void {
   db.exec("ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0");
 }
 
-export class SqliteTaskStore implements TaskStore {
+export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, ChainIntakeEnqueueStore {
   readonly #db: Database.Database;
 
   /**
@@ -174,13 +194,38 @@ export class SqliteTaskStore implements TaskStore {
     migrateOutboxRetryColumns(this.#db);
     migrateTasksNotBefore(this.#db);
     migrateTasksRevision(this.#db);
+    // The dependency-chain tables live in this same file (issue #788), and
+    // `freezeChainPrefix` writes one of them inside a task transaction (issue
+    // #891). Running the registry migration here is what makes that table
+    // present no matter which store opened the database first; it is additive
+    // and guarded, so on a file `SqliteChainRegistryStore` already upgraded it
+    // finds nothing to do.
+    migrateChainRegistrySchema(this.#db);
   }
 
   close(): void {
     this.#db.close();
   }
 
-  async enqueueTask(input: EnqueueTaskInput): Promise<StoreResult<AiTask>> {
+  /**
+   * `options.events`, when given, are inserted in the SAME transaction as the
+   * created (or reactivated) row, and only when the enqueue succeeded (issue
+   * #967 review). A row whose admission carries a MANDATORY audit record — the
+   * intake gate that creates a refinement task already held on
+   * `predecessor_not_ready` — cannot append that record afterwards: intake is
+   * idempotent, so a crash or a failed insert between the two writes leaves a
+   * permanently `blocked` row that every later poll reports as
+   * `already_exists`, never retrying the event. Committing both together means
+   * the row and its reason exist or neither does.
+   *
+   * The parameter is deliberately absent from the `TaskStore` interface, for
+   * the same reason as {@link replaceTask}: it serves a caller that already
+   * holds a concrete `SqliteTaskStore` and needs this file's own transaction.
+   */
+  async enqueueTask(
+    input: EnqueueTaskInput,
+    options?: { events?: TaskEvent[] },
+  ): Promise<StoreResult<AiTask>> {
     const now = input.now ?? new Date().toISOString();
 
     // IMMEDIATE prevents SQLITE_CONSTRAINT_PRIMARYKEY being thrown when two
@@ -188,6 +233,23 @@ export class SqliteTaskStore implements TaskStore {
     // second blocks on lock acquisition, then reads the already-inserted row
     // and returns already_exists cleanly.
     const enqueue = this.#db.transaction((): StoreResult<AiTask> => {
+      const applied = this.#applyEnqueue(input, now);
+      // A refused enqueue wrote no row, so it must leave no record of one.
+      if (applied.ok) for (const event of options?.events ?? []) this.#insertEvent(event);
+      return applied;
+    });
+
+    return enqueue.immediate();
+  }
+
+  /**
+   * The body of {@link enqueueTask}, factored out so
+   * {@link enqueueTaskWithChainFreeze} can run the identical create/reactivate
+   * decision inside its own combined transaction (issue #790). Must be called
+   * inside a transaction.
+   */
+  #applyEnqueue(input: EnqueueTaskInput, now: string): StoreResult<AiTask> {
+    {
       const existing = this.#db
         .prepare("SELECT * FROM tasks WHERE session_id = ? AND issue_number = ?")
         .get(input.sessionId, input.issueNumber) as RawTask | undefined;
@@ -264,18 +326,22 @@ export class SqliteTaskStore implements TaskStore {
           `INSERT INTO tasks
             (session_id, issue_number, status, phase, priority,
              implementation_agent, review_agent, research_agent,
-             attempts, context, created_at, updated_at)
-           VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, '{}', ?, ?, ?)`,
+             attempts, context, last_error, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?)`,
         )
         .run(
           input.sessionId,
           input.issueNumber,
+          // `queued` for every caller but the intake gate that creates an
+          // already-held row (issue #967; see EnqueueTaskInput.initialStatus).
+          input.initialStatus ?? "queued",
           input.phase,
           input.priority ?? "normal",
           input.implementationAgent ?? null,
           input.reviewAgent ?? null,
           input.researchAgent ?? null,
           JSON.stringify(input.context ?? {}),
+          input.lastError ?? null,
           now,
           now,
         );
@@ -284,9 +350,142 @@ export class SqliteTaskStore implements TaskStore {
         .prepare("SELECT * FROM tasks WHERE session_id = ? AND issue_number = ?")
         .get(input.sessionId, input.issueNumber) as RawTask;
       return { ok: true, value: rawToTask(row) };
+    }
+  }
+
+  /**
+   * Create (or reactivate) a task AND freeze its dependency prefix in one
+   * transaction (issue #790; the intake-side sibling of
+   * {@link freezeChainPrefix}). See {@link ChainIntakeEnqueueStore} for why the
+   * two halves must commit together: the snapshot is the contract the created
+   * task will run under, and a failure between two separate writes would leave
+   * either a claimable task nothing pinned or an immovable prefix for a task
+   * that never appeared.
+   *
+   * Decision order inside the transaction, and why it is the contract:
+   *
+   *   1. the chain is checked — existence, session ownership, and that its
+   *      graph still stands at the revision the snapshot was computed from.
+   *      The snapshot was derived outside this transaction, so a concurrent
+   *      acceptance may have moved the graph since; freezing then would pin an
+   *      ancestry the accepted graph no longer describes, invisibly. That
+   *      window is refused as `conflict` — the caller re-observes and retries;
+   *   2. the stored prefix is compared BEFORE anything is written. A different
+   *      contract already on record refuses the whole call — the task is not
+   *      created and not reactivated, which is the fail-closed half of
+   *      "atomic or fail-closed";
+   *   3. only then does the create/reactivate decision run, identical to
+   *      {@link enqueueTask}. A non-reactivatable existing task returns
+   *      `already_exists` without freezing anything: the first creation froze
+   *      it (or predates freezing entirely), and this call has nothing to add.
+   */
+  async enqueueTaskWithChainFreeze(
+    input: EnqueueTaskInput,
+    snapshot: FrozenPrefixSnapshot,
+  ): Promise<EnqueueTaskWithChainFreezeResult> {
+    const now = input.now ?? new Date().toISOString();
+
+    const invalid = validateFrozenPrefixSnapshot(snapshot);
+    if (invalid !== undefined) return { ok: false, code: "invalid_input", detail: invalid };
+    if (snapshot.sessionId !== input.sessionId || snapshot.issueNumber !== input.issueNumber) {
+      return {
+        ok: false,
+        code: "invalid_input",
+        detail:
+          `snapshot names ${snapshot.sessionId}#${snapshot.issueNumber} but the enqueue names ` +
+          `${input.sessionId}#${input.issueNumber}`,
+      };
+    }
+
+    const run = this.#db.transaction((): EnqueueTaskWithChainFreezeResult => {
+      const chain = this.#db
+        .prepare(
+          "SELECT session_id, graph_revision, graph_fingerprint FROM dependency_chain WHERE chain_id = ?",
+        )
+        .get(snapshot.chainId) as
+        | { session_id: string; graph_revision: number; graph_fingerprint: string }
+        | undefined;
+      if (!chain) {
+        return { ok: false, code: "not_found", detail: `no such chain: ${snapshot.chainId}` };
+      }
+      if (chain.session_id !== snapshot.sessionId) {
+        return {
+          ok: false,
+          code: "not_found",
+          detail:
+            `chain ${snapshot.chainId} belongs to session ${chain.session_id}, ` +
+            `not ${snapshot.sessionId}`,
+        };
+      }
+      if (
+        chain.graph_revision !== snapshot.graphRevision ||
+        chain.graph_fingerprint !== snapshot.graphFingerprint
+      ) {
+        return {
+          ok: false,
+          code: "conflict",
+          detail:
+            `chain ${snapshot.chainId} moved to graph revision ${chain.graph_revision} since the ` +
+            `snapshot was taken from revision ${snapshot.graphRevision}`,
+        };
+      }
+
+      const existingRow = this.#db
+        .prepare(SELECT_FROZEN_PREFIX)
+        .get(snapshot.sessionId, snapshot.issueNumber) as FrozenPrefixRow | undefined;
+      let stored: FrozenPrefixSnapshot | undefined;
+      if (existingRow) {
+        const existing = rowToFrozenPrefix(existingRow);
+        if (existing.fingerprint !== snapshot.fingerprint) {
+          return {
+            ok: false,
+            code: "frozen_prefix_conflict",
+            detail: `issue ${snapshot.issueNumber} is already frozen with a different prefix`,
+            frozen: existing,
+          };
+        }
+        stored = existing;
+      }
+
+      const applied = this.#applyEnqueue(input, now);
+      if (!applied.ok) {
+        // #applyEnqueue only ever refuses with already_exists, and always
+        // carries the row it found.
+        return { ok: false, code: "already_exists", current: applied.current! };
+      }
+
+      if (stored === undefined) {
+        this.#db.prepare(INSERT_FROZEN_PREFIX).run(...frozenPrefixInsertValues(snapshot));
+        stored = rowToFrozenPrefix(
+          this.#db
+            .prepare(SELECT_FROZEN_PREFIX)
+            .get(snapshot.sessionId, snapshot.issueNumber) as FrozenPrefixRow,
+        );
+        this.#insertEvent({
+          task: { sessionId: input.sessionId, issueNumber: input.issueNumber },
+          type: "chain.frozen",
+          message:
+            `dependency prefix frozen against ${snapshot.chainId} ` +
+            `(graph revision ${snapshot.graphRevision})`,
+          data: {
+            chainId: snapshot.chainId,
+            graphRevision: snapshot.graphRevision,
+            prefixFingerprint: snapshot.fingerprint,
+          },
+          createdAt: now,
+        });
+      }
+
+      return {
+        ok: true,
+        task: applied.value,
+        reactivated: applied.reactivated === true,
+        snapshot: stored,
+        alreadyFrozen: existingRow !== undefined,
+      };
     });
 
-    return enqueue.immediate();
+    return run.immediate();
   }
 
   async getTask(key: TaskKey): Promise<AiTask | undefined> {
@@ -499,6 +698,222 @@ export class SqliteTaskStore implements TaskStore {
       }
 
       return result;
+    });
+
+    return run.immediate();
+  }
+
+  /**
+   * Replace an existing task row wholesale with a freshly created one, under a
+   * compare-and-set on the row this caller observed (issue #867 review).
+   *
+   * Task rows are unique per (session, Issue), and {@link enqueueTask} answers
+   * `already_exists` for every row it cannot reactivate — so an Issue whose row
+   * belongs to a lane it has since LEFT (an executable task an operator
+   * cancelled, finished, or parked, on an Issue that now carries only
+   * `status:needs-refinement`) can otherwise never be admitted into the new
+   * lane: intake reports `already_exists` forever and the row it names is never
+   * reactivated. This is the deliberate, narrow way out of that dead end.
+   *
+   * "Wholesale" is the point, and the reason this is not a
+   * {@link transitionTask} patch: a patch SHALLOW-MERGES context, so the
+   * replacement would inherit the previous lane's keys (`prNumber`,
+   * `implementationMode`, `dependencyDecision`, a pinned `assignment`) under a
+   * phase that never wrote them. Every column is reset here to exactly what
+   * `enqueueTask` would have written for a first-time create, with one
+   * exception: `created_at` is left alone, because the row is the same Issue's
+   * row and its creation time is a fact.
+   *
+   * The CAS is the whole safety argument. `expected` names the status, phase,
+   * and revision the caller read; a concurrent claim, completion, or
+   * cancellation moves at least the revision, so the replacement is refused
+   * (`conflict`, with the current row) rather than silently discarding work that
+   * landed since. `event` and `extraEvents`, when given, are inserted in the
+   * SAME transaction, so a refused CAS leaves no record of a replacement that
+   * did not happen — and a committed one cannot be missing an audit record the
+   * replacement was required to carry (issue #967 review).
+   *
+   * Deliberately not on the `TaskStore` interface, for the same reason as
+   * {@link transitionTaskWithEffects}: it serves a caller that already holds a
+   * concrete `SqliteTaskStore`, rather than being a new contract every store
+   * implementation must satisfy.
+   */
+  async replaceTask(
+    input: EnqueueTaskInput,
+    expected: { status: TaskStatus; phase: TaskPhase; revision: number },
+    options?: { event?: TaskEvent; extraEvents?: TaskEvent[] },
+  ): Promise<StoreResult<AiTask>> {
+    const now = input.now ?? new Date().toISOString();
+    const run = this.#db.transaction((): StoreResult<AiTask> => {
+      const row = this.#db
+        .prepare("SELECT * FROM tasks WHERE session_id = ? AND issue_number = ?")
+        .get(input.sessionId, input.issueNumber) as RawTask | undefined;
+      if (!row) return { ok: false, code: "not_found" };
+
+      const current = rawToTask(row);
+      if (
+        current.status !== expected.status ||
+        current.phase !== expected.phase ||
+        current.revision !== expected.revision
+      ) {
+        return { ok: false, code: "conflict", current };
+      }
+
+      this.#db
+        .prepare(
+          `UPDATE tasks
+           SET status = ?, phase = ?, priority = ?,
+               implementation_agent = ?, review_agent = ?, research_agent = ?,
+               owner_run_id = NULL, lease_expires_at = NULL, not_before = NULL,
+               attempts = '{}', context = ?, last_error = ?, updated_at = ?,
+               revision = revision + 1
+           WHERE session_id = ? AND issue_number = ?`,
+        )
+        .run(
+          // The replacement is a fresh create, so it honours the same
+          // `initialStatus` a create does (issue #967): an Issue whose
+          // refinement predecessors are not ready must not become claimable
+          // just because the row it replaces belonged to another lane.
+          input.initialStatus ?? "queued",
+          input.phase,
+          input.priority ?? "normal",
+          input.implementationAgent ?? null,
+          input.reviewAgent ?? null,
+          input.researchAgent ?? null,
+          JSON.stringify(input.context ?? {}),
+          input.lastError ?? null,
+          now,
+          input.sessionId,
+          input.issueNumber,
+        );
+
+      if (options?.event) this.#insertEvent(options.event);
+      for (const extra of options?.extraEvents ?? []) this.#insertEvent(extra);
+
+      const updated = this.#db
+        .prepare("SELECT * FROM tasks WHERE session_id = ? AND issue_number = ?")
+        .get(input.sessionId, input.issueNumber) as RawTask;
+      return { ok: true, value: rawToTask(updated) };
+    });
+
+    return run.immediate();
+  }
+
+  /**
+   * Freeze a task's dependency prefix and perform the task-state transition
+   * that starting it requires, in one transaction on this store's connection
+   * (issue #891; see {@link ChainPrefixFreezeStore}).
+   *
+   * The snapshot table lives in this same file — `SqliteTaskStore` runs the
+   * registry migration for exactly this reason — so the two writes need no
+   * cross-connection coordination, and a `SqliteChainRegistryStore` opened on
+   * the same path simply sees the row once this transaction commits. Any
+   * failure rolls both back: there is no state in which a task has advanced
+   * against an unfrozen prefix, and none in which a prefix is frozen for a task
+   * that never started.
+   *
+   * The repeat case is decided here, before the compare-and-set, and that
+   * ordering is the contract rather than an optimization. A snapshot on record
+   * proves the transition it rode with committed, because they committed
+   * together — so a repeat has nothing left to advance, and re-running the CAS
+   * would fail against a task that has legitimately moved on since. The stored
+   * contract is returned and nothing is written.
+   *
+   * Deliberately not on the `TaskStore` interface, for the same reason as
+   * {@link transitionTaskWithEffects}: it serves callers that already hold a
+   * concrete `SqliteTaskStore` and need this file's own transaction, rather
+   * than being a new contract every store implementation must satisfy.
+   */
+  async freezeChainPrefix(input: FreezeChainPrefixInput): Promise<FreezeChainPrefixResult> {
+    const { snapshot, transition } = input;
+
+    const invalid = validateFrozenPrefixSnapshot(snapshot);
+    if (invalid !== undefined) return { ok: false, code: "invalid_input", detail: invalid };
+    // The snapshot and the transition must describe one task. They are supplied
+    // separately, so a caller can pair a snapshot with the wrong key; freezing
+    // one task's ancestry while advancing another's is the one mistake here
+    // that would be invisible afterwards.
+    if (
+      snapshot.sessionId !== transition.key.sessionId ||
+      snapshot.issueNumber !== transition.key.issueNumber
+    ) {
+      return {
+        ok: false,
+        code: "invalid_input",
+        detail:
+          `snapshot names ${snapshot.sessionId}#${snapshot.issueNumber} but the transition names ` +
+          `${transition.key.sessionId}#${transition.key.issueNumber}`,
+      };
+    }
+
+    const run = this.#db.transaction((): FreezeChainPrefixResult => {
+      // Existence is not enough: the chain has to be *this session's*. Chain IDs
+      // are global, so an existence-only lookup would happily freeze a task
+      // against another session's graph — and that row is what the chain's
+      // prefix listing later hands the mutation guard, constraining a run whose
+      // ancestry it never described. A chain belonging to someone else is
+      // reported as absent, which is what it is from here.
+      const chain = this.#db
+        .prepare("SELECT session_id FROM dependency_chain WHERE chain_id = ?")
+        .get(snapshot.chainId) as { session_id: string } | undefined;
+      if (!chain) {
+        return { ok: false, code: "not_found", detail: `no such chain: ${snapshot.chainId}` };
+      }
+      if (chain.session_id !== snapshot.sessionId) {
+        return {
+          ok: false,
+          code: "not_found",
+          detail:
+            `chain ${snapshot.chainId} belongs to session ${chain.session_id}, ` +
+            `not ${snapshot.sessionId}`,
+        };
+      }
+
+      const taskRow = this.#db
+        .prepare("SELECT * FROM tasks WHERE session_id = ? AND issue_number = ?")
+        .get(transition.key.sessionId, transition.key.issueNumber) as RawTask | undefined;
+      if (!taskRow) return { ok: false, code: "not_found", detail: "no such task" };
+
+      const existing = this.#db
+        .prepare(SELECT_FROZEN_PREFIX)
+        .get(snapshot.sessionId, snapshot.issueNumber) as FrozenPrefixRow | undefined;
+      if (existing) {
+        const stored = rowToFrozenPrefix(existing);
+        if (stored.fingerprint !== snapshot.fingerprint) {
+          return {
+            ok: false,
+            code: "frozen_prefix_conflict",
+            detail: `issue ${snapshot.issueNumber} is already frozen with a different prefix`,
+            frozen: stored,
+          };
+        }
+        return { ok: true, snapshot: stored, task: rawToTask(taskRow), alreadyFrozen: true };
+      }
+
+      const applied = this.#applyTransition(transition.key, transition.expected, transition.patch);
+      if (!applied.ok) {
+        return applied.current === undefined
+          ? { ok: false, code: applied.code === "not_found" ? "not_found" : "conflict" }
+          : {
+              ok: false,
+              code: applied.code === "not_found" ? "not_found" : "conflict",
+              current: applied.current,
+            };
+      }
+
+      this.#db.prepare(INSERT_FROZEN_PREFIX).run(...frozenPrefixInsertValues(snapshot));
+      if (transition.event) this.#insertEvent(transition.event);
+      for (const extra of transition.extraEvents ?? []) this.#insertEvent(extra);
+
+      const stored = this.#db
+        .prepare(SELECT_FROZEN_PREFIX)
+        .get(snapshot.sessionId, snapshot.issueNumber) as FrozenPrefixRow;
+      return {
+        ok: true,
+        snapshot: rowToFrozenPrefix(stored),
+        task: applied.value,
+        alreadyFrozen: false,
+      };
     });
 
     return run.immediate();
@@ -901,6 +1316,47 @@ export class SqliteTaskStore implements TaskStore {
 
   async appendEvent(event: TaskEvent): Promise<void> {
     this.#insertEvent(event);
+  }
+
+  /**
+   * {@link TaskStore.appendEventOnce}: the existence probe and the insert in one
+   * IMMEDIATE transaction (issue #936 review, P2).
+   *
+   * IMMEDIATE is what makes it atomic across connections, exactly as it does for
+   * `enqueueTask`'s create-or-reactivate decision: the write lock is taken at
+   * BEGIN, so two processes reaching the same dead-lettered outbox row serialize
+   * here and the second one's probe sees the first one's committed event instead
+   * of the state both of them read before either wrote. A plain (deferred)
+   * transaction would not do it — both would read, then one would lose its
+   * upgrade to a write.
+   */
+  async appendEventOnce(
+    event: TaskEvent,
+    dedupe: { field: string; value: string },
+  ): Promise<boolean> {
+    const run = this.#db.transaction((): boolean => {
+      // The path is bound, not interpolated, so a field name can never reshape
+      // the statement; an unexpected one simply matches nothing and the event is
+      // written, which is the safe direction for an audit record.
+      const existing = this.#db
+        .prepare(
+          `SELECT 1 FROM events
+            WHERE session_id = ? AND issue_number = ? AND type = ?
+              AND json_extract(data, ?) = ?
+            LIMIT 1`,
+        )
+        .get(
+          event.task.sessionId,
+          event.task.issueNumber,
+          event.type,
+          `$.${dedupe.field}`,
+          dedupe.value,
+        );
+      if (existing !== undefined) return false;
+      this.#insertEvent(event);
+      return true;
+    });
+    return run.immediate();
   }
 
   async listEvents(key: TaskKey): Promise<TaskEvent[]> {

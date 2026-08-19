@@ -122,6 +122,7 @@ invention:
 | `listCandidateItems`  | `gh issue list ... --json` → `parseCandidates` + `labelsToPhase` (`src/core/github-intake.ts`) |
 | `getItem`             | `gh issue view <n> --json ...` (`src/handlers/dependency-plan.ts` reads labels this way) |
 | `getDependencies`     | `DependencyChecker.getBlockedBy` via `gh api graphql` `blockedBy` field                  |
+| `getDependents`       | the same read in the other direction, via `gh api graphql` `blocking` field (issue #791) |
 | `commentItem`         | outbox topic `gh:comment` → `gh api .../comments` (`gh-dispatcher.ts`)                   |
 | `transitionItem`      | outbox topics `gh:label:add` / `gh:label:remove` → `gh api .../labels`                   |
 

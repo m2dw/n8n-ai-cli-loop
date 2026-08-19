@@ -1,18 +1,20 @@
 # Review Dispute, Reconsideration, and Arbitration Contract
 
-Status: approved design, not yet implemented (issue #835). This document is
-the authoritative contract for the review-dispute protocol. Follow-up
-implementation Issues reference this specification and MUST NOT redefine its
-policy; a change of policy is a change to this document first.
+Status: approved design (issue #835). This document is the authoritative
+contract for the review-dispute protocol. Follow-up implementation Issues
+reference this specification and MUST NOT redefine its policy; a change of
+policy is a change to this document first.
 
-No production review or fix behavior changes in #835. When the implementation
-lands it is gated behind `session.reviewDispute.enabled`, which defaults to
-`false`; a session that does not opt in behaves exactly as today.
+No production review or fix behavior changed in #835 itself — #835 shipped
+the contract, not the protocol. It is gated behind
+`session.reviewDispute.enabled`, which defaults to `false`; a session that
+does not opt in behaves exactly as today.
 
 **Implementation status (issue #849).** The protocol described here is now
 implemented across issues #836–#849 and ships default-off behind that same
-flag. This document remains the policy authority; how to enable it, read it,
-and turn it off again is
+flag. See [feature-status.md](feature-status.md#review-dispute) for the
+operator-facing availability summary. This document remains the policy
+authority; how to enable it, read it, and turn it off again is
 [review-dispute-operations.md](review-dispute-operations.md), which adds no
 policy of its own. Two turns of §7.1 still have no dispatcher — see §15/G2.
 

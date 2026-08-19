@@ -5,6 +5,10 @@ import type { AgentId } from "../core/task.js";
 import { DEFAULT_FLOW } from "../core/assignment.js";
 import { parseAntigravityPrintTimeout } from "../core/antigravity-print-timeout.js";
 import { REVIEW_DISPUTE_LIMIT_KEYS, resolveReviewDisputeSettings } from "../core/review-dispute.js";
+import {
+  ISSUE_REFINEMENT_LIMIT_KEYS,
+  resolveIssueRefinementSettings,
+} from "../core/issue-refinement.js";
 import type {
   AntigravityResearchConfig,
   AntigravityWorkspaceSettingsSessionConfig,
@@ -20,6 +24,9 @@ import type {
   GiteaLabelMappingStrategy,
   GiteaRepoHostConfig,
   GiteaWorkItemConfig,
+  IssueRefinementAgentsConfig,
+  IssueRefinementConfig,
+  IssueRefinementLimitsConfig,
   NotificationsConfig,
   ProviderAuthConfig,
   RepoHostProviderConfig,
@@ -579,6 +586,13 @@ function validateSession(value: unknown, index: number): SessionConfig {
     );
   }
 
+  if (session.issueRefinement !== undefined) {
+    config.issueRefinement = validateIssueRefinementConfig(
+      session.issueRefinement,
+      `sessions[${index}].issueRefinement`,
+    );
+  }
+
   if (session.conflictResolutionLoop !== undefined) {
     const conflictResolutionLoop = record(session.conflictResolutionLoop, `sessions[${index}].conflictResolutionLoop`);
     config.conflictResolutionLoop = {};
@@ -681,6 +695,7 @@ function resolveSession(config: SessionConfig): ResolvedSession {
     ...(config.claude ? { claude: cloneClaudeConfig(config.claude) } : {}),
     ...(config.research ? { research: cloneResearchConfig(config.research) } : {}),
     ...(config.reviewDispute ? { reviewDispute: cloneReviewDisputeConfig(config.reviewDispute) } : {}),
+    ...(config.issueRefinement ? { issueRefinement: cloneIssueRefinementConfig(config.issueRefinement) } : {}),
     artifactRoot: resolve(config.repoRoot, config.artifactDir),
     githubOwner,
     githubName,
@@ -1102,6 +1117,94 @@ function validateReviewDisputeConfig(value: unknown, path: string): ReviewDisput
   return config;
 }
 
+/**
+ * Chain-aware progressive Issue refinement (issue #867,
+ * docs/issue-refinement-contract.md §19).
+ *
+ * Shape checking lives here; the VALUE rules (a limit may only be lowered, six
+ * limits reject 0, an agent id must be one of the three) live in
+ * `resolveIssueRefinementSettings`, which this validator defers to so the two
+ * cannot drift.
+ */
+function validateIssueRefinementConfig(value: unknown, path: string): IssueRefinementConfig {
+  const obj = record(value, path);
+  const config: IssueRefinementConfig = {};
+  const allowedTop = ["enabled", "limits", "agents"];
+  for (const key of Object.keys(obj)) {
+    if (!allowedTop.includes(key)) {
+      throw new Error(
+        `${path}.${key} is not a known issue-refinement setting; expected one of: ${allowedTop.join(", ")}`,
+      );
+    }
+  }
+  if (obj.enabled !== undefined) {
+    if (typeof obj.enabled !== "boolean") {
+      throw new Error(`${path}.enabled must be a boolean`);
+    }
+    config.enabled = obj.enabled;
+  }
+  if (obj.limits !== undefined) {
+    const raw = record(obj.limits, `${path}.limits`);
+    const limits: IssueRefinementLimitsConfig = {};
+    for (const key of Object.keys(raw)) {
+      if (!(ISSUE_REFINEMENT_LIMIT_KEYS as readonly string[]).includes(key)) {
+        throw new Error(
+          `${path}.limits.${key} is not an issue-refinement limit; expected one of: `
+          + `${ISSUE_REFINEMENT_LIMIT_KEYS.join(", ")}`,
+        );
+      }
+    }
+    for (const key of ISSUE_REFINEMENT_LIMIT_KEYS) {
+      const configured = raw[key];
+      if (configured === undefined) continue;
+      if (typeof configured !== "number" || !Number.isInteger(configured)) {
+        throw new Error(`${path}.limits.${key} must be an integer`);
+      }
+      limits[key] = configured;
+    }
+    config.limits = limits;
+  }
+  if (obj.agents !== undefined) {
+    const raw = record(obj.agents, `${path}.agents`);
+    const allowed = ["refiner", "critic", "allowSameProvider"];
+    for (const key of Object.keys(raw)) {
+      if (!allowed.includes(key)) {
+        throw new Error(
+          `${path}.agents.${key} is not a known refinement agent setting; expected one of: ${allowed.join(", ")}`,
+        );
+      }
+    }
+    const agents: IssueRefinementAgentsConfig = {};
+    if (raw.refiner !== undefined) {
+      agents.refiner = requiredString(raw.refiner, `${path}.agents.refiner`);
+    }
+    if (raw.critic !== undefined) {
+      agents.critic = requiredString(raw.critic, `${path}.agents.critic`);
+    }
+    if (raw.allowSameProvider !== undefined) {
+      if (typeof raw.allowSameProvider !== "boolean") {
+        throw new Error(`${path}.agents.allowSameProvider must be a boolean`);
+      }
+      agents.allowSameProvider = raw.allowSameProvider;
+    }
+    config.agents = agents;
+  }
+  // One authority for the value rules; the registry only reports what it says.
+  const resolved = resolveIssueRefinementSettings(config, path);
+  if (!resolved.ok) {
+    throw new Error(resolved.errors.map((error) => error.message).join("; "));
+  }
+  return config;
+}
+
+function cloneIssueRefinementConfig(config: IssueRefinementConfig): IssueRefinementConfig {
+  return {
+    ...config,
+    ...(config.limits ? { limits: { ...config.limits } } : {}),
+    ...(config.agents ? { agents: { ...config.agents } } : {}),
+  };
+}
+
 function validateResearchConfig(value: unknown, path: string): ResearchConfig {
   const obj = record(value, path);
   const config: ResearchConfig = {};
@@ -1286,7 +1389,16 @@ function agent(value: unknown, path: string): AgentId {
   return id;
 }
 
-const OPTIONAL_PROFILE_ROLES = ["conflict_resolution", "research"] as const;
+// `refinement` / `refinement_critic` are the chain-aware refinement roles of
+// docs/issue-refinement-contract.md §14. Like the other optional roles they have
+// no built-in default; unlike them they have no session-`defaults` fallback
+// either, so a profile that omits them leaves the lane without a refiner.
+const OPTIONAL_PROFILE_ROLES = [
+  "conflict_resolution",
+  "research",
+  "refinement",
+  "refinement_critic",
+] as const;
 
 /**
  * Validate the assignment block (assignmentProfiles + flowRules + defaultFlow)
@@ -1532,6 +1644,7 @@ function cloneSession(session: ResolvedSession | undefined): ResolvedSession | u
     ...(session.claude ? { claude: cloneClaudeConfig(session.claude) } : {}),
     ...(session.research ? { research: cloneResearchConfig(session.research) } : {}),
     ...(session.reviewDispute ? { reviewDispute: cloneReviewDisputeConfig(session.reviewDispute) } : {}),
+    ...(session.issueRefinement ? { issueRefinement: cloneIssueRefinementConfig(session.issueRefinement) } : {}),
     ...(session.baseBranch !== undefined ? { baseBranch: session.baseBranch } : {}),
     ...(session.assignmentProfiles ? { assignmentProfiles: cloneAssignmentProfiles(session.assignmentProfiles) } : {}),
     ...(session.flowRules ? { flowRules: cloneFlowRules(session.flowRules) } : {}),

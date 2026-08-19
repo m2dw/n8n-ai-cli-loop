@@ -7,6 +7,9 @@ import {
   REVIEW_FINDINGS_END_MARKER,
   REVIEW_FINDINGS_MARKER,
 } from '../dist/core/review-finding-envelope.js';
+import { MAX_TRANSIENT_VERIFICATION_RETRIES } from '../dist/core/review-classifier.js';
+import { CLI_PROBE_INDETERMINATE_MARKER } from '../dist/core/cli-probe.js';
+import { resolveTransientRetryDelayMs } from '../dist/core/quota-classifier.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1075,6 +1078,126 @@ describe('review handler — failure cases', () => {
     expect(result.context?.reviewFeedback).toContain('3 tests failed');
     expect(result.context?.verificationFailure).toMatchObject({ name: 'test', exitCode: 1 });
     expect(result.context?.verificationFailedStep).toBe('test');
+  });
+
+  // Issue #897: a verification command that failed because a CLI availability
+  // probe never answered describes the HOST, not the diff. Routing it to
+  // needs_fix requeues an implementation phase that correctly finds nothing to
+  // change and then fails for producing no diff — the loop this issue was filed
+  // for. It takes the transient-retry policy instead, bounded so a failure that
+  // does not clear still reaches a human as the real failure it is.
+  const INDETERMINATE_VERIFICATION_OUTPUT =
+    `FAIL test/admin-cli.test.js\n  ● claudeCli\n    Received: "${CLI_PROBE_INDETERMINATE_MARKER} claude did not `
+    + 'finish before the probe timeout (ETIMEDOUT)."\n';
+
+  function verificationFailureRunner(output) {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification, issue #506)
+      { stdout: output, stderr: '', exitCode: 1 },          // npm test fails
+    ]);
+  }
+
+  test('an indeterminate CLI probe delays the retry instead of demanding a fix', async () => {
+    const runner = verificationFailureRunner(INDETERMINATE_VERIFICATION_OUTPUT);
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('delayed');
+    // Named, so the public status comment does not report a quota condition the
+    // agent never reported — the agent never ran.
+    expect(result.delayKind).toBe('transient_verification');
+    expect(result.message).toMatch(/indeterminate CLI probe/);
+    expect(result.message).toMatch(/says nothing about the diff/);
+    // The SAME short backoff the agent-side rate-limit path takes — this is the
+    // existing transient-retry policy, not a new one.
+    expect(result.retryAfterMs).toBe(resolveTransientRetryDelayMs(process.env));
+    expect(result.context?.verificationTransientRetries).toBe(1);
+    expect(result.context?.transientVerificationStep).toBe('test');
+    // A delayed release REPLACES task.context, so everything intake recorded has
+    // to survive — otherwise the retried review checks less than the first one.
+    expect(result.context?.labels).toEqual(['agent:codex', 'status:needs-review']);
+    expect(result.context?.prUrl).toBe('https://github.com/m2dw/test-repo/pull/99');
+    // No fix was requested, so nothing downstream should read one.
+    expect(result.context?.verificationFailure).toBeUndefined();
+    expect(result.context?.reviewFeedback).toBeUndefined();
+  });
+
+  test('the transient delay is bounded; a failure that does not clear becomes needs_fix', async () => {
+    const task = makeTask();
+    const exhausted = {
+      ...task,
+      context: { ...task.context, verificationTransientRetries: MAX_TRANSIENT_VERIFICATION_RETRIES },
+    };
+    const runner = verificationFailureRunner(INDETERMINATE_VERIFICATION_OUTPUT);
+    const result = await createReviewHandler(CONTEXT(), runner)(exhausted);
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.verificationFailedStep).toBe('test');
+  });
+
+  // The bound is per verification COMMAND. A shared counter would let a probe
+  // timeout in `test` spend the whole budget, pass on the retry, and then route
+  // `package`'s FIRST indeterminate probe to needs_fix — the misdiagnosis this
+  // issue exists to remove, just moved one command to the right.
+  test('each verification command gets its own transient budget', async () => {
+    const context = CONTEXT({
+      session: SESSION({ verification: { test: 'npm test', package: 'npm run package' } }),
+    });
+    const task = makeTask();
+    const spentOnTest = {
+      ...task,
+      context: {
+        ...task.context,
+        verificationTransientRetries: MAX_TRANSIENT_VERIFICATION_RETRIES,
+        transientVerificationStep: 'test',
+      },
+    };
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test — the command that spent the budget now passes
+      { stdout: INDETERMINATE_VERIFICATION_OUTPUT, stderr: '', exitCode: 1 }, // npm run package — indeterminate probe
+    ]);
+    const result = await createReviewHandler(context, runner)(spentOnTest);
+    expect(result.result).toBe('delayed');
+    expect(result.context?.transientVerificationStep).toBe('package');
+    expect(result.context?.verificationTransientRetries).toBe(1);
+    // `test` passed in this run, so the budget it had spent is released rather
+    // than carried into the next review cycle.
+    expect(result.context?.verificationTransientRetriesByStep).toEqual({ package: 1 });
+  });
+
+  test('a command that already spent its own budget still becomes needs_fix', async () => {
+    const task = makeTask();
+    const exhausted = {
+      ...task,
+      context: {
+        ...task.context,
+        verificationTransientRetriesByStep: { test: MAX_TRANSIENT_VERIFICATION_RETRIES },
+      },
+    };
+    const runner = verificationFailureRunner(INDETERMINATE_VERIFICATION_OUTPUT);
+    const result = await createReviewHandler(CONTEXT(), runner)(exhausted);
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.verificationFailedStep).toBe('test');
+  });
+
+  test('an ordinary verification failure is untouched by the transient rule', async () => {
+    // The marker is structural; prose about timeouts and unavailable CLIs is not
+    // evidence, or every flaky-sounding test failure would stop demanding a fix.
+    const runner = verificationFailureRunner(
+      'FAIL test/foo.test.js\n  ● timed out waiting for the claude cli, which was unavailable (EAGAIN)\n',
+    );
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
   });
 
   test('reviewFeedback from verification failure is bounded to 20000 chars', async () => {

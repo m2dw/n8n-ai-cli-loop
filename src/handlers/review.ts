@@ -7,8 +7,23 @@ import type { CommandRunner } from "./command-runner.js";
 // The read-only §3.3 evidence access the fix run (issue #843) shares with this
 // review run, so both resolve references under one admission posture.
 import { captureTrackedFiles, createTrackedFileReader } from "./evidence-checkout.js";
-import { classifyReviewOutput, hasConflictSignal, BLOCKING_PATTERNS, type ClassificationDetail } from "../core/review-classifier.js";
-import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory } from "../core/quota-classifier.js";
+import {
+  classifyReviewOutput,
+  classifyVerificationFailure,
+  hasConflictSignal,
+  BLOCKING_PATTERNS,
+  MAX_TRANSIENT_VERIFICATION_RETRIES,
+  TRANSIENT_VERIFICATION_LEDGER_KEY,
+  recordTransientVerificationRetry,
+  transientVerificationRetriesFor,
+  type ClassificationDetail,
+} from "../core/review-classifier.js";
+import {
+  classifyQuotaExhaustion,
+  resolveRetryDelayOverrideMsForCategory,
+  resolveTransientRetryDelayMs,
+  describeFailureCategory,
+} from "../core/quota-classifier.js";
 import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
 import { runArtifactDir, writeAssignmentFailureArtifact, ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "./artifact-dir.js";
 import { agentForPhase, readResolvedAssignment } from "../core/assignment.js";
@@ -1736,6 +1751,67 @@ export function createReviewHandler(
       if (verResult.exitCode !== 0) {
         const verificationOutput = (verResult.stdout + verResult.stderr).trim();
         const verificationFeedback = boundReviewFeedback(`Verification '${name}' failed (exit ${verResult.exitCode}):\n${verificationOutput}`);
+        // Issue #897: a verification command that failed because a CLI
+        // availability probe never answered (timeout / refused fork on a
+        // saturated host) is evidence about this machine, not about the diff.
+        // Routing it to `needs_fix` requeues an implementation phase that
+        // correctly finds nothing to change and then fails for producing no
+        // diff — so it takes the same short transient backoff the agent-side
+        // rate-limit path takes, bounded so a persistent failure still reaches
+        // a human as a real one.
+        const transientVerification = classifyVerificationFailure(verificationOutput);
+        // Budget is per verification COMMAND (issue #897 review, P2): a shared
+        // counter would let a probe timeout in an earlier command spend the
+        // budget, pass on the retry, and leave this command's first
+        // indeterminate probe with nothing left — routing it to `needs_fix`,
+        // which is precisely the misdiagnosis being fixed here.
+        const priorTransientRetries = transientVerificationRetriesFor(ctx, name);
+        if (transientVerification.transient && priorTransientRetries < MAX_TRANSIENT_VERIFICATION_RETRIES) {
+          const attempt = priorTransientRetries + 1;
+          const transientRetryLedger = recordTransientVerificationRetry({
+            ctx,
+            step: name,
+            attempt,
+            // Commands already past in this run answered, so their spent budget
+            // is released rather than carried into the next review cycle.
+            passedSteps: verificationResults.filter((v) => v.passed).map((v) => v.name),
+          });
+          writeFileSync(
+            join(artifactDir, "review-result.json"),
+            JSON.stringify({
+              issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
+              success: false, delayed: true,
+              transientSignal: transientVerification.signal,
+              step: `verification:${name}`,
+            }, null, 2),
+            "utf8",
+          );
+          return {
+            result: "delayed",
+            // The agent had no part in this: naming the delay keeps the public
+            // status comment from reporting a quota condition nobody reported.
+            delayKind: "transient_verification",
+            // The whole prior context is carried forward: a delayed release
+            // REPLACES `task.context`, and dropping the intake-recorded fields
+            // (issue body, labels, PR selector) would quietly change what the
+            // retried review is able to check.
+            context: {
+              ...ctx,
+              artifactDir,
+              verificationTransientRetries: attempt,
+              [TRANSIENT_VERIFICATION_LEDGER_KEY]: transientRetryLedger,
+              transientVerificationStep: name,
+              ...(transientVerification.signal === undefined
+                ? {}
+                : { transientVerificationSignal: transientVerification.signal }),
+            },
+            message:
+              `Verification '${name}' failed on an indeterminate CLI probe `
+              + `(signal: "${transientVerification.signal}"), which says nothing about the diff; `
+              + `delaying retry ${attempt}/${MAX_TRANSIENT_VERIFICATION_RETRIES}`,
+            retryAfterMs: resolveTransientRetryDelayMs(),
+          };
+        }
         writeFileSync(
           join(artifactDir, "review-result.json"),
           JSON.stringify({ issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId, success: false, step: `verification:${name}` }, null, 2),

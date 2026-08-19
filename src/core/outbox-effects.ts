@@ -18,11 +18,11 @@
  *  - any task → blocked status       → add blocked label
  */
 
-import type { AiTask, TaskPhase, TaskStatus } from "./task.js";
+import type { AiTask, TaskKey, TaskPhase, TaskStatus } from "./task.js";
 import type { ResolvedSession, WorkItemProviderKind } from "./session.js";
-import type { OutboxStore, OutboxEnqueueInput } from "./outbox.js";
-import type { OutboxEffect } from "./task-store.js";
-import type { PhaseHandlerResult } from "./phase-runner.js";
+import type { OutboxStore, OutboxEnqueueInput, OutboxEntry } from "./outbox.js";
+import type { OutboxEffect, TaskStore } from "./task-store.js";
+import type { PhaseDelayKind, PhaseHandlerResult } from "./phase-runner.js";
 import type { AgentFailureKind } from "./agent-diagnostics.js";
 import { makeOutboxKey } from "./outbox.js";
 import { agentForPhase, readResolvedAssignment } from "./assignment.js";
@@ -45,6 +45,14 @@ import {
   publishableDisputeOutcomes,
   renderDisputeOutcomeComment,
 } from "./review-dispute-publication.js";
+import {
+  REFINEMENT_HANDOFF_COMMENT_UNDELIVERABLE_EVENT,
+  publishableRefinementHandoffFromContext,
+  refinementHandoffCommentMarker,
+  refinementHandoffEffectFromKey,
+  refinementHandoffIdempotencyKey,
+  renderRefinementHandoffComment,
+} from "./issue-refinement-publication.js";
 import type { DiffClassification } from "./review-diff-context.js";
 import type { IssueRequiredVerification } from "../handlers/verification.js";
 
@@ -143,7 +151,19 @@ function rewriteWorkItemEnqueue(
       return {
         idempotencyKey,
         topic: "workitem:comment",
-        payload: { topic: "workitem:comment", provider, owner, repo, issueNumber: payload.issueNumber, body: payload.body },
+        // `dedupeMarker` travels with the body it is embedded in (issue #936):
+        // a rewritten row that dropped it would lose its delivery-side
+        // one-comment guarantee on exactly the providers whose comment API this
+        // rewrite exists to reach.
+        payload: {
+          topic: "workitem:comment",
+          provider,
+          owner,
+          repo,
+          issueNumber: payload.issueNumber,
+          body: payload.body,
+          ...(payload.dedupeMarker !== undefined ? { dedupeMarker: payload.dedupeMarker } : {}),
+        },
         now,
       };
     case "gh:label:add":
@@ -851,8 +871,16 @@ export async function enqueueStatusLabelEffects(
         payload: { topic: "gh:label:add", owner, repo, issueNumber: task.issueNumber, label: needsConflictResolution },
         now,
       });
-    } else if (nextPhase === "implementation") {
+    } else if (nextPhase === "implementation" && phase !== "implementation") {
       // Review needs_fix → queued for implementation: swap queue labels.
+      //
+      // Excluded: the implementation lane requeueing ITSELF after a
+      // verification failure the agent may keep fixing (issue #934). That task
+      // never left the lane, so its labels already say what they need to say —
+      // adding `status:needs-fix` would advertise a fix lane for an issue that
+      // may have no PR at all, and re-enqueue the same label writes on every
+      // automatic retry, which is GitHub churn for a state change no operator
+      // needs to see.
       //
       // Always remove the review-queue labels, falling back to the default
       // review lane labels (status:needs-review / agent:codex) when the optional
@@ -1071,6 +1099,33 @@ function quotaDelayCommentCopy(category: AgentFailureKind | undefined): { title:
   }
 }
 
+/**
+ * The delayed run's title and explanatory sentence.
+ *
+ * `transient_verification` (issue #897) is NOT an agent failure: the agent
+ * never ran. Wording it with the quota copy would tell an operator that the
+ * agent reported a quota condition it never reported — the same class of
+ * misattribution #897 exists to remove, only this time in public.
+ */
+function delayCommentCopy(
+  kind: PhaseDelayKind | undefined,
+  category: AgentFailureKind | undefined,
+  agentName: string,
+  phase: TaskPhase,
+): { title: string; sentence: string } {
+  if (kind === "transient_verification") {
+    return {
+      title: "Transient verification delay",
+      sentence:
+        `The workflow delayed the next \`${phase}\` attempt because a verification command failed on an `
+        + `indeterminate CLI availability probe — a timeout or a refused process spawn on the runner host. `
+        + `That is a condition of the machine, not of this change, so no fix has been requested.`,
+    };
+  }
+  const { title, reason } = quotaDelayCommentCopy(category);
+  return { title, sentence: `The workflow delayed the next \`${phase}\` attempt because ${agentName} ${reason}.` };
+}
+
 export async function enqueueQuotaDelayCommentEffect(
   outboxStore: OutboxStore,
   session: ResolvedSession,
@@ -1079,6 +1134,7 @@ export async function enqueueQuotaDelayCommentEffect(
   notBefore: string,
   now: string,
   category?: AgentFailureKind,
+  kind?: PhaseDelayKind,
 ): Promise<void> {
   // Route this quota-delay status comment through the session's work-item
   // provider. No-op passthrough for a GitHub session; for a non-GitHub provider
@@ -1092,11 +1148,11 @@ export async function enqueueQuotaDelayCommentEffect(
   const agentId = agentForPhase(task, session, phaseToAgentKind(phase));
   const agentName = agentId ? agentDisplayName(agentId) : "the agent";
   const retryTime = formatRetryTimestamp(notBefore);
-  const { title, reason } = quotaDelayCommentCopy(category);
+  const { title, sentence } = delayCommentCopy(kind, category, agentName, phase);
 
   const body = sanitizeBody(
     `⏳ **${title}**\n\n` +
-      `The workflow delayed the next \`${phase}\` attempt because ${agentName} ${reason}.\n\n` +
+      `${sentence}\n\n` +
       `Expected retry time: \`${retryTime}\`.\n\n` +
       `No manual action is required unless we want to bypass the wait by changing the agent ` +
       `assignment or manually clearing the delay.`,
@@ -2097,4 +2153,262 @@ export async function enqueueDisputeOutcomeEffects(
     },
     now,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Terminal refinement handoffs (issue #936, §13 items 3–4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Enqueue the public half of a terminal refinement handoff: the session's
+ * ready-for-human label, then one bounded comment carrying the handoff reason.
+ *
+ * This is the ONLY effect the refinement lane enqueues. §13 is explicit that
+ * everything else about the lane stays local until the application walk performs
+ * its own writes through the apply port, and the phase runner keeps the generic
+ * completion builders (handler comment, coarse status labels, PR summary,
+ * human-gate summary) off this phase for exactly that reason. A handoff is the
+ * one refinement outcome with an operator on the other end of it, and before
+ * this builder existed that operator had no GitHub-side signal at all — the
+ * Issue kept only `status:needs-refinement` and looked, from GitHub, like a task
+ * still waiting its turn (issue #936).
+ *
+ * Three properties are load-bearing:
+ *
+ *  - **Same transaction as the transition.** Both effects are collected into the
+ *    completion the block rides in, so a handoff cannot commit without its
+ *    publication being durable alongside it (issue #701's transactional-outbox
+ *    guarantee).
+ *  - **No marker removal, no executable status.** §13 item 2: the coarse marker
+ *    is deliberately left where it is, and adding `status:needs-implementation`
+ *    beside it would produce the both-markers combination §3 refuses. This
+ *    builder therefore only ever ADDS the ready-for-human label.
+ *  - **Retry-safe by key, not by luck.** Both keys are run-independent
+ *    (`refinementHandoffIdempotencyKey`), so a phase re-run after a lost CAS
+ *    re-derives the same two rows and the outbox dedupes them. A dispatch
+ *    failure leaves a visible pending/delayed/dead row for `admin outbox list`,
+ *    which §13 prefers over a silently omitted notice: the handoff itself
+ *    already stands on its local record.
+ *
+ * Routed through {@link workItemOutbox} like every other work-item effect, so a
+ * non-GitHub work-item session publishes to its own tracker rather than
+ * stranding a `gh:*` row behind a failing GitHub runner.
+ */
+export async function enqueueRefinementHandoffEffects(
+  outboxStore: OutboxStore,
+  session: ResolvedSession,
+  task: Pick<AiTask, "issueNumber">,
+  /**
+   * The context patch this completion is PERSISTING, not the task's stored
+   * context: the publication gate is "escalated in this delivery", so a claimed
+   * task that was already `escalated_human` before the run — the loop's
+   * `refused` path — must not re-announce a handoff an earlier run published.
+   */
+  context: Record<string, unknown> | undefined,
+  now: string,
+): Promise<void> {
+  const publication = publishableRefinementHandoffFromContext(task.issueNumber, context);
+  if (publication === null) return;
+
+  const workItemStore = workItemOutbox(outboxStore, session);
+  const owner = session.githubOwner;
+  const repo = session.githubName;
+
+  // §13 item 3, before item 4: the label is the cheap, structured signal an
+  // operator's saved search keys on, so it is enqueued first and does not wait
+  // behind the comment if only one of the two can be dispatched.
+  const readyForHumanLabel = session.labels["readyForHuman"] as string | undefined;
+  if (readyForHumanLabel) {
+    await workItemStore.enqueue({
+      idempotencyKey: refinementHandoffIdempotencyKey({
+        sessionId: session.sessionId,
+        issueNumber: task.issueNumber,
+        reason: publication.reason,
+        effect: "label",
+      }),
+      topic: "gh:label:add",
+      payload: {
+        topic: "gh:label:add",
+        owner,
+        repo,
+        issueNumber: task.issueNumber,
+        label: readyForHumanLabel,
+      },
+      now,
+    });
+  }
+
+  // §13 item 4. `sanitizeBody` is defence in depth rather than the bound: the
+  // rendered body is built from literals and counters only (§16), so there is
+  // nothing here for it to redact unless a session configured an agent id or
+  // model that looks like a path.
+  //
+  // `dedupeMarker` carries §16's "never two" past the durable row and into the
+  // delivery itself: the idempotency key stops a second ROW, but a dispatcher
+  // that posted this comment and then lost its claim before `markSent` leaves
+  // the first row pending, and the retry would post a second copy. The marker is
+  // the first line of the rendered body, so a delivery that landed is
+  // recognisable on the Issue itself (see `refinementHandoffCommentMarker`).
+  const commentKey = refinementHandoffIdempotencyKey({
+    sessionId: session.sessionId,
+    issueNumber: task.issueNumber,
+    reason: publication.reason,
+    effect: "comment",
+  });
+  const marker = refinementHandoffCommentMarker(commentKey);
+  await workItemStore.enqueue({
+    idempotencyKey: commentKey,
+    topic: "gh:comment",
+    payload: {
+      topic: "gh:comment",
+      owner,
+      repo,
+      issueNumber: task.issueNumber,
+      body: sanitizeBody(renderRefinementHandoffComment(publication, marker), sessionRedactionPaths(session)),
+      dedupeMarker: marker,
+    },
+    now,
+  });
+}
+
+/**
+ * Record §12 row 46 — the handoff comment proved undeliverable — against the
+ * task that raised the handoff. Returns whether an event was written.
+ *
+ * §13 is explicit that a handoff whose comment cannot be delivered still stands,
+ * and that no replacement comment is attempted. What it must NOT be is silent:
+ * the dead-lettered outbox row is the only trace that the Issue was supposed to
+ * carry a notice, and an operator reading the task — `admin task-status`, the
+ * event stream — would otherwise see a `ready_for_human` refinement task whose
+ * public half simply never appeared, with nothing saying so. §15 names
+ * `refinement.handoff.comment.undeliverable` for exactly this, and it is the one
+ * refinement event no §12 state row can emit, because the delivery fails long
+ * after the transition committed.
+ *
+ * Called from the two places a row reaches a terminal delivery state: the
+ * dispatcher, when `markFailed` exhausts the retry budget, and `admin outbox
+ * cancel`, when an operator retires the row by hand — plus the repair sweep
+ * below. It is deliberately at-most-once per row: a later `outbox retry` that
+ * dead-letters the row a second time records nothing new, because the fact
+ * ("this comment could not be delivered") has not changed. The event carries
+ * literals only (§15) — never the provider error text, which is already on the
+ * outbox row and may name a host or a path.
+ *
+ * "At most once" is the store's guarantee, not this function's: none of those
+ * callers holds a task transaction, and two of them run in separate processes —
+ * an `outbox cancel` can land in the middle of a drain's repair sweep, and two
+ * drains can overlap. A read of the event list followed by an append would let
+ * both observe an empty history and both write (issue #936 review, P2), so the
+ * check and the write are handed to `appendEventOnce` as one atomic operation,
+ * keyed on the row's idempotency key — the identity of the effect that failed.
+ */
+export async function recordRefinementHandoffCommentUndeliverable(
+  store: Pick<TaskStore, "getTask" | "appendEventOnce">,
+  entry: Pick<OutboxEntry, "idempotencyKey">,
+  disposition: "dead_lettered" | "cancelled",
+  now: string,
+): Promise<boolean> {
+  const target = refinementHandoffEffectFromKey(entry.idempotencyKey);
+  // Only the comment: the label add of §13 item 3 has no row-46 counterpart —
+  // it publishes no text an operator would go looking for — and every other
+  // outbox row belongs to some other lane entirely.
+  if (target === null || target.effect !== "comment") return false;
+
+  const key: TaskKey = { sessionId: target.sessionId, issueNumber: target.issueNumber };
+  // A task that no longer exists (retention, an operator `task cancel` that
+  // disposed the row) has nothing to append to; the outbox row itself remains
+  // the record.
+  const task = await store.getTask(key);
+  if (!task) return false;
+
+  // `idempotencyKey` is both the event's own field and its uniqueness key, so
+  // the record and the thing that makes it unrepeatable cannot drift apart. A
+  // task with several handoff comments across its life (different reasons, so
+  // different keys) still records each one exactly once.
+  return await store.appendEventOnce(
+    {
+      task: key,
+      type: REFINEMENT_HANDOFF_COMMENT_UNDELIVERABLE_EVENT,
+      data: {
+        issueNumber: target.issueNumber,
+        refinementState: "escalated_human",
+        handoffReason: target.reason,
+        disposition,
+        idempotencyKey: entry.idempotencyKey,
+      },
+      createdAt: now,
+    },
+    { field: "idempotencyKey", value: entry.idempotencyKey },
+  );
+}
+
+/**
+ * Whether an outbox row is a terminal handoff COMMENT row — one that
+ * {@link recordRefinementHandoffCommentUndeliverable} would write an event for
+ * if the event is not already there.
+ *
+ * Split out so a caller can decide whether any repair work exists at all before
+ * opening a task store: an ordinary drain, where nothing is dead-lettered and
+ * nothing belongs to this lane, must keep touching exactly the tables it did
+ * before (P2 review follow-up to issue #936).
+ */
+export function isUnpublishedRefinementHandoffComment(
+  entry: Pick<OutboxEntry, "idempotencyKey" | "sentAt" | "deadLetterAt">,
+): boolean {
+  if (entry.sentAt !== undefined) return false;
+  if (entry.deadLetterAt === undefined) return false;
+  return refinementHandoffEffectFromKey(entry.idempotencyKey)?.effect === "comment";
+}
+
+/**
+ * Re-derive §12 row 46 for every terminal handoff comment row that is missing
+ * it, and record what is missing.
+ *
+ * The dead-letter itself is the durable fact; the audit event is a second write
+ * against a different table, and the two cannot be made atomic — the row is
+ * dead-lettered by the dispatcher (or cancelled by an operator) and the event is
+ * appended after, outside any shared transaction. So the write that follows can
+ * fail on its own: a busy SQLite file, a crash between the two, a `cancel` whose
+ * append raised after `cancelEntry` committed. Each of those would otherwise
+ * lose the record permanently, because a dead-lettered row is never selected for
+ * dispatch again and so its one-shot hook never fires again (P2 review
+ * follow-up).
+ *
+ * This is the repair: the rows themselves ARE the durable repair record. They
+ * stay listable (`listUnsent`) until pruned, they carry the idempotency key the
+ * event is derived from, and `cancelledAt` still says which disposition it was —
+ * so any later run can reconstruct exactly the event the failed one owed, with
+ * no extra state to persist. Called on every dispatch run; per-row recording is
+ * atomically at-most-once (see `recordRefinementHandoffCommentUndeliverable`),
+ * so a repaired row is a no-op from then on — including when two overlapping
+ * sweeps, or a sweep and an `outbox cancel`, repair the same row at once.
+ *
+ * One row's failure does not stop the sweep: the failures are returned so the
+ * caller can report them, and the rows they belong to are simply repaired by a
+ * later run.
+ */
+export async function repairRefinementHandoffCommentUndeliverable(
+  store: Pick<TaskStore, "getTask" | "appendEventOnce">,
+  entries: readonly Pick<OutboxEntry, "id" | "idempotencyKey" | "sentAt" | "deadLetterAt" | "cancelledAt">[],
+  now: string,
+): Promise<{ recorded: number; errors: { id: number; error: string }[] }> {
+  let recorded = 0;
+  const errors: { id: number; error: string }[] = [];
+  for (const entry of entries) {
+    if (!isUnpublishedRefinementHandoffComment(entry)) continue;
+    try {
+      // A cancelled row is dead-lettered too, so the disposition is read from
+      // `cancelledAt` rather than from how this sweep found the row: an operator
+      // decision and an exhausted retry budget are different facts to an
+      // operator reading the event back.
+      const disposition = entry.cancelledAt !== undefined ? "cancelled" : "dead_lettered";
+      if (await recordRefinementHandoffCommentUndeliverable(store, entry, disposition, now)) recorded++;
+    } catch (err) {
+      errors.push({
+        id: entry.id,
+        error: `handoff audit record failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+  return { recorded, errors };
 }

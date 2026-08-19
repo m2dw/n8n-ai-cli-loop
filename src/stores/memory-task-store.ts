@@ -88,7 +88,9 @@ export class MemoryTaskStore implements TaskStore {
     const task: AiTask = {
       sessionId: input.sessionId,
       issueNumber: input.issueNumber,
-      status: "queued",
+      // `queued` for every caller but the intake gate that creates an
+      // already-held row (issue #967; see EnqueueTaskInput.initialStatus).
+      status: input.initialStatus ?? "queued",
       phase: input.phase,
       priority: input.priority ?? "normal",
       implementationAgent: input.implementationAgent,
@@ -96,6 +98,7 @@ export class MemoryTaskStore implements TaskStore {
       researchAgent: input.researchAgent,
       attempts: {},
       context: input.context ?? {},
+      ...(input.lastError !== undefined ? { lastError: input.lastError } : {}),
       createdAt: now,
       updatedAt: now,
       revision: 0,
@@ -363,6 +366,28 @@ export class MemoryTaskStore implements TaskStore {
 
   async appendEvent(event: TaskEvent): Promise<void> {
     this.#events.push({ ...event, task: { ...event.task }, data: cloneRecord(event.data) });
+  }
+
+  /**
+   * {@link TaskStore.appendEventOnce} (issue #936 review, P2). The probe and the
+   * push are one synchronous body with no `await` between them, which is this
+   * store's whole atomicity story: it has no cross-process backend to race
+   * against, and nothing can interleave inside a single JS turn.
+   */
+  async appendEventOnce(
+    event: TaskEvent,
+    dedupe: { field: string; value: string },
+  ): Promise<boolean> {
+    const already = this.#events.some(
+      (existing) =>
+        existing.task.sessionId === event.task.sessionId &&
+        existing.task.issueNumber === event.task.issueNumber &&
+        existing.type === event.type &&
+        (existing.data as Record<string, unknown> | undefined)?.[dedupe.field] === dedupe.value,
+    );
+    if (already) return false;
+    this.#events.push({ ...event, task: { ...event.task }, data: cloneRecord(event.data) });
+    return true;
   }
 
   async listEvents(key: TaskKey): Promise<TaskEvent[]> {

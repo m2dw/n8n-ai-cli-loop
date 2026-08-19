@@ -69,7 +69,12 @@ import {
 } from "../registries/json-session-registry.js";
 import { agentForPhase, ASSIGNMENT_CONTEXT_KEY, DEFAULT_FLOW, readResolvedAssignment } from "../core/assignment.js";
 import type { ResolvedAssignment } from "../core/assignment.js";
-import { enqueueStatusLabelEffects, workItemOutbox, sessionRedactionPaths } from "../core/outbox-effects.js";
+import {
+  enqueueStatusLabelEffects,
+  recordRefinementHandoffCommentUndeliverable,
+  workItemOutbox,
+  sessionRedactionPaths,
+} from "../core/outbox-effects.js";
 import { OutboxEffectCollector } from "../core/phase-runner.js";
 import { sanitizeBody, boundedExcerpt } from "../core/text-sanitize.js";
 import { redactCommand, hasUnresolvedToolRequest } from "../core/tool-request.js";
@@ -90,6 +95,17 @@ import {
   summarizeClassification,
 } from "../core/tool-request-changes.js";
 import type { RepoChangeAction } from "../core/tool-request-changes.js";
+// Issue #722: the direct-review continuation decision for a resolved
+// implementation Tool Request. All of the policy is pure and lives in core; this
+// module only collects the trusted, runner-owned evidence and commits the
+// selected transition (see the guided-run no-op path below).
+import {
+  buildToolRequestContinuationRecord,
+  collectPendingImplementationMarkers,
+  decideToolRequestContinuation,
+  resolveConfiguredVerification,
+} from "../core/tool-request-continuation.js";
+import { checkReviewAdmission, resolveDependencyReviewBase } from "../handlers/review-admission.js";
 import { bothStreamsCommandRunner, defaultCommandRunner, type CommandRunResult } from "../handlers/command-runner.js";
 import { listWorktrees, removeWorktree, canonicalizePath, IssueWorktreeLock, issueLockScope, DEFAULT_WORKTREE_LOCK_DIR } from "../handlers/worktree.js";
 import {
@@ -114,7 +130,7 @@ import {
   type OutboxScanCursorAfterIds,
   type OutboxScanCursorRewindPlan,
 } from "../core/outbox-scan-cursor.js";
-import { branchName, resolvePrContext } from "../handlers/pr-helpers.js";
+import { branchName, extractPrNumber, resolvePrContext } from "../handlers/pr-helpers.js";
 import { fileURLToPath, pathToFileURL } from "url";
 // Issue #822: `admin n8n deploy`. All ordering, verification, and publish
 // policy is pure and lives in core/n8n-deploy.ts; this module only resolves the
@@ -156,6 +172,11 @@ import {
 import { runAdminUi, formatAdminCommand } from "./admin-ui.js";
 import { ECOSYSTEM_PRESETS, PRESET_NAMES, findPreset } from "../core/presets.js";
 import { resolveReviewDisputeSettings, isTerminalLineageState } from "../core/review-dispute.js";
+// Issue #867: the operator surface of the chain-aware refinement lane. Same
+// posture as the dispute projection below — a pure read of the §15 task-context
+// block, shared with any other surface that needs it.
+import { renderRefinementLines, summarizeRefinementStatus } from "../core/issue-refinement-status.js";
+import type { RefinementTaskStatus } from "../core/issue-refinement-status.js";
 // Issue #848: the operator surface of the review-dispute protocol. The
 // projection is shared with the admin UI so the two cannot disagree; the
 // transition/commit path is #840's, reused rather than reimplemented, so an
@@ -181,6 +202,16 @@ import {
   evaluateArbiterCandidates,
   type ArbiterCandidateRejection,
 } from "../core/review-arbiter-profile.js";
+import type { ArbiterCliAvailability } from "../core/review-arbiter-profile.js";
+import {
+  CLI_PROBE_STUB_ENV,
+  classifyProbeFailure,
+  describeProbeOutcome,
+  isRetryableProbeFailure,
+  parseCliProbeStub,
+  probeSucceeded,
+} from "../core/cli-probe.js";
+import type { CliProbeOutcome } from "../core/cli-probe.js";
 import type { EcosystemPreset } from "../core/presets.js";
 import {
   parseIssueDiscussArgs,
@@ -195,6 +226,12 @@ import { runSessionAudit } from "./session-audit.js";
 import { parseIssuePlanArgs, runIssuePlanPreview } from "./issue-plan.js";
 import { parseIssuePlanAiArgs, runIssuePlanAiPreview } from "./issue-plan-ai.js";
 import { parseEvaluateHistoryArgs, runEvaluateHistory } from "./issue-plan-history.js";
+import { parseRefinementRunArgs, runRefinementRun } from "./issue-refinement-loop.js";
+import { runIssueActivate, runIssueSuspend } from "./issue-activation.js";
+import { runChainList, runChainShow, runChainValidate } from "./chain-inspect.js";
+import { runChainSync } from "./chain-sync.js";
+import { runChainAppend, runChainNew, runChainPrepend } from "./chain-edit.js";
+import { runChainFork, runChainMerge } from "./chain-advanced.js";
 import { prReviewReaderFromGhRunner } from "./pr-review-reader.js";
 import type { PrReviewReader } from "./pr-review-reader.js";
 import { defaultGhRunner } from "../providers/github/gh-runner.js";
@@ -479,6 +516,151 @@ export const COMMANDS: CommandInfo[] = [
       { flag: "--issue-number <n>", description: "Scan only this issue's task (optional; omit to scan every non-terminal task in the session)." },
       { flag: "--yes", description: "Actually cancel eligible tasks (without it, the command only previews)." },
       { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "issue suspend",
+    description:
+      "Suspend automation for one or more Issues by removing their currently-present execution labels — the status:*/agent:* labels core/github-intake.ts reads to pick up an Issue — while preserving every other label (issue #787). Resolves the execution-label vocabulary from session/flow configuration, never a hard-coded agent or phase. Records exactly which labels were removed so a later `admin issue activate` restores only what THIS operation suspended. Repeated calls are idempotent; a partial per-Issue failure never blocks the rest of the batch. Preview by default; pass --yes to apply.",
+    options: [
+      { flag: "<issue[,issue...]>", description: "One or more Issue numbers, comma-separated (required positional argument)." },
+      { flag: "--session-id <id>", description: "Canonical session ID (required unless --session-ref is given)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--yes", description: "Actually remove the labels (without it, the command only previews)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "issue activate",
+    description:
+      "Restore automation for one or more Issues by re-adding exactly the execution labels a prior `admin issue suspend` recorded for each Issue (issue #787). Never restores optimistically: an Issue with no standing suspension is a safe no-op, and a partial per-Issue failure leaves only the still-missing labels on record for a retry. Run this only after verifying the intended GitHub Issue Relationship state — this command does not check relationships itself. Preview by default; pass --yes to apply.",
+    options: [
+      { flag: "<issue[,issue...]>", description: "One or more Issue numbers, comma-separated (required positional argument)." },
+      { flag: "--session-id <id>", description: "Canonical session ID (required unless --session-ref is given)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--yes", description: "Actually restore the labels (without it, the command only previews)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain list",
+    description:
+      "List dependency chains from the registry (issue #789/#788): stable chain ID, session, head Issue, graph revision, accepted revision, and synchronization status for each. Read-only. Optionally scoped to a session and/or a synchronization status.",
+    options: [
+      { flag: "--session-id <id>", description: "Restrict to one session's chains (optional; omit to list every session's)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--sync-status <status>", description: "Restrict to chains with this synchronization status: unknown | in_sync | stale | error (optional)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain show",
+    description:
+      "Show one chain's full registered state (issue #789/#788/#891): members with roles, edges, graph revision and fingerprint, accepted revision, aliases, every frozen dependency-prefix snapshot recorded against it, and last synchronization/error metadata. Read-only. Resolves <chain-ref> by stable chain ID or alias — the two share one namespace.",
+    options: [
+      { flag: "<chain-ref>", description: "Chain ID or alias to show (required positional argument)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json (accepted for parser parity with chain validate; unused by chain show)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain validate",
+    description:
+      "Validate one chain against live GitHub Issue Relationships (issue #789/#890/#891) without mutating either system. Fetches `blocked by` relationships for every registered member via the owning session's work-item provider, builds the observed dependency graph, and reports: structural problems in the observed graph (cycles, missing members, ambiguous identity — #890's rules), drift between the observed graph and the graph currently on record, whether the registry's accepted revision is current, and frozen dependency-prefix conflicts (#891) evaluated against both the recorded graph and the observed one. Per-member provider fetch failures (an inaccessible or deleted Issue, a transient error) are reported separately from structural findings. Read-only: never updates the accepted graph, a revision, a fingerprint, a sync timestamp, or anything on GitHub.",
+    options: [
+      { flag: "<chain-ref>", description: "Chain ID or alias to validate (required positional argument)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to load the owning session's work-item provider configuration (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain sync",
+    description:
+      "Import valid GitHub Issue Relationship changes into the chain registry (issue #892). Fetches `blocked by` relationships for every registered member of the chain, builds the observed graph the same way `chain validate` does, and — if that graph passes #890's rules and does not contradict any frozen dependency prefix (#891) — makes it the chain's accepted graph, advancing the graph, its revision, its fingerprint, and the accepted-revision pointer as one atomic step, then recording `in_sync` sync metadata. Previews by default; pass --yes to apply. An import problem (a cycle, an inaccessible member, an ambiguous identity, a frozen-prefix conflict, a chain that moved mid-run) is refused with the expected and observed edges and a remediation direction, exits nonzero, and leaves the previously accepted graph exactly as it was. Transient provider failures are reported separately from structural graph failures. One-way: never writes a GitHub comment, label, or relationship. With --all, every chain is checked independently and every failure is reported.",
+    options: [
+      { flag: "<chain-ref>", description: "Chain ID or alias to synchronize (required unless --all is given)." },
+      { flag: "--all", description: "Synchronize every chain instead of one. Mutually exclusive with <chain-ref>." },
+      { flag: "--session-id <id>", description: "With --all, restrict to one session's chains (optional)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. With --all only; mutually exclusive with --session-id." },
+      { flag: "--yes", description: "Actually import (without it, the command only previews what it would import)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to load each owning session's work-item provider configuration (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain new",
+    description:
+      "Create a dependency chain from Issues that are not yet registered (issue #791). `<issue[,issue...]>` is read in dependency order: `admin chain new 10,11,12` means #10 blocks #11 blocks #12, and #12 — the downstream end — becomes the chain's head, which is also the Issue the stable chain ID is derived from. The optional [name] is registered as an operator alias for the chain (aliases share one namespace with chain IDs, so a name a chain or alias already occupies is refused before anything is created) and recorded as its title; the alias is taken by the same registry transaction that allocates the chain ID, so the chain is created with its name or not created at all. The command writes both sides: it creates the `blocked by` GitHub Issue Relationships and registers the verified graph as the chain's accepted revision. Previews by default; pass --yes to apply. An apply suspends the execution labels of every affected Issue before the first relationship write, re-checks the frozen dependency prefixes (#891) with automation quiesced, applies the relationships idempotently, reads GitHub back and verifies it holds exactly the planned graph, updates the registry only from that verified read, and restores the labels only after all of it succeeded. Any failure leaves automation suspended, never repairs GitHub from the registry, and reports the concrete recovery steps.",
+    options: [
+      { flag: "<issue[,issue...]>", description: "Issue numbers in dependency order (required positional argument)." },
+      { flag: "[name]", description: "Optional operator alias for the new chain (letters, digits, '.', '_', '-'; max 64 characters)." },
+      { flag: "--session-id <id>", description: "Canonical session ID (required unless --session-ref is given)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--yes", description: "Actually create the relationships and the chain (without it, the command only previews)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to load the session's work-item provider configuration (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain append",
+    description:
+      "Extend a chain past its head (issue #791): `admin chain append chain_777 13,14` makes the chain's head block #13, #13 block #14, and #14 the chain's new head. Accepts Issues that are not registered anywhere; an Issue that already belongs to another chain is refused with a pointer to the advanced merge operation (issue #893), and so is an Issue already in this chain (a reorder) or a head that already blocks something (an insert into the middle of a dependency path). Appending is downstream-only, so it stays valid after an upstream Issue has started and its dependency prefix has been frozen. Two preconditions keep the edit from repairing GitHub out of local state: the chain's persisted graph must be the revision #890 has accepted (an unaccepted candidate is refused with a pointer at `chain validate`/`chain sync`), and every relationship the chain already records must be one GitHub actually holds — only the edges this command introduces are ever written. Same mutation sequence, preview/--yes convention, and failure posture as `chain new`.",
+    options: [
+      { flag: "<chain-ref>", description: "Chain ID or alias to extend (required positional argument)." },
+      { flag: "<issue[,issue...]>", description: "Issue numbers in dependency order, appended after the current head (required positional argument)." },
+      { flag: "--session-id <id>", description: "Assert which session owns the chain; the command refuses a chain owned by a different one (optional — the chain-ref already resolves the session)." },
+      { flag: "--session-ref <ref>", description: "Short session reference resolved to the canonical sessionId, asserted the same way. Mutually exclusive with --session-id." },
+      { flag: "--yes", description: "Actually apply the relationships and the registry update (without it, the command only previews)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to load the owning session's work-item provider configuration (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain prepend",
+    description:
+      "Extend a chain ahead of its root (issue #791): `admin chain prepend chain_777 8,9` makes #8 block #9 and #9 block the Issue the chain currently starts with, leaving the head where it is. Requires the chain to have exactly one root — a fan-in has no single place to prepend, and picking one would silently make the new Issues an ancestor of only part of the chain (issue #893 owns those topologies). Because prepending rewrites the ancestry of everything below the root, it is refused outright once any Issue in the chain has started and frozen its dependency prefix (#891). Same preconditions (accepted graph current, recorded relationships actually present on GitHub), mutation sequence, preview/--yes convention, and failure posture as `chain append`.",
+    options: [
+      { flag: "<chain-ref>", description: "Chain ID or alias to extend (required positional argument)." },
+      { flag: "<issue[,issue...]>", description: "Issue numbers in dependency order, prepended ahead of the chain's root (required positional argument)." },
+      { flag: "--session-id <id>", description: "Assert which session owns the chain; the command refuses a chain owned by a different one (optional — the chain-ref already resolves the session)." },
+      { flag: "--session-ref <ref>", description: "Short session reference resolved to the canonical sessionId, asserted the same way. Mutually exclusive with --session-id." },
+      { flag: "--yes", description: "Actually apply the relationships and the registry update (without it, the command only previews)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to load the owning session's work-item provider configuration (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain fork",
+    description:
+      "Extract a contiguous segment of a chain into a chain of its own (issue #893): `admin chain fork chain_777 13 2` extracts #13 and the member it blocks into a new chain, removes the boundary relationships that attached the segment, and bridges every predecessor of the segment's first member to every successor of its last so the ordering constraints among the remaining members survive. Omit [length] to fork from <issue> through the chain's downstream end. With length 1 and no --name, the Issue is simply detached and receives no new chain identity; pass --name (or a length above 1) to register the segment as a chain, optionally aliased. The segment must be contiguous — a fan-in or fan-out strictly inside it is refused by name, while one at its boundary survives the extraction — and unfrozen: a started Issue's pinned dependency prefix (#891) can be neither extracted nor rewritten, so the segment must sit wholly downstream of every started Issue. Both operand graphs must be the accepted revision, and GitHub must agree with the registry before anything is touched. Same mutation sequence as the linear commands (issue #791): previews by default, applies with --yes, suspends execution labels before the first relationship write, applies additions before removals so a partial state never severs an ordering constraint, reads GitHub back and verifies the exact post-state, updates the registry only from that verified read (the shrunk chain first, then the new segment chain), and restores labels last. Any failure leaves automation suspended and reports concrete recovery steps; a fork interrupted after the chain was shrunk is finished with `admin chain new <segment-issues>`, which adopts the relationships already in place.",
+    options: [
+      { flag: "<chain-ref>", description: "Chain ID or alias to fork (required positional argument)." },
+      { flag: "<issue>", description: "First member of the segment to extract (required positional argument)." },
+      { flag: "[length]", description: "How many consecutive members the segment holds (optional; omit to fork through the chain's end)." },
+      { flag: "--name <alias>", description: "Register the extracted segment as a chain carrying this operator alias; with length 1 this is also what requests a chain identity at all (optional)." },
+      { flag: "--session-id <id>", description: "Assert which session owns the chain; the command refuses a chain owned by a different one (optional — the chain-ref already resolves the session)." },
+      { flag: "--session-ref <ref>", description: "Short session reference resolved to the canonical sessionId, asserted the same way. Mutually exclusive with --session-id." },
+      { flag: "--yes", description: "Actually apply the relationship changes and the registry updates (without it, the command only previews)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to load the owning session's work-item provider configuration (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "chain merge",
+    description:
+      "Merge one chain into another and retire the source (issue #893): `admin chain merge chain_777 chain_555 --position append` draws one relationship from chain_777's head to chain_555's root (with --position prepend, from chain_555's head to chain_777's root), makes every member of the source a member of the target, and retires the source in one registry transaction — the target keeps its chain ID, and the source's ID and every alias it carried become aliases of the target, so every handle an operator has written down stays resolvable, deterministically. Its frozen-prefix snapshots are re-recorded against the target. Append moves the target's head to the source's head; prepend leaves it in place. The attachment ends must be real: append requires the target's head to be a genuine downstream end (checked against GitHub as well as the registry) and the source to have exactly one root; prepend requires the reverse. Frozen prefixes (#891) rule out whichever direction would rewrite a started Issue's ancestry: a frozen source refuses append, a frozen target refuses prepend, and a frozen source survives prepend untouched. Both chains must belong to one session and hold their accepted revisions. Same mutation sequence, preview/--yes convention, and failure posture as `chain fork`; a merge interrupted after the target accepted the combined graph is finished by re-running the same command, which detects the merged state and performs only the retirement.",
+    options: [
+      { flag: "<target-chain>", description: "Chain ID or alias of the surviving chain — its ID is preserved (required positional argument)." },
+      { flag: "<source-chain>", description: "Chain ID or alias of the chain to merge in and retire (required positional argument)." },
+      { flag: "--position append|prepend", description: "Where the source attaches: append past the target's head, or prepend ahead of its root (required)." },
+      { flag: "--session-id <id>", description: "Assert which session owns the chains; the command refuses chains owned by a different one (optional — the chain refs already resolve the session)." },
+      { flag: "--session-ref <ref>", description: "Short session reference resolved to the canonical sessionId, asserted the same way. Mutually exclusive with --session-id." },
+      { flag: "--yes", description: "Actually apply the relationship, the registry update, and the retirement (without it, the command only previews)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to load the owning session's work-item provider configuration (optional)." },
       { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
     ],
   },
@@ -928,6 +1110,18 @@ export const COMMANDS: CommandInfo[] = [
     ],
   },
   {
+    name: "refinement run",
+    description: "Run one bounded two-agent Issue refinement attempt (issue #869, docs/issue-refinement-contract.md): resolve the refiner and critic as two independent no-tools agents, capture the bounded predecessor snapshot, and run the refiner/critic exchange up to the configured round cap. Both agents run isolated — write-enabling env vars stripped, throwaway working directory, no tool surface — and treat Issue/PR/comment text as untrusted data. Never mutates GitHub: no Issue body, label, dependency, comment, branch, or PR is touched; a critic pass persists the accepted refined contract locally (task context + artifact directory) and every cap, malformed output, blocking topology proposal, or persistent disagreement stops at a ready_for_human handoff with the reason recorded. Requires issueRefinement.enabled and a refinement-phase task admitted by intake.",
+    options: [
+      { flag: "--session-id <id>", description: "Session ID to resolve repo, artifact dir, and issueRefinement config (required)." },
+      { flag: "--issue-number <n>", description: "Issue number whose refinement-phase task to run (required)." },
+      { flag: "--timeout <ms>", description: "Per-agent-invocation timeout in milliseconds (default: 600000, max: 3600000)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+      { flag: "--lock-dir <path>", description: "Directory for lock files (optional; defaults to ~/.local/state/n8n-ai-cli-loop/locks — the run holds the same per-issue worktree lock the phase runner uses)." },
+    ],
+  },
+  {
     name: "n8n deploy",
     description: "Generate the deployment artifacts for one session and import the shared child plus that session's parent workflow into a local n8n (issue #822). Previews by default and imports nothing; --yes applies. Imports the child before the parent (the parent references the child by its stable ID), verifies the imported IDs/names with `n8n list:workflow` and the parent's Config sessionId and child reference, and refuses to publish when verification fails. A parent that was already active is re-activated after the import, so a re-deploy never silently deactivates a running workflow; an apply holds a lock scoped to that parent workflow, so two concurrent deploys of the same session cannot lose each other's activation. Local/same-host n8n CLI v1 only — no REST API or remote Docker deployment. Local filesystem paths are redacted from the output.",
     options: [
@@ -1085,6 +1279,13 @@ function renderTaskStatus(
        * is byte-identical for every such task.
        */
       reviewDispute?: DisputeTaskStatus | null;
+      /**
+       * Issue #867: the persisted §15 refinement block, or null for a task that
+       * carries none — every task outside the refinement lane, and every task in
+       * a session with `issueRefinement.enabled: false`. Null renders nothing at
+       * all, so existing output is byte-identical for every such task.
+       */
+      refinement?: RefinementTaskStatus | null;
       updatedAt: string;
     }>;
   },
@@ -1121,6 +1322,11 @@ function renderTaskStatus(
     // three that happen to agree today.
     if (t.reviewDispute) {
       lines.push(...renderDisputeLines(t.reviewDispute, "        "));
+    }
+    // Issue #867. Same posture as the dispute block above: a pure projection of
+    // what the task already carries, rendered through the shared core helper.
+    if (t.refinement) {
+      lines.push(...renderRefinementLines(t.refinement, "        "));
     }
   }
   return lines.join("\n");
@@ -1173,6 +1379,9 @@ async function runTaskStatus(argv: string[]): Promise<void> {
           ? (t.context["missingVerificationCommands"] as unknown[]).filter((c): c is string => typeof c === "string")
           : null,
         reviewDispute: disputeSummaries.get(t.issueNumber) ?? null,
+        // Issue #867: read straight off the task context — no extra query, so a
+        // session that never enabled the lane pays nothing for this field.
+        refinement: summarizeRefinementStatus(t),
         createdAt: t.createdAt,
         updatedAt: t.updatedAt,
       })),
@@ -3512,6 +3721,12 @@ interface CheckResult {
   ok: boolean;
   detail?: string;
   error?: string;
+  /**
+   * The check did not fail — it failed to ANSWER (issue #897). Present only on
+   * indeterminate CLI probes (timeout, refused fork), whose `ok: false` must not
+   * be read as a finding about the thing probed.
+   */
+  transient?: boolean;
 }
 
 interface SessionDoctorArgs {
@@ -3736,6 +3951,11 @@ const UNUSABLE_ARBITER_REASONS: ReadonlySet<string> = new Set([
   "unsupported-role",
   "candidate-not-found",
   "cli-unavailable",
+  // An indeterminate probe (#897) did not make the candidate usable either, so
+  // it belongs in this check rather than being silently dropped. Its own reason
+  // code keeps it readable as "ask again", not "install something" — and
+  // `arbiterCandidates` appends the re-run advice when one is present.
+  "cli-probe-indeterminate",
   "profile-error",
   "candidate-limit-exceeded",
 ]);
@@ -3751,23 +3971,46 @@ function describeArbiterRejections(rejections: readonly ArbiterCandidateRejectio
     .join("; ");
 }
 
-function probe(cmd: string, args: string[], cwd?: string): { ok: boolean; output: string } {
-  try {
-    const stdout = execFileSync(cmd, args, {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      // Generous enough to tolerate a loaded host: these calls include network
-      // ops (fetch/pull/ls-remote) whose latency is outside our control, and a
-      // spurious timeout here is misread as "could not fetch origin" even
-      // though the command actually completed.
-      timeout: 60_000,
-    }) as string;
-    return { ok: true, output: stdout.trim() };
-  } catch (err: unknown) {
-    const e = err as { stdout?: string; stderr?: string };
-    const msg = (e.stderr ?? e.stdout ?? String(err)).slice(0, 300);
-    return { ok: false, output: msg };
+/** Block the calling thread; `probe` is synchronous, so a promise is no use here. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Run a command and classify what happened (issue #897).
+ *
+ * Returns the full {@link CliProbeOutcome} rather than a bare boolean: the
+ * `ok`/`output` pair every pre-#897 caller reads is still there, but a caller
+ * that must not confuse "the binary is missing" with "this host could not fork
+ * right now" can read `status`/`transient`/`code` instead. Reducing the
+ * distinction away too early is what let a loaded machine be reported as an
+ * uninstalled CLI.
+ */
+function probe(cmd: string, args: string[], cwd?: string): CliProbeOutcome {
+  // Attempt 0 is the normal path; the retries exist only for a host that could
+  // not fork, and are spaced so the contended resource has a chance to free up.
+  const backoffMs = [100, 300];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const stdout = execFileSync(cmd, args, {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        // Generous enough to tolerate a loaded host: these calls include network
+        // ops (fetch/pull/ls-remote) whose latency is outside our control, and a
+        // spurious timeout here is misread as "could not fetch origin" even
+        // though the command actually completed.
+        timeout: 60_000,
+      }) as string;
+      return probeSucceeded(stdout);
+    } catch (err: unknown) {
+      const outcome = classifyProbeFailure(err);
+      if (attempt < backoffMs.length && isRetryableProbeFailure(outcome)) {
+        sleepSync(backoffMs[attempt]);
+        continue;
+      }
+      return outcome;
+    }
   }
 }
 
@@ -4130,6 +4373,17 @@ function runSessionDoctor(argv: string[]): void {
     ? session["defaults"]
     : {}) as Record<string, string>;
 
+  // Deterministic seam (issue #897): with the stub set, agent-CLI availability
+  // is read from it instead of from a spawn, so selection-policy assertions do
+  // not ride on whether this host can fork a throwaway script promptly. A
+  // stubbed outcome is always rendered with "[stubbed probe]" so it can never be
+  // read as a real availability fact. Only agent CLIs are stubbable — the git
+  // and gh probes below are untouched. Parsed here, before any check runs, so a
+  // malformed stub costs nothing and cannot be mistaken for a diagnosis.
+  const probeStubParse = parseCliProbeStub(process.env[CLI_PROBE_STUB_ENV]);
+  if (!probeStubParse.ok) die(probeStubParse.error);
+  const probeStub = probeStubParse.stub;
+
   const checks: CheckResult[] = [];
 
   // ---- Repo checks ----
@@ -4388,38 +4642,44 @@ function runSessionDoctor(argv: string[]): void {
    * once per candidate. Several checks may still REPORT the same probe — that is
    * a reporting choice — but the process is only ever run once per agent.
    */
-  const cliProbes = new Map<AgentId, { ok: boolean; output: string }>();
-  const probeAgentCli = (agent: AgentId): { ok: boolean; output: string } => {
+  const cliProbes = new Map<AgentId, CliProbeOutcome>();
+  const probeAgentCli = (agent: AgentId): CliProbeOutcome => {
     const cached = cliProbes.get(agent);
     if (cached) return cached;
     const bin = agent === "gemini" ? (process.env["ANTIGRAVITY_BIN"] ?? "agy") : agent;
-    const result = probe(bin, ["--version"]);
+    const result = probeStub.get(agent) ?? probe(bin, ["--version"]);
     cliProbes.set(agent, result);
     return result;
   };
 
-  for (const agent of agentSet) {
-    const cliCheck = probeAgentCli(agent);
+  /**
+   * Report one agent-CLI probe (issue #897).
+   *
+   * A transient outcome is still `ok: false` — doctor did not manage to verify
+   * the CLI, and saying otherwise would be its own lie — but it is labelled
+   * `transient` and its message says the probe, not the CLI, is what failed.
+   * That is the difference between "install claude" and "re-run when the box is
+   * quieter", and getting it wrong is what #897 exists to fix.
+   */
+  const pushCliCheck = (name: string, agent: AgentId, outcome: CliProbeOutcome): void => {
+    const bin = agent === "gemini" ? (process.env["ANTIGRAVITY_BIN"] ?? "agy") : agent;
     checks.push({
-      name: `${agent}Cli`,
+      name,
       category: "aiCli",
-      ok: cliCheck.ok,
-      ...(cliCheck.ok
-        ? { detail: cliCheck.output.split("\n")[0] }
-        : { error: cliCheck.output }),
+      ok: outcome.ok,
+      ...(outcome.transient ? { transient: true } : {}),
+      ...(outcome.ok
+        ? { detail: `${outcome.output.split("\n")[0]}${outcome.stubbed ? " [stubbed probe]" : ""}` }
+        : { error: describeProbeOutcome(bin, outcome) }),
     });
+  };
+
+  for (const agent of agentSet) {
+    pushCliCheck(`${agent}Cli`, agent, probeAgentCli(agent));
   }
 
   if (reviewAgent === "gemini" && VALID_AGENTS.includes(reviewAgent as AgentId)) {
-    const cliCheck = probeAgentCli("gemini");
-    checks.push({
-      name: "geminiReviewCli",
-      category: "aiCli",
-      ok: cliCheck.ok,
-      ...(cliCheck.ok
-        ? { detail: cliCheck.output.split("\n")[0] }
-        : { error: cliCheck.output }),
-    });
+    pushCliCheck("geminiReviewCli", "gemini", probeAgentCli("gemini"));
   }
 
   // NOTE (issue #292): the research agent's CLI probe is emitted by the shared
@@ -4510,7 +4770,15 @@ function runSessionDoctor(argv: string[]): void {
                   }
                 : {}),
             },
-            cliAvailable: (agent) => probeAgentCli(agent).ok,
+            // A probe that never answered is reported as `indeterminate`, not as
+            // a negative answer (issue #897): the candidate is still refused —
+            // doctor cannot promise an arbiter it could not verify — but under a
+            // reason code that says "ask again", not "this CLI is missing".
+            cliAvailable: (agent): ArbiterCliAvailability => {
+              const outcome = probeAgentCli(agent);
+              if (outcome.ok) return "available";
+              return outcome.transient ? "indeterminate" : "unavailable";
+            },
           }),
         });
         // Resolution-level problems: the candidate could not become an invocable
@@ -4521,11 +4789,22 @@ function runSessionDoctor(argv: string[]): void {
         const tried = evaluation.rejections.filter((r) => r.reason !== "candidate-limit-exceeded").length
           + (evaluation.selected === null ? 0 : 1);
         if (unusable.length > 0) {
+          // An indeterminate probe (#897) is not a diagnosis, so the finding says
+          // so and marks the whole check transient — an operator (or an automated
+          // reader) must not act on it as if a CLI were missing.
+          const indeterminate = unusable.some((r) => r.reason === "cli-probe-indeterminate");
           checks.push({
             name: "arbiterCandidates",
             category: "aiCli",
             ok: false,
-            error: `Unusable arbiter candidate(s): ${describeArbiterRejections(unusable)}`,
+            ...(indeterminate ? { transient: true } : {}),
+            error:
+              `Unusable arbiter candidate(s): ${describeArbiterRejections(unusable)}`
+              + (indeterminate
+                ? ". `cli-probe-indeterminate` means the availability probe never answered (timeout or refused "
+                  + "fork) — it is NOT evidence that the CLI is missing. Re-run session-doctor when the host is "
+                  + "less loaded before changing any configuration."
+                : ""),
           });
         } else {
           checks.push({
@@ -7223,6 +7502,38 @@ async function runOutboxCancel(argv: string[]): Promise<void> {
       return;
     }
     const result = await outboxStore.cancelEntry(id);
+    // A cancelled row is dead-lettered too, so for a terminal refinement
+    // handoff's comment this is §12 row 46 by operator decision rather than by
+    // exhausted retries (issue #936): the Issue will never carry the notice, and
+    // the task is the only surface left that can say so.
+    //
+    // The condition is "the row IS cancelled", not "this invocation cancelled
+    // it" (P2 review follow-up). `cancelEntry` and this append are two writes
+    // that cannot be made atomic, so the append can fail on its own — and a
+    // re-run would then report `already_cancelled` and, gated on
+    // `result.cancelled`, skip the very repair it was run for, leaving the
+    // handoff permanently without its audit record. Recording on the state
+    // instead makes the command idempotent AND repairing; the recorder is a
+    // no-op once the event exists, and for every other row shape. (The
+    // dispatcher's own sweep repairs it too, on its next run.)
+    if (result.cancelled || entry.cancelledAt !== undefined) {
+      const taskStore = new SqliteTaskStore(dbPath ?? DEFAULT_DB_PATH);
+      try {
+        await recordRefinementHandoffCommentUndeliverable(
+          taskStore, entry, "cancelled", new Date().toISOString(),
+        );
+      } catch (err) {
+        // The cancel itself already committed, so this cannot be reported as a
+        // failed cancel: say precisely what is missing and that re-running is
+        // how to repair it.
+        die(
+          `Outbox row ${id} is cancelled, but recording its undeliverable-handoff audit event failed: ` +
+            `${err instanceof Error ? err.message : String(err)}. Re-run this command to record it.`,
+        );
+      } finally {
+        taskStore.close();
+      }
+    }
     emit({ ok: true, sessionId, id, ...result });
   } finally {
     outboxStore.close();
@@ -12632,6 +12943,249 @@ async function runToolRequestGrant(argv: string[], surface: "grant" | "run" = "g
         };
         const resolvedToolRequest = { ...existing, resolved: true, resolution };
 
+        // ── CONTINUATION ROUTING (issue #722) ────────────────────────────────
+        // `docs/unattended-tool-request-contract.md` rows 26–27: a resolution
+        // that left the task re-queueable goes to `implementation` — UNLESS
+        // `docs/verification-execution-contract.md` §10's evidence gate holds,
+        // in which case it goes straight to `review` and the no-op
+        // implementation pass (#404's survivable detour) is skipped entirely.
+        // All of the policy is the pure core helper's; everything here is
+        // evidence collection. Only this true-no-op path is a candidate: a
+        // guided run that produced repository changes is out of scope for #722
+        // even when its disposition later left the tree clean.
+        //
+        // Always write `toolRequestResumeBranch` so applyTaskPatch's context
+        // merge does not preserve a stale resume branch from an earlier Tool
+        // Request; JSON.stringify drops the undefined value, removing the key
+        // (matches manual-done; issue #316).
+        const continuationContext: Record<string, unknown> = {
+          toolRequest: resolvedToolRequest,
+          toolRequestGrant: consumedGrant,
+          toolRequestResumeBranch,
+        };
+        // Previewed so the review-admission check and the decision read exactly
+        // the state the transition below is about to persist — in particular a
+        // Tool Request that this resolution has just closed.
+        const continuationPreview = applyTaskPatch(task, { context: continuationContext, now });
+
+        // Eligibility first (#918 §10.2): a command no `session.verification`
+        // value covers is never direct-reviewed, so the repository probes below
+        // are skipped for it. The decision helper evaluates its checks in a
+        // fixed order, so an unprobed field can never change the recorded
+        // reason — the eligibility miss is reported before any of them is read.
+        const configuredVerification = resolveConfiguredVerification(grantedCommand, session.verification);
+        const { base: recordedReviewBase, missing: reviewBaseMissing } = resolveDependencyReviewBase(task.context);
+        let worktreeCleanAfterRun: boolean | undefined;
+        let issueBranchLocalSha: string | undefined;
+        let issueBranchRemoteSha: string | undefined;
+        let commitsSinceReviewBase: number | undefined;
+        if (configuredVerification !== undefined) {
+          // Clean worktree AFTER disposition handling and the artifact cleanup
+          // above, using the same plain porcelain the implementation preflight
+          // uses — never the `:(exclude)` relaxation the dirtiness probe needs.
+          const cleanProbe = probe("git", ["status", "--porcelain"], grantRepoCwd);
+          worktreeCleanAfterRun = cleanProbe.ok ? cleanProbe.output.length === 0 : undefined;
+          // Read the BRANCH ref rather than HEAD: the shared-checkout tidy-up
+          // above may have moved HEAD back to the base branch, and an invented
+          // branch it deleted simply fails to resolve here (fail closed).
+          const localShaProbe = probe("git", ["rev-parse", "--verify", `refs/heads/${workBranch}`], grantRepoCwd);
+          const localSha = localShaProbe.ok ? localShaProbe.output.trim() : "";
+          issueBranchLocalSha = /^[0-9a-f]{7,64}$/.test(localSha) ? localSha : undefined;
+          // Origin's own view of the branch, read straight from the remote so a
+          // stale remote-tracking ref can never stand in for an actual push.
+          const lsRemoteProbe = probe("git", ["ls-remote", "--heads", "origin", workBranch], grantRepoCwd);
+          if (lsRemoteProbe.ok) {
+            const remoteSha = ((lsRemoteProbe.output.split("\n")[0] ?? "").trim().split(/\s+/)[0] ?? "").trim();
+            issueBranchRemoteSha = /^[0-9a-f]{7,64}$/.test(remoteSha) ? remoteSha : undefined;
+          }
+          // Committed issue work relative to the RECORDED review base: the
+          // predecessor head for a dependency-started task (#667, #681 check 4),
+          // else the session base branch on origin.
+          if (issueBranchLocalSha !== undefined) {
+            const reviewBaseRef = recordedReviewBase?.sha ?? `origin/${baseBranch}`;
+            const countProbe = probe(
+              "git",
+              ["rev-list", "--count", `${reviewBaseRef}..refs/heads/${workBranch}`],
+              grantRepoCwd,
+            );
+            if (countProbe.ok) {
+              const parsedCount = Number.parseInt(countProbe.output.trim(), 10);
+              if (Number.isFinite(parsedCount)) commitsSinceReviewBase = parsedCount;
+            }
+          }
+        }
+
+        // The existing #681 admission contract decides admissibility; #722 never
+        // weakens it and adds no verification evidence to it (#918 §10.3 step 4).
+        const continuationAdmission = checkReviewAdmission(continuationPreview);
+        const { prUrl: recordedPrUrlForContinuation } = resolvePrContext(task);
+        const recordedPrNumber =
+          recordedPrUrlForContinuation !== undefined ? extractPrNumber(recordedPrUrlForContinuation) : undefined;
+        const continuationDecision = decideToolRequestContinuation({
+          guidedRun: {
+            exitCode: runResult.exitCode,
+            command: grantedCommand,
+            disposition: resolution.disposition,
+            producedChanges,
+          },
+          verificationCommands: session.verification,
+          phase: task.phase,
+          toolRequestUnresolved: hasUnresolvedToolRequest(continuationPreview.context),
+          pendingMarkers: collectPendingImplementationMarkers(task.context, {
+            preservedPatchPending: patchPath !== null,
+          }),
+          repository: {
+            worktreeClean: worktreeCleanAfterRun,
+            branch: workBranch,
+            localHeadSha: issueBranchLocalSha,
+            remoteHeadSha: issueBranchRemoteSha,
+            commitsSinceReviewBase,
+          },
+          durableContext: {
+            prRecorded: recordedPrNumber !== undefined && recordedPrNumber > 0,
+            prHeadBranch: recordedPrBranch,
+            reviewBaseRecorded: !reviewBaseMissing,
+          },
+          reviewAdmitted: continuationAdmission.ok,
+        });
+        const continuationRecord = buildToolRequestContinuationRecord(continuationDecision, actionLabel, now);
+        // Durable on BOTH routes: the selected phase, the stable reason code,
+        // and the bounded evidence summary (#919 §10.2).
+        continuationContext["toolRequestContinuation"] = continuationRecord;
+
+        if (continuationDecision.phase === "review") {
+          // Direct review (#919 row 26 / #918 §10.3 step 4): the exact
+          // `{queued, review}` vocabulary the shipped implementation→review
+          // success edge uses, with the normal implementation→review label
+          // effects. Transition and effects commit in ONE transaction so a
+          // maintenance lock (or any other failure) takes both or neither and
+          // the operator command stays safely repeatable.
+          const reviewPatch: TaskPatch = {
+            status: "queued",
+            phase: "review",
+            ownerRunId: undefined,
+            leaseExpiresAt: undefined,
+            lastError: undefined,
+            // Branch, PR, review-base and every other implementation-complete
+            // key survive untouched: the patch only merges the resolution,
+            // the consumed grant, the resume point, and the decision record.
+            context: continuationContext,
+            now,
+          };
+          const reviewPreview = applyTaskPatch(task, reviewPatch);
+          const effects = new OutboxEffectCollector();
+          await enqueueStatusLabelEffects(
+            effects,
+            session,
+            reviewPreview,
+            "queued",
+            "review",
+            runId,
+            now,
+            "implementation",
+            {
+              result: "success",
+              context: {
+                branch: workBranch,
+                ...(recordedPrUrlForContinuation !== undefined ? { prUrl: recordedPrUrlForContinuation } : {}),
+              },
+            },
+          );
+          // `queued` has no coarse-label entry, so the shared helper never drops
+          // the ready-for-human marker this park left on the issue; remove it
+          // explicitly, exactly as the implementation requeue below does.
+          const reviewEffectStore = workItemOutbox(effects, session);
+          const readyForHumanOnReview = session.labels["readyForHuman"] as string | undefined;
+          if (readyForHumanOnReview) {
+            await reviewEffectStore.enqueue({
+              idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:remove", readyForHumanOnReview),
+              topic: "gh:label:remove",
+              payload: { topic: "gh:label:remove", owner, repo, issueNumber, label: readyForHumanOnReview },
+              now,
+            });
+          }
+
+          // Public surface stays bounded and redacted: the display command and
+          // the high-level outcome only — never output, paths, or evidence
+          // detail beyond the branch already named by every other comment here.
+          let reviewCommentBody =
+            `✅ **Tool Request guided run completed — queued for review.**\n\n` +
+            `Approved command: \`${displayCommand}\`\n\n` +
+            `The command is a configured verification command and completed successfully; the issue branch ` +
+            `\`${workBranch}\` is pushed with its work committed and no changes left behind, so the task was ` +
+            `queued directly for review instead of another implementation pass.`;
+          reviewCommentBody = sanitizeBody(reviewCommentBody, sessionRedactionPaths(session));
+          await reviewEffectStore.enqueue({
+            idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "success-review"),
+            topic: "gh:comment",
+            payload: { topic: "gh:comment", owner, repo, issueNumber, body: reviewCommentBody },
+            now,
+          });
+
+          const reviewResult = await store.transitionTaskWithEffects(
+            { sessionId, issueNumber },
+            { status: task.status },
+            reviewPatch,
+            effects.effects,
+          );
+          if (!reviewResult.ok) {
+            lockedDie(
+              `Failed to record guided run: ${reviewResult.code}` +
+                (reviewResult.current ? ` (current status: ${reviewResult.current.status})` : ""),
+            );
+          }
+
+          await store.appendEvent({
+            task: { sessionId, issueNumber },
+            type: "tool_request_grant_executed",
+            runId,
+            message: `Operator granted and executed Tool Request command for issue #${issueNumber} (exit 0, queued for review)`,
+            data: {
+              exitCode: 0,
+              success: true,
+              commandHash: grant.commandHash,
+              requeued: true,
+              dirtyAfter: false,
+              branch: workBranch,
+              continuationPhase: "review",
+              grantedBy: grant.grantedBy,
+            },
+            createdAt: now,
+          });
+          await store.appendEvent({
+            task: { sessionId, issueNumber },
+            type: "tool_request_continuation_routed",
+            runId,
+            message: `Tool Request continuation for issue #${issueNumber} routed to review (${continuationDecision.reason})`,
+            data: {
+              destination: continuationRecord.destination,
+              reason: continuationRecord.reason,
+              surface: continuationRecord.surface,
+              resolutionAction: actionLabel,
+              evidence: continuationRecord.evidence,
+            },
+            createdAt: now,
+          });
+
+          emit({
+            ok: true,
+            sessionId,
+            issueNumber,
+            action: actionLabel,
+            executed: true,
+            exitCode: 0,
+            success: true,
+            status: reviewResult.value.status,
+            phase: reviewResult.value.phase,
+            requeued: true,
+            dirtyAfter: false,
+            branch: workBranch,
+            commandHash: grant.commandHash,
+            continuation: { destination: continuationRecord.destination, reason: continuationRecord.reason },
+          });
+          return;
+        }
+
         const result = await store.transitionTask(
           { sessionId, issueNumber },
           { status: task.status },
@@ -12641,10 +13195,7 @@ async function runToolRequestGrant(argv: string[], surface: "grant" | "run" = "g
             ownerRunId: undefined,
             leaseExpiresAt: undefined,
             lastError: undefined,
-            // Always write the key so applyTaskPatch's context merge does not preserve
-            // a stale resume branch from an earlier Tool Request; JSON.stringify drops
-            // the undefined value, removing the key (matches manual-done; issue #316).
-            context: { toolRequest: resolvedToolRequest, toolRequestGrant: consumedGrant, toolRequestResumeBranch },
+            context: continuationContext,
             now,
           },
         );
@@ -12706,6 +13257,23 @@ async function runToolRequestGrant(argv: string[], surface: "grant" | "run" = "g
           createdAt: now,
         });
 
+        // The same routing event the direct-review branch records, naming the
+        // check that sent this resolution back to implementation (#919 §10.2).
+        await store.appendEvent({
+          task: { sessionId, issueNumber },
+          type: "tool_request_continuation_routed",
+          runId,
+          message: `Tool Request continuation for issue #${issueNumber} routed to implementation (${continuationDecision.reason})`,
+          data: {
+            destination: continuationRecord.destination,
+            reason: continuationRecord.reason,
+            surface: continuationRecord.surface,
+            resolutionAction: actionLabel,
+            evidence: continuationRecord.evidence,
+          },
+          createdAt: now,
+        });
+
         emit({
           ok: true,
           sessionId,
@@ -12720,6 +13288,7 @@ async function runToolRequestGrant(argv: string[], surface: "grant" | "run" = "g
           dirtyAfter: false,
           branch: workBranch,
           commandHash: grant.commandHash,
+          continuation: { destination: continuationRecord.destination, reason: continuationRecord.reason },
         });
         return;
       }
@@ -14483,6 +15052,31 @@ const HUMAN_DEFAULT_COMMANDS = new Set([
   // Workflow deployment (issue #822): an operator-facing preview/--yes command
   // run by hand during installation, never by the workflows themselves.
   "n8n deploy",
+  // Automation-label activation/suspension (issue #787): operator-facing
+  // preview/--yes commands run by hand ahead of dependency-chain repair;
+  // readable preview output without --json.
+  "issue activate",
+  "issue suspend",
+  // Read-only chain registry inspection/validation (issue #789): operator-
+  // facing diagnostics over #788/#890/#891, human-readable by default; --json
+  // gives the stable machine payload.
+  "chain list",
+  "chain show",
+  "chain validate",
+  // The one mutating chain command (issue #892): previews by default, applies
+  // with --yes, and follows the same operator-facing posture as its read-only
+  // siblings.
+  "chain sync",
+  // Linear chain construction and editing (issue #791): the same preview/--yes
+  // posture again, and the same operator-facing default — these are run by hand
+  // while looking at a dependency graph, never by a workflow.
+  "chain new",
+  "chain append",
+  "chain prepend",
+  // Advanced topology operations (issue #893): fork and merge, with the same
+  // preview/--yes posture and the same operator-facing default.
+  "chain fork",
+  "chain merge",
 ]);
 
 export async function main(rawArgv: string[]): Promise<void> {
@@ -14571,6 +15165,62 @@ export async function main(rawArgv: string[]): Promise<void> {
       return;
     }
     die(`Unknown task action: ${action ?? "(none)"}. Expected: clear-delay | cancel | reconcile-closed`);
+  }
+
+  if (subcommand === "issue") {
+    const action = argv[1];
+    if (action === "activate") {
+      await runIssueActivate(argv.slice(2));
+      return;
+    }
+    if (action === "suspend") {
+      await runIssueSuspend(argv.slice(2));
+      return;
+    }
+    die(`Unknown issue action: ${action ?? "(none)"}. Expected: activate | suspend`);
+  }
+
+  if (subcommand === "chain") {
+    const action = argv[1];
+    if (action === "list") {
+      await runChainList(argv.slice(2));
+      return;
+    }
+    if (action === "show") {
+      await runChainShow(argv.slice(2));
+      return;
+    }
+    if (action === "validate") {
+      await runChainValidate(argv.slice(2));
+      return;
+    }
+    if (action === "sync") {
+      await runChainSync(argv.slice(2));
+      return;
+    }
+    if (action === "new") {
+      await runChainNew(argv.slice(2));
+      return;
+    }
+    if (action === "append") {
+      await runChainAppend(argv.slice(2));
+      return;
+    }
+    if (action === "prepend") {
+      await runChainPrepend(argv.slice(2));
+      return;
+    }
+    if (action === "fork") {
+      await runChainFork(argv.slice(2));
+      return;
+    }
+    if (action === "merge") {
+      await runChainMerge(argv.slice(2));
+      return;
+    }
+    die(
+      `Unknown chain action: ${action ?? "(none)"}. Expected: list | show | validate | sync | new | append | prepend | fork | merge`,
+    );
   }
 
   if (subcommand === "n8n") {
@@ -14809,6 +15459,17 @@ export async function main(rawArgv: string[]): Promise<void> {
       return;
     }
     die(`Unknown issue-discuss action: ${action ?? "(none)"}. Expected: preview | post`);
+  }
+
+  if (subcommand === "refinement") {
+    const action = argv[1];
+    if (action === "run") {
+      const parsed = parseRefinementRunArgs(argv.slice(2));
+      if ("error" in parsed) die(parsed.error);
+      await runRefinementRun(parsed, { store: new SqliteTaskStore(parsed.dbPath) });
+      return;
+    }
+    die(`Unknown refinement action: ${action ?? "(none)"}. Expected: run`);
   }
 
   if (subcommand === "interventions") {

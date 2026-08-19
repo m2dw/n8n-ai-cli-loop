@@ -7,6 +7,9 @@ import { resolveIssueWorktree, canonicalizePath } from '../dist/handlers/worktre
 import { issueWorktreePath } from '../dist/core/worktree-paths.js';
 import { SqliteTaskStore, runNextPhase, TOOL_REQUEST_OPEN, TOOL_REQUEST_CLOSE, applyTaskPatch, IssueWorktreeLock } from '../dist/index.js';
 import { emptyReviewDisputeContext } from '../dist/core/review-dispute.js';
+import { DEFAULT_MAX_VERIFICATION_REPAIR_CYCLES } from '../dist/core/implementation-verification.js';
+import { MAX_TRANSIENT_VERIFICATION_RETRIES } from '../dist/core/review-classifier.js';
+import { CLI_PROBE_INDETERMINATE_MARKER } from '../dist/core/cli-probe.js';
 
 const CLI = new URL('../dist/cli/run-one-phase.js', import.meta.url).pathname;
 
@@ -2555,7 +2558,10 @@ describe('implementation handler — verification-failure dirty state recording 
       CONTEXT({ session }), runner, undefined, resolver.resolve,
     )(makeTask());
 
-    expect(result.result).toBe('failed');
+    // Issue #934: an ordinary verification failure requeues implementation
+    // rather than stopping at terminal `failed`; the marker it records is
+    // unchanged.
+    expect(result.result).toBe('needs_fix');
     expect(result.context?.dirtyContinuation).toMatchObject({
       issueNumber: 77,
       phase: 'implementation',
@@ -4208,15 +4214,15 @@ describe('implementation handler — pre-push verification', () => {
     expect(verCall.opts.maxBuffer).toBeGreaterThan(1024 * 1024);
   });
 
-  test('verification failure (after bounded repair) returns failed without committing or pushing', async () => {
+  test('verification failure (after bounded repair) requeues implementation without committing or pushing', async () => {
     const runner = sequenceRunner([
       ...upToVerification({ stdout: 'FAIL: 1 test failed', stderr: '', exitCode: 1 }), // verification fails
       { stdout: 'repaired', stderr: '', exitCode: 0 },      // repair claude
       { stdout: 'FAIL: still failing', stderr: '', exitCode: 1 }, // verification still fails
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    expect(r.result).toBe('failed');
-    expect(r.error).toMatch(/Verification 'test' failed/);
+    expect(r.result).toBe('needs_fix');
+    expect(r.message).toMatch(/Verification 'test' failed/);
     // No staging/commit/push or PR creation happened
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'add')).toBe(false);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('commit'))).toBe(false);
@@ -4231,7 +4237,7 @@ describe('implementation handler — pre-push verification', () => {
       { stdout: 'FAIL: assertion x', stderr: '', exitCode: 2 },
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    expect(r.result).toBe('failed');
+    expect(r.result).toBe('needs_fix');
     expect(r.context?.verificationFailure).toEqual({ name: 'test', exitCode: 2 });
     expect(r.context?.verificationFeedback).toContain('FAIL: assertion x');
   });
@@ -4264,7 +4270,7 @@ describe('implementation handler — pre-push verification', () => {
       { stdout: 'FAIL', stderr: '', exitCode: 1 },          // verification still fails
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
-    expect(r.result).toBe('failed');
+    expect(r.result).toBe('needs_fix');
     expect(runner.calls.filter((c) => c.cmd === 'claude')).toHaveLength(2);
     expect(runner.calls.filter((c) => c.cmd === 'npm')).toHaveLength(2);
   });
@@ -4443,9 +4449,268 @@ describe('implementation handler — pre-push verification', () => {
       { stdout: 'FAIL', stderr: '', exitCode: 1 },             // verification still fails
     ]);
     const r = await createImplementationHandler(CONTEXT(), runner)(makeFixTask());
-    expect(r.result).toBe('failed');
-    expect(r.error).toMatch(/Verification 'test' failed/);
+    expect(r.result).toBe('needs_fix');
+    expect(r.message).toMatch(/Verification 'test' failed/);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('push'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Verification-failure classification and requeue (issue #934)
+//
+// An ordinary nonzero verification result that survives the bounded inline
+// repair attempt is work the implementation agent can continue, so it requeues
+// the SAME task at `implementation` (bounded) instead of ending the chain at
+// terminal `failed`. Genuine abnormalities stay distinct: an indeterminate CLI
+// probe delays, and an operator-actionable setup failure (missing executable,
+// undefined script) stays terminal.
+// ---------------------------------------------------------------------------
+
+describe('implementation handler — verification failure classification (issue #934)', () => {
+  const worktreePath = () => join(tmpDir, 'wt', 'addon-dev', 'issue-77', 'repo');
+
+  // Runner steps through the failed initial verification, the bounded inline
+  // repair, and the failed re-verification. Two dirty-capture steps follow
+  // (git status -z, git diff HEAD); callers that care about the marker append
+  // them, and callers that do not let the exhausted queue answer them.
+  function upToRepairedVerificationFailure(firstFailure, repairFailure = firstFailure) {
+    return [
+      { stdout: '', stderr: '', exitCode: 0 },               // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },               // git status --porcelain (canonical — clean)
+      { stdout: '', stderr: '', exitCode: 0 },               // git status --porcelain (worktree — clean)
+      { stdout: 'done', stderr: '', exitCode: 0 },           // claude (initial agent)
+      { stdout: '1 file changed', stderr: '', exitCode: 0 }, // git diff --stat HEAD
+      firstFailure,                                          // npm test — fails
+      { stdout: 'repaired', stderr: '', exitCode: 0 },       // claude (inline repair agent)
+      repairFailure,                                         // npm test — still fails
+    ];
+  }
+
+  const RED_SUITE = { stdout: 'FAIL: 1 test failed', stderr: '', exitCode: 1 };
+
+  function taskWithContext(extra) {
+    return makeTask({ context: { ...makeTask().context, ...extra } });
+  }
+
+  test('an ordinary red suite requeues implementation and counts the repair cycle', async () => {
+    const runner = sequenceRunner([
+      ...upToRepairedVerificationFailure(RED_SUITE),
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },                              // git status -z
+      { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+fix\n', stderr: '', exitCode: 0 }, // git diff HEAD
+    ]);
+    const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+
+    expect(r.result).toBe('needs_fix');
+    expect(r.context.verificationRepairCycles).toBe(1);
+    expect(r.context.verificationRepairCapReached).toBe(false);
+    expect(r.context.verificationFailure).toEqual({ name: 'test', exitCode: 1 });
+    expect(r.context.verificationFeedback).toContain('FAIL: 1 test failed');
+    // The edits stay in the worktree as a valid continuation point: nothing is
+    // committed, pushed, discarded, or removed.
+    expect(r.context.dirtyContinuation).toMatchObject({ verificationName: 'test', commitSkipped: true });
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'add')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('commit'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('push'))).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'reset')).toBe(false);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree')).toBe(false);
+  });
+
+  test('the repair cycle counter advances across requeues', async () => {
+    const runner = sequenceRunner(upToRepairedVerificationFailure(RED_SUITE));
+    const r = await createImplementationHandler(CONTEXT(), runner)(
+      taskWithContext({ verificationRepairCycles: 1 }),
+    );
+
+    expect(r.result).toBe('needs_fix');
+    expect(r.context.verificationRepairCycles).toBe(2);
+  });
+
+  test('repair-cap exhaustion hands off deterministically instead of looping', async () => {
+    const runner = sequenceRunner(upToRepairedVerificationFailure(RED_SUITE));
+    const r = await createImplementationHandler(CONTEXT(), runner)(
+      taskWithContext({ verificationRepairCycles: DEFAULT_MAX_VERIFICATION_REPAIR_CYCLES }),
+    );
+
+    expect(r.result).toBe('failed');
+    expect(r.error).toMatch(
+      new RegExp(`${DEFAULT_MAX_VERIFICATION_REPAIR_CYCLES}/${DEFAULT_MAX_VERIFICATION_REPAIR_CYCLES} automatic implementation repair cycles`),
+    );
+    expect(r.context.verificationRepairCapReached).toBe(true);
+    // The budget resets on the way out so an operator who requeues the task
+    // gets a full set of cycles rather than an immediate second handoff.
+    expect(r.context.verificationRepairCycles).toBe(0);
+    // The failing tree is still preserved for the operator to inspect.
+    expect(r.context.dirtyContinuation).toBeDefined();
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('commit'))).toBe(false);
+  });
+
+  test('a missing verification executable stays an abnormal stop, not a code-fix retry', async () => {
+    const runner = sequenceRunner(upToRepairedVerificationFailure({
+      stdout: '',
+      stderr: 'Error: spawnSync npm ENOENT',
+      exitCode: 1,
+    }));
+    const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+
+    expect(r.result).toBe('failed');
+    expect(r.context.verificationEnvironmentSignal).toBe('spawn_failed');
+    expect(r.error).toMatch(/environment or configuration problem/);
+    // No repair cycle was spent: re-running the agent cannot install a binary.
+    expect(r.context.verificationRepairCycles).toBeUndefined();
+  });
+
+  test('a verification command naming an undefined script stays an abnormal stop', async () => {
+    const runner = sequenceRunner(upToRepairedVerificationFailure({
+      stdout: '',
+      stderr: 'npm ERR! Missing script: "test"\nnpm ERR! To see a list of scripts, run:\nnpm ERR!   npm run',
+      exitCode: 1,
+    }));
+    const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+
+    expect(r.result).toBe('failed');
+    expect(r.context.verificationEnvironmentSignal).toBe('missing_script');
+  });
+
+  test('an indeterminate CLI probe delays instead of spending a repair cycle', async () => {
+    const runner = sequenceRunner(upToRepairedVerificationFailure({
+      stdout: `doctor: claude ${CLI_PROBE_INDETERMINATE_MARKER} (probe timed out)`,
+      stderr: '',
+      exitCode: 1,
+    }));
+    const r = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+
+    expect(r.result).toBe('delayed');
+    expect(r.delayKind).toBe('transient_verification');
+    expect(r.context.verificationTransientRetries).toBe(1);
+    expect(r.context.transientVerificationStep).toBe('test');
+    expect(r.context.verificationRepairCycles).toBeUndefined();
+    // The continuation point survives the delay so the retry resumes from the
+    // same edits rather than refusing the dirty worktree.
+    expect(r.context.dirtyContinuation).toBeDefined();
+  });
+
+  test('a transient delay clears a stale artifactDirPending carried in from an earlier run', async () => {
+    const runner = sequenceRunner(upToRepairedVerificationFailure({
+      stdout: `doctor: claude ${CLI_PROBE_INDETERMINATE_MARKER} (probe timed out)`,
+      stderr: '',
+      exitCode: 1,
+    }));
+    // An earlier run on this task failed BEFORE creating its artifact dir and
+    // left the marker behind. This run created and validated its own directory,
+    // so the reference the delayed row carries is real and must be validated on
+    // backup restore rather than skipped.
+    const r = await createImplementationHandler(CONTEXT(), runner)(
+      taskWithContext({ artifactDirPending: true }),
+    );
+
+    expect(r.result).toBe('delayed');
+    expect(r.context.artifactDir).toBeDefined();
+    expect(r.context.artifactDirPending).toBe(false);
+  });
+
+  test('a spent transient budget falls through to the ordinary requeue', async () => {
+    const runner = sequenceRunner(upToRepairedVerificationFailure({
+      stdout: `doctor: claude ${CLI_PROBE_INDETERMINATE_MARKER} (probe timed out)`,
+      stderr: '',
+      exitCode: 1,
+    }));
+    const r = await createImplementationHandler(CONTEXT(), runner)(
+      taskWithContext({ verificationTransientRetriesByStep: { test: MAX_TRANSIENT_VERIFICATION_RETRIES } }),
+    );
+
+    expect(r.result).toBe('needs_fix');
+    expect(r.context.verificationRepairCycles).toBe(1);
+  });
+
+  test('verification success still stages, commits, pushes, and clears the repair counter', async () => {
+    const runner = happyRunner();
+    const r = await createImplementationHandler(CONTEXT(), runner)(
+      taskWithContext({ verificationRepairCycles: 2 }),
+    );
+
+    expect(r.result).toBe('success');
+    expect(r.context.verificationRepairCycles).toBeUndefined();
+    expect(r.context.prUrl).toMatch(/pull\/99/);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'add')).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('commit'))).toBe(true);
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('push'))).toBe(true);
+  });
+
+  test('verification success releases the transient retry budget it spent', async () => {
+    // A run delayed for an indeterminate probe and then passing on the retry
+    // must not leave its spent budget behind: the merged context travels to
+    // review, where the same command's first transient failure would otherwise
+    // start with an exhausted count and be misrouted to `needs_fix`.
+    const r = await createImplementationHandler(CONTEXT(), happyRunner())(
+      taskWithContext({
+        verificationTransientRetriesByStep: { test: MAX_TRANSIENT_VERIFICATION_RETRIES },
+        verificationTransientRetries: MAX_TRANSIENT_VERIFICATION_RETRIES,
+        transientVerificationStep: 'test',
+        transientVerificationSignal: CLI_PROBE_INDETERMINATE_MARKER,
+      }),
+    );
+
+    expect(r.result).toBe('success');
+    expect(r.context.verificationTransientRetriesByStep).toBeUndefined();
+    expect(r.context.verificationTransientRetries).toBeUndefined();
+    expect(r.context.transientVerificationStep).toBeUndefined();
+    expect(r.context.transientVerificationSignal).toBeUndefined();
+  });
+
+  test('the requeued run continues from the same worktree with the failure in its prompt', async () => {
+    const wt = worktreePath();
+    const patch = 'diff --git a/src/foo.ts b/src/foo.ts\n+fix\n';
+    const resolver = fakeWorktreeResolver(wt);
+    const session = SESSION({});
+    const firstRunner = sequenceRunner([
+      ...upToRepairedVerificationFailure(RED_SUITE),
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 }, // git status -z (dirty capture)
+      { stdout: patch, stderr: '', exitCode: 0 },             // git diff HEAD (patch artifact)
+    ]);
+    const firstResult = await createImplementationHandler(
+      CONTEXT({ session }), firstRunner, undefined, resolver.resolve,
+    )(makeTask());
+
+    expect(firstResult.result).toBe('needs_fix');
+
+    // What the phase runner persists on a `needs_fix`: the handler's context
+    // merged over the task's own (applyTaskPatch), with the task requeued at
+    // implementation.
+    const nextTask = makeTask({
+      context: { ...makeTask().context, ...firstResult.context },
+    });
+    const secondRunner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (canonical — clean)
+      { stdout: ' M src/foo.ts', stderr: '', exitCode: 0 },     // git status --porcelain (worktree — DIRTY)
+      { stdout: ' M src/foo.ts\0', stderr: '', exitCode: 0 },   // git status -z (drift check)
+      { stdout: patch, stderr: '', exitCode: 0 },               // git diff HEAD (content drift check)
+      { stdout: 'fixed the test', stderr: '', exitCode: 0 },    // claude
+      { stdout: '1 file changed', stderr: '', exitCode: 0 },    // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },              // npm test — passes
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },      // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                  // git add
+      { stdout: '', stderr: '', exitCode: 0 },                  // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                  // git push
+      { stdout: 'https://github.com/m2dw/test-repo/pull/101', stderr: '', exitCode: 0 }, // gh pr create
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove (canonical)
+    ]);
+    const secondResult = await createImplementationHandler(
+      CONTEXT({ session, runId: 'run-impl-2' }), secondRunner, undefined, resolver.resolve,
+    )(nextTask);
+
+    const prompt = readFileSync(
+      join(artifactRoot, 'runs', 'run-impl-2', 'implementation-prompt.md'), 'utf8',
+    );
+    expect(prompt).toContain('## Continuation Context');
+    expect(prompt).toContain('Prior Verification Failure: test (exit 1)');
+    expect(prompt).toContain('FAIL: 1 test failed');
+    expect(prompt).toContain('Fix the verification failure described below');
+    // The prior edits were never discarded — the continuing run reuses them and
+    // finishes the work.
+    expect(secondRunner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'reset')).toBe(false);
+    expect(secondResult.result).toBe('success');
+    expect(secondResult.context.verificationRepairCycles).toBeUndefined();
   });
 });
 
@@ -6587,7 +6852,7 @@ describe('implementation handler — structured finding disposition response (is
     expect(artifact.rejections[0].reason).toBe('fixed-without-diff');
   });
 
-  test('verification failure still fails a valid all-disputed run, before any commit', async () => {
+  test('verification failure still stops a valid all-disputed run before any commit', async () => {
     writeEvidenceFile();
     const dir = writeFindingsArtifact([findingRecord(LINEAGE_A)]);
     const runner = noDiffDisputeRunner(dispositionBlock([disputed(LINEAGE_A)]), [
@@ -6598,8 +6863,10 @@ describe('implementation handler — structured finding disposition response (is
     const result = await createImplementationHandler(disputeSession(), runner)(
       fixTask({ [LINEAGE_A]: lineage(LINEAGE_A) }, dir),
     );
-    expect(result.result).toBe('failed');
-    expect(result.error).toMatch(/Verification 'test' failed/);
+    // Issue #934: the run is requeued rather than failed, but it still never
+    // commits or pushes a tree whose verification is red.
+    expect(result.result).toBe('needs_fix');
+    expect(result.message).toMatch(/Verification 'test' failed/);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('commit'))).toBe(false);
     expect(runner.calls.some((c) => c.cmd === 'git' && c.args.includes('push'))).toBe(false);
   });
@@ -7107,7 +7374,7 @@ describe('implementation handler — dispute persistence (issue #844)', () => {
       fixTask({ [LINEAGE_A]: lineage(LINEAGE_A) }, dir),
     );
 
-    expect(result.result).toBe('failed');
+    expect(result.result).toBe('needs_fix');
     expect(result.context.reviewDispute).toBeUndefined();
     expect(existsSync(disputeArtifactPath(LINEAGE_A))).toBe(false);
   });

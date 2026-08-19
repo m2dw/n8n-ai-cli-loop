@@ -215,6 +215,15 @@ worktree paths that appear in prepare output.
 
 ## 3. Verification
 
+**Extended by #918.** This section remains authoritative for
+verification ownership, session configuration, and the
+non-derivation/runner-owned rules (§3.1–§3.3) and for the timing
+anchors in §3.4. The execution lifecycle, failure classification,
+multi-command aggregation, continuation routing, and evidence rules
+are fixed by
+[docs/verification-execution-contract.md](verification-execution-contract.md)
+(#918), which consumes this section without restating it.
+
 ### 3.1 Session configuration
 
 Verification commands are session-defined through `session.verification`, a

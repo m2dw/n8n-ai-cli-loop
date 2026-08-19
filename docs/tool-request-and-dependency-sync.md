@@ -231,6 +231,16 @@ raw command transcripts must not be leaked into public comments.
 
 ### 2.5 Task context metadata
 
+> **Field-name supersession (issue #919).** The shape below is this spec's
+> original *suggested* shape; the shipped record uses
+> `expectedFiles`/`requestedAt`/`resolved` in place of
+> `expectedFilesChanged`/`detectedAt`/`status` (see the head-note of
+> Section 2). `docs/unattended-tool-request-contract.md` §4 makes the
+> shipped shape normative: `resolved` plus `resolution` are the record's
+> only lifecycle fields, the request lifecycle states are *derived* from
+> them and the task status, and no `toolRequest.status` column exists or
+> may be introduced. Read `"status": "open"` below as `resolved: false`.
+
 So that admin tooling can list and resolve outstanding requests, the task
 context must record a structured Tool Request record, in the spirit of the
 existing `dependencyDecision` snapshot (see phase-contracts.md). Suggested shape:

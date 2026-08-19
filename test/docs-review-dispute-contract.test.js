@@ -36,8 +36,11 @@ const phaseContracts = read('docs/phase-contracts.md');
 // ---------------------------------------------------------------------------
 
 describe('docs/review-dispute-contract.md — authority and scope', () => {
-  test('is marked as an approved design that is not yet implemented', () => {
-    expect(doc).toMatch(/approved design, not yet implemented \(issue #835\)/);
+  test('is marked as an approved design, with implementation status recorded separately', () => {
+    expect(doc).toMatch(/approved design \(issue #835\)/);
+    expect(doc).toMatch(
+      /No production review or fix behavior changed in #835 itself — #835 shipped\s+the contract, not the protocol\./,
+    );
   });
 
   test('is the authoritative contract that follow-up issues must not redefine', () => {

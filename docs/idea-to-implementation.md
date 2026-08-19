@@ -134,7 +134,9 @@ To create a dependent stack safely, follow the **dormant-first** contract:
    Do not apply executable `status:*` labels (`status:needs-implementation`,
    `status:needs-review`, `status:research-needed`,
    `status:needs-conflict-resolution`). Prefer `status:backlog` or no workflow
-   status while relationships are being configured.
+   status while relationships are being configured. The `agent:*` label goes on
+   at activation time — step 4 for the root, step 5 for each dependent,
+   including the refinement variant below — never before the graph is verified.
 2. **Set all `blocked by` relationships** between the issues in the stack.
 3. **Verify the relationship graph.** Confirm each dependent issue shows its
    intended open blocker(s) before any executable label is applied.
@@ -160,6 +162,39 @@ To create a dependent stack safely, follow the **dormant-first** contract:
    The minimal-risk posture is to activate only the root first and label each
    dependent once you have confirmed its blocker state, so a mistaken
    relationship can never enqueue a dependent prematurely.
+
+   A dependent that is still rough at step 5 — written before its blocker's
+   design settled — has a specified home in the chain-aware progressive
+   refinement lane: it can instead be labelled `agent:<impl>` +
+   `status:needs-refinement` (an optional, default-off lane).
+
+   **That lane is implemented but default-off — confirm your session has
+   opted in before using it.** `status:needs-refinement` routes through the
+   refinement handler only when `session.issueRefinement.enabled` is `true`
+   (see [feature-status.md](feature-status.md#issue-refinement)); a session
+   that has not opted in treats the label as inert, so applying the pair
+   leaves the dependent dormant indefinitely instead of rewriting and
+   activating it. If your session has not enabled the lane, refine a rough
+   dependent's body by hand and activate it with the ordinary `agent:<impl>` +
+   `status:needs-implementation` pair described above.
+
+   The behavior the contract specifies is as follows.
+   Apply **both** labels: the marker is not an executable status and `agent:*`
+   alone routes nowhere, so the pair is dormant and cannot activate the
+   dependent, but the refinement lane requires the agent label at admission and
+   refuses an Issue that carries the marker without one. Applying the pair
+   hands the Issue to chain-aware progressive refinement, which rewrites the
+   Issue's contract from the blocker's stack-ready result, then swaps
+   `status:needs-refinement` for `status:needs-implementation` and leaves your
+   `agent:*` label in place — the ordinary implementation pair, which the next
+   intake scan picks up under the unchanged dependency gates. See
+   [issue-refinement-contract.md](issue-refinement-contract.md) (issue #866).
+
+   Labelling a whole chain this way up front is supported and costs nothing
+   while it waits: a dependent whose blocker is not yet usable is held by intake
+   as a non-runnable task, so it never takes a worker turn from runnable work
+   elsewhere, and it becomes runnable on its own once the blocker reaches the
+   stack-ready state (issue #967; see §4 of the contract).
 
 Distinguish three cases:
 

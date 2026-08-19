@@ -49,9 +49,11 @@
  *  - **No checkout to write to.** The agent runs in a throwaway temp directory,
  *    not the repository — every excerpt it needs is already in the prompt.
  *  - **No credentials to mutate GitHub with.** Token env vars are stripped and
- *    `HOME`/`GH_CONFIG_DIR` are redirected at an empty temp dir, so a
- *    prompt-injected instruction to run `gh` finds nothing to authenticate with.
- *    Only the SELECTED provider's own credentials survive (`agent-isolation.ts`).
+ *    `GH_CONFIG_DIR` is redirected at an empty temp dir, so a prompt-injected
+ *    instruction to run `gh` finds nothing to authenticate with. Only the
+ *    SELECTED provider's own credentials survive, and under the Anthropic home
+ *    policy its own CLI login is the only thing the real home restores
+ *    (`agent-isolation.ts`).
  *
  * The checkout is still read — by THIS process, not by the agent — to resolve and
  * excerpt evidence, under the same `evidence-checkout.ts` primitives the review,
@@ -198,6 +200,9 @@ export function createArbitrationAgentRunner(
     const isolated = buildIsolatedInvocation(env, {
       prefix: "ai-arbiter",
       provider: profile.provider,
+      // The profile's own record of the boundary its argv enforces; the home
+      // policy of `agent-isolation.ts` is conditioned on it.
+      toolPolicy: profile.toolPolicy,
     });
     try {
       return runner.run(profile.cmd, profile.argv, {

@@ -219,8 +219,10 @@ non-interactively.
 
 After the operator's decision the tooling performs all remaining mechanics:
 
-- Update `toolRequest.status` and populate `toolRequest.resolution` in the
-  task context.
+- Update `toolRequest.resolved` and populate `toolRequest.resolution` in the
+  task context. (There is no `toolRequest.status` field: the request
+  lifecycle is derived from `resolved`/`resolution` plus the task status —
+  see `docs/unattended-tool-request-contract.md` §4.)
 - Apply the file disposition to the worktree.
 - Update GitHub labels (remove the Tool Request / ready-for-human labels; add
   the appropriate status label for the next phase).
@@ -301,6 +303,64 @@ This path is appropriate when the command produced only diagnostic output and no
 files should be committed, while pre-existing partial work in the worktree must
 not be lost.
 
+### 4.8 Continuation destination (issue #722)
+
+Every outcome above requeues to `implementation` — with exactly one exception,
+added by issue #722 as `docs/verification-execution-contract.md` §10.5 R6
+requires. The destination set is closed:
+`{queued, implementation}` | `{queued, review}` | remain `ready_for_human`
+(`docs/unattended-tool-request-contract.md` §2).
+
+A resolution is routed `{queued, review}` — the only direct-to-review route in
+the system — when, and only when, **all** of the following hold. The checks run
+in this order, the first failure is the recorded reason, and there is no partial
+credit (§10.3 R2 of the verification contract: all of them, or
+`implementation`):
+
+| # | Check | Requirement |
+|---|---|---|
+| 1 | `guided-run-succeeded` | The runner itself observed exit code 0 |
+| 2 | `configured-verification-command` | The exact command matches a `session.verification` value under the shipped matching semantics (trimmed equality or `bash -lc '<cmd>'` wrapper equivalence). Free-form command text is never classified heuristically, and an issue-required command no session value covers is not eligible |
+| 3 | `no-repository-changes` | The run was a true no-op (`resolution.disposition: "no-op"`); a run that produced repository changes is never direct-reviewed, whatever disposition was applied afterwards |
+| 4 | `implementation-phase` | The request was emitted from the `implementation` phase |
+| 5 | `tool-request-resolved` | No unresolved Tool Request remains once this resolution commits |
+| 6 | `no-pending-implementation-state` | No review feedback, fix mode, conflict state, preserved patch, failed partial-diff capture, missing verification, or unfinished change disposition remains |
+| 7 | `worktree-clean` | `git status --porcelain` is empty after disposition handling |
+| 8 | `branch-recorded` | The expected issue branch is known |
+| 9 | `pr-recorded` | Durable context carries a `prUrl` that resolves to a PR number |
+| 10 | `pr-head-matches-branch` | The recorded PR head is the branch the command ran on |
+| 11 | `review-base-recorded` | A dependency-started task carries its `dependencyBase.baseHeadSha` (issue #667 / #681 check 4) |
+| 12 | `branch-pushed` | The local branch head equals origin's head for that branch, read from the remote (never a stale tracking ref) |
+| 13 | `committed-work-present` | The branch carries at least one commit beyond the recorded review base |
+| 14 | `review-admitted` | The existing review-admission contract (issue #681) accepts the task; #722 neither weakens it nor adds verification evidence to it |
+
+Eligibility (check 2) is routing metadata only: it selects which continuation is
+*attempted*, authorizes nothing, and its failure mode is the ordinary
+implementation continuation. The guided run's own success is an eligibility
+trigger, never review-admission evidence.
+
+**Recorded deviation.** `docs/verification-execution-contract.md` §10.3 step 1
+re-runs the whole resolved verification set as a runner-owned *cycle* in the
+`tool-request-continuation` lane and admits only a passed cycle bundle. That
+engine is #918's V1–V4 slices and is not shipped — there is no cycle, no
+bundle, no `setFingerprint`, and no per-command `requestDigest`, so the E7
+freshness comparison has no subject. Checks 1–2 above are what this slice can
+prove today: the runner's own observation that an exactly matching configured
+verification command exited 0. Checks 3–14 are unchanged state evidence, so an
+arbitrary successful command still never routes anything. When the cycle engine
+lands, its passed bundle becomes an additional required input to checks 1–2;
+nothing here is weakened by it.
+
+The selected destination, its stable reason code, and a bounded, path-safe
+evidence summary are persisted on the task (`toolRequestContinuation`) and in a
+`tool_request_continuation_routed` event, on both routes. The evidence summary
+carries booleans, counts, the matched `session.verification` KEY, and the branch
+name — never local paths, artifact locations, raw command output, or
+credentials.
+
+`manual-done` and `reject` are unaffected: they keep the implementation
+continuation, and no operator input can waive the evidence gate.
+
 ---
 
 ## 5. Safety checks (normative)
@@ -329,6 +389,9 @@ not be lost.
 |---|---|
 | `done` with no continuation point (no pushed issue branch) | Fail closed; direct operator to push branch before resolving |
 | `commit` when worktree is clean | No-op commit skipped; continue to requeue |
+| Direct-review evidence check 1–14 fails or cannot be proven (§4.8) | Fall back to the `{queued, implementation}` continuation with the failed check recorded; never a hard failure |
+| Repository state unprobeable (dirty-state, branch ref, remote head, or base-distance read fails) | Treat as unproven; fall back to `implementation` |
+| Review admission rejects the task (issue #681) | Fall back to `implementation`; the admission contract is never weakened to admit a direct-review continuation |
 
 ---
 

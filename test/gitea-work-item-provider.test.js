@@ -202,14 +202,14 @@ describe('GiteaWorkItemProvider — transitionItem', () => {
     // the removal is a no-op success and no DELETE is issued.
     const http = fakeHttp([ok(LABELS), ok([])]);
     const provider = new GiteaWorkItemProvider({ ...BASE, http });
-    expect(provider.transitionItem(5, { kind: 'remove-label', label: 'ai:gone' })).toEqual({ ok: true });
+    expect(provider.transitionItem(5, { kind: 'remove-label', label: 'ai:gone' })).toEqual({ ok: true, alreadyAbsent: true });
     expect(http.calls).toHaveLength(2); // label lookup only (page + empty page); no DELETE
   });
 
   test('remove-label tolerates a 404 from the delete', () => {
     const http = fakeHttp([ok(LABELS), { status: 404, statusText: 'Not Found', body: '' }]);
     const provider = new GiteaWorkItemProvider({ ...BASE, http });
-    expect(provider.transitionItem(5, { kind: 'remove-label', label: 'ai:active' })).toEqual({ ok: true });
+    expect(provider.transitionItem(5, { kind: 'remove-label', label: 'ai:active' })).toEqual({ ok: true, alreadyAbsent: true });
   });
 
   test('add-label returns ok:false when the label lookup itself fails', () => {
@@ -396,6 +396,124 @@ describe('GiteaWorkItemProvider — getDependencies', () => {
     const provider = new GiteaWorkItemProvider({ ...BASE, http });
     await expect(provider.getDependencies(3)).rejects.toThrow(/refusing to treat a truncated dependency list as complete/);
     expect(http.calls).toHaveLength(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getDependents — the outgoing end of the same relationship (issue #791 review)
+// ---------------------------------------------------------------------------
+
+describe('GiteaWorkItemProvider — getDependents', () => {
+  test('reads /blocks and maps the issues this one blocks', async () => {
+    const http = fakeHttp([ok([{ number: 99, state: 'open' }]), ok([])]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+    await expect(provider.getDependents(3)).resolves.toEqual([{ issueNumber: 99, state: 'open' }]);
+    expect(http.calls[0].url).toContain('/issues/3/blocks');
+    // Same paging discipline as the blocked-by read: only an empty page ends it.
+    expect(http.calls).toHaveLength(2);
+  });
+
+  test('throws (fail closed) on a non-2xx response', async () => {
+    const http = fakeHttp([{ status: 403, statusText: 'Forbidden', body: 'dependencies disabled' }]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+    await expect(provider.getDependents(3)).rejects.toThrow(/Gitea issue blocks read failed \(HTTP 403\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dependency relationship writes (issue #791)
+// ---------------------------------------------------------------------------
+
+describe('GiteaWorkItemProvider — dependency relationships', () => {
+  test('adds a `blocked by` relationship by the blocker\'s issue index', async () => {
+    const http = fakeHttp([ok({})]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+
+    expect(await provider.addDependency(11, 10)).toEqual({ ok: true, changed: true });
+    expect(http.calls[0].method).toBe('POST');
+    expect(http.calls[0].url).toBe('https://gitea.example.com/api/v1/repos/ai-private/work-items/issues/11/dependencies');
+    // Gitea's `IssueMeta` body, NOT GitHub's `issue_id`: the blocker is named by
+    // its repository-scoped index, and owner/repo are carried so Gitea resolves
+    // it against this repository instead of treating it as a cross-repository
+    // dependency (which it refuses unless that feature is enabled).
+    expect(JSON.parse(http.calls[0].body)).toEqual({ index: 10, owner: 'ai-private', repo: 'work-items' });
+  });
+
+  test('a duplicate add and an absent removal are both the requested end state', async () => {
+    const http = fakeHttp([
+      { status: 409, statusText: 'Conflict', body: 'dependency already exists' },
+      { status: 404, statusText: 'Not Found', body: 'no such dependency' },
+      // The 404 is believed only after the dependency list confirms it: #10 is
+      // not among #11's blockers.
+      ok([]),
+    ]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+    expect(await provider.addDependency(11, 10)).toEqual({ ok: true, changed: false });
+    expect(await provider.removeDependency(11, 10)).toEqual({ ok: true, changed: false });
+    expect(http.calls[1].method).toBe('DELETE');
+    expect(http.calls[2].method).toBe('GET');
+    expect(http.calls[2].url).toContain('/issues/11/dependencies');
+  });
+
+  test('removes a `blocked by` relationship and verifies it is gone', async () => {
+    const http = fakeHttp([ok({}), ok([{ number: 12, state: 'open' }]), ok([])]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+
+    expect(await provider.removeDependency(11, 10)).toEqual({ ok: true, changed: true });
+    expect(http.calls[0].method).toBe('DELETE');
+    // Gitea removes a dependency on the *collection* with the same `IssueMeta`
+    // body as the add — it has no `.../dependencies/{id}` route like GitHub's.
+    expect(http.calls[0].url).toBe('https://gitea.example.com/api/v1/repos/ai-private/work-items/issues/11/dependencies');
+    expect(JSON.parse(http.calls[0].body)).toEqual({ index: 10, owner: 'ai-private', repo: 'work-items' });
+  });
+
+  test('a 404 removal that left the relationship in place is a failure, not a success', async () => {
+    // 404 is also what a Gitea that routes the delete differently (or one whose
+    // transport dropped the DELETE body) answers while the blocker stays put.
+    // Reporting the requested end state here would record a removal that never
+    // happened, so the dependency list is the last word.
+    const http = fakeHttp([
+      { status: 404, statusText: 'Not Found', body: 'no such dependency' },
+      ok([{ number: 10, state: 'open' }]),
+      ok([]),
+    ]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+
+    const result = await provider.removeDependency(11, 10);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('#11 blocked by #10');
+    expect(result.error).toContain('still listed');
+  });
+
+  test('a 2xx removal the server did not apply is a failure too', async () => {
+    const http = fakeHttp([ok({}), ok([{ number: 10, state: 'open' }]), ok([])]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+
+    const result = await provider.removeDependency(11, 10);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('still listed');
+  });
+
+  test('an unverifiable removal is reported as a failure, with the token redacted', async () => {
+    const http = fakeHttp([
+      { status: 404, statusText: 'Not Found', body: 'no such dependency' },
+      { status: 403, statusText: 'Forbidden', body: `dependencies disabled ${TOKEN}` },
+    ]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+
+    const result = await provider.removeDependency(11, 10);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('could not be verified');
+    expect(result.error).not.toContain(TOKEN);
+  });
+
+  test('a real failure is reported rather than thrown, with the token redacted', async () => {
+    const http = fakeHttp([{ status: 500, statusText: 'Server Error', body: `boom ${TOKEN}` }]);
+    const provider = new GiteaWorkItemProvider({ ...BASE, http });
+    const result = await provider.addDependency(11, 10);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('#11 blocked by #10');
+    expect(result.error).not.toContain(TOKEN);
   });
 });
 

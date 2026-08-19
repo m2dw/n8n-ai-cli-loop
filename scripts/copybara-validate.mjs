@@ -44,6 +44,212 @@ export function walkFiles(dir) {
 }
 
 // ---------------------------------------------------------------------------
+// Value classification (issue #971)
+// ---------------------------------------------------------------------------
+
+/**
+ * `y` counts as a vowel: it carries the syllable in plenty of ordinary
+ * identifier words (`topology`, `sync`, `system`), and excluding it would
+ * reject readable literals for no security gain.
+ */
+const VOWELS = new Set(['a', 'e', 'i', 'o', 'u', 'y']);
+
+/**
+ * Thresholds for `isReadableSemanticValue`. Collected in one table so the
+ * policy is reviewable as data rather than scattered through the function.
+ */
+export const SEMANTIC_VALUE_LIMITS = {
+  maxLength: 40,
+  minSegments: 2,
+  maxSegments: 3,
+  minSegmentLength: 3,
+  maxSegmentLength: 20,
+  maxConsonantRun: 3,
+  minVowelRatio: 0.22,
+  maxVowelRatio: 0.7,
+  // Shannon entropy over an N-character string is capped at log2(N), so for
+  // a 16-20 character value a readable word pair and a random one score
+  // almost identically and the estimate cannot separate them. The check is
+  // therefore only applied to values long enough for it to be informative;
+  // below that, the word-shape signals above carry the decision.
+  entropyMinLength: 24,
+  maxNormalizedEntropy: 0.87,
+};
+
+/** Shannon entropy of a string's own character distribution, in bits/char. */
+export function shannonEntropyBitsPerChar(value) {
+  if (value.length === 0) return 0;
+  const counts = new Map();
+  for (const ch of value) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let bits = 0;
+  for (const count of counts.values()) {
+    const p = count / value.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits;
+}
+
+/** Longest run of consecutive characters satisfying `predicate`. */
+function maxRun(word, predicate) {
+  let best = 0;
+  let run = 0;
+  for (const ch of word) {
+    if (predicate(ch)) {
+      run += 1;
+      if (run > best) best = run;
+    } else {
+      run = 0;
+    }
+  }
+  return best;
+}
+
+/**
+ * Classify the value captured by the generic secret-assignment rule (issue
+ * #971). Returns true ONLY for values that are confidently readable semantic
+ * literals — routing keys, status slugs, marker strings. Everything else,
+ * including anything merely *plausibly* harmless, stays a credential: this
+ * scanner is fail-closed, and the explicit suppression marker below (not a
+ * looser classifier) is the escape hatch for reviewed ambiguous values.
+ *
+ * The input is the quoted value's own text. Nothing here inspects JavaScript
+ * syntax — no lexer, no scope tracking, no brace/string/comment/regex-literal
+ * parsing — so it applies uniformly to any file type the scanner reads.
+ *
+ * Signals, all of which must hold:
+ *
+ *  1. **Length.** Bounded overall and per segment; credential material is
+ *     routinely longer than a readable literal, and a very short segment is
+ *     not a word.
+ *  2. **Character-class diversity.** Lowercase ASCII words joined by single
+ *     `-`/`_` separators, and nothing else. One uppercase letter, digit,
+ *     `+`, `/`, `=`, or `.` is enough to keep the value a credential —
+ *     base64, hex, and opaque-token alphabets all carry them, readable
+ *     kebab/snake literals do not.
+ *  3. **Separators and word boundaries.** At least two and at most three
+ *     segments. One segment has no readable word boundary at all; four or
+ *     more is the shape of a word-list passphrase, which issue #971
+ *     deliberately leaves blocked.
+ *  4. **Not hex-alphabet-only.** `deadbeef-cafebabe` is lowercase, separated,
+ *     and vowel-bearing, but it is hex-like credential material.
+ *  5. **Word-shaped segments.** A vowel ratio in the range ordinary English
+ *     words occupy, and no consonant run longer than three — the signal that
+ *     most reliably separates words from random lowercase, where long
+ *     consonant runs are the norm.
+ *  6. **Estimated entropy.** For values long enough for the estimate to mean
+ *     something, normalized Shannon entropy must sit below the readable-text
+ *     band.
+ *
+ * Known limitation: a random lowercase-only value with no digits, no
+ * uppercase, word-shaped segments, and exactly two or three of them would be
+ * exempted. Real credential generators emit base64/hex/mixed-case alphabets,
+ * and the known-format rules in CONTENT_RULES are unaffected either way —
+ * this classifier only ever relaxes the single generic heuristic rule.
+ */
+export function isReadableSemanticValue(value) {
+  if (typeof value !== 'string') return false;
+  const limits = SEMANTIC_VALUE_LIMITS;
+  if (value.length > limits.maxLength) return false;
+
+  // Signal 2. The anchored shape also rules out leading/trailing and doubled
+  // separators, so segment splitting below can never yield an empty segment.
+  if (!/^[a-z]+(?:[-_][a-z]+)*$/.test(value)) return false;
+
+  const segments = value.split(/[-_]/);
+  if (segments.length < limits.minSegments) return false;
+  if (segments.length > limits.maxSegments) return false;
+
+  if (/^[a-f]+$/.test(segments.join(''))) return false;
+
+  for (const segment of segments) {
+    if (segment.length < limits.minSegmentLength) return false;
+    if (segment.length > limits.maxSegmentLength) return false;
+    const vowelCount = [...segment].filter((ch) => VOWELS.has(ch)).length;
+    const vowelRatio = vowelCount / segment.length;
+    if (vowelRatio < limits.minVowelRatio) return false;
+    if (vowelRatio > limits.maxVowelRatio) return false;
+    if (maxRun(segment, (ch) => !VOWELS.has(ch)) > limits.maxConsonantRun) return false;
+  }
+
+  if (value.length >= limits.entropyMinLength) {
+    const normalized = shannonEntropyBitsPerChar(value) / Math.log2(value.length);
+    if (normalized > limits.maxNormalizedEntropy) return false;
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Explicit suppression marker (issue #971)
+// ---------------------------------------------------------------------------
+
+/**
+ * Grammar, written on the line IMMEDIATELY ABOVE the reported line, inside
+ * whatever comment syntax the file already uses:
+ *
+ *     copybara-allow-next-line: <rule-id> <finding-key> -- <reason>
+ *
+ * `<rule-id>` must be the exact id of a rule declared `suppressible`;
+ * `<finding-key>` must be the exact key that rule derives from the match (for
+ * `credential-generic-assignment`, the assigned identifier); `<reason>` is
+ * free text after a `--` or `—` separator and must be non-empty.
+ *
+ * The design constraints this satisfies:
+ *
+ * - **Generic across files.** One line-based grammar, no file allowlist, no
+ *   per-file or per-constant special case. It is parsed out of the raw
+ *   previous line, so it works in `//`, `#`, `<!-- -->`, or fenced-code
+ *   contexts without any language awareness.
+ * - **Visible in code review.** It is a literal comment on the line above the
+ *   thing it exempts, carrying a written justification.
+ * - **Does not expose the value.** The key is the identifier being assigned,
+ *   never the assigned value.
+ * - **Finding-scoped.** Both the rule id and the finding key must match, so a
+ *   marker does not cover the whole file, does not cover the whole line when
+ *   that line carries a second assignment under a different identifier, and
+ *   does not cover a different rule that happens to fire on the same line.
+ *   It also applies to the next line only — not two lines down.
+ */
+export const SUPPRESSION_MARKER_PATTERN =
+  /copybara-allow-next-line:[ \t]*([a-z][a-z0-9-]*)[ \t]+([A-Za-z0-9_.$-]+)[ \t]*(?:--|—)[ \t]*\S/g;
+
+const NO_SUPPRESSIONS = new Map();
+
+/**
+ * Parse every suppression marker on one line into `ruleId -> Set(findingKey)`.
+ * A malformed marker (unknown shape, missing key, missing reason) simply does
+ * not parse and therefore suppresses nothing — fail closed.
+ */
+export function parseSuppressionMarkers(line) {
+  if (typeof line !== 'string' || line.length === 0) return NO_SUPPRESSIONS;
+  const byRule = new Map();
+  SUPPRESSION_MARKER_PATTERN.lastIndex = 0;
+  let m;
+  while ((m = SUPPRESSION_MARKER_PATTERN.exec(line)) !== null) {
+    const [, ruleId, findingKey] = m;
+    if (!byRule.has(ruleId)) byRule.set(ruleId, new Set());
+    byRule.get(ruleId).add(findingKey);
+  }
+  return byRule;
+}
+
+/**
+ * Decide whether one regex match is exempt: either the classifier says its
+ * captured value is a confidently readable semantic literal, or the previous
+ * line carries a marker naming both this rule and this finding's key.
+ */
+function isExemptMatch(rule, match, suppressions) {
+  if (rule.classifyValue && rule.valueGroup !== undefined) {
+    if (rule.classifyValue(match[rule.valueGroup])) return true;
+  }
+  if (!rule.suppressible) return false;
+  const keys = suppressions.get(rule.id);
+  if (!keys || keys.size === 0) return false;
+  const findingKey = rule.suppressionKeyGroup === undefined ? undefined : match[rule.suppressionKeyGroup];
+  return typeof findingKey === 'string' && keys.has(findingKey);
+}
+
+// ---------------------------------------------------------------------------
 // Rules
 // ---------------------------------------------------------------------------
 
@@ -51,6 +257,15 @@ export function walkFiles(dir) {
  * Content rules: each tests one line of a text file and returns the matched
  * substring(s), or an empty array when clean. Kept as plain RegExp so new
  * rules are easy to review and extend.
+ *
+ * Optional per-rule fields (issue #971), used only by the one generic
+ * heuristic rule — every known-format rule below stays an unconditional,
+ * fail-closed regex match:
+ *   - `valueGroup` / `classifyValue`: capture group holding the candidate
+ *     secret, and the classifier that may exempt it.
+ *   - `suppressible` / `suppressionKeyGroup`: whether an explicit
+ *     `copybara-allow-next-line` marker can exempt a match, and the capture
+ *     group whose text the marker must name.
  */
 export const CONTENT_RULES = [
   {
@@ -89,9 +304,30 @@ export const CONTENT_RULES = [
     pattern: /npm_[A-Za-z0-9]{36}/g,
   },
   {
+    id: 'credential-jwt',
+    description: 'JWT-shaped value (base64url header.payload.signature)',
+    // `eyJ` is base64url for `{"`, i.e. the start of every JSON JWT header.
+    // Kept as its own known-format rule rather than left to the generic
+    // assignment rule below, because a JWT most often leaks somewhere that is
+    // not an assignment at all (a log line, a curl example, a fixture).
+    // Mirrors the redaction regex in src/core/text-sanitize.ts, with a looser
+    // bound on the signature segment — a scanner should not be the laxer of
+    // the two.
+    pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/g,
+  },
+  {
     id: 'credential-generic-assignment',
     description: 'Quoted secret/API-key-shaped assignment',
-    pattern: /(?:api[_-]?key|secret|token)\s*[:=]\s*['"][A-Za-z0-9_\-]{16,}['"]/gi,
+    // Group 1 is the full assigned identifier (the suppression key); group 2
+    // is the quoted value handed to the classifier. The value alphabet
+    // covers base64 (`+/=`) and dotted forms as well as the plain
+    // word/hyphen shape, since those are credential-shaped too — the
+    // classifier rejects all of them, so widening it only ever detects more.
+    pattern: /([A-Za-z0-9_.$-]*(?:api[_-]?key|secret|token))\s*[:=]\s*['"]([A-Za-z0-9_\-+\/=.]{16,})['"]/gi,
+    valueGroup: 2,
+    classifyValue: isReadableSemanticValue,
+    suppressible: true,
+    suppressionKeyGroup: 1,
   },
   {
     id: 'internal-repo-identifier',
@@ -183,6 +419,165 @@ export function checkDependencyManifest(presentPaths, manifest = DEPENDENCY_MANI
   return findings;
 }
 
+/**
+ * Concrete-file entries of copy.bara.sky's PRIVATE_ONLY_PATHS — paths a
+ * test could plausibly `readFileSync`/`read` by their exact name.
+ */
+export const PRIVATE_ONLY_DOC_PATHS = ['docs/DOMAIN.md'];
+
+/**
+ * Directory-glob entries of copy.bara.sky's PRIVATE_ONLY_PATHS (currently
+ * only `docs/design/**`), expressed as literal path prefixes instead of
+ * enumerated filenames: a read of ANY path under one of these directories
+ * dangles in an export tree exactly like a read of docs/DOMAIN.md, but the
+ * concrete files under docs/design/ change over time. Matching by prefix
+ * means checkUnconditionalPrivateReads covers a newly added private design
+ * doc automatically, without a matching edit here — the review follow-up
+ * for issue #973 found that the original fix only listed docs/DOMAIN.md
+ * and missed docs/design/**, leaving the same export-CI failure class
+ * (ENOENT in the public tree) open for design docs.
+ */
+export const PRIVATE_ONLY_DOC_PREFIXES = ['docs/design/'];
+
+/**
+ * Files whose own source is expected to contain `read(...)`/`readFileSync(...)`
+ * text mentioning a private-only path as a quoted fixture string (test data
+ * for checkUnconditionalPrivateReads itself), not as an executable call this
+ * file would run. Scanning those fixture strings as if they were live code
+ * produces a false positive the moment this validator's own test file is
+ * part of the tree being scanned — see issue #973 review follow-up. Kept
+ * separate from PERSONAL_PATH_EXEMPT_FILES because it exempts a different
+ * check (unconditional-private-read, not the personal-path content rules)
+ * and a different file (the test, not the validator source).
+ */
+const UNCONDITIONAL_READ_CHECK_EXEMPT_FILES = new Set(['test/copybara-validate.test.js']);
+
+const GUARD_LOOKBACK_CHARS = 200;
+
+/**
+ * Returns the index of the `)` that closes the `(` at `openParenIndex`, by
+ * depth counting, or -1 if unbalanced. Used to find the true end of an
+ * `existsSync(...)` call even when its argument is itself a call
+ * (`existsSync(resolve(ROOT, 'docs/DOMAIN.md'))`) — a naive `[^;]*?\)`
+ * regex stops at the FIRST `)` it meets, which is `resolve(...)`'s, not
+ * `existsSync(...)`'s, and that misidentified boundary is what let a
+ * `||`-joined read slip past the pre-#973-review-follow-up version of this
+ * check (see checkUnconditionalPrivateReads below).
+ */
+function matchingParenEnd(content, openParenIndex) {
+  let depth = 0;
+  for (let i = openParenIndex; i < content.length; i++) {
+    if (content[i] === '(') depth++;
+    else if (content[i] === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * True when `index` falls inside a `//` line comment or a block comment
+ * (`/star ... star/`), by a simple backward scan (this file deliberately has no lexer —
+ * see the module banner). Used only to refuse crediting an `existsSync(...)`
+ * guard that appears in commented-out/example text as though it gated a
+ * real read; it never suppresses detection of the read call itself, so it
+ * can only make this check MORE conservative, never less.
+ */
+function isInsideComment(content, index) {
+  const lineStart = content.lastIndexOf('\n', index - 1) + 1;
+  if (content.slice(lineStart, index).includes('//')) return true;
+  return content.lastIndexOf('/*', index) > content.lastIndexOf('*/', index);
+}
+
+/**
+ * True only for the exact guarded conditional-read shape used throughout
+ * test/docs-*-contract.test.js: `existsSync(<call containing the path>) ?
+ * read(...)`, with the read sitting directly on the ternary's affirmative
+ * (present-path) branch — nothing else between the guard's closing paren
+ * and the read but the `?` and whitespace.
+ *
+ * This is deliberately a positive match on that one safe shape rather than
+ * a negative "no `;` or `:` in between" test. The negative test was
+ * defeated two ways (issue #973 review follow-up): `existsSync(path) ||
+ * read(path)` contains neither `;` nor `:` yet runs the read exactly when
+ * the path is ABSENT, and a comment mentioning `existsSync(path)` ahead of
+ * a real unconditional read also contains neither. Requiring the exact `?`
+ * ternary shape — via matchingParenEnd for the guard's true boundary, and
+ * isInsideComment to refuse comment text as a guard — rejects both:
+ * `||` leaves `between` as `" || "`, not `?`-only, and a commented-out
+ * `existsSync(...)` is skipped as a guard candidate entirely.
+ */
+function isGuardedByExistsSyncTernary(content, readCallIndex, pathLiteralPattern) {
+  const windowStart = Math.max(0, readCallIndex - GUARD_LOOKBACK_CHARS);
+  const existsSyncCallPattern = /\bexistsSync\(/g;
+  existsSyncCallPattern.lastIndex = windowStart;
+  let gm;
+  while ((gm = existsSyncCallPattern.exec(content)) !== null && gm.index < readCallIndex) {
+    const openParenIndex = gm.index + gm[0].length - 1;
+    const closeParenIndex = matchingParenEnd(content, openParenIndex);
+    if (closeParenIndex === -1 || closeParenIndex >= readCallIndex) continue;
+    if (isInsideComment(content, gm.index)) continue;
+    const guardSpan = content.slice(openParenIndex, closeParenIndex + 1);
+    if (!pathLiteralPattern.test(guardSpan)) continue;
+    const between = content.slice(closeParenIndex + 1, readCallIndex);
+    if (/^\s*\?\s*$/.test(between)) return true;
+  }
+  return false;
+}
+
+/**
+ * Regression guard for issue #973: catches the general shape of the #811
+ * failure mode (an exported file that unconditionally reads a private-only
+ * path dangles with ENOENT the moment that path is correctly excluded from
+ * an export) without requiring a new hand-curated DEPENDENCY_MANIFEST entry
+ * for every future contract test. It reads one present file's own source for
+ * a `read(...)`/`readFileSync(...)` call, extracts the first string-literal
+ * argument, and — when that literal is declared private (an exact match in
+ * `privatePaths` or prefixed by an entry in `privatePrefixes`) and itself
+ * absent from the same tree — flags it. That means it fires against a
+ * transformed export tree (where the read would actually throw) but stays
+ * silent against the private source tree (where the read succeeds).
+ *
+ * A call is exempt only when isGuardedByExistsSyncTernary recognizes it as
+ * sitting on the affirmative branch of an `existsSync(<same path>) ? ...`
+ * guard immediately to its left — see that function for why this is a
+ * positive shape match rather than a looser "no `;`/`:` in between" test.
+ * An `existsSync` call that checks an unrelated path, or one whose result
+ * is discarded in an earlier statement, does not exempt the read either —
+ * the tree would still dangle with ENOENT in that case.
+ */
+export function checkUnconditionalPrivateReads(
+  relPath,
+  content,
+  presentPaths,
+  privatePaths = PRIVATE_ONLY_DOC_PATHS,
+  privatePrefixes = PRIVATE_ONLY_DOC_PREFIXES,
+) {
+  if (UNCONDITIONAL_READ_CHECK_EXEMPT_FILES.has(relPath)) return [];
+  const findings = [];
+  const readCallPattern = /\b(?:readFileSync|read)\([^)]*?['"`]([^'"`]+)['"`]/g;
+  let m;
+  while ((m = readCallPattern.exec(content)) !== null) {
+    const literalPath = m[1];
+    const isDeclaredPrivate =
+      privatePaths.includes(literalPath) || privatePrefixes.some((prefix) => literalPath.startsWith(prefix));
+    if (!isDeclaredPrivate) continue;
+    if (presentPaths.has(literalPath)) continue;
+    const escaped = literalPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pathLiteralPattern = new RegExp(`['"\`]${escaped}['"\`]`);
+    if (isGuardedByExistsSyncTernary(content, m.index, pathLiteralPattern)) continue;
+    findings.push({
+      rule: 'unconditional-private-read',
+      description: `Unconditionally reads private-only path ${literalPath}, which this tree does not contain — guard with existsSync(<same path>) ? read(...) : ...`,
+      file: relPath,
+      line: content.slice(0, m.index).split('\n').length,
+      match: literalPath,
+    });
+  }
+  return findings;
+}
+
 // ---------------------------------------------------------------------------
 // Fixture/example exemptions
 // ---------------------------------------------------------------------------
@@ -252,24 +647,36 @@ function isLikelyBinary(path) {
 /**
  * Scan one file's content against CONTENT_RULES, line by line.
  * Returns an array of findings: { rule, description, line, match }.
+ *
+ * Two per-match exemptions can drop a candidate finding (issue #971), both
+ * confined to rules that opt into them: the value classifier, and an explicit
+ * `copybara-allow-next-line` marker on the preceding raw line. Lookback is
+ * exactly one line and is not carried forward, so a marker never widens to
+ * cover a file, a block, or a later assignment.
  */
 export function scanFileContent(relPath, content, rules = CONTENT_RULES) {
   const findings = [];
   const lines = content.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const suppressions = i > 0 ? parseSuppressionMarkers(lines[i - 1]) : NO_SUPPRESSIONS;
     for (const rule of rules) {
       rule.pattern.lastIndex = 0;
       let m;
       while ((m = rule.pattern.exec(line)) !== null) {
-        findings.push({
-          rule: rule.id,
-          description: rule.description,
-          file: relPath,
-          line: i + 1,
-          match: m[0],
-        });
+        if (!isExemptMatch(rule, m, suppressions)) {
+          findings.push({
+            rule: rule.id,
+            description: rule.description,
+            file: relPath,
+            line: i + 1,
+            match: m[0],
+          });
+        }
         if (!rule.pattern.global) break;
+        // A zero-length match leaves lastIndex where it was; without this the
+        // exec loop would never terminate for such a rule.
+        if (m[0].length === 0) rule.pattern.lastIndex += 1;
       }
     }
   }
@@ -296,6 +703,8 @@ export function scanTree(rootDir, opts = {}) {
   const contentRules = opts.contentRules ?? CONTENT_RULES;
   const pathRules = opts.pathRules ?? FORBIDDEN_PATH_RULES;
   const dependencyManifest = opts.dependencyManifest ?? DEPENDENCY_MANIFEST;
+  const privateOnlyDocPaths = opts.privateOnlyDocPaths ?? PRIVATE_ONLY_DOC_PATHS;
+  const privateOnlyDocPrefixes = opts.privateOnlyDocPrefixes ?? PRIVATE_ONLY_DOC_PREFIXES;
   const files = walkFiles(rootDir);
   const findings = [];
   const presentPaths = new Set(files.map((file) => toPosixRelative(rootDir, file)));
@@ -343,6 +752,9 @@ export function scanTree(rootDir, opts = {}) {
     // Skip files that don't decode cleanly as text (heuristic: NUL byte).
     if (content.includes('\u0000')) continue;
     findings.push(...scanFileContent(relPath, content, rulesForFile));
+    findings.push(
+      ...checkUnconditionalPrivateReads(relPath, content, presentPaths, privateOnlyDocPaths, privateOnlyDocPrefixes),
+    );
   }
 
   return { ok: findings.length === 0, findings };

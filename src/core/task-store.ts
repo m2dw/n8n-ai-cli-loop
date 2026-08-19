@@ -79,6 +79,31 @@ export interface TaskStore {
   ): Promise<StoreResult<AiTask>>;
   releaseClaim(key: TaskKey, ownerRunId: string, now?: string): Promise<StoreResult<AiTask>>;
   appendEvent(event: TaskEvent): Promise<void>;
+
+  /**
+   * Append `event` unless this task already carries an event of the same
+   * `type` whose `data[dedupe.field]` equals `dedupe.value`. Returns whether
+   * this call is the one that wrote it.
+   *
+   * The existence check and the insert must be ONE atomic operation against the
+   * durable backend — not a `listEvents` followed by an `appendEvent` (issue
+   * #936 review, P2). The callers are the outbox lanes: two `dispatch-outbox`
+   * runs, or a drain racing an `admin outbox cancel`, can reach the same
+   * terminal row at the same moment from different processes, and a
+   * check-then-append would let both observe "no event yet" and both write one.
+   * An implementation whose backend has no shared transaction domain (a
+   * single-process in-memory store) satisfies this by keeping the check and the
+   * insert in one synchronous body, with no `await` between them.
+   *
+   * Deduping on a `data` field rather than on the event type keeps the
+   * guarantee per-effect: a task may legitimately carry several events of one
+   * type, one for each effect that produced it.
+   */
+  appendEventOnce(
+    event: TaskEvent,
+    dedupe: { field: string; value: string },
+  ): Promise<boolean>;
+
   listEvents(key: TaskKey): Promise<TaskEvent[]>;
   /**
    * Atomically commit a phase completion: the task transition, its

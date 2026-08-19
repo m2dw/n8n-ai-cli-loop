@@ -1,5 +1,6 @@
 import type { AgentId, AiTask } from "./task.js";
 import type { AssignmentProfile, FlowRule, ResolvedSession } from "./session.js";
+import { refinementRoleFallbacks } from "./issue-refinement.js";
 
 /** Task-context key under which the resolved assignment is persisted. */
 export const ASSIGNMENT_CONTEXT_KEY = "assignment";
@@ -35,12 +36,25 @@ export interface ResolvedAssignment {
   reviewAgent: AgentId;
   conflictResolutionAgent: AgentId;
   researchAgent?: AgentId;
+  /**
+   * Chain-aware refinement roles (docs/issue-refinement-contract.md §14).
+   * Absent when neither the flow profile nor `issueRefinement.agents` names one;
+   * the refinement lane refuses to start rather than substituting a default.
+   */
+  refinementAgent?: AgentId;
+  refinementCriticAgent?: AgentId;
   resolvedAt: string;
   source: "session-config" | "default";
 }
 
 /** Phase slots a handler can request an agent for. */
-export type PhaseAgentKind = "implementation" | "review" | "conflictResolution" | "research";
+export type PhaseAgentKind =
+  | "implementation"
+  | "review"
+  | "conflictResolution"
+  | "research"
+  | "refinement"
+  | "refinementCritic";
 
 /**
  * Explicit per-phase agent overrides derived from issue labels (e.g. `agent:codex`).
@@ -110,12 +124,23 @@ export function resolveAssignment(
   const conflictResolutionAgent: AgentId = CONFLICT_RESOLUTION_SUPPORTED_AGENTS.has(rawConflictCandidate)
     ? rawConflictCandidate
     : "claude";
+  // Refinement roles (issue-refinement-contract §14). The flow profile is the
+  // source of truth; `issueRefinement.agents.*` is only the session-level
+  // fallback. Neither has a built-in default: an unconfigured role stays absent
+  // so the refinement lane records `null` and refuses to start, rather than
+  // silently handing the Issue's contract to whichever agent the session
+  // happens to implement with.
+  const refinementFallbacks = refinementRoleFallbacks(session.issueRefinement);
+  const refinementAgent = profile.refinement ?? refinementFallbacks.refiner;
+  const refinementCriticAgent = profile.refinement_critic ?? refinementFallbacks.critic;
   return {
     flow,
     implementationAgent: labelOverrides?.implementationAgent ?? profile.implementation,
     reviewAgent: labelOverrides?.reviewAgent ?? profile.review,
     conflictResolutionAgent,
     ...(researchAgent ? { researchAgent } : {}),
+    ...(refinementAgent ? { refinementAgent } : {}),
+    ...(refinementCriticAgent ? { refinementCriticAgent } : {}),
     resolvedAt: now,
     source: configured ? "session-config" : "default",
   };
@@ -190,5 +215,13 @@ export function agentForPhase(
       );
     case "research":
       return resolved?.researchAgent ?? task.researchAgent ?? session.defaults.researchAgent;
+    // Refinement roles have NO fallback chain, deliberately: neither the task's
+    // per-phase agent columns nor the session defaults name a refiner or a
+    // critic, and substituting the implementation agent for either would quietly
+    // defeat the critic independence §7.3 requires.
+    case "refinement":
+      return resolved?.refinementAgent;
+    case "refinementCritic":
+      return resolved?.refinementCriticAgent;
   }
 }

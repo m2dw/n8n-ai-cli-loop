@@ -1,4 +1,12 @@
-import { classifyReviewOutput } from '../dist/core/review-classifier.js';
+import {
+  MAX_TRANSIENT_VERIFICATION_RETRIES,
+  classifyReviewOutput,
+  classifyVerificationFailure,
+  clearTransientVerificationRetries,
+  recordTransientVerificationRetry,
+  transientVerificationRetriesFor,
+} from '../dist/core/review-classifier.js';
+import { CLI_PROBE_INDETERMINATE_MARKER } from '../dist/core/cli-probe.js';
 
 describe('classifyReviewOutput — conflict (strong, structural evidence only)', () => {
   test('Git conflict markers (<<<<<<<) -> conflict', () => {
@@ -188,5 +196,137 @@ describe('classifyReviewOutput — conflict takes priority over needs_fix', () =
   test('real conflict marker overrides P1 finding', () => {
     const r = classifyReviewOutput('<<<<<<< HEAD\nx\n>>>>>>> theirs\n[P1] also a blocking issue');
     expect(r.classification).toBe('conflict');
+  });
+});
+
+describe('classifyVerificationFailure — transient probe failures (#897)', () => {
+  test('an indeterminate CLI probe in the output is transient, and names its signal', () => {
+    const output = `FAIL test/admin-cli.test.js\n  Received: "${CLI_PROBE_INDETERMINATE_MARKER} claude timed out"`;
+    expect(classifyVerificationFailure(output)).toEqual({
+      transient: true, signal: CLI_PROBE_INDETERMINATE_MARKER,
+    });
+  });
+
+  test('an ordinary test failure is not transient', () => {
+    for (const output of [
+      '',
+      'FAIL test/foo.test.js\n  ● expected 1 received 2',
+      'Error: Cannot find module "left-pad"',
+    ]) {
+      expect(classifyVerificationFailure(output)).toEqual({ transient: false });
+    }
+  });
+
+  test('prose about probes, timeouts and unavailable CLIs is not evidence', () => {
+    // Verification output quotes these words constantly. Only the structural
+    // marker counts, or the rule would start delaying real test failures.
+    for (const output of [
+      'the cli probe was indeterminate',
+      'Timeout - Async callback was not invoked within the 5000 ms timeout',
+      'claude: cli-unavailable',
+      'spawn claude EAGAIN',
+    ]) {
+      expect(classifyVerificationFailure(output).transient).toBe(false);
+    }
+  });
+
+  test('the retry bound is small and positive', () => {
+    // Unbounded delays would strand the task where no human is looking.
+    expect(MAX_TRANSIENT_VERIFICATION_RETRIES).toBeGreaterThan(0);
+    expect(MAX_TRANSIENT_VERIFICATION_RETRIES).toBeLessThanOrEqual(3);
+  });
+});
+
+describe('transient verification retry ledger — per command (#897)', () => {
+  const LEDGER = 'verificationTransientRetriesByStep';
+
+  test('a fresh context has spent nothing', () => {
+    for (const ctx of [undefined, {}, { [LEDGER]: 'nope' }, { [LEDGER]: ['test'] }]) {
+      expect(transientVerificationRetriesFor(ctx, 'test')).toBe(0);
+    }
+  });
+
+  test('one command spending its budget leaves every other command a full one', () => {
+    const ctx = { [LEDGER]: { test: MAX_TRANSIENT_VERIFICATION_RETRIES } };
+    expect(transientVerificationRetriesFor(ctx, 'test')).toBe(MAX_TRANSIENT_VERIFICATION_RETRIES);
+    expect(transientVerificationRetriesFor(ctx, 'package')).toBe(0);
+  });
+
+  test('junk counters are ignored rather than trusted', () => {
+    const ctx = { [LEDGER]: { a: 0, b: -1, c: 1.5, d: '2', e: null, f: 2 } };
+    for (const step of ['a', 'b', 'c', 'd', 'e']) {
+      expect(transientVerificationRetriesFor(ctx, step)).toBe(0);
+    }
+    expect(transientVerificationRetriesFor(ctx, 'f')).toBe(2);
+  });
+
+  test('a pre-ledger scalar counts only against the step it was recorded for', () => {
+    const ctx = { verificationTransientRetries: 2, transientVerificationStep: 'test' };
+    expect(transientVerificationRetriesFor(ctx, 'test')).toBe(2);
+    expect(transientVerificationRetriesFor(ctx, 'package')).toBe(0);
+  });
+
+  test('a scalar with no recorded step still bounds whichever command is failing', () => {
+    // Never widen a budget that is already in flight: with no step recorded the
+    // scalar is all that is known about the task's spend.
+    const ctx = { verificationTransientRetries: 2 };
+    expect(transientVerificationRetriesFor(ctx, 'anything')).toBe(2);
+  });
+
+  test('recording a retry keeps other pending spend and drops the commands that passed', () => {
+    const ctx = { [LEDGER]: { test: 2, typecheck: 1 } };
+    expect(recordTransientVerificationRetry({
+      ctx, step: 'package', attempt: 1, passedSteps: ['test'],
+    })).toEqual({ typecheck: 1, package: 1 });
+  });
+
+  test('recording migrates a pre-ledger scalar onto its own step', () => {
+    const ctx = { verificationTransientRetries: 2, transientVerificationStep: 'test' };
+    expect(recordTransientVerificationRetry({
+      ctx, step: 'package', attempt: 1, passedSteps: [],
+    })).toEqual({ test: 2, package: 1 });
+  });
+
+  test('clearing after a full pass releases the ledger and the legacy scalar (#934)', () => {
+    const ctx = {
+      [LEDGER]: { test: MAX_TRANSIENT_VERIFICATION_RETRIES },
+      verificationTransientRetries: MAX_TRANSIENT_VERIFICATION_RETRIES,
+      transientVerificationStep: 'test',
+      transientVerificationSignal: '[cli-probe-indeterminate]',
+    };
+    const patch = clearTransientVerificationRetries(ctx, ['test', 'package', 'typecheck']);
+    expect(patch[LEDGER]).toBeUndefined();
+    expect(patch.verificationTransientRetries).toBeUndefined();
+    expect(patch.transientVerificationStep).toBeUndefined();
+    expect(patch.transientVerificationSignal).toBeUndefined();
+    // The next phase's first transient failure of the same command gets a full budget.
+    expect(transientVerificationRetriesFor({ ...ctx, ...patch }, 'test')).toBe(0);
+  });
+
+  test('clearing keeps spend for a command that did not pass', () => {
+    const ctx = { [LEDGER]: { test: 1, package: 2 } };
+    const patch = clearTransientVerificationRetries(ctx, ['test']);
+    expect(patch[LEDGER]).toEqual({ package: 2 });
+    expect(transientVerificationRetriesFor({ ...ctx, ...patch }, 'package')).toBe(2);
+  });
+
+  test('clearing keeps a pre-ledger scalar naming a command that did not pass', () => {
+    const ctx = { verificationTransientRetries: 2, transientVerificationStep: 'package' };
+    const patch = clearTransientVerificationRetries(ctx, ['test']);
+    expect(patch).not.toHaveProperty('verificationTransientRetries');
+    expect(transientVerificationRetriesFor({ ...ctx, ...patch }, 'package')).toBe(2);
+  });
+
+  test('clearing drops a step-less scalar once any command has answered', () => {
+    // With no step recorded the scalar is the whole task's count, so a command
+    // that passed is enough to make it stale for every command.
+    const ctx = { verificationTransientRetries: 2 };
+    const patch = clearTransientVerificationRetries(ctx, ['test']);
+    expect(transientVerificationRetriesFor({ ...ctx, ...patch }, 'anything')).toBe(0);
+  });
+
+  test('clearing a fresh context is a no-op patch', () => {
+    expect(clearTransientVerificationRetries(undefined, ['test'])[LEDGER]).toBeUndefined();
+    expect(clearTransientVerificationRetries({}, [])[LEDGER]).toBeUndefined();
   });
 });

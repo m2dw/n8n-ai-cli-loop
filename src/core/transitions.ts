@@ -111,6 +111,23 @@ export function nextPhaseAfter(
   if (phase === "implementation" && result === "success") {
     return { status: "queued", phase: "review" };
   }
+  // An implementation run whose configured verification still failed after the
+  // bounded inline repair attempt (issue #934). This is an ordinary quality-gate
+  // failure the implementation agent can keep working on — nothing was committed
+  // or pushed, and the per-Issue worktree still holds the edits — so the SAME
+  // task is requeued at the SAME phase instead of stopping the chain at terminal
+  // `failed` and waiting for `admin recover`.
+  //
+  // The cycle counting and the cap live in the implementation handler
+  // (src/core/implementation-verification.ts), not here: only the handler can
+  // tell an ordinary red suite apart from a missing executable or an
+  // indeterminate CLI probe, and only it can write the artifacts and the
+  // operator-facing error the cap handoff needs. By the time a `needs_fix`
+  // reaches this table the handler has already decided the task may go round
+  // again, so this stays a pure destination.
+  if (phase === "implementation" && result === "needs_fix") {
+    return { status: "queued", phase };
+  }
   if (phase === "review" && result === "needs_fix") {
     return { status: "queued", phase: "implementation" };
   }
@@ -161,6 +178,19 @@ export function nextPhaseAfter(
         ...(researchArtifactDir !== undefined ? { artifactDir: researchArtifactDir } : {}),
       },
     };
+  }
+  // A refinement `success` is a mid-lane step, never a handoff (issue #870,
+  // docs/issue-refinement-contract.md §11/§12): the loop's acceptance (rows
+  // 14/15) and the application's row-22 commit point each complete with more
+  // lane work to run, so the row stays queued at this phase for the next tick
+  // to continue — acceptance into the commit point, the commit point into the
+  // body/comment/label stages. The lane's terminal outcomes never reach this
+  // arm: an escalation returns `blocked` (→ `ready_for_human` above), and the
+  // row-45 activation park (`blocked`/phase `implementation`) is routed by the
+  // handler's `PhaseHandlerResult.refinementActivation` override in the phase
+  // runner, which takes precedence over this destination.
+  if (phase === "refinement" && result === "success") {
+    return { status: "queued", phase };
   }
   // Review passed. A dependency-started PR (one whose branch was created from a
   // blocker PR head) is delivered to the session base branch (`main`) just like
