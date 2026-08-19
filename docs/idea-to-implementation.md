@@ -190,6 +190,12 @@ To create a dependent stack safely, follow the **dormant-first** contract:
    intake scan picks up under the unchanged dependency gates. See
    [issue-refinement-contract.md](issue-refinement-contract.md) (issue #866).
 
+   Labelling a whole chain this way up front is supported and costs nothing
+   while it waits: a dependent whose blocker is not yet usable is held by intake
+   as a non-runnable task, so it never takes a worker turn from runnable work
+   elsewhere, and it becomes runnable on its own once the blocker reaches the
+   stack-ready state (issue #967; see §4 of the contract).
+
 Distinguish three cases:
 
 - **Single independent issue** — no `blocked by` relationship is expected.

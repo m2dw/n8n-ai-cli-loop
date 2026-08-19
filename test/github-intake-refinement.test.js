@@ -10,7 +10,7 @@ import { execFileSync } from 'child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { SqliteOutboxStore, SqliteTaskStore } from '../dist/index.js';
+import { SqliteChainRegistryStore, SqliteOutboxStore, SqliteTaskStore } from '../dist/index.js';
 import { runIntake } from '../dist/cli/github-intake.js';
 import { runNextPhase } from '../dist/core/phase-runner.js';
 
@@ -53,7 +53,10 @@ function issue(number, labels, extra = {}) {
   };
 }
 
-async function intake(issues, { depChecker = noBlockerChecker, supportedPhases, dryRun = false, stackReadyResolver } = {}) {
+async function intake(
+  issues,
+  { depChecker = noBlockerChecker, supportedPhases, dryRun = false, stackReadyResolver, eligibilitySource } = {},
+) {
   const args = {
     sessionId: 'addon-dev',
     sessionsPath,
@@ -66,7 +69,15 @@ async function intake(issues, { depChecker = noBlockerChecker, supportedPhases, 
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = (chunk) => { chunks.push(chunk); return true; };
   try {
-    await runIntake(args, { listIssues: () => issues }, depChecker, stackReadyResolver);
+    await runIntake(
+      args,
+      { listIssues: () => issues },
+      depChecker,
+      stackReadyResolver,
+      // The #967 predecessor gate reads through this port; with none injected
+      // intake behaves exactly as it did before the gate existed.
+      eligibilitySource ? { refinementEligibilitySource: eligibilitySource } : undefined,
+    );
   } finally {
     process.stdout.write = origWrite;
   }
@@ -891,5 +902,358 @@ describe('intake refinement — activation hands the parked row to ordinary inta
     );
     expect(out.results).toEqual([{ issueNumber: 101, action: 'reactivated', phase: 'implementation' }]);
     expect(await readTask(101)).toMatchObject({ status: 'queued', phase: 'implementation' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §4 / §12 row 4 — a predecessor-ineligible Issue is held BEFORE it is
+// claimable (issue #967)
+//
+// The hold used to be decided only inside the phase handler: intake admitted a
+// `queued` refinement task, the runner claimed it, and the handler refused with
+// `predecessor_not_ready` and delayed the row fifteen minutes. With a
+// five-minute poll cadence and several Issues marked ahead of time, at least
+// one held row is claimable on nearly every tick — and since those rows are
+// created before the chain root's own implementation task, claim order
+// (priority, then creation time) hands them the worker first and the runnable
+// work behind them never starts.
+// ---------------------------------------------------------------------------
+
+describe('intake refinement — the predecessor gate runs before the claim (issue #967)', () => {
+  const HANDLER_DELAY_MS = 15 * 60 * 1000;
+  const TICK_MS = 5 * 60 * 1000;
+  const RUNNER_PHASES = ['implementation', 'review', 'research', 'refinement'];
+
+  /**
+   * A mutable predecessor world: which Issues have a PR, which carry the
+   * stack-ready marker, and which edges exist. Tests flip a predecessor to
+   * ready between polls, exactly as a real chain does.
+   */
+  function world({ edges = {}, ready = [], withPr = [] } = {}) {
+    const state = { edges, ready: new Set(ready), withPr: new Set(withPr) };
+    state.source = {
+      getBlockedBy: async (n) =>
+        (state.edges[n] ?? []).map((p) => ({ issueNumber: p, state: 'open' })),
+      readIssue: async (n) => ({
+        number: n,
+        state: 'open',
+        title: `Issue ${n}`,
+        body: '',
+        labels: state.ready.has(n) ? ['status:stack-ready'] : [],
+      }),
+      readPullRequest: async (n) =>
+        state.withPr.has(n)
+          ? {
+              kind: 'found',
+              pullRequest: {
+                number: n * 10,
+                state: 'open',
+                headRefName: `ai/issue-${n}`,
+                headSha: `sha-${n}`,
+                title: `PR for ${n}`,
+                body: '',
+              },
+            }
+          : { kind: 'none' },
+    };
+    return state;
+  }
+
+  async function withStore(fn) {
+    const store = new SqliteTaskStore(dbPath);
+    try {
+      return await fn(store);
+    } finally {
+      store.close();
+    }
+  }
+
+  let runSeq = 0;
+  function claim(now) {
+    runSeq += 1;
+    return withStore((store) =>
+      store.claimNextTask({
+        sessionId: 'addon-dev',
+        workerId: 'worker-1',
+        runId: `run-${runSeq}`,
+        supportedPhases: RUNNER_PHASES,
+        ...(now ? { now } : {}),
+      }),
+    );
+  }
+
+  /** What the handler's row-4 hold does to a claimed row: requeue, delayed. */
+  function applyHandlerHold(task, now) {
+    return withStore((store) =>
+      store.transitionTask(
+        { sessionId: 'addon-dev', issueNumber: task.issueNumber },
+        { status: task.status, revision: task.revision },
+        {
+          status: 'queued',
+          ownerRunId: undefined,
+          leaseExpiresAt: undefined,
+          notBefore: new Date(Date.parse(now) + HANDLER_DELAY_MS).toISOString(),
+          now,
+        },
+      ),
+    );
+  }
+
+  function events(issueNumber) {
+    return withStore((store) => store.listEvents({ sessionId: 'addon-dev', issueNumber }));
+  }
+
+  const pir = (n) => issue(n, ['status:needs-refinement', 'agent:claude']);
+
+  test('six predecessor-ineligible PIR Issues cannot starve a runnable implementation task', async () => {
+    // The observed chain: #951/#956/#962/#964/#965/#968 each wait on a
+    // predecessor with no usable result, while the chain root #950 and the
+    // unrelated bug #966 are ordinary runnable implementation work.
+    const pirs = [951, 956, 962, 964, 965, 968];
+    const edges = Object.fromEntries(pirs.map((n) => [n, [n - 1]]));
+    const w = world({ edges });
+    // Scan order puts every PIR Issue ahead of the runnable ones, so the rows
+    // they create are the OLDEST — the claim order that produced the bug.
+    const issues = [
+      ...pirs.map(pir),
+      issue(950, ['agent:claude', 'status:needs-implementation']),
+      issue(966, ['agent:claude', 'status:needs-implementation']),
+    ];
+
+    // ---- Without the gate: reproduce the starvation ------------------------
+    await intake(issues);
+    expect((await readTask(956)).status).toBe('queued');
+
+    let clock = Date.parse('2026-08-18T09:00:00.000Z');
+    const claimedPhases = [];
+    for (let tick = 0; tick < 6; tick++) {
+      const now = new Date(clock).toISOString();
+      const claimed = await claim(now);
+      claimedPhases.push(claimed?.phase);
+      if (claimed?.phase === 'refinement') await applyHandlerHold(claimed, now);
+      clock += TICK_MS;
+    }
+    // Every tick was spent refusing a refinement task; #950 and #966 never ran.
+    expect(claimedPhases).toEqual(Array(6).fill('refinement'));
+    expect((await readTask(950)).attempts).toEqual({});
+    expect((await readTask(966)).attempts).toEqual({});
+
+    // ---- With the gate: the same poll reconciles and the work starts -------
+    const out = await intake(issues, { eligibilitySource: w.source });
+    expect(out.refinementHeld).toBe(6);
+    for (const n of pirs) {
+      const task = await readTask(n);
+      expect(task).toMatchObject({ status: 'blocked', phase: 'refinement' });
+      expect(task.context.refinementPredecessorHold).toMatchObject({
+        reason: 'predecessor_not_ready',
+        predecessorIssueNumbers: [n - 1],
+        previousStatus: 'queued',
+      });
+    }
+
+    // Nothing refinement-shaped is claimable any more, so the two runnable
+    // implementation tasks are what the worker gets — oldest first.
+    const later = new Date(clock).toISOString();
+    expect(await claim(later)).toMatchObject({ issueNumber: 950, phase: 'implementation' });
+    expect(await claim(later)).toMatchObject({ issueNumber: 966, phase: 'implementation' });
+    expect(await claim(later)).toBeUndefined();
+  }, 30_000);
+
+  test('an ineligible candidate is created parked, consuming no phase execution', async () => {
+    const w = world({ edges: { 956: [955] } });
+    const out = await intake([pir(956)], { eligibilitySource: w.source });
+
+    expect(out.refinementAdmitted).toBe(1);
+    expect(out.refinementHeld).toBe(1);
+    expect(out.results).toEqual([
+      {
+        issueNumber: 956,
+        action: 'enqueued',
+        phase: 'refinement',
+        status: 'blocked',
+        reason: 'predecessor_not_ready',
+      },
+    ]);
+
+    const task = await readTask(956);
+    expect(task.status).toBe('blocked');
+    expect(task.attempts).toEqual({});
+    expect(task.notBefore).toBeUndefined();
+    // The §15 block is the one admission writes — the hold is a scheduling
+    // decision, not a refinement state.
+    expect(task.context.refinement.state).toBe('pending');
+    expect(task.lastError).toContain('predecessor_not_ready');
+    expect(task.lastError).toContain('#955 no_pull_request');
+    expect(await claim()).toBeUndefined();
+
+    // §12 row 4's event, emitted under the handler's own name, plus the fact
+    // that distinguishes the two: this hold costs no worker turn.
+    const refused = (await events(956)).filter((e) => e.type === 'refinement.eligibility.refused');
+    expect(refused).toHaveLength(1);
+    expect(refused[0].data).toMatchObject({
+      reason: 'predecessor_not_ready',
+      predecessors: [955],
+      runnable: false,
+    });
+  });
+
+  test('a repeated poll leaves the held row untouched', async () => {
+    const w = world({ edges: { 956: [955] } });
+    await intake([pir(956)], { eligibilitySource: w.source });
+    const before = await readTask(956);
+
+    const second = await intake([pir(956)], { eligibilitySource: w.source });
+    expect(second.refinementHeld).toBe(0);
+    expect(second.results).toEqual([
+      {
+        issueNumber: 956,
+        action: 'refinement_hold_unchanged',
+        phase: 'refinement',
+        reason: 'already_held',
+      },
+    ]);
+    expect(await readTask(956)).toEqual(before);
+    expect((await events(956)).filter((e) => e.type === 'refinement.eligibility.refused')).toHaveLength(1);
+  });
+
+  test('the hold is released once the predecessor becomes usable, preserving the admitted task', async () => {
+    const w = world({ edges: { 956: [955] } });
+    await intake([pir(956)], { eligibilitySource: w.source });
+    const held = await readTask(956);
+    expect(held.status).toBe('blocked');
+
+    // The predecessor lands its PR and is marked stack-ready.
+    w.withPr.add(955);
+    w.ready.add(955);
+
+    const out = await intake([pir(956)], { eligibilitySource: w.source });
+    expect(out.refinementReactivated).toBe(1);
+    expect(out.results).toEqual([
+      { issueNumber: 956, action: 'refinement_reactivated', phase: 'refinement' },
+    ]);
+
+    const released = await readTask(956);
+    expect(released.status).toBe('queued');
+    expect(released.notBefore).toBeUndefined();
+    expect(released.lastError).toBeUndefined();
+    expect(released.context.refinementPredecessorHold).toBeUndefined();
+    // Everything the hold did not write survives it: the pinned assignment,
+    // the §15 block with its source fingerprint and activation plan, the
+    // implementation owner, and the row's own creation time.
+    expect(released.context.assignment).toEqual(held.context.assignment);
+    expect(released.context.refinement).toEqual(held.context.refinement);
+    expect(released.implementationAgent).toBe(held.implementationAgent);
+    expect(released.createdAt).toBe(held.createdAt);
+    expect(released.attempts).toEqual({});
+
+    // The row is claimable again, and the release is on the record.
+    expect(await claim()).toMatchObject({ issueNumber: 956, phase: 'refinement' });
+    expect((await events(956)).some((e) => e.type === 'task.reactivated')).toBe(true);
+  });
+
+  test('the hold touches no GitHub label and no frozen prefix (§18)', async () => {
+    const w = world({ edges: { 956: [955] } });
+    await intake([pir(956)], { eligibilitySource: w.source });
+    w.withPr.add(955);
+    w.ready.add(955);
+    await intake([pir(956)], { eligibilitySource: w.source });
+
+    const outbox = new SqliteOutboxStore(dbPath);
+    try {
+      expect(await outbox.listPending(50)).toEqual([]);
+    } finally {
+      outbox.close();
+    }
+    const registry = new SqliteChainRegistryStore(dbPath);
+    try {
+      expect(await registry.getFrozenPrefix({ sessionId: 'addon-dev', issueNumber: 956 })).toBeUndefined();
+    } finally {
+      registry.close();
+    }
+  });
+
+  test('a structural failure is admitted so the handler can raise its handoff', async () => {
+    // No direct predecessor: §4 row 7 needs a human, and only a claimable row
+    // reaches the handler that hands off.
+    const w = world({ edges: {} });
+    const out = await intake([pir(956)], { eligibilitySource: w.source });
+    expect(out.refinementHeld).toBe(0);
+    expect(out.results).toEqual([{ issueNumber: 956, action: 'enqueued', phase: 'refinement' }]);
+    expect((await readTask(956)).status).toBe('queued');
+  });
+
+  test('a provider error admits as before and never releases an existing hold', async () => {
+    const w = world({ edges: { 956: [955] } });
+    const exploding = {
+      ...w.source,
+      getBlockedBy: async () => {
+        throw new Error('graphql down');
+      },
+    };
+
+    // With no row yet, the pre-#967 behavior stands: admitted, and the handler
+    // holds it on its own reads.
+    const admitted = await intake([pir(956)], { eligibilitySource: exploding });
+    expect(admitted.results).toEqual([{ issueNumber: 956, action: 'enqueued', phase: 'refinement' }]);
+    expect((await readTask(956)).status).toBe('queued');
+
+    // Once the gate has parked it, a non-answer must not release it.
+    await intake([pir(956)], { eligibilitySource: w.source });
+    expect((await readTask(956)).status).toBe('blocked');
+    const out = await intake([pir(956)], { eligibilitySource: exploding });
+    expect(out.results).toEqual([
+      {
+        issueNumber: 956,
+        action: 'refinement_hold_unchanged',
+        phase: 'refinement',
+        reason: 'undetermined',
+      },
+    ]);
+    expect((await readTask(956)).status).toBe('blocked');
+  });
+
+  test('a row a runner already claimed is left to that run, not parked mid-flight', async () => {
+    // The handler's own §4 evaluation — which sees fresher reads than this
+    // poll — stays the authority while it holds the claim.
+    await intake([pir(956)]);
+    expect(await claim()).toMatchObject({ issueNumber: 956, phase: 'refinement' });
+
+    const w = world({ edges: { 956: [955] } });
+    const out = await intake([pir(956)], { eligibilitySource: w.source });
+    expect(out.refinementHeld).toBe(0);
+    expect(out.results).toEqual([
+      {
+        issueNumber: 956,
+        action: 'refinement_hold_unchanged',
+        phase: 'refinement',
+        reason: 'not_this_gate_s_row',
+      },
+    ]);
+    expect((await readTask(956)).status).toBe('claimed');
+  });
+
+  test('--dry-run previews the hold instead of a claimable admission', async () => {
+    const w = world({ edges: { 956: [955] } });
+    const out = await intake([pir(956)], { eligibilitySource: w.source, dryRun: true });
+    expect(out.results).toEqual([
+      {
+        issueNumber: 956,
+        action: 'dry_run',
+        phase: 'refinement',
+        title: 'Issue 956',
+        status: 'blocked',
+        reason: 'predecessor_not_ready',
+        predecessors: [955],
+      },
+    ]);
+    expect(await readTask(956)).toBeUndefined();
+  });
+
+  test('with no eligibility source wired the lane behaves exactly as before', async () => {
+    const out = await intake([pir(956)]);
+    expect(out.refinementHeld).toBe(0);
+    expect(out.refinementReactivated).toBe(0);
+    expect(out.results).toEqual([{ issueNumber: 956, action: 'enqueued', phase: 'refinement' }]);
+    expect((await readTask(956)).status).toBe('queued');
   });
 });

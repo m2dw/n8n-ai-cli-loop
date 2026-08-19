@@ -553,9 +553,34 @@ export {
   buildRefinementSnapshot,
   classifyPredecessorUsability,
   computePredecessorFingerprint,
+  directPredecessorNumbers,
   refinementPredecessorRecords,
   refinementSnapshotByteBudget,
 } from "./core/issue-refinement-snapshot.js";
+// §4 condition 5 against the chain registry, shared by the handler's snapshot
+// source and the intake gate below (issue #967).
+export type { ChainAgreementRegistryReader } from "./core/issue-refinement-chain-agreement.js";
+export { readChainAgreementFromRegistry } from "./core/issue-refinement-chain-agreement.js";
+// The intake-side predecessor gate: §4 conditions 2–5 evaluated before a
+// claimable task exists, so a held Issue never consumes a worker turn
+// (issue #967, docs/issue-refinement-contract.md §4, §12 row 4).
+export type {
+  EvaluateRefinementIntakeEligibilityInput,
+  RefinementEligibilitySource,
+  RefinementIntakeDisposition,
+  RefinementIntakeEligibility,
+  RefinementIntakeLeaveReason,
+  RefinementPredecessorHoldRecord,
+  RefinementStructuralReason,
+} from "./core/issue-refinement-eligibility.js";
+export {
+  REFINEMENT_PREDECESSOR_HOLD_KEY,
+  buildRefinementPredecessorHold,
+  decideRefinementIntakeDisposition,
+  describeRefinementPredecessorHold,
+  evaluateRefinementIntakeEligibility,
+  readRefinementPredecessorHold,
+} from "./core/issue-refinement-eligibility.js";
 // The two-agent refinement loop's pure half: result schemas, fail-closed
 // validation, topology combination, region rendering, role independence
 // (issue #869, docs/issue-refinement-contract.md §7, §9, §10, §17).

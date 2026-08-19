@@ -1607,6 +1607,108 @@ describe('SqliteTaskStore appendEventOnce', () => {
   });
 });
 
+// A row created already `blocked` carries a MANDATORY reason (issue #967
+// review): intake is idempotent, so a later poll finds the held row and takes
+// the `already_held`/`already_exists` path — it never retries an audit event
+// that failed to land. The row and its reason therefore have to commit in one
+// transaction, or the hold becomes silently unauditable.
+describe('SqliteTaskStore admission events commit with the row (issue #967 review)', () => {
+  const key = { sessionId: 'ai-cli-loop', issueNumber: 956 };
+  const HOLD = 'refinement.eligibility.refused';
+  const NOW = '2026-06-06T00:00:00.000Z';
+
+  function holdEvent(overrides = {}) {
+    return {
+      task: key,
+      type: HOLD,
+      message: 'Refinement held: predecessor #955 is not stack-ready.',
+      data: { reason: 'predecessor_not_ready', predecessorIssueNumbers: [955] },
+      createdAt: NOW,
+      ...overrides,
+    };
+  }
+
+  const heldInput = {
+    sessionId: key.sessionId,
+    issueNumber: key.issueNumber,
+    phase: 'refinement',
+    initialStatus: 'blocked',
+    lastError: 'Refinement held: predecessor #955 is not stack-ready.',
+    context: { title: 'Downstream PIR issue' },
+    now: NOW,
+  };
+
+  async function eventTypes() {
+    return (await store.listEvents(key)).map((e) => e.type);
+  }
+
+  test('enqueueTask commits the created row and its hold event together', async () => {
+    const result = await store.enqueueTask(heldInput, { events: [holdEvent()] });
+
+    expect(result.ok).toBe(true);
+    expect(result.value).toMatchObject({ status: 'blocked', phase: 'refinement' });
+    expect(await eventTypes()).toEqual([HOLD]);
+  });
+
+  test('a refused enqueue records no hold event', async () => {
+    await store.enqueueTask({ sessionId: key.sessionId, issueNumber: key.issueNumber, phase: 'review', now: NOW });
+
+    const again = await store.enqueueTask(heldInput, { events: [holdEvent()] });
+
+    expect(again).toMatchObject({ ok: false, code: 'already_exists' });
+    expect(await eventTypes()).toEqual([]);
+    expect(await store.getTask(key)).toMatchObject({ phase: 'review', status: 'queued' });
+  });
+
+  test('a failed event insert rolls the new row back instead of leaving it unauditable', async () => {
+    await expect(
+      // A BigInt cannot be serialized into the event's `data` column, so the
+      // insert throws AFTER the task row was written — exactly the window the
+      // finding describes. One transaction means the row goes with it.
+      store.enqueueTask(heldInput, { events: [holdEvent({ data: { predecessor: 955n } })] }),
+    ).rejects.toThrow();
+
+    expect(await store.getTask(key)).toBeUndefined();
+    expect(await eventTypes()).toEqual([]);
+  });
+
+  test('replaceTask commits the replacement, its transition event, and the hold event together', async () => {
+    await store.enqueueTask({ sessionId: key.sessionId, issueNumber: key.issueNumber, phase: 'review', now: NOW });
+    const existing = await store.getTask(key);
+
+    const replaced = await store.replaceTask(
+      heldInput,
+      { status: existing.status, phase: existing.phase, revision: existing.revision },
+      {
+        event: { task: key, type: 'task.replaced', createdAt: NOW },
+        extraEvents: [holdEvent()],
+      },
+    );
+
+    expect(replaced.ok).toBe(true);
+    expect(replaced.value).toMatchObject({ status: 'blocked', phase: 'refinement' });
+    expect(await eventTypes()).toEqual(['task.replaced', HOLD]);
+  });
+
+  test('a refused replaceTask CAS records neither event', async () => {
+    await store.enqueueTask({ sessionId: key.sessionId, issueNumber: key.issueNumber, phase: 'review', now: NOW });
+    const existing = await store.getTask(key);
+
+    const replaced = await store.replaceTask(
+      heldInput,
+      { status: existing.status, phase: existing.phase, revision: existing.revision + 1 },
+      {
+        event: { task: key, type: 'task.replaced', createdAt: NOW },
+        extraEvents: [holdEvent()],
+      },
+    );
+
+    expect(replaced).toMatchObject({ ok: false, code: 'conflict' });
+    expect(await eventTypes()).toEqual([]);
+    expect(await store.getTask(key)).toMatchObject({ phase: 'review', status: 'queued' });
+  });
+});
+
 describe('SqliteTaskStore concurrent appendEventOnce (two connections, same DB)', () => {
   test('exactly one of two racing appends writes the event', async () => {
     const tmpDir2 = mkdtempSync(join(tmpdir(), 'sqlite-concurrent-audit-'));

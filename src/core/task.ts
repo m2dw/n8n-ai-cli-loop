@@ -87,6 +87,27 @@ export interface EnqueueTaskInput {
   researchAgent?: AgentId;
   context?: TaskContext;
   now?: string;
+  /**
+   * The status a NEWLY CREATED row starts at. Defaults to `queued`, which is
+   * every caller but one.
+   *
+   * `blocked` exists for a gate that already knows the task cannot run yet and
+   * must not leave it claimable even briefly (issue #967: a refinement task
+   * whose predecessors are not stack-ready). Creating the row `queued` and
+   * transitioning it a moment later would be two writes with a window between
+   * them in which a concurrent worker can claim — the precise starvation the
+   * gate exists to remove. Ignored on the reactivation path: reactivating an
+   * existing row always produces a `queued` task, because that is what
+   * reactivation means.
+   */
+  initialStatus?: Extract<TaskStatus, "queued" | "blocked">;
+  /**
+   * The human-readable reason a row created with `initialStatus: "blocked"`
+   * carries, so `admin status` can say why it is parked instead of showing a
+   * blocked row with no explanation. Ignored on the reactivation path, which
+   * clears `lastError` as part of releasing the row.
+   */
+  lastError?: string;
 }
 
 export interface TaskKey {

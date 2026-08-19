@@ -1145,8 +1145,13 @@ function canonicalDisputeLineages(
  * §1: the direct `blocked by` neighbours, canonically. Duplicate edges are
  * collapsed so a provider that reports an edge twice cannot inflate the fan-in
  * count past its cap, and the ascending order is the one §5/§6 capture in.
+ *
+ * Exported for the intake-side gate of issue #967, which answers §4 conditions
+ * 2–5 before a claimable task exists: it must derive the predecessor set from
+ * the same edges, in the same canonical order, or the two evaluations could
+ * disagree about the fan-in count.
  */
-function directPredecessorNumbers(blockedBy: readonly BlockedByEntry[]): number[] {
+export function directPredecessorNumbers(blockedBy: readonly BlockedByEntry[]): number[] {
   return [...new Set(blockedBy.map((b) => b.issueNumber))].sort((a, b) => a - b);
 }
 

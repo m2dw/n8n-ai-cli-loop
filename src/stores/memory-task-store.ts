@@ -88,7 +88,9 @@ export class MemoryTaskStore implements TaskStore {
     const task: AiTask = {
       sessionId: input.sessionId,
       issueNumber: input.issueNumber,
-      status: "queued",
+      // `queued` for every caller but the intake gate that creates an
+      // already-held row (issue #967; see EnqueueTaskInput.initialStatus).
+      status: input.initialStatus ?? "queued",
       phase: input.phase,
       priority: input.priority ?? "normal",
       implementationAgent: input.implementationAgent,
@@ -96,6 +98,7 @@ export class MemoryTaskStore implements TaskStore {
       researchAgent: input.researchAgent,
       attempts: {},
       context: input.context ?? {},
+      ...(input.lastError !== undefined ? { lastError: input.lastError } : {}),
       createdAt: now,
       updatedAt: now,
       revision: 0,

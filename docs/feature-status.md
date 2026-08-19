@@ -178,6 +178,7 @@ in a longer row here.
   handover into ordinary implementation.
 - **Configuration:** `session.issueRefinement.enabled`, default `false`.
 - **Evidence:** `src/core/issue-refinement.ts`,
+  `src/core/issue-refinement-eligibility.ts`,
   `src/handlers/issue-refinement-apply.ts`, `src/cli/issue-refinement-loop.ts`;
   `admin refinement run`.
 - **Docs:** [issue-refinement-contract.md](issue-refinement-contract.md)
@@ -185,8 +186,12 @@ in a longer row here.
   implemented"), [idea-to-implementation.md](idea-to-implementation.md).
 - **Gaps:** subject to the publication and config boundaries the contract
   describes; a session that has not opted in treats
-  `status:needs-refinement` as an inert label.
-- **Related Issues:** #866, #867, #868, #869, #870, #871
+  `status:needs-refinement` as an inert label. An Issue whose predecessors are
+  not yet usable is held by intake as a non-runnable `blocked` task and
+  released automatically once they are (§4), so marking a chain ahead of time
+  costs no worker turn; removing the marker while an Issue is held leaves the
+  parked row for an operator to re-mark.
+- **Related Issues:** #866, #867, #868, #869, #870, #871, #967
 
 ### Tool Request and verification
 
@@ -592,6 +597,7 @@ represented as their own matrix row, with the reason:
   operator-facing capability.
 - [agent-isolation-policy.md](agent-isolation-policy.md) — a cross-cutting
   implementation invariant (the environment every isolated no-tool agent run
-  gets) rather than an operator-facing capability. The features it backs —
-  Issue refinement, Review dispute, and the AI planner — carry their own rows
-  above, and their availability is what an operator acts on.
+  gets) rather than an operator-facing capability. Its `Status:` line records
+  that the policy is implemented. The features it backs — Issue refinement,
+  Review dispute, and the AI planner — carry their own rows above, and their
+  availability is what an operator acts on.

@@ -326,6 +326,57 @@ hold instead would bury a condition that needs a human under an indefinite
 sequence of `predecessor_not_ready` refusals. The hold of row 4 is therefore
 reserved for an Issue on which conditions 1–3 all pass.
 
+**A held Issue is not a runnable task.** Conditions 2–5 are evaluated by the
+intake poll itself, before the task row becomes claimable, and the row 4 hold is
+persisted as a **non-runnable `blocked` refinement task** rather than as a
+queued one. The distinction is not cosmetic. A queued task is claimed, and a
+claim spends the runner's turn: with the hold decided only inside the phase
+handler, each held Issue costs one worker turn per retry window, several
+ahead-of-time refinement Issues cost a turn on nearly every poll, and because
+those rows are created before the chain root's own implementation task, claim
+order (priority, then creation time) hands them the worker first — starving
+runnable work behind a queue of Issues that can only refuse. Applying the marker
+to a whole dependency chain in advance is a supported operator workflow, so the
+hold has to be free.
+
+Four rules keep that gate honest:
+
+- **A structural failure is admitted, never held.** Rows 5, 6, and 7 need the
+  handler to raise their handoff, and only a claimable row reaches the handler.
+  The guard order above is therefore evaluated in full at intake: an Issue that
+  fails conditions 2, 3, or 5 becomes a claimable task even though it will not
+  refine.
+- **A provider error decides nothing.** A relationship query, Issue read, PR
+  read, or chain lookup that throws leaves the persisted row exactly as it was
+  — an already-held row stays held, and an Issue with no row yet is admitted so
+  that the handler's own evaluation holds it, which is the behavior that
+  predates this gate. An error is never read as "eligible" and never as "not
+  ready".
+- **Reactivation is intake's job, and it is idempotent.** When every predecessor
+  becomes usable, the next poll releases *that same row* to `queued`: the status
+  and the hold record are undone and nothing else is, so `context.assignment`,
+  the §15 block (including `sourceFingerprint`, the counters, and the §14
+  activation plan), and the row's `created_at` survive the hold unchanged. A
+  poll that finds the hold still unsatisfied writes nothing at all. Consistent
+  with §18, the hold neither reads nor writes the chain registry's frozen
+  prefixes, and it moves no GitHub label — the Issue keeps the marker it was
+  waiting under.
+- **The handler check remains, as a backstop.** The gate decides whether a row
+  is worth claiming; it is not the authority on eligibility. The handler
+  re-evaluates §4 on every claim against fresher reads, so a predecessor that
+  becomes unusable between the poll and the phase run is still refused there.
+
+Rows admitted before this gate existed converge without operator intervention:
+a claimable `refinement` row whose predecessors are not ready is parked by the
+next poll under a compare-and-set on the row it observed, so a row a runner has
+already claimed is left to that run rather than pulled out from under it.
+
+One consequence is worth stating: an operator who removes the marker from a
+*held* Issue leaves a parked row that ordinary intake cannot re-derive a lane
+for, because the row belongs to a lane the Issue no longer claims. Re-applying
+the marker returns it to this gate, which releases or re-holds it on the next
+poll.
+
 **Main-branch merge is not required.** Eligibility deliberately uses the same
 signal as Gate 2: a stack-ready predecessor with a usable PR head. Waiting for
 the predecessor to merge into the default branch would serialize the chain
@@ -1122,6 +1173,14 @@ is the second admission refusal of §4 condition 1, and it sits beside row 2
 rather than replacing it because the two failures are repaired by opposite
 label edits.
 
+Row 4 is the one row whose effect is stated in terms of the **task row** as well
+as the state: its hold is persisted as a non-runnable `blocked` refinement task
+and released by a later poll (§4). That is a representation of the hold this
+table already describes, not a transition of its own — the refinement state
+stays `pending` throughout, no counter moves, and the row is re-evaluated on
+every poll exactly as it was before. Consequently the release needs no row here
+either: it restores the same `pending` task the hold interrupted.
+
 Three rows continue past a terminal refinement state, and none weakens the
 terminality: row 33 keeps the state `activated` and moves only the shared
 **task row** into the implementation lane; row 34 keeps the state `activated`
@@ -1136,7 +1195,7 @@ and changes no state.
 | 1 | `pending` | `intake.scanned` | marker present, no executable `status:*`, at least one implementation-lane `agent:*` label | `pending` | admit a `refinement`-phase task; resolve and persist `context.assignment` |
 | 2 | `pending` | `intake.scanned` | marker present with an executable `status:*` | `pending` | refuse admission; no task; `refinement.eligibility.refused` (`conflicting_markers`) |
 | 3 | `pending` | `predecessors.resolved` | every direct predecessor usable in either §4 shape (open stack-ready head, or merged), count within cap, chain agrees | `eligible` | `refinement.eligibility.granted` |
-| 4 | `pending` | `predecessors.resolved` | rows 5–7 do not apply, and at least one predecessor satisfies neither §4 shape | `pending` | hold; `refinement.eligibility.refused` (`predecessor_not_ready`); re-evaluated next poll |
+| 4 | `pending` | `predecessors.resolved` | rows 5–7 do not apply, and at least one predecessor satisfies neither §4 shape | `pending` | hold as a non-runnable task (§4); `refinement.eligibility.refused` (`predecessor_not_ready`); re-evaluated next poll |
 | 5 | `pending` | `predecessors.resolved` | predecessor count above `MAX_PREDECESSORS_PER_REFINEMENT` | `escalated_human` | handoff (`fan_in_exceeded`) |
 | 6 | `pending` | `predecessors.resolved` | observed predecessors disagree with the chain's accepted revision | `escalated_human` | handoff (`chain_disagreement`) |
 | 7 | `pending` | `predecessors.resolved` | no direct predecessor | `escalated_human` | handoff (`not_chain_scoped`) |
@@ -1478,6 +1537,26 @@ emit it when nothing was returned to parse, so no malformed-attempt counter
 moved and the `refinement.draft.malformed` / `refinement.critique.malformed`
 pair would misreport what happened.
 
+The row 4 hold emits `refinement.eligibility.refused` wherever it is decided —
+the intake gate of §4 and the phase handler record the same fact under the same
+name, with the same `predecessor_not_ready` reason literal, because inventing a
+second name for one fact would make every surface that counts holds count them
+twice. An intake-placed hold adds `runnable: false` to the event's fields and
+persists its reason on the task row (`task.context.refinementPredecessorHold`:
+the reason literal, the observed predecessor numbers, the per-predecessor hold
+literals, the status the row was parked from, and the timestamp), so an operator
+can see both that the Issue is waiting and that it is waiting for free. Its
+release changes no refinement state and therefore emits no `refinement.*` event;
+it is recorded as a generic `task.reactivated` event on the task row.
+
+An intake-placed hold writes the parked row and this event in **one
+transaction** — whether the row is being created, replaced, or parked from
+`queued`. The event is mandatory and unrepairable after the fact: intake is
+idempotent, so the next poll observes a row that is already held and writes
+nothing, which means a hold that committed without its event would stay
+unauditable for the life of the task. Either both are on record or neither is,
+and a refused compare-and-set leaves no trace of a hold that did not happen.
+
 Two events belong to tasks and effects outside the §12 state machine, and exist
 so that neither is silent. `refinement.execution.suspended` records the
 pre-execution marker guard of §3.1 stopping an already-existing executable task
@@ -1634,7 +1713,19 @@ revision pointer, or touches a frozen prefix.
 `status:needs-refinement` is not executable it cannot itself lose the
 label-versus-relationship race, but it must still be applied after
 relationships are configured and verified, so the first eligibility
-evaluation sees the true predecessor set.
+evaluation sees the true predecessor set. Applying the marker to a whole chain
+ahead of time is nonetheless supported and cheap: an Issue whose predecessors
+are not ready is held as a non-runnable task (§4), so it consumes no worker
+turn and cannot delay unrelated work.
+
+**Task statuses and the claim order.** The lane adds one status/phase
+combination existing operator surfaces had not seen: `blocked` at phase
+`refinement`, the §4 hold. It is inert by construction — `blocked` is not
+claimable, so no scheduler, worktree, or lock behavior changes — and it is
+reversed only by the intake gate that set it. Unlike the `blocked`
+implementation row of §11 step 6, it carries no coarse `blocked` label: nothing
+published it, the Issue is already visibly waiting under its marker, and adding
+one would make every ahead-of-time chain label its own Issues.
 
 **Review-dispute protocol (#835).** Independent. Refinement reads only
 terminal lineage literals and counts from a predecessor (§5) and follows the

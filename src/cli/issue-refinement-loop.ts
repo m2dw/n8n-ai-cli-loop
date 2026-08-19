@@ -43,7 +43,8 @@ import {
   JsonSessionRegistry,
 } from "../registries/json-session-registry.js";
 import type { TaskStore } from "../core/task-store.js";
-import type { ChainGraph, ChainListFilter, ChainRecord } from "../core/chain-registry.js";
+import type { ChainAgreementRegistryReader } from "../core/issue-refinement-chain-agreement.js";
+import { readChainAgreementFromRegistry } from "../core/issue-refinement-chain-agreement.js";
 import { SqliteChainRegistryStore } from "../stores/sqlite-chain-registry-store.js";
 import type { TaskEvent } from "../core/task.js";
 import type {
@@ -66,8 +67,6 @@ import type {
   RefinementChangedPathListing,
   RefinementChangedPathRead,
   RefinementCommentRead,
-  RefinementIssueRead,
-  RefinementPullRequestLookup,
   RefinementSnapshotSource,
 } from "../core/issue-refinement-snapshot.js";
 import type { RefinementLoopContextBlock } from "../core/issue-refinement-loop.js";
@@ -90,7 +89,7 @@ import type { AcquireResult } from "../stores/repo-lock-store.js";
 import { ghRunnerFromCommandRunner } from "../providers/github/gh-runner.js";
 import type { GhRunner as ProviderGhRunner } from "../providers/github/gh-runner.js";
 import { resolveGhRunner } from "../providers/github/github-app-auth.js";
-import { GraphQLDependencyChecker, runGhViaRunner } from "./github-intake.js";
+import { createGhRefinementReads, runGhViaRunner } from "./github-intake.js";
 import { tokenizeArgs } from "./admin-command.js";
 import { die, emit } from "./cli-io.js";
 
@@ -171,15 +170,6 @@ export function parseRefinementRunArgs(argv: string[]): RefinementRunArgs | { er
 type GhRunner = (args: string[]) => string;
 
 /**
- * The two chain-registry reads the §4 condition-5 cross-check needs.
- * `SqliteChainRegistryStore` satisfies it structurally.
- */
-export interface ChainAgreementRegistryReader {
-  listChainsForIssue(issueNumber: number, filter?: ChainListFilter): Promise<ChainRecord[]>;
-  getChain(chainId: string): Promise<ChainGraph | undefined>;
-}
-
-/**
  * Wiring for the registered-chain cross-check (§4 condition 5, §12 row 6).
  *
  * `sessionId` scopes membership to this session's chains — the registry file is
@@ -218,93 +208,12 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-/**
- * §4 condition 5 against the persistent chain registry (#788/#890): does the
- * observed direct-predecessor set agree with the accepted revision of the
- * chain the target Issue is registered in?
- *
- * The scoping and the fail-closed choices, stated once:
- *
- *  - An Issue in NO chain of this session is `unregistered` — not a
- *    disagreement; §4 scopes the cross-check to registered members.
- *  - Membership in MORE than one chain is a disagreement: the cross-check
- *    refuses to pick which chain to believe, matching contract gap G3's
- *    refusal of cross-chain refinement.
- *  - A member chain with no accepted revision, or whose accepted revision is
- *    no longer the stored graph (the store persists members/edges for the
- *    CURRENT graph revision only), has no reconstructible accepted edge set to
- *    compare against. Both read as disagreement rather than agreement — the
- *    contract's registry clause has disagreement escalate rather than choose a
- *    side, and §4 orders structural conditions ahead of holds precisely so a
- *    state that needs a human is not buried under retries.
- *  - Agreement itself is set equality between the observed predecessors and
- *    the accepted graph's direct `blocked by` edges into the target,
- *    deduplicated; both directions of a mismatch are named in the detail.
- *
- * A registry read that throws propagates: the snapshot builder records it as a
- * `chain_agreement` stage failure and fails closed like any other provider
- * error.
- */
-export async function readChainAgreementFromRegistry(
-  registry: ChainAgreementRegistryReader,
-  sessionId: string,
-  issueNumber: number,
-  observedPredecessors: readonly number[],
-): Promise<RefinementChainAgreement> {
-  const chains = await registry.listChainsForIssue(issueNumber, { sessionId });
-  if (chains.length === 0) return { kind: "unregistered" };
-  if (chains.length > 1) {
-    const ids = chains.map((c) => c.chainId).sort().join(", ");
-    return {
-      kind: "disagrees",
-      detail: `member of ${chains.length} registered chains (${ids}); the cross-check refuses multi-chain membership`,
-    };
-  }
-  const chain = chains[0];
-  if (chain.acceptedRevision === undefined) {
-    return {
-      kind: "disagrees",
-      detail: `chain ${chain.chainId} has no accepted revision to check the observed predecessor set against`,
-    };
-  }
-  if (chain.acceptedRevision !== chain.graphRevision) {
-    return {
-      kind: "disagrees",
-      detail:
-        `chain ${chain.chainId} accepted revision ${chain.acceptedRevision} is not the stored graph `
-        + `(revision ${chain.graphRevision}), so the accepted edge set cannot be read`,
-    };
-  }
-  const graph = await registry.getChain(chain.chainId);
-  if (!graph) {
-    // Listed as a member moments ago; the chain vanished between the two
-    // reads. A half-observed registry is a provider failure, not a verdict.
-    throw new Error(`chain ${chain.chainId} disappeared between membership and graph reads`);
-  }
-  const expected = [
-    ...new Set(
-      graph.edges
-        .filter((e) => e.blockedIssueNumber === issueNumber)
-        .map((e) => e.blockerIssueNumber),
-    ),
-  ].sort((a, b) => a - b);
-  const observed = [...new Set(observedPredecessors)].sort((a, b) => a - b);
-  const expectedSet = new Set(expected);
-  const observedSet = new Set(observed);
-  const missing = expected.filter((n) => !observedSet.has(n));
-  const unexpected = observed.filter((n) => !expectedSet.has(n));
-  if (missing.length === 0 && unexpected.length === 0) return { kind: "agrees" };
-  const parts: string[] = [];
-  if (missing.length > 0) {
-    parts.push(`accepted predecessors missing on GitHub: ${missing.map((n) => `#${n}`).join(", ")}`);
-  }
-  if (unexpected.length > 0) {
-    parts.push(
-      `observed predecessors outside the accepted revision: ${unexpected.map((n) => `#${n}`).join(", ")}`,
-    );
-  }
-  return { kind: "disagrees", detail: `chain ${chain.chainId}: ${parts.join("; ")}` };
-}
+// §4 condition 5 lives in `core/issue-refinement-chain-agreement.ts` as of
+// issue #967: the intake-side eligibility gate needs the same cross-check, and
+// having the CLI shell own it would force the wrong import direction. Both
+// names are re-exported here so this module's existing callers are unchanged.
+export type { ChainAgreementRegistryReader };
+export { readChainAgreementFromRegistry };
 
 export function createGhRefinementSnapshotSource(
   options: GhSnapshotSourceOptions,
@@ -314,60 +223,11 @@ export function createGhRefinementSnapshotSource(
     ?? ((args) => execFileSync("gh", args, { encoding: "utf8", maxBuffer: GH_MAX_BUFFER }));
   const repo = options.githubRepo;
   const chainAgreement = options.chainAgreement;
-  const dependencyChecker = new GraphQLDependencyChecker(repo, runGh);
 
   return {
-    getBlockedBy: (issueNumber) => dependencyChecker.getBlockedBy(issueNumber),
-
-    readIssue: async (issueNumber): Promise<RefinementIssueRead> => {
-      const raw = asRecord(
-        ghJson(runGh, [
-          "issue", "view", String(issueNumber),
-          "--repo", repo,
-          "--json", "number,state,title,body,labels",
-        ]),
-      );
-      const labels = Array.isArray(raw["labels"])
-        ? (raw["labels"] as unknown[]).map((l) => str(asRecord(l)["name"])).filter((n) => n !== "")
-        : [];
-      return {
-        number: typeof raw["number"] === "number" ? (raw["number"] as number) : issueNumber,
-        state: str(raw["state"]).toLowerCase() === "closed" ? "closed" : "open",
-        title: str(raw["title"]),
-        body: str(raw["body"]),
-        labels,
-      };
-    },
-
-    readPullRequest: async (issueNumber): Promise<RefinementPullRequestLookup> => {
-      // The session's own head-branch convention: `ai/issue-<n>`. A transient
-      // lookup failure THROWS (the port forbids reading it as "no PR").
-      const raw = ghJson(runGh, [
-        "pr", "list",
-        "--repo", repo,
-        "--state", "all",
-        "--head", `ai/issue-${issueNumber}`,
-        "--json", "number,state,headRefName,headRefOid,mergeCommit,title,body",
-      ]);
-      const rows = Array.isArray(raw) ? raw.map(asRecord) : [];
-      if (rows.length === 0) return { kind: "none" };
-      if (rows.length > 1) return { kind: "ambiguous", detail: `matches:${rows.length}` };
-      const pr = rows[0];
-      const state = str(pr["state"]).toLowerCase();
-      const mergeCommit = asRecord(pr["mergeCommit"]);
-      return {
-        kind: "found",
-        pullRequest: {
-          number: typeof pr["number"] === "number" ? (pr["number"] as number) : 0,
-          state: state === "merged" ? "merged" : state === "open" ? "open" : "closed",
-          headRefName: str(pr["headRefName"]),
-          headSha: str(pr["headRefOid"]) || undefined,
-          mergeCommitSha: str(mergeCommit["oid"]) || undefined,
-          title: str(pr["title"]),
-          body: str(pr["body"]),
-        },
-      };
-    },
+    // The three predecessor reads §4 conditions 2–4 need are shared with the
+    // intake-side gate (issue #967) and implemented once, in `cli/github-intake`.
+    ...createGhRefinementReads({ githubRepo: repo, runGh }),
 
     readChangedPaths: async (
       prNumber,

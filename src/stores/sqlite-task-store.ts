@@ -207,14 +207,37 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
     this.#db.close();
   }
 
-  async enqueueTask(input: EnqueueTaskInput): Promise<StoreResult<AiTask>> {
+  /**
+   * `options.events`, when given, are inserted in the SAME transaction as the
+   * created (or reactivated) row, and only when the enqueue succeeded (issue
+   * #967 review). A row whose admission carries a MANDATORY audit record — the
+   * intake gate that creates a refinement task already held on
+   * `predecessor_not_ready` — cannot append that record afterwards: intake is
+   * idempotent, so a crash or a failed insert between the two writes leaves a
+   * permanently `blocked` row that every later poll reports as
+   * `already_exists`, never retrying the event. Committing both together means
+   * the row and its reason exist or neither does.
+   *
+   * The parameter is deliberately absent from the `TaskStore` interface, for
+   * the same reason as {@link replaceTask}: it serves a caller that already
+   * holds a concrete `SqliteTaskStore` and needs this file's own transaction.
+   */
+  async enqueueTask(
+    input: EnqueueTaskInput,
+    options?: { events?: TaskEvent[] },
+  ): Promise<StoreResult<AiTask>> {
     const now = input.now ?? new Date().toISOString();
 
     // IMMEDIATE prevents SQLITE_CONSTRAINT_PRIMARYKEY being thrown when two
     // connections race to enqueue the same (session_id, issue_number): the
     // second blocks on lock acquisition, then reads the already-inserted row
     // and returns already_exists cleanly.
-    const enqueue = this.#db.transaction((): StoreResult<AiTask> => this.#applyEnqueue(input, now));
+    const enqueue = this.#db.transaction((): StoreResult<AiTask> => {
+      const applied = this.#applyEnqueue(input, now);
+      // A refused enqueue wrote no row, so it must leave no record of one.
+      if (applied.ok) for (const event of options?.events ?? []) this.#insertEvent(event);
+      return applied;
+    });
 
     return enqueue.immediate();
   }
@@ -303,18 +326,22 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
           `INSERT INTO tasks
             (session_id, issue_number, status, phase, priority,
              implementation_agent, review_agent, research_agent,
-             attempts, context, created_at, updated_at)
-           VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, '{}', ?, ?, ?)`,
+             attempts, context, last_error, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?)`,
         )
         .run(
           input.sessionId,
           input.issueNumber,
+          // `queued` for every caller but the intake gate that creates an
+          // already-held row (issue #967; see EnqueueTaskInput.initialStatus).
+          input.initialStatus ?? "queued",
           input.phase,
           input.priority ?? "normal",
           input.implementationAgent ?? null,
           input.reviewAgent ?? null,
           input.researchAgent ?? null,
           JSON.stringify(input.context ?? {}),
+          input.lastError ?? null,
           now,
           now,
         );
@@ -701,8 +728,10 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
    * and revision the caller read; a concurrent claim, completion, or
    * cancellation moves at least the revision, so the replacement is refused
    * (`conflict`, with the current row) rather than silently discarding work that
-   * landed since. `event`, when given, is inserted in the SAME transaction, so a
-   * refused CAS leaves no record of a replacement that did not happen.
+   * landed since. `event` and `extraEvents`, when given, are inserted in the
+   * SAME transaction, so a refused CAS leaves no record of a replacement that
+   * did not happen — and a committed one cannot be missing an audit record the
+   * replacement was required to carry (issue #967 review).
    *
    * Deliberately not on the `TaskStore` interface, for the same reason as
    * {@link transitionTaskWithEffects}: it serves a caller that already holds a
@@ -712,7 +741,7 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
   async replaceTask(
     input: EnqueueTaskInput,
     expected: { status: TaskStatus; phase: TaskPhase; revision: number },
-    options?: { event?: TaskEvent },
+    options?: { event?: TaskEvent; extraEvents?: TaskEvent[] },
   ): Promise<StoreResult<AiTask>> {
     const now = input.now ?? new Date().toISOString();
     const run = this.#db.transaction((): StoreResult<AiTask> => {
@@ -733,26 +762,33 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
       this.#db
         .prepare(
           `UPDATE tasks
-           SET status = 'queued', phase = ?, priority = ?,
+           SET status = ?, phase = ?, priority = ?,
                implementation_agent = ?, review_agent = ?, research_agent = ?,
                owner_run_id = NULL, lease_expires_at = NULL, not_before = NULL,
-               attempts = '{}', context = ?, last_error = NULL, updated_at = ?,
+               attempts = '{}', context = ?, last_error = ?, updated_at = ?,
                revision = revision + 1
            WHERE session_id = ? AND issue_number = ?`,
         )
         .run(
+          // The replacement is a fresh create, so it honours the same
+          // `initialStatus` a create does (issue #967): an Issue whose
+          // refinement predecessors are not ready must not become claimable
+          // just because the row it replaces belonged to another lane.
+          input.initialStatus ?? "queued",
           input.phase,
           input.priority ?? "normal",
           input.implementationAgent ?? null,
           input.reviewAgent ?? null,
           input.researchAgent ?? null,
           JSON.stringify(input.context ?? {}),
+          input.lastError ?? null,
           now,
           input.sessionId,
           input.issueNumber,
         );
 
       if (options?.event) this.#insertEvent(options.event);
+      for (const extra of options?.extraEvents ?? []) this.#insertEvent(extra);
 
       const updated = this.#db
         .prepare("SELECT * FROM tasks WHERE session_id = ? AND issue_number = ?")

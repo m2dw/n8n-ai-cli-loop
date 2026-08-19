@@ -4,6 +4,7 @@ import {
   evaluateRefinementAdmission,
   type RefinementRefusalReason,
 } from "./issue-refinement.js";
+import type { RefinementIntakeEligibility } from "./issue-refinement-eligibility.js";
 
 export interface IssueCandidate {
   issueNumber: number;
@@ -327,6 +328,12 @@ export type StackReadyResolver = (issueNumber: number) => Promise<boolean>;
  */
 export type IssueCandidateWithDecision = IssueCandidate & {
   dependencyDecision?: DependencyDecision;
+  /**
+   * The §4 conditions 2–5 answer for a `refinement` candidate, when the caller
+   * supplied {@link RefinementIntakeOptions.resolveEligibility} (issue #967).
+   * Never present on any other phase, and absent when no resolver was wired.
+   */
+  refinementEligibility?: RefinementIntakeEligibility;
 };
 
 // ---------------------------------------------------------------------------
@@ -362,6 +369,21 @@ export interface RefinementIntakeOptions {
   markerLabel?: string;
   /** Called once per refused Issue, in scan order. */
   onRefusal?: (refusal: RefinementIntakeRefusal) => void;
+  /**
+   * §4 conditions 2–5, evaluated BEFORE a claimable task exists (issue #967).
+   *
+   * Optional, and absent means "unchanged": every admitted Issue becomes a
+   * claimable `refinement` task exactly as it did before, and the phase handler
+   * remains the only place the predecessor set is read. When present, the
+   * answer rides along on the candidate and the caller decides what to persist
+   * (see `decideRefinementIntakeDisposition`) — this function still creates no
+   * task and still never fails an Issue on a provider error, because the
+   * resolver reports that as `undetermined` rather than throwing.
+   */
+  resolveEligibility?: (input: {
+    issueNumber: number;
+    labels: string[];
+  }) => Promise<RefinementIntakeEligibility>;
 }
 
 /**
@@ -446,6 +468,15 @@ export async function parseCandidates(
         // own terms: a refinement-marked Issue exists precisely because its
         // predecessors are still open, so the implementation gates would hold
         // every Issue this lane is for (§4).
+        //
+        // Conditions 2–5 ARE evaluated here when a resolver is wired (issue
+        // #967) — not as a second admission gate, but so the caller can create
+        // the row non-runnable instead of letting a held Issue consume a worker
+        // turn every retry window. The answer is attached to the candidate; no
+        // routing decision above depends on it.
+        const refinementEligibility = refinement.resolveEligibility
+          ? await refinement.resolveEligibility({ issueNumber: issue.number, labels })
+          : undefined;
         candidates.push({
           issueNumber: issue.number,
           title: issue.title,
@@ -454,6 +485,7 @@ export async function parseCandidates(
           ...(typeof issue.body === "string" && issue.body.length > 0 ? { body: issue.body } : {}),
           phase: "refinement",
           implementationAgent: admission.implementationAgent,
+          ...(refinementEligibility !== undefined ? { refinementEligibility } : {}),
         });
         continue;
       }

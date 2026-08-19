@@ -12,6 +12,9 @@ import {
   FORBIDDEN_PATH_RULES,
   DEPENDENCY_MANIFEST,
   checkDependencyManifest,
+  PRIVATE_ONLY_DOC_PATHS,
+  PRIVATE_ONLY_DOC_PREFIXES,
+  checkUnconditionalPrivateReads,
 } from '../scripts/copybara-validate.mjs';
 import { mkdirSync, writeFileSync, rmSync, readFileSync } from 'fs';
 import { join, resolve, dirname } from 'path';
@@ -523,6 +526,163 @@ describe('checkDependencyManifest', () => {
 });
 
 // ---------------------------------------------------------------------------
+// checkUnconditionalPrivateReads (issue #973 dependency closure — general form)
+// ---------------------------------------------------------------------------
+
+describe('checkUnconditionalPrivateReads', () => {
+  test('flags an unconditional read() call when the private path is absent from the tree', () => {
+    const content = "const domain = read('docs/DOMAIN.md');";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings).toHaveLength(1);
+    expect(findings[0].rule).toBe('unconditional-private-read');
+    expect(findings[0].match).toBe('docs/DOMAIN.md');
+  });
+
+  test('flags an unconditional readFileSync(resolve(...)) call', () => {
+    const content = "const domain = readFileSync(resolve(ROOT, 'docs/DOMAIN.md'), 'utf8');";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings).toHaveLength(1);
+  });
+
+  test('is silent for the existsSync-guarded conditional-read pattern', () => {
+    const content =
+      "const domain = existsSync(resolve(ROOT, 'docs/DOMAIN.md')) ? read('docs/DOMAIN.md') : null;";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings).toHaveLength(0);
+  });
+
+  // Review follow-up (issue #973): an existsSync guard whose ternary puts the
+  // read on the ABSENT-path branch still executes that read against an
+  // exported tree — the earlier version of this check only looked for an
+  // intervening `;` and mistook this for the safe pattern above.
+  test('flags the inverted ternary where the read runs precisely when the path is absent', () => {
+    const content =
+      "const domain = existsSync(resolve(ROOT, 'docs/DOMAIN.md')) ? null : read('docs/DOMAIN.md');";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings).toHaveLength(1);
+    expect(findings[0].match).toBe('docs/DOMAIN.md');
+  });
+
+  test('is silent when the private path is present in the same tree (the private source tree, not an export)', () => {
+    const content = "const domain = read('docs/DOMAIN.md');";
+    const findings = checkUnconditionalPrivateReads(
+      'test/example.test.js',
+      content,
+      new Set(['docs/DOMAIN.md']),
+    );
+    expect(findings).toHaveLength(0);
+  });
+
+  test('is silent for a mere string-literal reference that is not a read call', () => {
+    const content = "expect(findings.some(f => f.match === 'docs/DOMAIN.md')).toBe(true);";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings).toHaveLength(0);
+  });
+
+  test('the default private-only path list includes docs/DOMAIN.md', () => {
+    expect(PRIVATE_ONLY_DOC_PATHS).toContain('docs/DOMAIN.md');
+  });
+
+  // Review follow-up (issue #973): an existsSync guard for a DIFFERENT path,
+  // or one whose result is never used to gate the read, must not suppress
+  // the finding — the tree still dangles with ENOENT in both cases.
+  test('is not silenced by an existsSync guard on an unrelated path', () => {
+    const content = "existsSync('README.md'); const domain = read('docs/DOMAIN.md');";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings).toHaveLength(1);
+  });
+
+  test('is not silenced by an existsSync guard on the right path in a discarded earlier statement', () => {
+    const content = "existsSync('docs/DOMAIN.md'); const domain = read('docs/DOMAIN.md');";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings).toHaveLength(1);
+  });
+
+  // Review follow-up (issue #973, P2): the earlier "no `;` or `:` in between"
+  // test only rejected two specific separators, so an `existsSync(path) ||
+  // read(path)` guard slipped through as "guarded" even though `||` means the
+  // read runs precisely when existsSync is FALSE — the path is absent — which
+  // still throws ENOENT in an exported tree.
+  test('is not silenced by an existsSync guard joined with || (read runs when the path is absent)', () => {
+    const content = "existsSync(resolve(ROOT, 'docs/DOMAIN.md')) || read('docs/DOMAIN.md');";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings).toHaveLength(1);
+  });
+
+  // Review follow-up (issue #973, P2): a same-window `existsSync(...)` mention
+  // that is only commented-out text, not a live guard, must not be credited
+  // as one either — the read below it still executes unconditionally.
+  test('is not silenced by an existsSync mention that only appears in a comment', () => {
+    const content =
+      "// existsSync(resolve(ROOT, 'docs/DOMAIN.md')) ? read('docs/DOMAIN.md') : null\n" +
+      "const domain = read('docs/DOMAIN.md');";
+    const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+    expect(findings.some((f) => f.match === 'docs/DOMAIN.md')).toBe(true);
+  });
+
+  // Review follow-up (issue #973): this validator's own test file legitimately
+  // contains the above patterns as quoted fixture strings (test data for this
+  // very function), not as executable calls it would run — scanning them as
+  // live code produced a false positive against the real public export tree.
+  test('is exempt for this validator\'s own test file, whose source is fixture strings, not live calls', () => {
+    const content = "const content = \"const domain = read('docs/DOMAIN.md');\";";
+    const findings = checkUnconditionalPrivateReads('test/copybara-validate.test.js', content, new Set());
+    expect(findings).toHaveLength(0);
+  });
+
+  // Review follow-up (issue #973, P2): copy.bara.sky's PRIVATE_ONLY_PATHS
+  // also excludes docs/design/** as a directory glob, not just
+  // docs/DOMAIN.md. The default check must cover an unconditional read of
+  // any concrete file under docs/design/ — not just the ones enumerated at
+  // the time this test was written — or a newly added private design doc
+  // reintroduces the exact same public-export ENOENT failure class.
+  describe('docs/design/** prefix coverage', () => {
+    test('the default private-only prefix list includes docs/design/', () => {
+      expect(PRIVATE_ONLY_DOC_PREFIXES).toContain('docs/design/');
+    });
+
+    test('flags an unconditional read of a concrete docs/design/ file absent from the tree', () => {
+      const content = "const inventory = read('docs/design/handlers-responsibility-inventory.md');";
+      const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+      expect(findings).toHaveLength(1);
+      expect(findings[0].rule).toBe('unconditional-private-read');
+      expect(findings[0].match).toBe('docs/design/handlers-responsibility-inventory.md');
+    });
+
+    test('flags an unconditional read of a docs/design/ file never enumerated by this test file', () => {
+      const content = "const contract = readFileSync(resolve(ROOT, 'docs/design/some-future-doc.md'), 'utf8');";
+      const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+      expect(findings).toHaveLength(1);
+      expect(findings[0].match).toBe('docs/design/some-future-doc.md');
+    });
+
+    test('is silent for the existsSync-guarded conditional-read pattern under docs/design/', () => {
+      const content =
+        "const inventory = existsSync(resolve(ROOT, 'docs/design/handlers-responsibility-inventory.md')) " +
+        "? read('docs/design/handlers-responsibility-inventory.md') : null;";
+      const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+      expect(findings).toHaveLength(0);
+    });
+
+    test('is silent when the docs/design/ file is present in the same tree (the private source tree)', () => {
+      const content = "const inventory = read('docs/design/handlers-responsibility-inventory.md');";
+      const findings = checkUnconditionalPrivateReads(
+        'test/example.test.js',
+        content,
+        new Set(['docs/design/handlers-responsibility-inventory.md']),
+      );
+      expect(findings).toHaveLength(0);
+    });
+
+    test('does not flag a read of a public docs/ path that merely starts with a similar prefix', () => {
+      const content = "const contract = read('docs/design-notes.md');";
+      const findings = checkUnconditionalPrivateReads('test/example.test.js', content, new Set());
+      expect(findings).toHaveLength(0);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // scanTree — end-to-end
 // ---------------------------------------------------------------------------
 
@@ -628,6 +788,67 @@ describe('scanTree', () => {
     // (defense in depth); isolate the dependency-manifest check specifically.
     const result = scanTree(dir, { pathRules: [] });
     expect(result.findings.some(f => f.rule === 'handlers-extraction-plan-requires-private-only-docs')).toBe(false);
+  });
+
+  // Issue #973 regression guard: this is the exact failure mode from public
+  // CI run m2dw/n8n-ai-cli-loop#actions/runs/32203801983 — a still-exported
+  // test that unconditionally reads a private-only path (unlike the #811
+  // case above, this file is NOT itself excluded) must fail validation
+  // before it's presented as a clean public snapshot, without requiring a
+  // new hand-curated DEPENDENCY_MANIFEST entry.
+  test('fails on an exported test that reintroduces an unconditional read of a private-only doc', () => {
+    const dir = join(TMP, 'unconditional-private-read-tree');
+    mkdirSync(join(dir, 'test'), { recursive: true });
+    writeFileSync(
+      join(dir, 'test', 'docs-chatops-result-contract.test.js'),
+      "const domain = read('docs/DOMAIN.md');\n",
+    );
+    const result = scanTree(dir);
+    expect(result.ok).toBe(false);
+    expect(result.findings.some(f => f.rule === 'unconditional-private-read')).toBe(true);
+  });
+
+  test('passes when the same read is guarded by existsSync, docs/DOMAIN.md absent (the real public export shape)', () => {
+    const dir = join(TMP, 'guarded-private-read-tree');
+    mkdirSync(join(dir, 'test'), { recursive: true });
+    writeFileSync(
+      join(dir, 'test', 'docs-chatops-result-contract.test.js'),
+      "const domain = existsSync(resolve(ROOT, 'docs/DOMAIN.md')) ? read('docs/DOMAIN.md') : null;\n",
+    );
+    const result = scanTree(dir);
+    expect(result.findings.some(f => f.rule === 'unconditional-private-read')).toBe(false);
+  });
+
+  // Review follow-up (issue #973): validating the actual public export tree
+  // (docs/DOMAIN.md absent) with this validator's own test file present must
+  // not flag that file's quoted fixture strings as an unconditional read —
+  // this is the exact false positive that blocked the real export.
+  test('does not flag this validator\'s own test file for its quoted fixture strings', () => {
+    const dir = join(TMP, 'validator-own-test-fixture-tree');
+    mkdirSync(join(dir, 'test'), { recursive: true });
+    writeFileSync(
+      join(dir, 'test', 'copybara-validate.test.js'),
+      "const content = \"const domain = read('docs/DOMAIN.md');\";\n" +
+        "const guarded = \"const domain = existsSync(resolve(ROOT, 'docs/DOMAIN.md')) ? read('docs/DOMAIN.md') : null;\";\n",
+    );
+    const result = scanTree(dir);
+    expect(result.findings.some(f => f.rule === 'unconditional-private-read')).toBe(false);
+  });
+
+  test('still flags an unrelated exported test with a genuinely unguarded read alongside the exempt file', () => {
+    const dir = join(TMP, 'mixed-exempt-and-real-tree');
+    mkdirSync(join(dir, 'test'), { recursive: true });
+    writeFileSync(
+      join(dir, 'test', 'copybara-validate.test.js'),
+      "const content = \"const domain = read('docs/DOMAIN.md');\";\n",
+    );
+    writeFileSync(
+      join(dir, 'test', 'docs-chatops-result-contract.test.js'),
+      "const domain = read('docs/DOMAIN.md');\n",
+    );
+    const result = scanTree(dir);
+    expect(result.findings.some(f => f.rule === 'unconditional-private-read' && f.file === 'test/docs-chatops-result-contract.test.js')).toBe(true);
+    expect(result.findings.some(f => f.rule === 'unconditional-private-read' && f.file === 'test/copybara-validate.test.js')).toBe(false);
   });
 });
 

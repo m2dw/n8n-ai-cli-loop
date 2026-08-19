@@ -413,6 +413,59 @@ describe('docs/issue-refinement-contract.md — eligibility and trigger', () => 
     );
   });
 
+  // Issue #967: the row 4 hold used to be decided only inside the phase
+  // handler, so every held Issue spent a worker turn per retry window and a
+  // chain labelled ahead of time starved runnable work by claim order.
+  test('holds a predecessor-ineligible Issue as a non-runnable task, not a queued one', () => {
+    expect(doc).toMatch(/\*\*A held Issue is not a runnable task\.\*\*/);
+    expect(doc).toMatch(
+      /the row 4 hold is\s+persisted as a \*\*non-runnable `blocked` refinement task\*\* rather than as a\s+queued one/,
+    );
+    expect(doc).toMatch(
+      /claim order \(priority, then creation time\) hands them the worker first — starving\s+runnable work/,
+    );
+    expect(doc).toMatch(
+      /Applying the marker\s+to a whole dependency chain in advance is a supported operator workflow/,
+    );
+  });
+
+  test('the intake gate admits structural failures and decides nothing on a provider error', () => {
+    expect(doc).toMatch(/\*\*A structural failure is admitted, never held\.\*\*/);
+    expect(doc).toMatch(
+      /Rows 5, 6, and 7 need the\s+handler to raise their handoff, and only a claimable row reaches the handler/,
+    );
+    expect(doc).toMatch(/\*\*A provider error decides nothing\.\*\*/);
+    expect(doc).toMatch(
+      /An error is never read as "eligible" and never as "not\s+ready"/,
+    );
+  });
+
+  test('reactivation is idempotent and preserves everything the hold did not write', () => {
+    expect(doc).toMatch(/\*\*Reactivation is intake's job, and it is idempotent\.\*\*/);
+    expect(doc).toMatch(
+      /`context\.assignment`,\s+the §15 block \(including `sourceFingerprint`, the counters, and the §14\s+activation plan\), and the row's `created_at` survive the hold unchanged/,
+    );
+    expect(doc).toMatch(/A\s+poll that finds the hold still unsatisfied writes nothing at all/);
+    expect(doc).toMatch(
+      /the hold neither reads nor writes the chain registry's frozen\s+prefixes, and it moves no GitHub label/,
+    );
+    // Rows admitted before the gate existed must converge on their own, and a
+    // row a runner already claimed must not be pulled out from under it.
+    expect(doc).toMatch(
+      /Rows admitted before this gate existed converge without operator intervention/,
+    );
+    expect(doc).toMatch(
+      /under a compare-and-set on the row it observed, so a row a runner has\s+already claimed is left to that run/,
+    );
+  });
+
+  test('keeps the handler evaluation as the backstop rather than the schedule', () => {
+    expect(doc).toMatch(/\*\*The handler check remains, as a backstop\.\*\*/);
+    expect(doc).toMatch(
+      /The handler\s+re-evaluates §4 on every claim against fresher reads, so a predecessor that\s+becomes unusable between the poll and the phase run is still refused there/,
+    );
+  });
+
   test('requires every direct predecessor to carry a usable stack-ready result', () => {
     expect(doc).toMatch(/\*\*Every\*\* direct predecessor has a usable result, in one of exactly two shapes/);
     expect(doc).toMatch(/`session\.labels\.stackReady`, `status:stack-ready` by default/);
@@ -1446,6 +1499,21 @@ describe('docs/issue-refinement-contract.md — transition table', () => {
     );
   });
 
+  // Issue #967 changed how row 4's hold is REPRESENTED, not what it decides,
+  // so the table must not have grown a row for it (nor for its release).
+  test('row 4 states the non-runnable representation of its hold without adding a row', () => {
+    const row4 = rows.find((r) => r.num === 4);
+    expect(row4.next).toBe('pending');
+    expect(row4.effect).toMatch(/hold as a non-runnable task \(§4\)/);
+    expect(row4.effect).toMatch(/`refinement\.eligibility\.refused` \(`predecessor_not_ready`\)/);
+    expect(doc).toMatch(
+      /That is a representation of the hold this table already describes, not a transition of its own/,
+    );
+    expect(doc).toMatch(
+      /Consequently the release needs no row here either: it restores the same `pending` task the hold interrupted/,
+    );
+  });
+
   test('has 47 rows numbered contiguously from 1', () => {
     expect(rows).toHaveLength(47);
     expect(rows.map((r) => r.num)).toEqual(Array.from({ length: 47 }, (_, i) => i + 1));
@@ -2135,6 +2203,22 @@ describe('docs/issue-refinement-contract.md — persistence and audit', () => {
     }
   });
 
+  // Issue #967: the hold is now decided in two places. One event name for one
+  // fact, or every surface that counts holds counts them twice.
+  test('the intake hold shares the handler event name and records why it is free', () => {
+    expect(doc).toMatch(
+      /The row 4 hold emits `refinement\.eligibility\.refused` wherever it is decided/,
+    );
+    expect(doc).toMatch(
+      /inventing a second name for one fact would make every surface that counts holds count them twice/,
+    );
+    expect(doc).toMatch(/An intake-placed hold adds `runnable: false` to the event's fields/);
+    expect(doc).toMatch(/`task\.context\.refinementPredecessorHold`/);
+    expect(doc).toMatch(
+      /Its release changes no refinement state and therefore emits no `refinement\.\*` event; it is recorded as a generic `task\.reactivated` event/,
+    );
+  });
+
   // Both facts happen outside the §12 state machine, so without their own
   // events neither would be recorded anywhere.
   test('the two out-of-lane events are explained rather than left dangling', () => {
@@ -2412,6 +2496,20 @@ describe('docs/issue-refinement-contract.md — compatibility', () => {
 
   test('keeps the dormant-first contract required', () => {
     expect(doc).toMatch(/\*\*Dormant-first contract\.\*\* Unchanged and still required/);
+    // Ahead-of-time labelling of a whole chain is supported, so it must be free
+    // (issue #967).
+    expect(doc).toMatch(
+      /Applying the marker to a whole chain ahead of time is nonetheless supported and cheap/,
+    );
+  });
+
+  test('names the one new status/phase combination and keeps it label-free', () => {
+    expect(doc).toMatch(/\*\*Task statuses and the claim order\.\*\*/);
+    expect(doc).toMatch(/`blocked` at phase `refinement`, the §4 hold/);
+    expect(doc).toMatch(/`blocked` is not claimable, so no scheduler, worktree, or lock behavior changes/);
+    expect(doc).toMatch(
+      /it carries no coarse `blocked` label: nothing published it/,
+    );
   });
 
   // The outbox is still the only mutation path, but it cannot carry this
@@ -2726,6 +2824,18 @@ describe('cross-document pointers', () => {
     );
     expect(ideaToImplementation).toMatch(
       /swaps `status:needs-refinement` for `status:needs-implementation` and leaves your `agent:\*` label in place — the ordinary implementation pair, which the next intake scan picks up under the unchanged dependency gates/,
+    );
+  });
+
+  // Issue #967: the guide tells operators to label a chain ahead of time, so it
+  // must also say what that costs — nothing, because the wait is not a task the
+  // runner can claim.
+  test('idea-to-implementation.md says an ahead-of-time chain label costs no worker turn', () => {
+    expect(ideaToImplementation).toMatch(
+      /Labelling a whole chain this way up front is supported and costs nothing while it waits/,
+    );
+    expect(ideaToImplementation).toMatch(
+      /a dependent whose blocker is not yet usable is held by intake as a non-runnable task, so it never takes a worker turn from runnable work elsewhere/,
     );
   });
 });

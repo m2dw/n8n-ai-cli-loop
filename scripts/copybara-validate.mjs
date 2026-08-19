@@ -419,6 +419,165 @@ export function checkDependencyManifest(presentPaths, manifest = DEPENDENCY_MANI
   return findings;
 }
 
+/**
+ * Concrete-file entries of copy.bara.sky's PRIVATE_ONLY_PATHS — paths a
+ * test could plausibly `readFileSync`/`read` by their exact name.
+ */
+export const PRIVATE_ONLY_DOC_PATHS = ['docs/DOMAIN.md'];
+
+/**
+ * Directory-glob entries of copy.bara.sky's PRIVATE_ONLY_PATHS (currently
+ * only `docs/design/**`), expressed as literal path prefixes instead of
+ * enumerated filenames: a read of ANY path under one of these directories
+ * dangles in an export tree exactly like a read of docs/DOMAIN.md, but the
+ * concrete files under docs/design/ change over time. Matching by prefix
+ * means checkUnconditionalPrivateReads covers a newly added private design
+ * doc automatically, without a matching edit here — the review follow-up
+ * for issue #973 found that the original fix only listed docs/DOMAIN.md
+ * and missed docs/design/**, leaving the same export-CI failure class
+ * (ENOENT in the public tree) open for design docs.
+ */
+export const PRIVATE_ONLY_DOC_PREFIXES = ['docs/design/'];
+
+/**
+ * Files whose own source is expected to contain `read(...)`/`readFileSync(...)`
+ * text mentioning a private-only path as a quoted fixture string (test data
+ * for checkUnconditionalPrivateReads itself), not as an executable call this
+ * file would run. Scanning those fixture strings as if they were live code
+ * produces a false positive the moment this validator's own test file is
+ * part of the tree being scanned — see issue #973 review follow-up. Kept
+ * separate from PERSONAL_PATH_EXEMPT_FILES because it exempts a different
+ * check (unconditional-private-read, not the personal-path content rules)
+ * and a different file (the test, not the validator source).
+ */
+const UNCONDITIONAL_READ_CHECK_EXEMPT_FILES = new Set(['test/copybara-validate.test.js']);
+
+const GUARD_LOOKBACK_CHARS = 200;
+
+/**
+ * Returns the index of the `)` that closes the `(` at `openParenIndex`, by
+ * depth counting, or -1 if unbalanced. Used to find the true end of an
+ * `existsSync(...)` call even when its argument is itself a call
+ * (`existsSync(resolve(ROOT, 'docs/DOMAIN.md'))`) — a naive `[^;]*?\)`
+ * regex stops at the FIRST `)` it meets, which is `resolve(...)`'s, not
+ * `existsSync(...)`'s, and that misidentified boundary is what let a
+ * `||`-joined read slip past the pre-#973-review-follow-up version of this
+ * check (see checkUnconditionalPrivateReads below).
+ */
+function matchingParenEnd(content, openParenIndex) {
+  let depth = 0;
+  for (let i = openParenIndex; i < content.length; i++) {
+    if (content[i] === '(') depth++;
+    else if (content[i] === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * True when `index` falls inside a `//` line comment or a block comment
+ * (`/star ... star/`), by a simple backward scan (this file deliberately has no lexer —
+ * see the module banner). Used only to refuse crediting an `existsSync(...)`
+ * guard that appears in commented-out/example text as though it gated a
+ * real read; it never suppresses detection of the read call itself, so it
+ * can only make this check MORE conservative, never less.
+ */
+function isInsideComment(content, index) {
+  const lineStart = content.lastIndexOf('\n', index - 1) + 1;
+  if (content.slice(lineStart, index).includes('//')) return true;
+  return content.lastIndexOf('/*', index) > content.lastIndexOf('*/', index);
+}
+
+/**
+ * True only for the exact guarded conditional-read shape used throughout
+ * test/docs-*-contract.test.js: `existsSync(<call containing the path>) ?
+ * read(...)`, with the read sitting directly on the ternary's affirmative
+ * (present-path) branch — nothing else between the guard's closing paren
+ * and the read but the `?` and whitespace.
+ *
+ * This is deliberately a positive match on that one safe shape rather than
+ * a negative "no `;` or `:` in between" test. The negative test was
+ * defeated two ways (issue #973 review follow-up): `existsSync(path) ||
+ * read(path)` contains neither `;` nor `:` yet runs the read exactly when
+ * the path is ABSENT, and a comment mentioning `existsSync(path)` ahead of
+ * a real unconditional read also contains neither. Requiring the exact `?`
+ * ternary shape — via matchingParenEnd for the guard's true boundary, and
+ * isInsideComment to refuse comment text as a guard — rejects both:
+ * `||` leaves `between` as `" || "`, not `?`-only, and a commented-out
+ * `existsSync(...)` is skipped as a guard candidate entirely.
+ */
+function isGuardedByExistsSyncTernary(content, readCallIndex, pathLiteralPattern) {
+  const windowStart = Math.max(0, readCallIndex - GUARD_LOOKBACK_CHARS);
+  const existsSyncCallPattern = /\bexistsSync\(/g;
+  existsSyncCallPattern.lastIndex = windowStart;
+  let gm;
+  while ((gm = existsSyncCallPattern.exec(content)) !== null && gm.index < readCallIndex) {
+    const openParenIndex = gm.index + gm[0].length - 1;
+    const closeParenIndex = matchingParenEnd(content, openParenIndex);
+    if (closeParenIndex === -1 || closeParenIndex >= readCallIndex) continue;
+    if (isInsideComment(content, gm.index)) continue;
+    const guardSpan = content.slice(openParenIndex, closeParenIndex + 1);
+    if (!pathLiteralPattern.test(guardSpan)) continue;
+    const between = content.slice(closeParenIndex + 1, readCallIndex);
+    if (/^\s*\?\s*$/.test(between)) return true;
+  }
+  return false;
+}
+
+/**
+ * Regression guard for issue #973: catches the general shape of the #811
+ * failure mode (an exported file that unconditionally reads a private-only
+ * path dangles with ENOENT the moment that path is correctly excluded from
+ * an export) without requiring a new hand-curated DEPENDENCY_MANIFEST entry
+ * for every future contract test. It reads one present file's own source for
+ * a `read(...)`/`readFileSync(...)` call, extracts the first string-literal
+ * argument, and — when that literal is declared private (an exact match in
+ * `privatePaths` or prefixed by an entry in `privatePrefixes`) and itself
+ * absent from the same tree — flags it. That means it fires against a
+ * transformed export tree (where the read would actually throw) but stays
+ * silent against the private source tree (where the read succeeds).
+ *
+ * A call is exempt only when isGuardedByExistsSyncTernary recognizes it as
+ * sitting on the affirmative branch of an `existsSync(<same path>) ? ...`
+ * guard immediately to its left — see that function for why this is a
+ * positive shape match rather than a looser "no `;`/`:` in between" test.
+ * An `existsSync` call that checks an unrelated path, or one whose result
+ * is discarded in an earlier statement, does not exempt the read either —
+ * the tree would still dangle with ENOENT in that case.
+ */
+export function checkUnconditionalPrivateReads(
+  relPath,
+  content,
+  presentPaths,
+  privatePaths = PRIVATE_ONLY_DOC_PATHS,
+  privatePrefixes = PRIVATE_ONLY_DOC_PREFIXES,
+) {
+  if (UNCONDITIONAL_READ_CHECK_EXEMPT_FILES.has(relPath)) return [];
+  const findings = [];
+  const readCallPattern = /\b(?:readFileSync|read)\([^)]*?['"`]([^'"`]+)['"`]/g;
+  let m;
+  while ((m = readCallPattern.exec(content)) !== null) {
+    const literalPath = m[1];
+    const isDeclaredPrivate =
+      privatePaths.includes(literalPath) || privatePrefixes.some((prefix) => literalPath.startsWith(prefix));
+    if (!isDeclaredPrivate) continue;
+    if (presentPaths.has(literalPath)) continue;
+    const escaped = literalPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pathLiteralPattern = new RegExp(`['"\`]${escaped}['"\`]`);
+    if (isGuardedByExistsSyncTernary(content, m.index, pathLiteralPattern)) continue;
+    findings.push({
+      rule: 'unconditional-private-read',
+      description: `Unconditionally reads private-only path ${literalPath}, which this tree does not contain — guard with existsSync(<same path>) ? read(...) : ...`,
+      file: relPath,
+      line: content.slice(0, m.index).split('\n').length,
+      match: literalPath,
+    });
+  }
+  return findings;
+}
+
 // ---------------------------------------------------------------------------
 // Fixture/example exemptions
 // ---------------------------------------------------------------------------
@@ -544,6 +703,8 @@ export function scanTree(rootDir, opts = {}) {
   const contentRules = opts.contentRules ?? CONTENT_RULES;
   const pathRules = opts.pathRules ?? FORBIDDEN_PATH_RULES;
   const dependencyManifest = opts.dependencyManifest ?? DEPENDENCY_MANIFEST;
+  const privateOnlyDocPaths = opts.privateOnlyDocPaths ?? PRIVATE_ONLY_DOC_PATHS;
+  const privateOnlyDocPrefixes = opts.privateOnlyDocPrefixes ?? PRIVATE_ONLY_DOC_PREFIXES;
   const files = walkFiles(rootDir);
   const findings = [];
   const presentPaths = new Set(files.map((file) => toPosixRelative(rootDir, file)));
@@ -591,6 +752,9 @@ export function scanTree(rootDir, opts = {}) {
     // Skip files that don't decode cleanly as text (heuristic: NUL byte).
     if (content.includes('\u0000')) continue;
     findings.push(...scanFileContent(relPath, content, rulesForFile));
+    findings.push(
+      ...checkUnconditionalPrivateReads(relPath, content, presentPaths, privateOnlyDocPaths, privateOnlyDocPrefixes),
+    );
   }
 
   return { ok: findings.length === 0, findings };

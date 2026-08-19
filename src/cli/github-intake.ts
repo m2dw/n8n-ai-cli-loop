@@ -43,6 +43,24 @@ import {
   resolveIssueRefinementSettings,
   resolveRefinementLabels,
 } from "../core/issue-refinement.js";
+import type {
+  RefinementIssueRead,
+  RefinementPullRequestLookup,
+  RefinementSnapshotSource,
+} from "../core/issue-refinement-snapshot.js";
+import type {
+  RefinementEligibilitySource,
+  RefinementPredecessorHoldRecord,
+} from "../core/issue-refinement-eligibility.js";
+import {
+  REFINEMENT_PREDECESSOR_HOLD_KEY,
+  buildRefinementPredecessorHold,
+  decideRefinementIntakeDisposition,
+  describeRefinementPredecessorHold,
+  evaluateRefinementIntakeEligibility,
+  readRefinementPredecessorHold,
+} from "../core/issue-refinement-eligibility.js";
+import { readChainAgreementFromRegistry } from "../core/issue-refinement-chain-agreement.js";
 import { SqliteChainRegistryStore } from "../stores/sqlite-chain-registry-store.js";
 import { acceptChainGraph, collectChainOwnership } from "../core/chain-acceptance.js";
 import { buildFrozenPrefix, checkFrozenPrefixes } from "../core/chain-frozen-prefix.js";
@@ -71,7 +89,7 @@ import { GiteaWorkItemProvider } from "../providers/gitea/gitea-work-item-provid
 import { resolveGiteaToken, redactGiteaSecrets } from "../providers/gitea/gitea-client.js";
 import type { GiteaHttpRequest } from "../providers/gitea/gitea-client.js";
 import type { WorkItem } from "../providers/types.js";
-import type { TaskPhase } from "../core/task.js";
+import type { TaskEvent, TaskPhase } from "../core/task.js";
 import { REPORT_ONLY_BLOCKED_PHASES, describeReportOnlyDeferral } from "../handlers/report-only-admission.js";
 import { emit, die } from "./cli-io.js";
 import { tokenizeArgs } from "./admin-command.js";
@@ -314,6 +332,99 @@ export class GraphQLDependencyChecker implements DependencyChecker {
       })
       .filter((e): e is BlockedByEntry => e !== null);
   }
+}
+
+// ---------------------------------------------------------------------------
+// The three gh reads §4 conditions 2–4 need (issue #967)
+//
+// They live here rather than beside the rest of the refinement snapshot source
+// because BOTH callers need them and only one direction of import is safe:
+// `cli/issue-refinement-loop.ts` already imports this module for
+// GraphQLDependencyChecker, so the shared reads sit on this side and the
+// snapshot source composes them. One implementation, so the intake gate and the
+// handler's capture can never read a predecessor differently.
+// ---------------------------------------------------------------------------
+
+export interface GhRefinementReadOptions {
+  githubRepo: string;
+  /** Injected in production so App-auth sessions read as the App; tests pass a fake. */
+  runGh: (args: string[]) => string;
+}
+
+/**
+ * Read-only predecessor reads for the refinement lane: the `blocked by` edge
+ * set, a work item, and the Issue's PR under the session's `ai/issue-<n>` head
+ * convention.
+ *
+ * Every failure THROWS, per {@link RefinementSnapshotSource}: an unread PR must
+ * never be reported as "no PR exists", because that reads as a usable-shape
+ * verdict rather than as the provider failure it is.
+ */
+export function createGhRefinementReads(
+  options: GhRefinementReadOptions,
+): Pick<RefinementSnapshotSource, "getBlockedBy" | "readIssue" | "readPullRequest"> {
+  const { githubRepo: repo, runGh } = options;
+  const dependencyChecker = new GraphQLDependencyChecker(repo, runGh);
+  const ghJson = (args: string[]): unknown => JSON.parse(runGh(args));
+  const asRecord = (value: unknown): Record<string, unknown> =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const str = (value: unknown): string => (typeof value === "string" ? value : "");
+
+  return {
+    getBlockedBy: (issueNumber) => dependencyChecker.getBlockedBy(issueNumber),
+
+    readIssue: async (issueNumber): Promise<RefinementIssueRead> => {
+      const raw = asRecord(
+        ghJson([
+          "issue", "view", String(issueNumber),
+          "--repo", repo,
+          "--json", "number,state,title,body,labels",
+        ]),
+      );
+      const labels = Array.isArray(raw["labels"])
+        ? (raw["labels"] as unknown[]).map((l) => str(asRecord(l)["name"])).filter((n) => n !== "")
+        : [];
+      return {
+        number: typeof raw["number"] === "number" ? (raw["number"] as number) : issueNumber,
+        state: str(raw["state"]).toLowerCase() === "closed" ? "closed" : "open",
+        title: str(raw["title"]),
+        body: str(raw["body"]),
+        labels,
+      };
+    },
+
+    readPullRequest: async (issueNumber): Promise<RefinementPullRequestLookup> => {
+      // The session's own head-branch convention: `ai/issue-<n>`. A transient
+      // lookup failure THROWS (the port forbids reading it as "no PR").
+      const raw = ghJson([
+        "pr", "list",
+        "--repo", repo,
+        "--state", "all",
+        "--head", `ai/issue-${issueNumber}`,
+        "--json", "number,state,headRefName,headRefOid,mergeCommit,title,body",
+      ]);
+      const rows = Array.isArray(raw) ? raw.map(asRecord) : [];
+      if (rows.length === 0) return { kind: "none" };
+      if (rows.length > 1) return { kind: "ambiguous", detail: `matches:${rows.length}` };
+      const pr = rows[0];
+      const state = str(pr["state"]).toLowerCase();
+      const mergeCommit = asRecord(pr["mergeCommit"]);
+      return {
+        kind: "found",
+        pullRequest: {
+          number: typeof pr["number"] === "number" ? (pr["number"] as number) : 0,
+          state: state === "merged" ? "merged" : state === "open" ? "open" : "closed",
+          headRefName: str(pr["headRefName"]),
+          headSha: str(pr["headRefOid"]) || undefined,
+          mergeCommitSha: str(mergeCommit["oid"]) || undefined,
+          title: str(pr["title"]),
+          body: str(pr["body"]),
+        },
+      };
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +796,38 @@ async function registerCandidateChain(
   }
 }
 
+/**
+ * The §12 row 4 audit record for a hold this gate placed (issue #967).
+ *
+ * Deliberately the SAME event the handler's own row-4 hold emits, with the same
+ * reason literal: the fact recorded is identical — "§4 condition 4 is not
+ * satisfied, the Issue is held, re-evaluated next poll" — and §15's event
+ * catalogue is closed, so inventing a second name for one fact would make every
+ * operator surface that counts holds count them twice. `runnable: false` is what
+ * distinguishes the two: this one also says the row will not be claimed while it
+ * waits.
+ */
+function refinementHoldEvent(
+  key: { sessionId: string; issueNumber: number },
+  record: RefinementPredecessorHoldRecord,
+  now: string,
+): TaskEvent {
+  return {
+    task: key,
+    type: "refinement.eligibility.refused",
+    message: describeRefinementPredecessorHold(record),
+    data: {
+      reason: record.reason,
+      predecessors: record.predecessorIssueNumbers,
+      holds: record.holds,
+      runnable: false,
+      ...(record.previousStatus !== undefined ? { previousStatus: record.previousStatus } : {}),
+      heldAt: record.heldAt,
+    },
+    createdAt: now,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Main (exported for testing with a fake gh runner and dep checker)
 // ---------------------------------------------------------------------------
@@ -698,6 +841,18 @@ export interface IntakeDeps {
   giteaHttp?: GiteaHttpRequest;
   env?: NodeJS.ProcessEnv;
   resolveKey?: (key: string) => string;
+  /**
+   * Read-only port for the §4 conditions 2–5 gate the refinement lane runs
+   * before it creates a claimable task (issue #967).
+   *
+   * Production builds it from the session's resolved work-item runner; tests
+   * inject a fake so the gate can be driven without GitHub. Absent on a
+   * non-GitHub work-item provider, where the refinement lane has no snapshot
+   * reads at all — the gate then makes no decision and intake behaves exactly
+   * as it did before, leaving the handler to raise its own unsupported-provider
+   * handoff rather than silently parking the Issue where no operator looks.
+   */
+  refinementEligibilitySource?: RefinementEligibilitySource;
 }
 
 /** Adapt a provider {@link WorkItem} to the intake {@link GhIssue} shape. */
@@ -751,6 +906,9 @@ export async function runIntake(
   let issues: GhIssue[];
   let effectiveDepChecker: DependencyChecker | undefined;
   let effectiveStackReadyResolver: StackReadyResolver | undefined;
+  // The §4 conditions 2–4 reads for the refinement gate (issue #967). Left
+  // undefined on the Gitea work-item path (see IntakeDeps).
+  let refinementReads: RefinementEligibilitySource | undefined = deps?.refinementEligibilitySource;
   // Stacked-base facts observed by the default Gate-2 resolver, consumed by
   // chain registration so the frozen base decision names the blocker PR's
   // real head ref (issue #790).
@@ -872,6 +1030,14 @@ export async function runIntake(
         }
         return plan.kind === "ready";
       });
+
+    // The refinement gate reads through the SAME work-item runner as everything
+    // else above, so an App-auth session evaluates §4 as the App rather than as
+    // whatever operator `gh` happens to be logged in (issue #967).
+    refinementReads ??= createGhRefinementReads({
+      githubRepo: session.githubRepo,
+      runGh: runGhViaRunner(workItemRunner, session.repoRoot),
+    });
   }
 
   // Chain-aware progressive Issue refinement (issue #867). Resolved once per
@@ -888,16 +1054,60 @@ export async function runIntake(
   const refinementLabels = resolveRefinementLabels(session.labels);
   const refinementRefusals: RefinementIntakeRefusal[] = [];
 
-  const allCandidates = await parseCandidates(
-    issues,
-    effectiveDepChecker,
-    effectiveStackReadyResolver,
-    {
-      enabled: refinementSettings.enabled,
-      markerLabel: refinementLabels.marker,
-      onRefusal: (refusal) => refinementRefusals.push(refusal),
-    },
-  );
+  // §4 conditions 2–5, evaluated before a claimable task exists (issue #967).
+  //
+  // The chain cross-check (condition 5) reads the SAME registry the handler's
+  // snapshot source does, through the same core function, so the two can never
+  // disagree about whether an Issue needs the row-6 handoff. It is opened
+  // lazily — only a session with the lane enabled and at least one marked Issue
+  // pays for it — and closed as soon as the scan is done, because nothing below
+  // this call ever consults it again.
+  let refinementChainRegistry: SqliteChainRegistryStore | undefined;
+  const refinementEligibilitySource: RefinementEligibilitySource | undefined =
+    refinementSettings.enabled && refinementReads
+      ? {
+          ...refinementReads,
+          readChainAgreement:
+            refinementReads.readChainAgreement
+            ?? ((issueNumber: number, observedPredecessors: readonly number[]) => {
+              refinementChainRegistry ??= new SqliteChainRegistryStore(args.dbPath);
+              return readChainAgreementFromRegistry(
+                refinementChainRegistry,
+                sessionId,
+                issueNumber,
+                observedPredecessors,
+              );
+            }),
+        }
+      : undefined;
+
+  let allCandidates: IssueCandidateWithDecision[];
+  try {
+    allCandidates = await parseCandidates(
+      issues,
+      effectiveDepChecker,
+      effectiveStackReadyResolver,
+      {
+        enabled: refinementSettings.enabled,
+        markerLabel: refinementLabels.marker,
+        onRefusal: (refusal) => refinementRefusals.push(refusal),
+        ...(refinementEligibilitySource
+          ? {
+              resolveEligibility: (input) =>
+                evaluateRefinementIntakeEligibility({
+                  issueNumber: input.issueNumber,
+                  source: refinementEligibilitySource,
+                  stackReadyLabel: session.labels["stackReady"] ?? "status:stack-ready",
+                  maxPredecessorsPerRefinement:
+                    refinementSettings.limits.maxPredecessorsPerRefinement,
+                }),
+            }
+          : {}),
+      },
+    );
+  } finally {
+    refinementChainRegistry?.close();
+  }
   const effectivePhases = args.supportedPhases ?? DEFAULT_SUPPORTED_PHASES;
   // A refinement candidate is exempt from the supported-phase filter. That
   // filter answers "can THIS runner execute the phase?", and the refinement
@@ -918,6 +1128,13 @@ export async function runIntake(
   let chainDeferredCount = 0;
   let refinementAdmittedCount = 0;
   let refinementSuspendedCount = 0;
+  // Issue #967: how many marked Issues this poll left (or made) non-runnable
+  // for `predecessor_not_ready`, and how many it released once §4 was
+  // satisfied. `refinementHeld` counts rows WRITTEN as held — a row that was
+  // already held is reported per-issue but not counted again, so the number
+  // reads as "state changed", not "still waiting".
+  let refinementHeldCount = 0;
+  let refinementReactivatedCount = 0;
   const reportOnlyEnabled = session.reportOnly?.enabled === true;
 
   if (!args.dryRun) {
@@ -1181,13 +1398,187 @@ export async function runIntake(
             if (outcome !== "not_applicable") continue;
           }
 
+          // §4 conditions 2–5, decided BEFORE the row becomes claimable (issue
+          // #967). Absent when no eligibility source is wired (a non-GitHub
+          // work-item provider, or a caller that injected none), in which case
+          // every branch below is the pre-#967 one and the handler stays the
+          // only place predecessors are read.
+          const disposition = candidate.refinementEligibility
+            ? decideRefinementIntakeDisposition({
+                eligibility: candidate.refinementEligibility,
+                existing,
+              })
+            : ({ kind: "admit" } as const);
+
+          if (disposition.kind === "leave") {
+            // Already parked by this gate, or a row this gate must not touch.
+            // Nothing is written, and the identical evaluation runs next poll.
+            // Reported under its own action rather than as a fresh hold: the
+            // per-poll line says "still waiting", while `refinementHeld` counts
+            // only the polls that actually changed a row's state.
+            alreadyExistsCount++;
+            results.push({
+              issueNumber: candidate.issueNumber,
+              action: "refinement_hold_unchanged",
+              phase: "refinement",
+              reason: disposition.reason,
+            });
+            continue;
+          }
+
+          if (disposition.kind === "reactivate" && existing !== undefined) {
+            // The predecessors became usable. Release the row THIS gate parked
+            // — in place, under a CAS on what was just read, so a concurrent
+            // claim or operator action is refused rather than overwritten.
+            //
+            // Only the four fields the hold itself wrote are undone: the
+            // status, the `notBefore` a handler hold may have left, the
+            // `lastError` describing the hold, and the hold record. Everything
+            // else the row carries — the pinned `context.assignment`, the §15
+            // refinement block with its `sourceFingerprint` and activation
+            // plan, the admission timestamp — is deliberately untouched, so
+            // reactivation restores exactly the task that was admitted rather
+            // than re-admitting a new one over it.
+            const heldRecord = readRefinementPredecessorHold(existing.context);
+            const released = await store.completePhaseWithEffects(
+              {
+                key: refinementKey,
+                expected: {
+                  status: existing.status,
+                  phase: existing.phase,
+                  revision: existing.revision,
+                },
+                patch: {
+                  status: "queued",
+                  notBefore: undefined,
+                  lastError: undefined,
+                  context: { [REFINEMENT_PREDECESSOR_HOLD_KEY]: undefined },
+                  now,
+                },
+                // A generic task event, not a `refinement.*` one: §15's audit
+                // catalogue is closed and every name in it records a §12
+                // transition, while this changes no refinement state at all —
+                // the block stays `pending` and the lane starts exactly where
+                // the hold interrupted it. Without it the ledger would show a
+                // row that went `blocked` for no visible reason and later ran.
+                event: {
+                  task: refinementKey,
+                  type: "task.reactivated",
+                  message:
+                    "Refinement predecessors are usable; releasing the intake hold "
+                    + "(predecessor_not_ready).",
+                  data: {
+                    phase: "refinement",
+                    previousStatus: existing.status,
+                    reason: "predecessor_not_ready",
+                    ...(heldRecord ? { heldAt: heldRecord.heldAt } : {}),
+                  },
+                  createdAt: now,
+                },
+              },
+              [],
+            );
+            if (released.ok) {
+              refinementReactivatedCount++;
+              results.push({
+                issueNumber: candidate.issueNumber,
+                action: "refinement_reactivated",
+                phase: "refinement",
+              });
+            } else {
+              results.push({
+                issueNumber: candidate.issueNumber,
+                action: "refinement_reactivate_deferred",
+                phase: "refinement",
+                reason: released.code,
+              });
+            }
+            continue;
+          }
+
+          if (disposition.kind === "hold_existing" && existing !== undefined) {
+            // A claimable row for an Issue §4 does not admit yet: either one
+            // admitted before this gate existed, or one the handler's own hold
+            // delayed back to `queued`. Park it under a CAS on what was just
+            // read — this is the reconciliation that makes the fix converge
+            // without an operator touching the database.
+            const record = buildRefinementPredecessorHold({
+              eligibility: disposition.eligibility,
+              previousStatus: existing.status,
+              now,
+            });
+            const parked = await store.completePhaseWithEffects(
+              {
+                key: refinementKey,
+                expected: {
+                  status: existing.status,
+                  phase: existing.phase,
+                  revision: existing.revision,
+                },
+                patch: {
+                  status: "blocked",
+                  ownerRunId: undefined,
+                  leaseExpiresAt: undefined,
+                  notBefore: undefined,
+                  lastError: describeRefinementPredecessorHold(record),
+                  context: { [REFINEMENT_PREDECESSOR_HOLD_KEY]: record },
+                  now,
+                },
+                event: refinementHoldEvent(refinementKey, record, now),
+              },
+              [],
+            );
+            if (parked.ok) {
+              refinementHeldCount++;
+              results.push({
+                issueNumber: candidate.issueNumber,
+                action: "refinement_held",
+                phase: "refinement",
+                reason: "predecessor_not_ready",
+                previousStatus: existing.status,
+                predecessors: record.predecessorIssueNumbers,
+              });
+            } else {
+              // A raced transition or a held maintenance lock: nothing was
+              // written, and the identical guard runs again on the next poll.
+              results.push({
+                issueNumber: candidate.issueNumber,
+                action: "refinement_hold_deferred",
+                phase: "refinement",
+                reason: parked.code,
+              });
+            }
+            continue;
+          }
+
+          // From here the row is either created or replaced. A `hold` writes
+          // exactly the same row an `admit` does, at `blocked` instead of
+          // `queued` and carrying the hold record — so nothing about the §15
+          // block, the activation plan, or the pinned assignment depends on
+          // which of the two this poll chose.
+          const holdRecord =
+            disposition.kind === "hold"
+              ? buildRefinementPredecessorHold({ eligibility: disposition.eligibility, now })
+              : undefined;
+          const admissionInput = holdRecord
+            ? {
+                ...refinementInput,
+                initialStatus: "blocked" as const,
+                lastError: describeRefinementPredecessorHold(holdRecord),
+                context: {
+                  ...refinementInput.context,
+                  [REFINEMENT_PREDECESSOR_HOLD_KEY]: holdRecord,
+                },
+              }
+            : refinementInput;
+
           if (existing !== undefined && existing.phase !== "refinement") {
             // Disposed of, parked, or finished under the OLD lane. Replace it
             // wholesale — a fresh `refinement` row with only this lane's
             // context — under a compare-and-set on what was just read, so a
             // concurrent claim or requeue is refused rather than overwritten.
             const replaced = await store.replaceTask(
-              refinementInput,
+              admissionInput,
               {
                 status: existing.status,
                 phase: existing.phase,
@@ -1205,20 +1596,34 @@ export async function runIntake(
                     previousStatus: existing.status,
                     phase: "refinement",
                     markerLabel: refinementLabels.marker,
+                    ...(holdRecord ? { held: "predecessor_not_ready" } : {}),
                   },
                   createdAt: now,
                 },
+                // The hold's own audit record, committed in the SAME
+                // transaction as the replacement (issue #967 review). A
+                // replacement that was refused writes neither; one that
+                // committed can never be missing its reason, which matters
+                // because the row it produces is `blocked` and every later
+                // poll takes the `already_held` path without re-appending.
+                ...(holdRecord
+                  ? { extraEvents: [refinementHoldEvent(refinementKey, holdRecord, now)] }
+                  : {}),
               },
             );
             if (replaced.ok) {
               enqueuedCount++;
               refinementAdmittedCount++;
+              if (holdRecord) refinementHeldCount++;
               results.push({
                 issueNumber: candidate.issueNumber,
                 action: "replaced",
                 phase: "refinement",
                 previousPhase: existing.phase,
                 previousStatus: existing.status,
+                ...(holdRecord
+                  ? { status: "blocked", reason: "predecessor_not_ready" }
+                  : {}),
               });
             } else {
               // Raced (or absent — the row was pruned since the read). Nothing
@@ -1233,14 +1638,26 @@ export async function runIntake(
             continue;
           }
 
-          const admissionResult = await store.enqueueTask(refinementInput);
+          // The hold record and the blocked row it explains commit together
+          // (issue #967 review): intake is idempotent, so a crash between two
+          // separate writes would leave a `blocked` row that every later poll
+          // reports as `already_exists` — the missing audit event would never
+          // be retried.
+          const admissionResult = await store.enqueueTask(
+            admissionInput,
+            holdRecord
+              ? { events: [refinementHoldEvent(refinementKey, holdRecord, now)] }
+              : undefined,
+          );
           if (admissionResult.ok) {
             enqueuedCount++;
             refinementAdmittedCount++;
+            if (holdRecord) refinementHeldCount++;
             results.push({
               issueNumber: candidate.issueNumber,
               action: admissionResult.reactivated ? "reactivated" : "enqueued",
               phase: "refinement",
+              ...(holdRecord ? { status: "blocked", reason: "predecessor_not_ready" } : {}),
             });
           } else {
             // Idempotent intake: a repeated poll finds the refinement row and
@@ -1441,6 +1858,20 @@ export async function runIntake(
         });
         continue;
       }
+      // Preview the #967 gate too, so `--dry-run` does not report a claimable
+      // refinement task for an Issue a live poll would park.
+      if (candidate.refinementEligibility?.kind === "hold") {
+        results.push({
+          issueNumber: candidate.issueNumber,
+          action: "dry_run",
+          phase: candidate.phase,
+          title: candidate.title,
+          status: "blocked",
+          reason: "predecessor_not_ready",
+          predecessors: candidate.refinementEligibility.predecessorIssueNumbers,
+        });
+        continue;
+      }
       results.push({ issueNumber: candidate.issueNumber, action: "dry_run", phase: candidate.phase, title: candidate.title });
     }
   }
@@ -1480,6 +1911,8 @@ export async function runIntake(
     refinementAdmitted: refinementAdmittedCount,
     refinementRefused: refinementRefusals.length,
     refinementSuspended: refinementSuspendedCount,
+    refinementHeld: refinementHeldCount,
+    refinementReactivated: refinementReactivatedCount,
     dryRun: args.dryRun,
     results,
   });

@@ -11,7 +11,7 @@
  * drift. They are structural only, mirroring the doc-only pin pattern
  * already used for docs/issue-refinement-contract.md (#866).
  */
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -29,7 +29,14 @@ const DOC_PATH = 'docs/chatops-result-contract.md';
 const doc = read(DOC_PATH);
 const mapping = read('docs/chatops-operation-mapping-contract.md');
 const port = read('docs/operation-dispatch-port-contract.md');
-const domain = read('docs/DOMAIN.md');
+
+// docs/DOMAIN.md is a PRIVATE_ONLY_PATH (copybara/copy.bara.sky): the public
+// export excludes it, so an unconditional read here dangles with ENOENT in the
+// public repo's own CI (issue #811/#973). The DOMAIN.md reconciliation pins
+// below therefore run only where the document exists (the private source of
+// truth); every other assertion in this file stays unconditional.
+const domain = existsSync(resolve(ROOT, 'docs/DOMAIN.md')) ? read('docs/DOMAIN.md') : null;
+const domainTest = domain === null ? test.skip : test;
 
 describe(`${DOC_PATH} — status and scope`, () => {
   test('is marked approved design, not yet implemented', () => {
@@ -431,7 +438,7 @@ describe('cross-document reconciliation actually landed', () => {
     expect(mapping).toMatch(/\*\*Delivered \(#785\)\*\*: `docs\/chatops-result-contract\.md`/);
   });
 
-  test('DOMAIN.md §5 item 3 narrates both #784 and #785 as delivered', () => {
+  domainTest('DOMAIN.md §5 item 3 narrates both #784 and #785 as delivered', () => {
     expect(domain).toMatch(/\*\*Delivered \(#784\)\*\*: the\s*operation mapping and routing-protection layer/);
     expect(domain).toMatch(
       /\*\*Delivered \(#785\)\*\*: the result, acknowledgement, and\s*dependency contract/,
