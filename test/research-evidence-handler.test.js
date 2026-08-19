@@ -122,10 +122,15 @@ const artifactDirPath = () => join(artifactRoot, 'runs', 'run-evidence-1');
 // for several minutes on every worker, and per-spawn latency there is dominated
 // by other processes rather than by anything measured here. A 30s budget was
 // still exceeded that way (the file needed 98s of wall clock for ~60 spawns),
-// so the budget is sized for the worst contention rather than the work: a real
-// hang is caught by Jest's own suite-level failure, while a slow host is not
-// reported as a behavioural regression.
-const SPAWN_TIMEOUT_MS = 120000;
+// and so was a 120s one: on a host where `admin-cli.test.js` alone took 589s of
+// a 589s suite, the single heaviest case here — the six-spawn end-to-end
+// evidence run — burned the whole 120s while its two siblings in the same
+// `describe`, spawning the same fixture the same way, passed in that same run.
+// A budget the sibling cases clear cannot be diagnosing a hang in the one
+// between them, so the budget is sized for the worst contention rather than the
+// work: a real hang is caught by Jest's own suite-level failure, while a slow
+// host is not reported as a behavioural regression.
+const SPAWN_TIMEOUT_MS = 300000;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'research-evidence-handler-'));

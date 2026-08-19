@@ -71,7 +71,7 @@ import { resolve, dirname } from 'path';
 // backward-compatible fallback (a sessionId is itself a valid reference).  A
 // reference that itself contains a comma (or leading/trailing spaces) is written
 // with backslash escapes — see parseSessionRefs.
-const SUPPORTED_PHASES = 'implementation,review,conflict_resolution,research,content_research,content_draft,content_review';
+const SUPPORTED_PHASES = 'implementation,review,conflict_resolution,research,content_research,content_draft,content_review,refinement';
 const SCHEDULE_MINUTES = 5;
 
 // Repository root — used to locate the compiled session resolver in dist/.

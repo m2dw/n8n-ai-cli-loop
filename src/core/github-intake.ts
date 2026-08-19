@@ -1,4 +1,9 @@
 import type { AgentId, ImplementationMode, TaskPhase } from "./task.js";
+import {
+  DEFAULT_REFINEMENT_MARKER_LABEL,
+  evaluateRefinementAdmission,
+  type RefinementRefusalReason,
+} from "./issue-refinement.js";
 
 export interface IssueCandidate {
   issueNumber: number;
@@ -324,6 +329,41 @@ export type IssueCandidateWithDecision = IssueCandidate & {
   dependencyDecision?: DependencyDecision;
 };
 
+// ---------------------------------------------------------------------------
+// Chain-aware progressive Issue refinement — intake admission
+// (issue #866/#867, docs/issue-refinement-contract.md §4, §12 rows 1/2/47)
+// ---------------------------------------------------------------------------
+
+/**
+ * An admission refusal (§12 rows 2 and 47). No task exists, so this is a HOLD
+ * recorded by the poll — never a handoff — and it is re-evaluated on the next
+ * poll once an operator fixes the labels.
+ */
+export interface RefinementIntakeRefusal {
+  issueNumber: number;
+  title: string;
+  reason: Extract<RefinementRefusalReason, "conflicting_markers" | "no_implementation_agent">;
+  /** The marker that triggered the evaluation. */
+  markerLabel: string;
+  /** The executable `status:*` labels observed beside the marker (`conflicting_markers` only). */
+  conflictingLabels: string[];
+}
+
+/**
+ * Refinement-lane options for {@link parseCandidates}.
+ *
+ * Absent or `enabled: false` means the marker is inert (§19): every Issue is
+ * routed exactly as it is today, including one carrying the marker beside an
+ * executable status. That is the whole of the lane's rollout gate.
+ */
+export interface RefinementIntakeOptions {
+  enabled: boolean;
+  /** `status:needs-refinement`, or the session's override. */
+  markerLabel?: string;
+  /** Called once per refused Issue, in scan order. */
+  onRefusal?: (refusal: RefinementIntakeRefusal) => void;
+}
+
 /**
  * Gate 2 stackable case: a dependent issue may advance to implementation before
  * its blocker is closed when it has exactly one open blocker and is a new
@@ -366,15 +406,59 @@ function isStackableBlockedCase(
  *
  * When depChecker is omitted no dependency gate is applied (useful in tests
  * that supply a controlled issue list without a live GitHub connection).
+ *
+ * `refinement` enables the chain-aware refinement lane (issue #867). It is
+ * evaluated BEFORE `labelsToPhase`, because §3 of the contract makes the marker
+ * a veto: an Issue carrying it beside a stale executable status must be refused
+ * entirely rather than routed by whichever of the two labels the router happens
+ * to check first (`status:needs-fix` is checked first, so a rough Issue would
+ * otherwise enter fix mode).
  */
 export async function parseCandidates(
   issues: GhIssue[],
   depChecker?: DependencyChecker,
   stackReadyResolver?: StackReadyResolver,
+  refinement?: RefinementIntakeOptions,
 ): Promise<IssueCandidateWithDecision[]> {
   const candidates: IssueCandidateWithDecision[] = [];
+  const markerLabel = refinement?.markerLabel ?? DEFAULT_REFINEMENT_MARKER_LABEL;
   for (const issue of issues) {
     const labels = issue.labels.map((l) => l.name);
+
+    if (refinement?.enabled) {
+      const admission = evaluateRefinementAdmission(labels, markerLabel);
+      if (admission.kind === "refused") {
+        refinement.onRefusal?.({
+          issueNumber: issue.number,
+          title: issue.title,
+          reason: admission.reason,
+          markerLabel,
+          conflictingLabels: admission.executableStatusLabels,
+        });
+        continue;
+      }
+      if (admission.kind === "admit") {
+        // No dependency gate, deliberately. §12 row 1 is decided on
+        // `intake.scanned` from labels alone, before any relationship query;
+        // conditions 2–5 (rows 3–7) are the separate predecessor-resolution
+        // event, which owns the fan-in cap, the chain cross-check, and the
+        // not-ready hold. Applying Gate 1/Gate 2 here would also be wrong on its
+        // own terms: a refinement-marked Issue exists precisely because its
+        // predecessors are still open, so the implementation gates would hold
+        // every Issue this lane is for (§4).
+        candidates.push({
+          issueNumber: issue.number,
+          title: issue.title,
+          url: issue.url,
+          labels,
+          ...(typeof issue.body === "string" && issue.body.length > 0 ? { body: issue.body } : {}),
+          phase: "refinement",
+          implementationAgent: admission.implementationAgent,
+        });
+        continue;
+      }
+    }
+
     const mapping = labelsToPhase(labels);
     if (!mapping) continue;
 

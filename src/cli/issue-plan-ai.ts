@@ -238,6 +238,12 @@ export interface PlannerAgent {
    * it needs to locate its own credentials/config; the caller merges them into
    * the isolated env without re-exposing GitHub credentials. Given the original
    * (pre-isolation) env so it can resolve the real HOME-based config path.
+   *
+   * A provider whose login is only reachable from the real HOME may return
+   * `HOME` itself (see {@link claudeAuthEnv}). That is a provider-scoped policy
+   * and not a general relaxation: whatever a provider returns, the caller re-pins
+   * `GH_CONFIG_DIR` at the throwaway dir afterwards, so GitHub isolation is not
+   * restorable through this seam.
    */
   authEnv?(originalEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
 }
@@ -293,10 +299,11 @@ const CLAUDE_DISALLOWED_TOOLS = [
  *   - `--strict-mcp-config` (with no `--mcp-config`) refuses to load any
  *     filesystem MCP server config, so no MCP-backed tool can be reached.
  *   - `--safe-mode` disables user/project customizations (hooks, plugins,
- *     agents, slash commands). For a HOME-backed login, `claudeAuthEnv` points
- *     `CLAUDE_CONFIG_DIR` at the operator's real HOME, so without this an
- *     operator's configured hooks/plugins could still load and run around the
- *     untrusted issue prompt — breaking the read-only/no-side-effect boundary.
+ *     agents, slash commands). For a subscription login, `claudeAuthEnv` restores
+ *     the operator's real HOME, so without this an operator's configured
+ *     hooks/plugins could load and run around the untrusted issue prompt —
+ *     breaking the read-only/no-side-effect boundary. It is the compensating
+ *     control that makes that HOME policy admissible, not an extra.
  *   - `--no-session-persistence` stops Claude Code from writing the print-mode
  *     session (the untrusted issue prompt and planner conversation) into the
  *     real config dir. Sessions persist by default, so without this a normal
@@ -342,13 +349,29 @@ const CLAUDE_AUTH_PASSTHROUGH_KEYS: readonly string[] = [
  *
  * Two login modes must keep working:
  *   - API-key/token: pass the Anthropic credential vars through unchanged.
- *   - HOME-backed OAuth (the standard `claude` CLI login): the credentials live
- *     under the caller's real HOME (`$HOME/.claude.json`), which isolation hides
- *     by repointing HOME at a throwaway dir. Set `CLAUDE_CONFIG_DIR` to the real
- *     HOME (the dir that CONTAINS `.claude.json`) so the planner finds that login
- *     without us un-isolating HOME (GH_CONFIG_DIR stays pinned to the throwaway
- *     dir, so gh credentials remain unreachable). An explicit caller-set
- *     CLAUDE_CONFIG_DIR is honored as-is.
+ *   - Subscription/OAuth (the standard `claude` CLI login): the credentials are
+ *     HOME-backed, and — issue #935 — they are NOT reachable through
+ *     `CLAUDE_CONFIG_DIR`. A local matrix confirmed a throwaway HOME reports
+ *     "Not logged in · Please run /login" with `CLAUDE_CONFIG_DIR` pointed at the
+ *     real HOME, at `$HOME/.claude`, and at a copy of the visible config files
+ *     alike, while the same invocation with the real HOME preserved is
+ *     authenticated. So the real HOME is restored here, as an Anthropic-specific
+ *     policy with compensating controls: GH_CONFIG_DIR stays pinned to the
+ *     throwaway dir and every write-enabling token var stays stripped (gh finds
+ *     nothing to authenticate with either way), the cwd stays a throwaway
+ *     directory, and {@link CLAUDE_NO_TOOLS_ARGS} — the empty tool set,
+ *     `--strict-mcp-config`, `--safe-mode`, `--no-session-persistence` — is what
+ *     stops the operator's own hooks, plugins, MCP servers, and session files
+ *     from becoming reachable along with the login. A logged-out CLI still fails
+ *     closed: nothing here supplies a credential.
+ *
+ * An explicit caller-set CLAUDE_CONFIG_DIR is honored as-is. It is no longer
+ * synthesized from HOME: with the real HOME restored the CLI resolves its own
+ * default, and the synthesized value could only override a correct default.
+ *
+ * The same policy, and the same reasoning, applies to the handler-side no-tool
+ * turns; see `PROVIDER_HOME_POLICY` in `src/handlers/agent-isolation.ts` and
+ * docs/agent-isolation-policy.md.
  */
 function claudeAuthEnv(originalEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
@@ -357,13 +380,8 @@ function claudeAuthEnv(originalEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   }
   if (originalEnv["CLAUDE_CONFIG_DIR"]) {
     out["CLAUDE_CONFIG_DIR"] = originalEnv["CLAUDE_CONFIG_DIR"];
-  } else if (originalEnv["HOME"]) {
-    // CLAUDE_CONFIG_DIR is the directory that CONTAINS `.claude.json`, which for
-    // the standard CLI OAuth login lives directly at `$HOME/.claude.json`. So we
-    // point it at the real HOME itself, not `$HOME/.claude` (that would make the
-    // CLI look for `$HOME/.claude/.claude.json` and report "not logged in").
-    out["CLAUDE_CONFIG_DIR"] = originalEnv["HOME"];
   }
+  if (originalEnv["HOME"]) out["HOME"] = originalEnv["HOME"];
   return out;
 }
 
@@ -469,18 +487,25 @@ export function executePlannerAgent(
   // buildIsolatedEnv() created a throwaway HOME (and GH_CONFIG_DIR) inside it.
   // Capture that path so it is cleaned up alongside the cwd below — otherwise
   // repeated automation runs accumulate stale planner/session/config data in
-  // both temp dirs outside the artifact root.
+  // both temp dirs outside the artifact root. Captured BEFORE the provider's
+  // auth merge below, which may replace HOME with the operator's real one: the
+  // directory this removes is the throwaway one either way, never a real home.
   const isolatedHome = isolatedEnv["HOME"];
   // Pin PWD to the sandbox so the agent's reported cwd matches its actual cwd
   // (buildIsolatedEnv already removed the inherited, checkout-pointing PWD).
   isolatedEnv["PWD"] = isolatedCwd;
   // Restore the planner provider's own auth/config on top of the GitHub
   // isolation. The throwaway HOME hides a HOME-backed planner login (e.g. the
-  // default `claude` CLI's OAuth session); the provider re-declares the minimal
-  // credential env it needs (e.g. CLAUDE_CONFIG_DIR pointing at the user's real
-  // ~/.claude). GH_CONFIG_DIR stays pinned to the throwaway dir, so GitHub
-  // credential isolation is preserved.
+  // default `claude` CLI's subscription session); the provider re-declares the
+  // minimal credential env it needs — for Claude, its real HOME, which is the
+  // only thing that reaches that login (issue #935).
   Object.assign(isolatedEnv, agent.authEnv?.(process.env) ?? {});
+  // GitHub isolation is not a provider's to relax: re-pinned AFTER the merge so
+  // no auth env, present or future, can hand the agent back the caller's gh
+  // credential store — which is the one thing a restored real HOME would
+  // otherwise make reachable by `GH_CONFIG_DIR` simply going missing.
+  if (isolatedHome) isolatedEnv["GH_CONFIG_DIR"] = isolatedHome;
+  delete isolatedEnv["XDG_CONFIG_HOME"];
   try {
     return agent.run({
       prompt: invocation.prompt,

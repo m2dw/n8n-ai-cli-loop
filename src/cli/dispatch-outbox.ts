@@ -26,6 +26,12 @@ import {
 } from "../registries/json-session-registry.js";
 import { SqliteOutboxStore, DEFAULT_DB_PATH } from "../stores/sqlite-outbox-store.js";
 import { SqliteContextStore } from "../stores/sqlite-context-store.js";
+import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
+import {
+  isUnpublishedRefinementHandoffComment,
+  recordRefinementHandoffCommentUndeliverable,
+  repairRefinementHandoffCommentUndeliverable,
+} from "../core/outbox-effects.js";
 import { dispatchOutbox, defaultGhRunner, defaultOutboxProviderFactory } from "../handlers/gh-dispatcher.js";
 import { deriveOwnershipScanCursorKey } from "../core/outbox-scan-cursor.js";
 import type { GhRunner, OutboxProviderFactory } from "../handlers/gh-dispatcher.js";
@@ -45,6 +51,7 @@ import {
 } from "../providers/gitea/gitea-client.js";
 import type { GiteaHttpRequest } from "../providers/gitea/gitea-client.js";
 import type { ProviderAuthConfig } from "../core/session.js";
+import type { OutboxEntry } from "../core/outbox.js";
 import type { WorkItemProvider } from "../providers/types.js";
 import { fileURLToPath } from "url";
 import { emit, die } from "./cli-io.js";
@@ -107,6 +114,15 @@ function failingWorkItemProvider(message: string): WorkItemProvider {
     },
     async getDependencies() {
       throw new Error(message);
+    },
+    async getDependents() {
+      throw new Error(message);
+    },
+    async addDependency() {
+      return { ok: false, error: message };
+    },
+    async removeDependency() {
+      return { ok: false, error: message };
     },
     commentItem() {
       return { ok: false, error: message };
@@ -466,7 +482,37 @@ export async function main(
       ...(scanCursorKey ? { scanCursorKey } : {}),
       repoHostRunner: resolveRepoHostRunner,
       ...(providerFactory ? { providers: providerFactory } : {}),
+      // A dead letter is the moment an effect becomes permanently undelivered,
+      // and for a terminal refinement handoff's comment that is the §12 row-46
+      // fact the task itself has to carry (issue #936): the Issue will never
+      // show the notice, so the task row is the only place left that can say so.
+      // The task store is opened HERE rather than beside the outbox store so an
+      // ordinary drain — the overwhelmingly common case, where nothing dies —
+      // touches exactly the tables it did before. The recorder writes nothing
+      // for rows it does not own, which is every other dead letter.
+      onDeadLettered: async (entry) => {
+        const taskStore = new SqliteTaskStore(dbPath);
+        try {
+          await recordRefinementHandoffCommentUndeliverable(
+            taskStore, entry, "dead_lettered", new Date().toISOString(),
+          );
+        } finally {
+          taskStore.close();
+        }
+      },
     });
+
+    // The durable half of the §12 row-46 audit (P2 review follow-up to issue
+    // #936). `onDeadLettered` above is one shot: the row it fires for is never
+    // selected for dispatch again, so a transient failure there — a busy SQLite
+    // file, a crash between the two writes — would lose the record for good.
+    // Dead-lettered rows, though, stay listable until they are pruned and carry
+    // everything the event is derived from, so every run re-derives what is
+    // missing and records it. Skipped while maintenance holds the lock (issue
+    // #818), where nothing was claimed and the run is deliberately idle.
+    const auditRepair = result.maintenanceLocked
+      ? { recorded: 0, errors: [] as { id: number; error: string }[] }
+      : await repairHandoffAudits(outboxStore, dbPath, entryFilter);
 
     emit({
       ok: true,
@@ -487,8 +533,14 @@ export async function main(
       ...(result.cursorFenceStale ? { cursorFenceStale: true } : {}),
       dispatched: result.dispatched,
       failed: result.failed,
-      errors: result.errors,
+      // A repair failure is reported beside the dispatch failures rather than
+      // in a channel of its own: to an operator it is the same kind of fact —
+      // something this run could not finish — and the next run retries it.
+      errors: [...result.errors, ...auditRepair.errors],
       deadLettered: result.deadLettered,
+      // Emitted only when a repair actually happened, so a normal drain's JSON
+      // shape is unchanged.
+      ...(auditRepair.recorded > 0 ? { handoffAuditsRepaired: auditRepair.recorded } : {}),
       ...(sessionId ? { sessionId } : {}),
       ...(contextId ? { contextId } : {}),
     });
@@ -504,6 +556,56 @@ export async function main(
   } finally {
     outboxStore.close();
   }
+}
+
+/**
+ * Record the §12 row-46 audit event for every terminal handoff comment row that
+ * is still missing it (P2 review follow-up to issue #936).
+ *
+ * Reads the outbox and writes tasks — it never mutates a row, so a repair can
+ * neither resurrect a dead letter nor re-attempt a delivery. The `listUnsent`
+ * read covers the rows a dispatch scan deliberately cannot see: a dead-lettered
+ * row is excluded from `listPendingEntries` forever, which is exactly why the
+ * one-shot dead-letter hook cannot be the durable record.
+ *
+ * The task store is opened only once a row actually needs repairing, so an
+ * ordinary drain — nothing dead-lettered, or nothing belonging to this lane —
+ * touches the same tables it did before this existed. `filter` is the run's own
+ * ownership filter, so a shared database never has one session's run write
+ * events against another session's tasks.
+ */
+async function repairHandoffAudits(
+  outboxStore: SqliteOutboxStore,
+  dbPath: string,
+  filter: ((entry: { payload: { owner: string; repo: string } }) => boolean) | undefined,
+): Promise<{ recorded: number; errors: { id: number; error: string }[] }> {
+  let unrepaired: OutboxEntry[];
+  try {
+    const unsent = await outboxStore.listUnsent();
+    unrepaired = unsent.filter(
+      (entry) => isUnpublishedRefinementHandoffComment(entry) && (!filter || filter(entry)),
+    );
+  } catch (err) {
+    // The read itself failing is the same class of transient problem this sweep
+    // exists to survive: report it and let the next run try again. Reported
+    // under id 0 — no row is implicated, and row ids are positive — so the
+    // errors array keeps one shape.
+    return { recorded: 0, errors: [{ id: 0, error: `handoff audit scan failed: ${errorText(err)}` }] };
+  }
+  if (unrepaired.length === 0) return { recorded: 0, errors: [] };
+
+  const taskStore = new SqliteTaskStore(dbPath);
+  try {
+    return await repairRefinementHandoffCommentUndeliverable(
+      taskStore, unrepaired, new Date().toISOString(),
+    );
+  } finally {
+    taskStore.close();
+  }
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 // ---------------------------------------------------------------------------

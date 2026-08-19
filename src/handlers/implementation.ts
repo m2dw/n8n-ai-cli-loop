@@ -32,7 +32,17 @@ import type { DependencySyncOutcome } from "./dependency-sync.js";
 import { ensureEnvironmentPrepared } from "./environment-prepare.js";
 import { runDependencyUpdate } from "./dependency-update.js";
 import type { DependencyUpdateApplied, DependencyUpdateFailed } from "./dependency-update.js";
-import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory } from "../core/quota-classifier.js";
+import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory, resolveTransientRetryDelayMs } from "../core/quota-classifier.js";
+import {
+  TRANSIENT_VERIFICATION_LEDGER_KEY,
+  clearTransientVerificationRetries,
+  recordTransientVerificationRetry,
+} from "../core/review-classifier.js";
+import {
+  VERIFICATION_REPAIR_CYCLES_CONTEXT_FIELD,
+  decideImplementationVerificationOutcome,
+  describeVerificationEnvironmentSignal,
+} from "../core/implementation-verification.js";
 import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
 import { parseToolRequest, toolRequestPromptSection, toolRequestResolutionPromptSection, normalizeToolRequestCommand } from "../core/tool-request.js";
 import type { StoredToolRequest, ToolRequest } from "../core/tool-request.js";
@@ -3604,26 +3614,142 @@ export function createImplementationHandler(
         timestamp: new Date().toISOString(),
         commitSkipped: true,
       };
-      writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
-        issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
-        exitCode: failure.exitCode, success: false, step: `verification:${failure.name}`, artifactDir,
+      // Nothing below this point commits or pushes: whatever the disposition,
+      // the run ends here with the failing tree intact in the per-Issue
+      // worktree and the branch untouched, so a known-broken commit can never
+      // reach the PR (issue #934).
+      const verificationContext: Record<string, unknown> = {
+        artifactDir,
+        resolvedProfile,
+        verificationFailure: { name: failure.name, exitCode: failure.exitCode },
+        verificationFeedback: failure.output,
         dirtyContinuation,
-      }, null, 2), "utf8");
-      return {
-        result: "failed",
-        context: {
-          artifactDir,
-          resolvedProfile,
-          verificationFailure: { name: failure.name, exitCode: failure.exitCode },
-          verificationFeedback: failure.output,
+        // Clear any stale agent-exit diagnostic from an earlier attempt on
+        // this issue (issue #727 review): this failure came from
+        // verification, so the continuation prompt must render the
+        // verification failure above, not a lingering agent-exit message.
+        agentExitFailure: undefined,
+      };
+      const writeVerificationResultArtifact = (extra: Record<string, unknown>): void => {
+        writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
+          issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
+          exitCode: failure.exitCode, success: false, step: `verification:${failure.name}`, artifactDir,
           dirtyContinuation,
-          // Clear any stale agent-exit diagnostic from an earlier attempt on
-          // this issue (issue #727 review): this failure came from
-          // verification, so the continuation prompt must render the
-          // verification failure above, not a lingering agent-exit message.
-          agentExitFailure: undefined,
+          ...extra,
+        }, null, 2), "utf8");
+      };
+      // Issue #934: classify BEFORE selecting the transition. An ordinary red
+      // suite is work the implementation agent can continue; a saturated host
+      // and an operator-actionable setup failure are not, and each keeps its
+      // own existing contract.
+      const disposition = decideImplementationVerificationOutcome({
+        failure,
+        context: task.context,
+      });
+      if (disposition.kind === "transient") {
+        // Issue #897's policy, applied on the implementation side of the same
+        // verification commands: an indeterminate CLI probe says nothing about
+        // the diff, so re-running the agent against it would spend a repair
+        // cycle to discover there is nothing to change. Short backoff instead,
+        // on the SAME per-command budget the review phase spends.
+        writeVerificationResultArtifact({
+          delayed: true,
+          transientSignal: disposition.signal,
+        });
+        return {
+          result: "delayed",
+          // The agent had no part in this: naming the delay keeps the public
+          // status comment from reporting a quota condition nobody reported.
+          delayKind: "transient_verification",
+          context: {
+            // The whole prior context is carried forward (mirrors review.ts):
+            // the released row keeps its intake-recorded fields, and the
+            // continuation marker/feedback below are what let the retried run
+            // resume from these same edits rather than refuse the dirty tree.
+            ...task.context,
+            ...verificationContext,
+            // issue #611 review: the `...task.context` spread above can carry a
+            // stale `artifactDirPending: true` forward from an earlier
+            // pre-creation failure on this task, while `verificationContext`
+            // overrides `artifactDir` to THIS run's own, already-created
+            // directory. Because the patch then contains the key,
+            // `applyTaskPatch`'s spread-aware auto-clear (which only fires when
+            // the patch omits it outright) cannot correct it, and backup restore
+            // would skip validating a real artifact reference. Assert `false`
+            // explicitly, as the content-research quota-delayed return does.
+            [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: false,
+            [TRANSIENT_VERIFICATION_LEDGER_KEY]: recordTransientVerificationRetry({
+              ctx: task.context,
+              step: failure.name,
+              attempt: disposition.attempt,
+              passedSteps: verification.results.filter((v) => v.passed).map((v) => v.name),
+            }),
+            verificationTransientRetries: disposition.attempt,
+            transientVerificationStep: failure.name,
+            transientVerificationSignal: disposition.signal,
+          },
+          message:
+            `Verification '${failure.name}' failed on an indeterminate CLI probe `
+            + `(signal: "${disposition.signal}"), which says nothing about the diff; `
+            + `delaying retry ${disposition.attempt}/${disposition.maxAttempts}`,
+          retryAfterMs: resolveTransientRetryDelayMs(),
+        };
+      }
+      if (disposition.kind === "environment") {
+        // Operator-actionable setup failure (missing executable, undefined
+        // script, command the shell cannot find). Re-running the agent cannot
+        // make this pass, so it stays terminal exactly as before #934.
+        writeVerificationResultArtifact({ environmentSignal: disposition.signal });
+        return {
+          result: "failed",
+          context: { ...verificationContext, verificationEnvironmentSignal: disposition.signal },
+          error:
+            `Verification '${failure.name}' failed (exit ${failure.exitCode}) before commit/push because `
+            + `${describeVerificationEnvironmentSignal(disposition.signal)} — this is an environment or `
+            + `configuration problem, not a code failure:\n${failure.output.slice(0, 500)}`,
+        };
+      }
+      if (disposition.kind === "repair_cap_reached") {
+        writeVerificationResultArtifact({
+          verificationRepairCycles: disposition.cycles,
+          verificationRepairCapReached: true,
+        });
+        return {
+          result: "failed",
+          context: {
+            ...verificationContext,
+            // Reset the budget on the way out. Only a human can requeue a
+            // `failed` task, and an operator who inspects the worktree and
+            // decides the loop deserves another go should get a full budget
+            // rather than an immediate second handoff on the next failure.
+            [VERIFICATION_REPAIR_CYCLES_CONTEXT_FIELD]: 0,
+            verificationRepairCapReached: true,
+          },
+          error:
+            `Verification '${failure.name}' failed (exit ${failure.exitCode}) before commit/push after `
+            + `${disposition.cycles}/${disposition.maxCycles} automatic implementation repair cycles — `
+            + `escalating to human:\n${failure.output.slice(0, 500)}`,
+        };
+      }
+      // Ordinary quality-gate failure: requeue the SAME task at implementation
+      // so the next run continues from these edits with the failing command's
+      // output in its prompt (see buildPrompt's Continuation Context section).
+      writeVerificationResultArtifact({
+        verificationRepairCycles: disposition.cycle,
+        requeued: true,
+      });
+      return {
+        result: "needs_fix",
+        context: {
+          ...verificationContext,
+          [VERIFICATION_REPAIR_CYCLES_CONTEXT_FIELD]: disposition.cycle,
+          verificationRepairCapReached: false,
         },
-        error: `Verification '${failure.name}' failed (exit ${failure.exitCode}) before commit/push:\n${failure.output.slice(0, 500)}`,
+        message:
+          `Verification '${failure.name}' failed (exit ${failure.exitCode}) before commit/push; `
+          + `requeueing implementation to continue the fix `
+          + `(repair cycle ${disposition.cycle}/${disposition.maxCycles}): `
+          + `${failure.output.slice(0, 300)}`,
       };
     }
 
@@ -4040,6 +4166,23 @@ export function createImplementationHandler(
         // implementation attempt for the same issue does not inherit it and
         // incorrectly treat a new dirty worktree as safe to continue.
         dirtyContinuation: undefined,
+        // Verification passed, so every automatic repair cycle this task spent
+        // getting here is finished business (issue #934). Clearing the counter
+        // is what gives a later review→fix cycle a full budget of its own; a
+        // stale count would hand that cycle's first verification failure
+        // straight to a human instead of letting the agent try.
+        [VERIFICATION_REPAIR_CYCLES_CONTEXT_FIELD]: undefined,
+        verificationRepairCapReached: undefined,
+        // Same reasoning for the #897 transient budget: every configured
+        // verification command answered in this run, so any retry this task
+        // spent on an indeterminate probe is finished business. Leaving the
+        // ledger (or the legacy scalar) in context would hand the review
+        // phase's first transient failure of the same command a partial or
+        // exhausted budget and misroute it to `needs_fix`.
+        ...clearTransientVerificationRetries(
+          task.context,
+          verification.results.filter((v) => v.passed).map((v) => v.name),
+        ),
       },
     };
   };

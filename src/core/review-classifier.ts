@@ -9,6 +9,8 @@
  *   4. blocked   — empty/ambiguous output (human needed)
  */
 
+import { CLI_PROBE_INDETERMINATE_MARKER, hasIndeterminateProbeSignal } from "./cli-probe.js";
+
 export type ReviewClassification = "success" | "needs_fix" | "conflict" | "blocked";
 
 export interface ClassificationDetail {
@@ -84,6 +86,170 @@ const HUMAN_INPUT_PATTERNS = [
  */
 export function hasConflictSignal(output: string): boolean {
   return CONFLICT_PATTERNS.some((p) => p.test(output.trim()));
+}
+
+/**
+ * How many times one review task may re-run a verification command that failed
+ * for a transient reason before the failure is treated as real (issue #897).
+ *
+ * Small on purpose. A genuinely loaded host recovers within a couple of short
+ * backoffs; anything that survives them is either not transient or not going to
+ * clear on its own, and an unbounded delay loop would strand the task where no
+ * human is looking.
+ */
+export const MAX_TRANSIENT_VERIFICATION_RETRIES = 2;
+
+/**
+ * Task-context key holding the per-command transient retry ledger (issue #897).
+ *
+ * The budget is per VERIFICATION COMMAND, not per review task. A session with
+ * `test`, `package` and `typecheck` would otherwise let an indeterminate probe
+ * in `test` spend a shared counter, pass on the retry, and leave `package`'s
+ * FIRST indeterminate probe with no budget at all — falling straight through to
+ * `needs_fix`, which is the misdiagnosis this issue exists to prevent.
+ */
+export const TRANSIENT_VERIFICATION_LEDGER_KEY = "verificationTransientRetriesByStep";
+
+/** Legacy single-counter keys, still honoured for tasks delayed before the ledger existed. */
+const LEGACY_RETRY_COUNT_KEY = "verificationTransientRetries";
+const LEGACY_RETRY_STEP_KEY = "transientVerificationStep";
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function readLedger(ctx: Record<string, unknown> | undefined): Record<string, number> {
+  const raw = ctx?.[TRANSIENT_VERIFICATION_LEDGER_KEY];
+  const ledger: Record<string, number> = {};
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    for (const [step, count] of Object.entries(raw as Record<string, unknown>)) {
+      const parsed = positiveInteger(count);
+      if (parsed !== undefined) ledger[step] = parsed;
+    }
+  }
+  return ledger;
+}
+
+/**
+ * How many transient retries the named verification command has already spent.
+ *
+ * A pre-ledger context carries a single scalar. It counts only against the step
+ * it was recorded alongside; when no step was recorded the scalar is the whole
+ * task's count and is honoured for whichever command is failing now, so an
+ * in-flight budget is never silently widened by this change.
+ */
+export function transientVerificationRetriesFor(
+  ctx: Record<string, unknown> | undefined,
+  step: string,
+): number {
+  const ledger = readLedger(ctx);
+  const scalar = positiveInteger(ctx?.[LEGACY_RETRY_COUNT_KEY]);
+  if (scalar === undefined) return ledger[step] ?? 0;
+  const scalarStep = ctx?.[LEGACY_RETRY_STEP_KEY];
+  const scalarApplies =
+    typeof scalarStep === "string" && scalarStep !== "" ? scalarStep === step : true;
+  return Math.max(ledger[step] ?? 0, scalarApplies ? scalar : 0);
+}
+
+/**
+ * The ledger to carry forward when `step` is delayed for the `attempt`-th time.
+ *
+ * Commands that PASSED in this run have their counters dropped: a command that
+ * answered is not mid-transient-failure any more, and keeping its spent budget
+ * would shrink what it gets the next time the host actually is saturated.
+ */
+export function recordTransientVerificationRetry(args: {
+  ctx: Record<string, unknown> | undefined;
+  step: string;
+  attempt: number;
+  passedSteps: readonly string[];
+}): Record<string, number> {
+  const ledger = readLedger(args.ctx);
+  const scalar = positiveInteger(args.ctx?.[LEGACY_RETRY_COUNT_KEY]);
+  const scalarStep = args.ctx?.[LEGACY_RETRY_STEP_KEY];
+  if (scalar !== undefined && typeof scalarStep === "string" && scalarStep !== "") {
+    ledger[scalarStep] = Math.max(ledger[scalarStep] ?? 0, scalar);
+  }
+  for (const passed of args.passedSteps) delete ledger[passed];
+  ledger[args.step] = args.attempt;
+  return ledger;
+}
+
+/**
+ * The context patch that retires transient-retry state for commands that PASSED
+ * (issue #934 review).
+ *
+ * A phase that delays for an indeterminate probe and then passes on the retry
+ * leaves its spent budget in task context, and the context merge carries it into
+ * the next phase. The same command failing transiently in a LATER phase would
+ * then start with the earlier phase's partial (or exhausted) count and could be
+ * routed to `needs_fix` instead of getting its allowed delayed retry. A command
+ * that answered is not mid-transient-failure any more, so its budget is released
+ * here exactly as {@link recordTransientVerificationRetry} releases it for the
+ * commands that passed alongside a still-failing one.
+ *
+ * Returns a patch, not a context: every key is meant to be spread over the
+ * outgoing context so the merge clears the stale value rather than preserving it.
+ */
+export function clearTransientVerificationRetries(
+  ctx: Record<string, unknown> | undefined,
+  passedSteps: readonly string[],
+): Record<string, unknown> {
+  const ledger = readLedger(ctx);
+  for (const passed of passedSteps) delete ledger[passed];
+  const scalar = positiveInteger(ctx?.[LEGACY_RETRY_COUNT_KEY]);
+  const scalarStep = ctx?.[LEGACY_RETRY_STEP_KEY];
+  // A pre-ledger scalar survives only when it names a command that did NOT pass
+  // here; a scalar with no step is the whole task's count and is stale once any
+  // command has answered, so it is cleared with the rest.
+  const scalarSurvives =
+    scalar !== undefined
+    && typeof scalarStep === "string"
+    && scalarStep !== ""
+    && !passedSteps.includes(scalarStep);
+  return {
+    [TRANSIENT_VERIFICATION_LEDGER_KEY]: Object.keys(ledger).length > 0 ? ledger : undefined,
+    ...(scalarSurvives
+      ? {}
+      : {
+        [LEGACY_RETRY_COUNT_KEY]: undefined,
+        [LEGACY_RETRY_STEP_KEY]: undefined,
+        transientVerificationSignal: undefined,
+      }),
+  };
+}
+
+export interface VerificationFailureClassification {
+  /**
+   * The failure is evidence about the HOST, not about the diff — retry it under
+   * the transient-retry policy instead of routing it to `needs_fix`.
+   */
+  transient: boolean;
+  /** The token that established transience, for the task event / operator log. */
+  signal?: string;
+}
+
+/**
+ * Classify a FAILED verification command's captured output (issue #897).
+ *
+ * The one signal recognized today is an indeterminate CLI probe: a
+ * `session-doctor` probe that timed out or could not fork reports itself with
+ * {@link CLI_PROBE_INDETERMINATE_MARKER}, and a verification run that surfaces
+ * that marker failed because the machine was saturated, not because the
+ * implementation is wrong. Routing it to `needs_fix` requeues an
+ * implementation phase that correctly finds nothing to change and then fails
+ * for producing no diff — the exact loop issue #897 was filed for.
+ *
+ * Deliberately narrow: it matches the structural marker and nothing else.
+ * Verification output quotes the words "timeout", "EAGAIN" and "unavailable"
+ * for countless unrelated reasons, and a broader rule would start delaying real
+ * test failures.
+ */
+export function classifyVerificationFailure(output: string): VerificationFailureClassification {
+  if (hasIndeterminateProbeSignal(output)) {
+    return { transient: true, signal: CLI_PROBE_INDETERMINATE_MARKER };
+  }
+  return { transient: false };
 }
 
 export function classifyReviewOutput(output: string): ClassificationDetail {

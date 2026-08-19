@@ -365,6 +365,28 @@ export class MemoryTaskStore implements TaskStore {
     this.#events.push({ ...event, task: { ...event.task }, data: cloneRecord(event.data) });
   }
 
+  /**
+   * {@link TaskStore.appendEventOnce} (issue #936 review, P2). The probe and the
+   * push are one synchronous body with no `await` between them, which is this
+   * store's whole atomicity story: it has no cross-process backend to race
+   * against, and nothing can interleave inside a single JS turn.
+   */
+  async appendEventOnce(
+    event: TaskEvent,
+    dedupe: { field: string; value: string },
+  ): Promise<boolean> {
+    const already = this.#events.some(
+      (existing) =>
+        existing.task.sessionId === event.task.sessionId &&
+        existing.task.issueNumber === event.task.issueNumber &&
+        existing.type === event.type &&
+        (existing.data as Record<string, unknown> | undefined)?.[dedupe.field] === dedupe.value,
+    );
+    if (already) return false;
+    this.#events.push({ ...event, task: { ...event.task }, data: cloneRecord(event.data) });
+    return true;
+  }
+
   async listEvents(key: TaskKey): Promise<TaskEvent[]> {
     return this.#events
       .filter((event) => event.task.sessionId === key.sessionId && event.task.issueNumber === key.issueNumber)

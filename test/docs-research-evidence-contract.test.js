@@ -8,8 +8,9 @@
  * prohibitions, the failure vocabulary, the public/local split, and the
  * rejected alternatives.
  *
- * They are structural only — no runtime behavior is asserted here, because
- * issue #805 intentionally changes no production research behavior.
+ * They are structural only — no runtime behavior is asserted here, even
+ * though the resolver this contract specifies is now implemented (issue
+ * #806), default-off behind `session.research.evidence.enabled`.
  */
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
@@ -33,8 +34,9 @@ const phaseContracts = read('docs/phase-contracts.md');
 // ---------------------------------------------------------------------------
 
 describe('docs/research-evidence-contract.md — single chosen mechanism', () => {
-  test('is marked as an approved design that is not yet implemented', () => {
-    expect(doc).toMatch(/approved design, not yet implemented/i);
+  test('is marked as an approved design, implemented default-off', () => {
+    expect(doc).toMatch(/approved design, implemented \(issue #806\), default-off/i);
+    expect(doc).toMatch(/session\.research\.evidence\.enabled.*default `false`/);
   });
 
   test('names the runner-owned in-process resolver as the mechanism', () => {
@@ -911,8 +913,8 @@ describe('docs/research-evidence-contract.md — decision record', () => {
 // ---------------------------------------------------------------------------
 
 describe('docs/research-evidence-contract.md — scope', () => {
-  test('states no production research behavior changes in issue #805', () => {
-    expect(doc).toMatch(/No production research behavior changes in #805/);
+  test('states no production research behavior changed in issue #805 itself', () => {
+    expect(doc).toMatch(/no production research behavior changed in #805\s+itself/);
   });
 
   test('states the implementation is off by default when it lands', () => {

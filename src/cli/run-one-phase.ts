@@ -37,6 +37,11 @@ import { createConflictResolutionHandler } from "../handlers/conflict-resolution
 import { createContentResearchHandler } from "../handlers/content-research.js";
 import { createContentDraftHandler } from "../handlers/content-draft.js";
 import { createContentReviewHandler } from "../handlers/content-review.js";
+import { createRefinementHandler } from "../handlers/issue-refinement-loop.js";
+import {
+  createGhRefinementApplyPort,
+  createGhRefinementSnapshotSource,
+} from "./issue-refinement-loop.js";
 import { resolveWorktreeExecutionContext } from "../handlers/worktree-context.js";
 import { IssueWorktreeLock } from "../handlers/worktree.js";
 import type { PhaseLockAcquisition } from "../core/phase-runner.js";
@@ -62,37 +67,55 @@ import { tokenizeArgs } from "./admin-command.js";
 import { fileURLToPath } from "url";
 
 const ALL_PHASES = new Set<TaskPhase>([
-  "implementation", "review", "conflict_resolution", "research", "content_research", "content_draft", "content_review", "planner",
+  "implementation", "review", "conflict_resolution", "research", "content_research", "content_draft", "content_review", "planner", "refinement",
 ]);
 const DEFAULT_SUPPORTED_PHASES: TaskPhase[] = ["research", "content_research", "content_draft", "content_review"];
 
 // Phases that operate inside the repository checkout and therefore run in the
 // per-issue worktree unconditionally (issue #438; issue #731 dropped the
-// shared-checkout mode entirely). Research/planner do not touch the issue
-// branch, so they never trigger worktree (and `ai/issue-<n>` branch) creation.
+// shared-checkout mode entirely). Research/planner/refinement do not touch the
+// issue branch — refinement's agents run isolated with no tools in a throwaway
+// cwd (issue #869) — so they never trigger worktree (and `ai/issue-<n>`
+// branch) creation.
 const WORKTREE_PHASES = new Set<TaskPhase>([
   "implementation", "review", "conflict_resolution",
 ]);
 
+// Phases serialized under the issue-scoped lock. Every worktree phase is, and
+// so is refinement despite touching no worktree (issue #869 review follow-up):
+// its loop spends multiple bounded agent invocations (up to ten minutes each)
+// across rounds, retries, and malformed-output re-asks, so a single run can
+// outlive the 30-minute task lease — and an expired lease lets claimNextTask
+// hand the SAME issue to a second tick while the first is still mid-loop,
+// doubling agent spend and racing the artifact writes and the block/result
+// commit. The same `<session>::issue-<n>` lock the worktree phases use (24h
+// TTL, `admin worktree release-lock` recovery) serializes refinement per issue
+// while distinct issues keep running in parallel. Worktree RESOLUTION stays
+// keyed to WORKTREE_PHASES, so refinement still never materializes a worktree
+// or an `ai/issue-<n>` branch.
+const ISSUE_LOCK_PHASES = new Set<TaskPhase>([...WORKTREE_PHASES, "refinement"]);
+
 /**
  * Acquire the issue-scoped worktree lock around phase execution (issue #440).
  *
- * Every repo-working phase (`WORKTREE_PHASES`) takes the `<session>::issue-<n>`
- * lock so the SAME issue cannot run concurrently while DIFFERENT issues
- * (distinct lock scopes) proceed in parallel — independent of whether n8n
- * prevents overlapping executions. A research/planner phase that never
- * touches the issue branch gets a no-op acquisition. The owner id ties the
- * lock to this run's execution so `admin worktree recovery` / `release-lock`
- * can attribute a stale lock to its origin. The session repo lock is left to
- * canonical-repo / worktree-registry mutations (admin commands) and is
- * intentionally NOT taken here.
+ * Every issue-serialized phase (`ISSUE_LOCK_PHASES` — the worktree phases plus
+ * refinement) takes the `<session>::issue-<n>` lock so the SAME issue cannot
+ * run concurrently while DIFFERENT issues (distinct lock scopes) proceed in
+ * parallel — independent of whether n8n prevents overlapping executions. A
+ * research/planner phase that never touches the issue branch gets a no-op
+ * acquisition. The owner id ties the lock to this run's execution so
+ * `admin worktree recovery` / `release-lock` can attribute a stale lock to its
+ * origin. The session repo lock is left to canonical-repo / worktree-registry
+ * mutations (admin commands) and is intentionally NOT taken here.
+ *
+ * Exported for tests only; `main` is the sole production caller.
  */
-function acquireIssuePhaseLock(
+export function acquireIssuePhaseLock(
   lock: IssueWorktreeLock,
   ownerId: string,
   task: AiTask,
 ): PhaseLockAcquisition {
-  if (!WORKTREE_PHASES.has(task.phase)) {
+  if (!ISSUE_LOCK_PHASES.has(task.phase)) {
     return { ok: true, acquired: true, handle: { release() {} } };
   }
   let result: AcquireResult;
@@ -207,10 +230,21 @@ function parseSupportedPhases(
 // causes runNextPhase() to move tasks to ready_for_human — no crash.
 // ---------------------------------------------------------------------------
 
+/**
+ * Composition inputs that are not session config. `dbPath` is the runner's
+ * SQLite file (the `--db-path` the stores in `main` open); the refinement
+ * snapshot's registered-chain cross-check reads the chain registry from the
+ * same file, so it sees the chains the intake that registered them wrote.
+ */
+export interface PhaseHandlerRuntimeOptions {
+  dbPath?: string | undefined;
+}
+
 export async function createPhaseHandlers(
   context: PhaseHandlerContext,
   authDeps?: GhRunnerAuthDeps,
   giteaHttp: GiteaHttpRequest = defaultGiteaHttp,
+  runtime?: PhaseHandlerRuntimeOptions,
 ): Promise<PhaseHandlers> {
   // Resolve the work-item provider's `gh` executor so dependency relationship
   // reads run as the session's configured identity. For `gh` mode this is the
@@ -324,6 +358,74 @@ export async function createPhaseHandlers(
     implementation: createImplementationHandler(context, undefined, depChecker),
     review: createReviewHandler(context, undefined, undefined, undefined, undefined, reviewPhaseLockOwnerId),
     conflict_resolution: createConflictResolutionHandler(context, undefined, undefined, undefined, conflictPhaseLockOwnerId),
+    // Chain-aware progressive Issue refinement (issue #869 review follow-up):
+    // an intake-admitted `refinement` task is executed by the same tick as
+    // every other phase instead of waiting for a manual `admin refinement run`.
+    // Read-only snapshot, no worktree, no OUTBOX side effects (the runner's
+    // refinement effect gate); the loop mutates nothing on GitHub, and the
+    // application walk (issue #870) performs exactly the §11 step 3–5 writes
+    // through the apply port below — the same gh-backed adapters the admin
+    // command uses. The source is built on the first refinement claim — like every
+    // other deferral in this factory — because its dependency checker
+    // validates `session.githubRepo` at construction and its `gh` executor
+    // resolves the session's work-item identity (a token exchange in
+    // `github-app` mode); an eager build would fail the whole handler map
+    // (idle/research/no-handler runs included) over a phase this run may never
+    // claim. A construction failure here surfaces as that one refinement task
+    // failing closed.
+    refinement: (() => {
+      let refinementHandler: ReturnType<typeof createRefinementHandler> | undefined;
+      return async (task: AiTask) => {
+        // A non-GitHub work-item provider has no gh-backed snapshot to build.
+        // Not a throw: `runHandler` would turn that into a `failed` task, and
+        // §17 forbids the refinement lane ending there — the marker label
+        // stays on the work item with no recovery surface. A `blocked` result
+        // routes to `ready_for_human` (the §13 handoff shape), parking the
+        // task for an operator; the refinement effect gate keeps this from
+        // touching the provider either way.
+        if (workItemKind !== "github-issues") {
+          return {
+            result: "blocked" as const,
+            message:
+              `Refinement snapshot reads are not implemented for work-item provider "${workItemKind}"; `
+              + "parking the task for an operator instead of failing it. Disable "
+              + "issueRefinement for this session or remove the refinement marker label.",
+          };
+        }
+        if (!refinementHandler) {
+          // The snapshot's `gh` reads — and the application slice's `gh`
+          // writes (issue #870) — run as the session's configured work-item
+          // identity, exactly like `getBlockedBy()` above: built without a
+          // runner, both fall back to raw `execFileSync("gh", ...)`, which
+          // fails on a host with no interactive `gh` login or acts under an
+          // unrelated local account in App-only deployments.
+          const runner = await resolveWorkItemRunner();
+          const runGh = runGhViaRunner(runner, session.repoRoot);
+          refinementHandler = createRefinementHandler(context, {
+            source: createGhRefinementSnapshotSource({
+              githubRepo: session.githubRepo,
+              artifactRoot: session.artifactRoot,
+              runGh,
+              // Registered-chain cross-check (§4 condition 5): read the chain
+              // registry from the same SQLite file the runner's stores use, so
+              // a registered member whose live `blocked by` set contradicts
+              // its accepted chain revision takes the `chain_disagreement`
+              // handoff instead of being refined against a topology the
+              // registry does not accept.
+              chainAgreement: { sessionId: session.sessionId, dbPath: runtime?.dbPath },
+            }),
+            // The §11 step 3–5 write surface for an `accepted`/`applying`
+            // block: the managed-region body update, the one §16 audit
+            // comment, and the labels-last transition (issue #870).
+            applyPort: createGhRefinementApplyPort({
+              githubRepo: session.githubRepo,
+              runGh,
+            }),
+          });
+        }
+        return refinementHandler(task);
+      };
+    })(),
   };
 }
 
@@ -371,7 +473,12 @@ async function main(): Promise<void> {
   // session.repoRoot and runId for deterministic artifact paths.
   let handlers: PhaseHandlers;
   try {
-    handlers = await createPhaseHandlers({ session, runId, workerId, contextId });
+    handlers = await createPhaseHandlers(
+      { session, runId, workerId, contextId },
+      undefined,
+      undefined,
+      { dbPath },
+    );
   } catch (err) {
     die(`Failed to resolve GitHub provider auth: ${err instanceof Error ? err.message : String(err)}`);
   }

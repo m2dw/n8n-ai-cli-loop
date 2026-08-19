@@ -22,6 +22,11 @@ A workflow template for queuing GitHub Issues and running local CLI agents seque
 checkout through a successful first run, covering prerequisites, `sessions.json`
 configuration, workflow import order, and a smoke-test checklist.
 
+> **Wondering whether a documented feature actually runs today?**
+> **[docs/feature-status.md](docs/feature-status.md)** is the canonical,
+> repository-wide status matrix — available, config-gated, foundation-only,
+> or design-only — with evidence and known gaps for every major area.
+
 > **Security note:** This system is designed for **private/internal** AI
 > control planes. Do not use public GitHub Issues as the primary orchestration
 > surface. See [docs/private-control-plane-security.md](docs/private-control-plane-security.md)

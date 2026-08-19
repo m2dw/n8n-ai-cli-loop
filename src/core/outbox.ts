@@ -34,6 +34,20 @@ export interface GhCommentPayload {
   repo: string;
   issueNumber: number;
   body: string;
+  /**
+   * An opaque literal contained in `body` that identifies this comment on the
+   * tracker itself (issue #936). When set, the dispatcher first asks the provider
+   * whether a comment carrying it already exists and treats one that does as this
+   * row's own delivery, instead of posting a second copy.
+   *
+   * The row's idempotency key only deduplicates the durable row; it cannot see a
+   * delivery that landed and then lost its claim before `markSent` (a crashed
+   * dispatcher, an expired claim mid-call, an operator `outbox retry` of a row
+   * that had in fact been posted). Set it only for a comment whose contract caps
+   * deliveries at one — an ordinary status comment is cheap to repeat and pays
+   * the extra read for nothing.
+   */
+  dedupeMarker?: string;
 }
 
 export interface GhLabelAddPayload {
@@ -70,6 +84,8 @@ export interface WorkItemCommentPayload {
   repo: string;
   issueNumber: number;
   body: string;
+  /** See {@link GhCommentPayload.dedupeMarker}; carried across the rewrite. */
+  dedupeMarker?: string;
 }
 
 /** Coarse work-item state change routed through the configured WorkItemProvider. */

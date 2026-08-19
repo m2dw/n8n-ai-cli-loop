@@ -1545,3 +1545,99 @@ describe('SqliteTaskStore — supportedPhases filtering', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// appendEventOnce — the atomic at-most-once audit append (issue #936 review)
+//
+// The callers are outbox lanes with no task transaction of their own: two
+// `dispatch-outbox` runs, or a drain and an `admin outbox cancel`, can reach the
+// same terminal row at the same moment. A read-then-append would let both see an
+// empty history and both write.
+// ---------------------------------------------------------------------------
+
+describe('SqliteTaskStore appendEventOnce', () => {
+  const key = { sessionId: 'addon-dev', issueNumber: 697 };
+  const UNDELIVERABLE = 'refinement.handoff.comment.undeliverable';
+
+  function event(idempotencyKey) {
+    return {
+      task: key,
+      type: UNDELIVERABLE,
+      data: { idempotencyKey },
+      createdAt: '2026-06-06T00:00:00.000Z',
+    };
+  }
+
+  function dedupe(value) {
+    return { field: 'idempotencyKey', value };
+  }
+
+  test('writes once and reports which call wrote it', async () => {
+    expect(await store.appendEventOnce(event('key-a'), dedupe('key-a'))).toBe(true);
+    expect(await store.appendEventOnce(event('key-a'), dedupe('key-a'))).toBe(false);
+    expect(await store.listEvents(key)).toHaveLength(1);
+  });
+
+  test('dedupes per effect, not per event type', async () => {
+    await store.appendEventOnce(event('key-a'), dedupe('key-a'));
+    // A second handoff on the same task — a different reason, so a different
+    // effect — is a different fact and must still be recorded.
+    expect(await store.appendEventOnce(event('key-b'), dedupe('key-b'))).toBe(true);
+    expect(await store.listEvents(key)).toHaveLength(2);
+  });
+
+  test('an event of another type carrying the same key is not mistaken for it', async () => {
+    await store.appendEventOnce({ ...event('key-a'), type: 'other.event' }, dedupe('key-a'));
+    expect(await store.appendEventOnce(event('key-a'), dedupe('key-a'))).toBe(true);
+    expect((await store.listEvents(key)).map((e) => e.type)).toEqual(['other.event', UNDELIVERABLE]);
+  });
+
+  test('the same event on another task does not suppress this one', async () => {
+    const other = { sessionId: 'addon-dev', issueNumber: 42 };
+    await store.appendEventOnce({ ...event('key-a'), task: other }, dedupe('key-a'));
+    expect(await store.appendEventOnce(event('key-a'), dedupe('key-a'))).toBe(true);
+    expect(await store.listEvents(key)).toHaveLength(1);
+    expect(await store.listEvents(other)).toHaveLength(1);
+  });
+
+  test('an event with no data at all is stepped over rather than matched', async () => {
+    await store.appendEvent({ task: key, type: UNDELIVERABLE, createdAt: '2026-06-06T00:00:00.000Z' });
+    expect(await store.appendEventOnce(event('key-a'), dedupe('key-a'))).toBe(true);
+    expect(await store.listEvents(key)).toHaveLength(2);
+  });
+});
+
+describe('SqliteTaskStore concurrent appendEventOnce (two connections, same DB)', () => {
+  test('exactly one of two racing appends writes the event', async () => {
+    const tmpDir2 = mkdtempSync(join(tmpdir(), 'sqlite-concurrent-audit-'));
+    const sharedPath = join(tmpDir2, 'shared.db');
+    let storeA;
+    let storeB;
+
+    try {
+      storeA = new SqliteTaskStore(sharedPath);
+      storeB = new SqliteTaskStore(sharedPath);
+
+      const key = { sessionId: 'addon-dev', issueNumber: 697 };
+      const event = {
+        task: key,
+        type: 'refinement.handoff.comment.undeliverable',
+        data: { idempotencyKey: 'addon-dev:697:handoff:agent_unavailable:comment' },
+        createdAt: '2026-06-06T00:00:00.000Z',
+      };
+      const dedupe = { field: 'idempotencyKey', value: event.data.idempotencyKey };
+
+      const results = await Promise.all([
+        storeA.appendEventOnce(event, dedupe),
+        storeB.appendEventOnce(event, dedupe),
+      ]);
+
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(await storeA.listEvents(key)).toHaveLength(1);
+    } finally {
+      storeA?.close();
+      storeB?.close();
+      rmSync(tmpDir2, { recursive: true, force: true });
+    }
+  });
+});

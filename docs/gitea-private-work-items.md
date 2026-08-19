@@ -391,7 +391,8 @@ compatibility.
    bounded/sanitized by the outbox), `transitionItem` (Gitea numeric label-id
    add/remove, failing clearly when a workflow label is absent), and
    `getDependencies` via Gitea's native issue-dependencies endpoint (option 1 of
-   the degradation ladder). It is wired into intake (`src/cli/github-intake.ts`)
+   the degradation ladder), with `getDependents` reading the other end of the
+   same relationship from `/issues/{n}/blocks`. It is wired into intake (`src/cli/github-intake.ts`)
    and outbox dispatch (`src/cli/dispatch-outbox.ts`) so `workitem:*` rows go to
    Gitea while `repohost:*` PR comments stay on the GitHub repo host; the API
    token is resolved by indirection and never logged. Proven by

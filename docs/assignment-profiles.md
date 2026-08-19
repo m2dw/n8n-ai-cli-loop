@@ -70,10 +70,24 @@ An **assignment profile** maps each phase role to a concrete agent:
 | `review`              | `review`               | Agent that reviews the resulting PR      |
 | `conflict_resolution` | `conflict_resolution`  | Agent that resolves merge conflicts      |
 | `research`            | `research` / `planner` | Agent that performs research/planning    |
+| `refinement`          | `refinement`           | Refiner (AI A) for chain-aware Issue refinement |
+| `refinement_critic`   | `refinement`           | Critic (AI B) that independently critiques the refiner |
 
 `implementation` and `review` are required in every profile. The others are
 optional and fall back to the session defaults (`SessionDefaults`) and then to
 the existing hard-coded behavior when absent, so partial profiles are valid.
+
+The two refinement roles (issue #866/#867,
+[issue-refinement-contract.md](issue-refinement-contract.md) §14) are the one
+exception to that fallback chain: `SessionDefaults` names no refiner and no
+critic, so an unconfigured role stays **absent**. Their only fallback is the
+session-level `issueRefinement.agents.refiner` / `.critic`, which the flow
+profile overrides whenever it names one. Absent means absent: the refinement
+task records `refinerAgent: null` / `criticAgent: null` and the lane refuses to
+start, rather than substituting the implementation agent — which for the critic
+would quietly defeat the independence requirement of §7.3. The refinement roles
+are never expressed as `agent:*` labels; the `agent:*` label on a
+refinement-marked Issue names the intended *implementation* owner (§14).
 
 ### Flow Rules
 

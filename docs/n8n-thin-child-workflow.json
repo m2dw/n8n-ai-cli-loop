@@ -21,7 +21,7 @@
         240
       ],
       "parameters": {
-        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/github-intake.js' --context-id \" + $(\"When Called by Parent\").first().json.contextId + \" --supported-phases implementation,review,conflict_resolution,research,content_research,content_draft,content_review\" }}"
+        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/github-intake.js' --context-id \" + $(\"When Called by Parent\").first().json.contextId + \" --supported-phases implementation,review,conflict_resolution,research,content_research,content_draft,content_review,refinement\" }}"
       },
       "typeVersion": 1
     },
@@ -34,7 +34,7 @@
         240
       ],
       "parameters": {
-        "command": "={{ (function() { var rid = $execution.id || (\"run-\" + $now.toMillis()); return \"node '/opt/n8n-ai-cli-loop/dist/cli/run-one-phase.js' --context-id \" + $(\"When Called by Parent\").first().json.contextId + \" --run-id \" + rid + \" --supported-phases implementation,review,conflict_resolution,research,content_research,content_draft,content_review\"; })() }}"
+        "command": "={{ (function() { var rid = $execution.id || (\"run-\" + $now.toMillis()); return \"node '/opt/n8n-ai-cli-loop/dist/cli/run-one-phase.js' --context-id \" + $(\"When Called by Parent\").first().json.contextId + \" --run-id \" + rid + \" --supported-phases implementation,review,conflict_resolution,research,content_research,content_draft,content_review,refinement\"; })() }}"
       },
       "typeVersion": 1
     },

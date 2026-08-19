@@ -11,16 +11,17 @@ import { collectActiveTasks } from '../dist/cli/admin-ui.js';
 // promotion is supposed to establish.
 
 describe('TaskStore composition-root confinement (issue #613/P1, §11 item 7)', () => {
-  // Only these five files are permitted to construct `SqliteTaskStore` — each
+  // Only these six files are permitted to construct `SqliteTaskStore` — each
   // is its own composition root (admin.ts/admin-ui.ts for the admin surface;
-  // enqueue-task.ts/github-intake.ts/run-one-phase.ts are independent CLI
-  // entrypoints, out of this document's charter). No other source file may
-  // import the concrete adapter as a value: a future admin resource module
-  // that does so would silently reintroduce the dependency this port exists
-  // to remove.
+  // dispatch-outbox.ts/enqueue-task.ts/github-intake.ts/run-one-phase.ts are
+  // independent CLI entrypoints, out of this document's charter). No other
+  // source file may import the concrete adapter as a value: a future admin
+  // resource module that does so would silently reintroduce the dependency
+  // this port exists to remove.
   const ALLOWED_IMPORTERS = new Set([
     'src/cli/admin.ts',
     'src/cli/admin-ui.ts',
+    'src/cli/dispatch-outbox.ts',
     'src/cli/enqueue-task.ts',
     'src/cli/github-intake.ts',
     'src/cli/run-one-phase.ts',

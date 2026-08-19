@@ -1167,6 +1167,7 @@ async function runFilterMenu(current: UiFilter): Promise<UiFilter> {
         "content_draft",
         "content_review",
         "planner",
+        "refinement",
       ] as const;
       const phaseOptions = [
         { value: "", label: "(clear phase filter)" },

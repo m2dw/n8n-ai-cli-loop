@@ -5,7 +5,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteTaskStore, SqliteOutboxStore, SqliteContextStore, JsonSessionRegistry } from '../dist/index.js';
-import { createPhaseHandlers } from '../dist/cli/run-one-phase.js';
+import { acquireIssuePhaseLock, createPhaseHandlers } from '../dist/cli/run-one-phase.js';
+import { IssueWorktreeLock } from '../dist/handlers/worktree.js';
 
 const CLI = new URL('../dist/cli/run-one-phase.js', import.meta.url).pathname;
 
@@ -233,6 +234,74 @@ describe('createPhaseHandlers — dependency checker auth wiring (issue #217)', 
     expect(http.calls).toHaveLength(0);
   });
 
+  test('registers the refinement phase handler so admitted refinement tasks run on the normal tick (issue #869)', async () => {
+    const context = {
+      session: resolvedSession({ mode: 'gh' }),
+      runId: 'run-refine',
+      workerId: 'test',
+    };
+
+    const handlers = await createPhaseHandlers(context, {});
+
+    expect(typeof handlers.refinement).toBe('function');
+  });
+
+  test('github-app refinement resolves the app-aware runner before any snapshot read and fails closed on exchange failure (issue #869 review)', async () => {
+    // The token exchange is mocked to FAIL. The pin is twofold: invoking the
+    // refinement handler attempts the App token exchange at all (before the
+    // fix the snapshot source was built without a runner and fell back to raw
+    // `execFileSync("gh", ...)`, bypassing github-app auth entirely), and the
+    // exchange failure fails the task closed instead of letting the snapshot
+    // read under an unrelated local `gh` account.
+    const http = mockHttp([{ status: 500, statusText: 'exchange down', body: '' }]);
+    const context = {
+      session: resolvedSession({
+        mode: 'github-app',
+        appIdEnv: 'APP_ID',
+        installationIdEnv: 'INST_ID',
+        privateKeyPathEnv: 'KEY_PATH',
+      }),
+      runId: 'run-app-refine',
+      workerId: 'test',
+    };
+    const handlers = await createPhaseHandlers(context, {
+      env: { APP_ID: '123456', INST_ID: '789', KEY_PATH: '/key.pem' },
+      readFile: () => privateKey,
+      httpPostJson: http,
+    });
+    // Building the handler map still exchanges nothing (deferral pinned above).
+    expect(http.calls).toHaveLength(0);
+
+    const task = { sessionId: 'addon-dev', issueNumber: 500, phase: 'refinement', status: 'running', context: {} };
+    await expect(handlers.refinement(task)).rejects.toThrow();
+    expect(http.calls.length).toBeGreaterThan(0);
+  });
+
+  test('a non-GitHub work-item session parks refinement for an operator instead of failing it (issue #869 review)', async () => {
+    // A throw here would become a `failed` task via runHandler, which §17
+    // forbids for the refinement lane: the marker label stays on the work item
+    // with no ready_for_human recovery surface. `blocked` routes to
+    // `ready_for_human` (transitions.ts) without shelling raw gh.
+    const context = {
+      session: {
+        ...resolvedSession({ mode: 'gh' }),
+        workItemProvider: {
+          provider: 'gitea-issues',
+          auth: { mode: 'api-token', tokenEnv: 'GITEA_TOKEN' },
+          gitea: { baseUrl: 'https://gitea.example.com', owner: 'ai-private', repo: 'work-items' },
+        },
+      },
+      runId: 'run-gitea-refine',
+      workerId: 'test',
+    };
+    const handlers = await createPhaseHandlers(context, { env: { GITEA_TOKEN: 'tok-secret' } });
+
+    const task = { sessionId: 'addon-dev', issueNumber: 500, phase: 'refinement', status: 'running', context: {} };
+    const result = await handlers.refinement(task);
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/gitea-issues/);
+  });
+
   test('gitea-issues session builds handlers and defers Gitea provider/token resolution (issue #382)', async () => {
     // The dependency checker for a Gitea session reads `blocked by` from Gitea
     // over its REST API (not the GitHub GraphQL checker, which would always throw
@@ -263,6 +332,48 @@ describe('createPhaseHandlers — dependency checker auth wiring (issue #217)', 
     expect(typeof handlers.implementation).toBe('function');
     // No eager Gitea HTTP request and no token resolution at construction time.
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('acquireIssuePhaseLock — refinement serialization (issue #869 review)', () => {
+  const task = (overrides = {}) => ({
+    sessionId: 'addon-dev',
+    issueNumber: 500,
+    phase: 'refinement',
+    status: 'running',
+    ...overrides,
+  });
+
+  test('refinement takes the per-issue lock, so a second run for the same issue contends instead of double-running', () => {
+    // The refinement loop can outlive the 30-minute task lease (multiple
+    // bounded agent invocations across rounds and retries); once the lease
+    // expires, claimNextTask would hand the same issue to a second tick. The
+    // issue-scoped lock is what serializes them.
+    const lock = new IssueWorktreeLock(mkdtempSync(join(tmpdir(), 'issue-lock-')));
+
+    const first = acquireIssuePhaseLock(lock, 'ctx-a', task());
+    expect(first).toMatchObject({ ok: true, acquired: true });
+
+    const second = acquireIssuePhaseLock(lock, 'ctx-b', task());
+    expect(second).toMatchObject({ ok: true, acquired: false, ownerContextId: 'ctx-a' });
+    expect(second.reason).toContain('already running');
+
+    // A different issue is a different lock scope and stays parallel.
+    const otherIssue = acquireIssuePhaseLock(lock, 'ctx-b', task({ issueNumber: 501 }));
+    expect(otherIssue).toMatchObject({ ok: true, acquired: true });
+
+    // Release frees the scope for the next refinement run.
+    first.handle.release();
+    const third = acquireIssuePhaseLock(lock, 'ctx-b', task());
+    expect(third).toMatchObject({ ok: true, acquired: true });
+  });
+
+  test('research keeps its no-op acquisition — never serialized, never blocked by a held refinement lock', () => {
+    const lock = new IssueWorktreeLock(mkdtempSync(join(tmpdir(), 'issue-lock-')));
+    expect(acquireIssuePhaseLock(lock, 'ctx-a', task()).acquired).toBe(true);
+
+    const research = acquireIssuePhaseLock(lock, 'ctx-b', task({ phase: 'research' }));
+    expect(research).toMatchObject({ ok: true, acquired: true });
   });
 });
 

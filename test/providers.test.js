@@ -131,6 +131,53 @@ describe('GhWorkItemProvider', () => {
     await expect(failing.getDependencies(1)).rejects.toThrow(/field missing/);
   });
 
+  test('getDependencies fails closed when GitHub returns a null issue', async () => {
+    const gh = fakeGh([{ exitCode: 0, stdout: JSON.stringify({ data: { repository: { issue: null } } }), stderr: '' }]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+    await expect(provider.getDependencies(404)).rejects.toThrow(/issue #404 not found or inaccessible/);
+  });
+
+  test('getDependencies fails closed when the blockedBy payload is missing', async () => {
+    const gh = fakeGh([{ exitCode: 0, stdout: JSON.stringify({ data: { repository: { issue: {} } } }), stderr: '' }]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+    await expect(provider.getDependencies(5)).rejects.toThrow(/missing blockedBy payload/);
+  });
+
+  // The outgoing end of the same relationship (issue #791 review): without it an
+  // Issue that blocks something outside the set being read looks like a
+  // downstream end, and `admin chain append` would extend past it.
+  test('getDependents asks for `blocking` and maps its nodes', async () => {
+    const gh = fakeGh([{ exitCode: 0, stdout: JSON.stringify({ data: { repository: { issue: { blocking: { nodes: [{ number: 99, state: 'OPEN' }], pageInfo: { hasNextPage: false, endCursor: null } } } } } }), stderr: '' }]);
+    const provider = new GhWorkItemProvider(gh, 'm2dw/test-repo', CWD);
+    await expect(provider.getDependents(21)).resolves.toEqual([{ issueNumber: 99, state: 'open' }]);
+    const query = gh.calls[0].args[gh.calls[0].args.indexOf('-f') + 1];
+    expect(query).toContain('blocking(first: 50');
+    expect(gh.calls[0].args).toContain('number=21');
+  });
+
+  test('getDependents fails closed when the blocking payload is missing', async () => {
+    const gh = fakeGh([{ exitCode: 0, stdout: JSON.stringify({ data: { repository: { issue: {} } } }), stderr: '' }]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+    await expect(provider.getDependents(5)).rejects.toThrow(/missing blocking payload/);
+  });
+
+  test('getDependents pages until the last page, like the blocked-by read', async () => {
+    const page = (nodes, cursor) => ({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        data: { repository: { issue: { blocking: { nodes, pageInfo: { hasNextPage: cursor !== null, endCursor: cursor } } } } },
+      }),
+      stderr: '',
+    });
+    const gh = fakeGh([page([{ number: 30, state: 'OPEN' }], 'CUR'), page([{ number: 31, state: 'OPEN' }], null)]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+    await expect(provider.getDependents(21)).resolves.toEqual([
+      { issueNumber: 30, state: 'open' },
+      { issueNumber: 31, state: 'open' },
+    ]);
+    expect(gh.calls[1].args).toContain('after=CUR');
+  });
+
   test('commentItem posts to the issue comments endpoint', () => {
     const gh = fakeGh([{ exitCode: 0, stdout: '', stderr: '' }]);
     const provider = new GhWorkItemProvider(gh, 'org/repo', CWD);
@@ -148,7 +195,7 @@ describe('GhWorkItemProvider', () => {
   test('transitionItem remove-label tolerates a 404 (label already absent)', () => {
     const gh = fakeGh([{ exitCode: 1, stdout: '', stderr: 'HTTP 404: Not Found' }]);
     const provider = new GhWorkItemProvider(gh, 'org/repo', CWD);
-    expect(provider.transitionItem(10, { kind: 'remove-label', label: 'ai:blocked' })).toEqual({ ok: true });
+    expect(provider.transitionItem(10, { kind: 'remove-label', label: 'ai:blocked' })).toEqual({ ok: true, alreadyAbsent: true });
     expect(gh.calls[0].args[1]).toBe('repos/org/repo/issues/10/labels/ai%3Ablocked');
   });
 
@@ -156,6 +203,68 @@ describe('GhWorkItemProvider', () => {
     const gh = fakeGh([{ exitCode: 1, stdout: '', stderr: 'HTTP 500' }]);
     const provider = new GhWorkItemProvider(gh, 'org/repo', CWD);
     expect(provider.transitionItem(10, { kind: 'remove-label', label: 'x' }).ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dependency relationship writes (issue #791)
+// ---------------------------------------------------------------------------
+
+describe('GhWorkItemProvider — dependency relationships', () => {
+  test('adds a `blocked by` relationship by the blocker\'s database id', async () => {
+    const gh = fakeGh([
+      { exitCode: 0, stdout: '4242\n', stderr: '' },
+      { exitCode: 0, stdout: '', stderr: '' },
+    ]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+
+    // "#11 is blocked by #10": the Issue the relationship is recorded ON comes
+    // first, exactly as `getDependencies` reads it back.
+    expect(await provider.addDependency(11, 10)).toEqual({ ok: true, changed: true });
+    expect(gh.calls[0].args).toEqual(['api', 'repos/m2dw/test-repo/issues/10', '--jq', '.id']);
+    expect(gh.calls[1].args).toEqual([
+      'api', 'repos/m2dw/test-repo/issues/11/dependencies/blocked_by', '--method', 'POST', '-F', 'issue_id=4242',
+    ]);
+  });
+
+  test('a relationship the tracker already holds is not an error', async () => {
+    const gh = fakeGh([
+      { exitCode: 0, stdout: '4242', stderr: '' },
+      { exitCode: 1, stdout: '', stderr: 'HTTP 422: Validation Failed' },
+    ]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+    expect(await provider.addDependency(11, 10)).toEqual({ ok: true, changed: false });
+  });
+
+  test('a genuine write failure is reported, naming both Issues', async () => {
+    const gh = fakeGh([
+      { exitCode: 0, stdout: '4242', stderr: '' },
+      { exitCode: 1, stdout: '', stderr: 'HTTP 500: server error' },
+    ]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+    const result = await provider.addDependency(11, 10);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('#11 blocked by #10');
+  });
+
+  test('an unusable id lookup fails without attempting the write', async () => {
+    const gh = fakeGh([{ exitCode: 0, stdout: 'not-a-number', stderr: '' }]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+    const result = await provider.addDependency(11, 10);
+    expect(result.ok).toBe(false);
+    expect(gh.calls).toHaveLength(1);
+  });
+
+  test('removing an absent relationship is the requested end state', async () => {
+    const gh = fakeGh([
+      { exitCode: 0, stdout: '4242', stderr: '' },
+      { exitCode: 1, stdout: '', stderr: 'HTTP 404: Not Found' },
+    ]);
+    const provider = new GhWorkItemProvider(gh, REPO, CWD);
+    expect(await provider.removeDependency(11, 10)).toEqual({ ok: true, changed: false });
+    expect(gh.calls[1].args).toEqual([
+      'api', 'repos/m2dw/test-repo/issues/11/dependencies/blocked_by/4242', '--method', 'DELETE',
+    ]);
   });
 });
 

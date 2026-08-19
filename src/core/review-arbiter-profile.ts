@@ -110,6 +110,12 @@ export const ARBITER_REJECTION_REASONS = [
   "candidate-not-found",
   /** The candidate's CLI is not available on this host. */
   "cli-unavailable",
+  /**
+   * The availability probe never answered (timeout / refused fork, issue #897).
+   * Distinct from `cli-unavailable` because the remedy differs: nothing is
+   * installed or configured differently, the question is simply re-asked.
+   */
+  "cli-probe-indeterminate",
   /** Its model, effort, or budget could not be resolved to a usable value. */
   "profile-error",
   /** It shares a provider with a party and `allowSameProvider` is not `true`. */
@@ -130,6 +136,7 @@ export const ARBITER_CANDIDATE_FAILURES = [
   "unsupported-role",
   "candidate-not-found",
   "cli-unavailable",
+  "cli-probe-indeterminate",
   "profile-error",
 ] as const;
 export type ArbiterCandidateFailure = (typeof ARBITER_CANDIDATE_FAILURES)[number];
@@ -487,18 +494,28 @@ function arbiterArgv(agentId: AgentId, metadata: ArbiterAgentMetadata): string[]
   return [...noTools];
 }
 
+/**
+ * A caller's answer to "is this agent's CLI usable here?".
+ *
+ * `true`/`"available"` is the only pass. `"indeterminate"` (issue #897) is for
+ * a probe that never answered — a timeout or a refused fork — and is kept
+ * distinct from a negative answer so the rejection an operator reads describes
+ * the host, not a CLI that was never shown to be missing. Anything else,
+ * `undefined` included, is a negative answer: a caller that asked the question
+ * and got nothing back has not shown the CLI is there.
+ */
+export type ArbiterCliAvailability = boolean | "available" | "unavailable" | "indeterminate" | undefined;
+
 export interface ArbiterCandidateResolverOptions {
   config?: ArbiterAgentConfig;
   env?: NodeJS.ProcessEnv;
   /**
    * Whether an agent's CLI is present on this host, as a FACT supplied by the
    * caller — this module never spawns a process. Omit it entirely to skip the
-   * availability question (the invocation layer discovers it); supply it and an
-   * answer that is not exactly `true`, including `undefined`, rejects the
-   * candidate, because a caller that asked the question and got no answer has
-   * not shown the CLI is there.
+   * availability question (the invocation layer discovers it); supply it and
+   * see {@link ArbiterCliAvailability} for how each answer is read.
    */
-  cliAvailable?: (agentId: AgentId) => boolean | undefined;
+  cliAvailable?: (agentId: AgentId) => ArbiterCliAvailability;
 }
 
 /**
@@ -521,8 +538,14 @@ export function createArbiterCandidateResolver(
     if (ARBITER_NO_TOOLS_ARGS[agentId] === undefined) {
       return { ok: false, reason: "unsupported-role", detail: "no-no-tools-invocation" };
     }
-    if (options.cliAvailable !== undefined && options.cliAvailable(agentId) !== true) {
-      return { ok: false, reason: "cli-unavailable", detail: agentId };
+    if (options.cliAvailable !== undefined) {
+      const availability = options.cliAvailable(agentId);
+      if (availability === "indeterminate") {
+        return { ok: false, reason: "cli-probe-indeterminate", detail: agentId };
+      }
+      if (availability !== true && availability !== "available") {
+        return { ok: false, reason: "cli-unavailable", detail: agentId };
+      }
     }
     const metadata = resolveArbiterAgentMetadata(agentId, config, env);
     const problem = validateArbiterMetadata(metadata);

@@ -154,6 +154,16 @@ describe('phase transitions', () => {
     });
   });
 
+  test('an implementation needs_fix requeues the same task at implementation (issue #934)', () => {
+    // A verification failure the implementation agent can keep working on: the
+    // handler already decided the task may go round again (and owns the cycle
+    // cap), so this table only names the destination.
+    expect(nextPhaseAfter('implementation', 'needs_fix')).toEqual({
+      status: 'queued',
+      phase: 'implementation',
+    });
+  });
+
   test('a blocked conflict_resolution result escalates to ready_for_human by default', () => {
     // A genuine handler-decided escalation (e.g. a non-auto-resolvable or
     // repeated semantic conflict) is a terminal human handoff, unaffected by
@@ -937,5 +947,42 @@ describe('MemoryTaskStore — recoverHandoff (issue #677 Tool Request guard pari
     );
     expect(result.ok).toBe(false);
     expect(result.code).toBe('not_found');
+  });
+});
+
+describe('MemoryTaskStore appendEventOnce (issue #936 review)', () => {
+  const key = { sessionId: 'addon-dev', issueNumber: 697 };
+
+  function event(idempotencyKey) {
+    return {
+      task: key,
+      type: 'refinement.handoff.comment.undeliverable',
+      data: { idempotencyKey },
+      createdAt: '2026-06-06T00:00:00.000Z',
+    };
+  }
+
+  test('behaves as the SQLite store does: once per effect, and it says which call wrote it', async () => {
+    const store = new MemoryTaskStore();
+
+    expect(await store.appendEventOnce(event('key-a'), { field: 'idempotencyKey', value: 'key-a' })).toBe(true);
+    expect(await store.appendEventOnce(event('key-a'), { field: 'idempotencyKey', value: 'key-a' })).toBe(false);
+    // A different effect on the same task is a different fact.
+    expect(await store.appendEventOnce(event('key-b'), { field: 'idempotencyKey', value: 'key-b' })).toBe(true);
+
+    expect(await store.listEvents(key)).toHaveLength(2);
+  });
+
+  test('two concurrent appends of the same effect write it once', async () => {
+    const store = new MemoryTaskStore();
+    const dedupe = { field: 'idempotencyKey', value: 'key-a' };
+
+    const results = await Promise.all([
+      store.appendEventOnce(event('key-a'), dedupe),
+      store.appendEventOnce(event('key-a'), dedupe),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(await store.listEvents(key)).toHaveLength(1);
   });
 });

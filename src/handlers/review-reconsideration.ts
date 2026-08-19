@@ -47,8 +47,10 @@
  *  - **No checkout to write to.** The agent runs in a throwaway temp directory,
  *    not the repository — every excerpt it needs is already in the prompt.
  *  - **No credentials to mutate GitHub with.** Token env vars are stripped and
- *    `HOME`/`GH_CONFIG_DIR` are redirected at an empty temp dir, so a
- *    prompt-injected instruction to run `gh` finds nothing to authenticate with.
+ *    `GH_CONFIG_DIR` is redirected at an empty temp dir, so a prompt-injected
+ *    instruction to run `gh` finds nothing to authenticate with — including
+ *    under the Anthropic home policy of `agent-isolation.ts`, which leaves the
+ *    reviewer's own CLI login reachable and nothing else.
  *
  * The checkout is still read — by THIS process, not by the agent — to resolve
  * and excerpt evidence, under the same `evidence-checkout.ts` primitives the
@@ -302,6 +304,9 @@ export function createReconsiderationAgentRunner(
     const isolated = buildIsolatedInvocation(env, {
       prefix: "ai-reconsider",
       provider: profile.provider,
+      // The profile's own record of the boundary its argv enforces; the home
+      // policy of `agent-isolation.ts` is conditioned on it.
+      toolPolicy: profile.toolPolicy,
     });
     try {
       return runner.run(profile.cmd, profile.argv, {

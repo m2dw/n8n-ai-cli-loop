@@ -1,4 +1,4 @@
-import type { AiTask, ClaimNextTaskRequest, TaskEvent, TaskKey, TaskPhase } from "./task.js";
+import type { AiTask, ClaimNextTaskRequest, TaskEvent, TaskExpected, TaskKey, TaskPatch, TaskPhase } from "./task.js";
 import type { OutboxEffect, TaskStore } from "./task-store.js";
 import type { ResolvedSession } from "./session.js";
 import type { OutboxEnqueueInput, OutboxEntry, OutboxStore } from "./outbox.js";
@@ -6,7 +6,7 @@ import type { AgentFailureKind } from "./agent-diagnostics.js";
 import type { RunLedgerEntryInput, RunLedgerOutcome, SessionPauseState } from "./session-control.js";
 import { extractRunMetadata } from "./session-control.js";
 import { applyTaskPatch, leaseExpiry, nextPhaseAfter } from "./transitions.js";
-import { enqueueHandlerCommentEffect, enqueueStatusLabelEffects, enqueueQuotaDelayCommentEffect, enqueueSlackNotificationEffect, enqueuePrSummaryEffect, enqueueHumanGateSummaryEffect, enqueueDisputeOutcomeEffects } from "./outbox-effects.js";
+import { enqueueHandlerCommentEffect, enqueueStatusLabelEffects, enqueueQuotaDelayCommentEffect, enqueueSlackNotificationEffect, enqueuePrSummaryEffect, enqueueHumanGateSummaryEffect, enqueueDisputeOutcomeEffects, enqueueRefinementHandoffEffects } from "./outbox-effects.js";
 import { readResolvedAssignment } from "./assignment.js";
 import type { ResolvedAssignment } from "./assignment.js";
 import { resolveQuotaRetryDelayMs } from "./quota-classifier.js";
@@ -122,11 +122,29 @@ export interface PhaseHandlerContext {
   contextId?: string;
 }
 
+/**
+ * One handler-authored audit event, committed by the runner in the SAME
+ * `completePhaseWithEffects` transaction as the completion event (issue #869:
+ * the refinement loop's `refinement.*` events must land atomically with the
+ * context block they describe — an append after a committed completion could
+ * fail and leave the block persisted without its required events). The runner
+ * stamps the envelope (task key, runId, createdAt); the handler owns type,
+ * message, and data. Data must follow the same rule as every task event:
+ * literals, counters, and identifiers — never prose or local paths.
+ */
+export interface PhaseHandlerEvent {
+  type: string;
+  message?: string;
+  data?: Record<string, unknown>;
+}
+
 export type PhaseHandlerResult =
   | {
       result: "success" | "needs_fix" | "conflict" | "blocked" | "tool_request";
       context?: Record<string, unknown>;
       message?: string;
+      /** See {@link PhaseHandlerEvent}. */
+      extraEvents?: PhaseHandlerEvent[];
       /**
        * An already-approved review-dispute transition this run applied (issue
        * #840), carried OUTSIDE `context` because it is not task context: the
@@ -141,6 +159,21 @@ export type PhaseHandlerResult =
        * keeps the legacy free-form review path unchanged (§13).
        */
       disputeTransition?: DisputeTransitionApplication;
+      /**
+       * The refinement lane's activation park (issue #870,
+       * docs/issue-refinement-contract.md §11 step 6 / §12 row 45): a
+       * refinement `success` whose application walk reached `activated` must
+       * park the SHARED task row at `blocked`/phase `implementation` — the
+       * hold-and-reactivate shape ordinary intake already reactivates (issue
+       * #224) — in the SAME completion transaction that commits the
+       * `activated` block, so the state move and the park cannot land
+       * separately. Overrides the ordinary `nextPhaseAfter` destination the
+       * way the dispute routing does; set only by the refinement handler, on
+       * the one outcome that finished the label transition, and always from
+       * the activation plan persisted at admission (§14) rather than from
+       * anything re-derived at activation time.
+       */
+      refinementActivation?: { targetStatus: "blocked"; targetPhase: "implementation" };
     }
   // A quota/rate-limit exhaustion (issue #25). Not a task failure: the phase is
   // released back to `queued` with a future `notBefore` so the normal schedule
@@ -151,8 +184,23 @@ export type PhaseHandlerResult =
   // public comment regardless of what a given handler's `context` shape
   // contains, and so category-appropriate wording never claims usage-quota
   // exhaustion for a `rate_limit`/`provider_capacity` failure.
-  | { result: "delayed"; context?: Record<string, unknown>; message?: string; retryAfterMs?: number; category?: AgentFailureKind }
+  // `delayKind` (issue #897) says WHAT was delayed. It defaults to the
+  // agent-failure reading every pre-#897 caller assumes; a handler that delayed
+  // for a reason the agent had no part in must say so, or the public status
+  // comment attributes a quota condition to an agent that never ran.
+  | { result: "delayed"; context?: Record<string, unknown>; message?: string; retryAfterMs?: number; category?: AgentFailureKind; delayKind?: PhaseDelayKind; extraEvents?: PhaseHandlerEvent[] }
   | { result: "failed"; context?: Record<string, unknown>; error: string };
+
+/**
+ * Why a handler asked for a delay.
+ *
+ * - `agent_failure` — the agent process itself reported a recoverable
+ *   quota/rate-limit/capacity condition (issue #25/#672). The default.
+ * - `transient_verification` — a runner-owned verification command failed for a
+ *   reason that is about the HOST, not the diff (issue #897): today, an
+ *   indeterminate CLI availability probe.
+ */
+export type PhaseDelayKind = "agent_failure" | "transient_verification";
 
 export type PhaseHandler = (task: AiTask) => Promise<PhaseHandlerResult>;
 
@@ -729,18 +777,62 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     // even for instant handlers. The lease bounds how long a handler may hold the
     // task, so `now + delayMs` is the correct, reproducible cool-down window.
     const notBefore = leaseExpiry(now, delayMs);
-    const delayed = await store.transitionTask(
-      key,
-      { status: "running", phase: running.value.phase, ownerRunId: request.runId },
-      {
-        status: "queued",
-        ownerRunId: undefined,
-        leaseExpiresAt: undefined,
-        notBefore,
-        context: result.context,
-        now,
-      },
+    const delayedExpected: TaskExpected = {
+      status: "running",
+      phase: running.value.phase,
+      ownerRunId: request.runId,
+    };
+    const delayedPatch: TaskPatch = {
+      status: "queued",
+      ownerRunId: undefined,
+      leaseExpiresAt: undefined,
+      notBefore,
+      context: result.context,
+      now,
+    };
+    // Handler-authored audit events (issue #869) for a delayed outcome — e.g.
+    // the refinement loop's eligibility-hold or agent process-failure event.
+    // They are the only record of WHY the released context now carries its
+    // hold/`pendingRetry` position, so they commit in the SAME transaction as
+    // the release itself (issue #869 review follow-up): appended best-effort
+    // after `transitionTask`, a failed write would strand the committed
+    // position with its cause missing from the log for good — the resumed run
+    // consumes the position and never re-emits the event. Ordered ahead of
+    // `phase.delayed` so the log reads cause before effect; that event stays
+    // best-effort below, as on every other delayed path.
+    const handlerEvents = (result.extraEvents ?? []).map(
+      (extra): TaskEvent => ({
+        task: key,
+        type: extra.type,
+        runId: request.runId,
+        ...(extra.message !== undefined ? { message: extra.message } : {}),
+        ...(extra.data !== undefined ? { data: extra.data } : {}),
+        createdAt: now,
+      }),
     );
+    const [firstHandlerEvent, ...restHandlerEvents] = handlerEvents;
+    const delayed = firstHandlerEvent
+      ? await store.completePhaseWithEffects(
+          {
+            key,
+            expected: delayedExpected,
+            patch: delayedPatch,
+            event: firstHandlerEvent,
+            ...(restHandlerEvents.length > 0 ? { extraEvents: restHandlerEvents } : {}),
+          },
+          [],
+        )
+      : await store.transitionTask(key, delayedExpected, delayedPatch);
+    // A held maintenance lock refuses the whole transactional release (issue
+    // #818) rather than requeueing the task without its events; surface it as
+    // its own retryable outcome exactly like the completion commit does —
+    // `claim_lost` would report a concurrent takeover that never happened.
+    if (!delayed.ok && delayed.code === "maintenance_locked") {
+      return {
+        status: "maintenance_locked",
+        task: await requeueClaimForMaintenance(store, key, running.value, request.runId, priorAttempts, now),
+      };
+    }
     if (!delayed.ok) return { status: "claim_lost", task: delayed.current };
 
     await store.appendEvent({
@@ -777,10 +869,14 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
         // content_draft, content_research, and content_review quota retries must
         // not emit a generic GitHub comment — only fixed outcome enums and approved
         // metadata are permitted in GitHub-visible status for these phases
-        // (contract §Public status boundary).
-        if (running.value.phase !== "content_draft" && running.value.phase !== "content_research" && running.value.phase !== "content_review") {
+        // (contract §Public status boundary). The refinement lane (issue #869)
+        // publishes exactly one thing, and a quota delay is not it: §13 gives
+        // the Issue a public comment on a terminal HANDOFF (issue #936), never
+        // on a retryable pause, so it is excluded the same way.
+        if (running.value.phase !== "content_draft" && running.value.phase !== "content_research" && running.value.phase !== "content_review" && running.value.phase !== "refinement") {
           await enqueueQuotaDelayCommentEffect(
             outboxStore, session, running.value, running.value.phase, notBefore, now, result.category,
+            result.delayKind,
           );
         }
       } catch (outboxErr) {
@@ -852,9 +948,20 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
   const contextPatch = disputeApplication
     ? disputeContextPatch(disputeApplication, baseContextPatch)
     : baseContextPatch;
+  // The refinement activation park (issue #870, §12 row 45): committed in
+  // this same transaction as the `activated` block it belongs to, CAS'd on
+  // the row still being this run's — a repeated delivery re-derives the same
+  // park and converges. Honoured only for a refinement-phase success, so no
+  // other handler can reach for it.
+  const refinementActivation =
+    result.result === "success" && running.value.phase === "refinement"
+      ? result.refinementActivation
+      : undefined;
   const routed = disputeApplication
     ? routedPhaseCompletion(disputeApplication.routing, transition, running.value.phase)
-    : transition;
+    : refinementActivation
+      ? { status: refinementActivation.targetStatus, phase: refinementActivation.targetPhase }
+      : transition;
 
   const patch = {
     status: routed.status,
@@ -873,10 +980,26 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     data: { phase: running.value.phase, result: result.result, ...(contextId !== undefined ? { contextId } : {}) },
     createdAt: now,
   };
-  const extraEvents: TaskEvent[] =
-    disputeApplication && !disputeApplication.replayed
+  // Handler-authored audit events (issue #869) ride in the same transaction as
+  // the completion, before any dispute-transition event. A `failed` result has
+  // no `extraEvents` field by type, so only delivered outcomes contribute.
+  const handlerEvents: PhaseHandlerEvent[] =
+    result.result === "failed" ? [] : result.extraEvents ?? [];
+  const extraEvents: TaskEvent[] = [
+    ...handlerEvents.map(
+      (e): TaskEvent => ({
+        task: key,
+        type: e.type,
+        runId: request.runId,
+        ...(e.message !== undefined ? { message: e.message } : {}),
+        ...(e.data !== undefined ? { data: e.data } : {}),
+        createdAt: now,
+      }),
+    ),
+    ...(disputeApplication && !disputeApplication.replayed
       ? [disputeTransitionEvent({ key, application: disputeApplication, runId: request.runId, now })]
-      : [];
+      : []),
+  ];
 
   // Build every GitHub side effect for this completion up front — via a
   // collector standing in for the real outbox store — instead of writing them
@@ -888,16 +1011,34 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
   // stays `running` (recoverable via its lease) rather than completing with
   // silently dropped labels/comments/notifications.
   //
-  // `preview` mirrors what completePhaseWithEffects will persist for `patch`
-  // (same `applyTaskPatch` over the same pre-transition task): the effect
-  // builders read fields off the post-transition task (e.g. merged context),
-  // so they need that shape before the real commit happens.
+  // The refinement lane (issue #869/#866 §13) enqueues almost NO GitHub side
+  // effects: the loop must not mutate Issue bodies, labels, dependencies,
+  // comments, branches, or PRs on its own behalf — the application walk performs
+  // its writes through its own port — and the generic completion builders below
+  // (status labels, handler comment, human-gate summary) would do exactly that.
+  // Its completion commits the task transition, the handler's own audit events,
+  // and nothing else.
+  //
+  // The ONE exception is a terminal handoff (issue #936): §13 items 3–4 require
+  // the ready-for-human label and one bounded comment, and a lane that stops
+  // without them leaves an Issue that looks — from GitHub — like it is still
+  // waiting its turn. `enqueueRefinementHandoffEffects` builds only those two
+  // rows, only for a completion whose own context patch reached
+  // `escalated_human`, and adds no executable status label (§13 item 2).
   const effectCollector = new OutboxEffectCollector();
-  if (outboxStore && session) {
-    // `active` (not `running.value`) is the pre-transition base: it carries any
-    // worktree-context bookkeeping already persisted before the handler ran
-    // (issue #438), which is what the real DB row underneath
-    // `completePhaseWithEffects` reflects at this point.
+  if (outboxStore && session && running.value.phase === "refinement") {
+    await enqueueRefinementHandoffEffects(
+      effectCollector, session, running.value, result.context, now,
+    );
+  } else if (outboxStore && session) {
+    // `preview` mirrors what completePhaseWithEffects will persist for `patch`
+    // (same `applyTaskPatch` over the same pre-transition task): the effect
+    // builders read fields off the post-transition task (e.g. merged context),
+    // so they need that shape before the real commit happens. `active` (not
+    // `running.value`) is the pre-transition base: it carries any worktree-context
+    // bookkeeping already persisted before the handler ran (issue #438), which is
+    // what the real DB row underneath `completePhaseWithEffects` reflects at this
+    // point.
     const preview = applyTaskPatch(active, patch);
     await enqueueHandlerCommentEffect(
       effectCollector, session, preview, running.value.phase, result, request.runId, now, durationMs,

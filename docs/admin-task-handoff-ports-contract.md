@@ -623,9 +623,11 @@ produces).
 
   This "two composition roots" framing is scoped to the admin surface this
   document extracts, not a claim about the whole source tree. On the
-  current tree, `src/cli/enqueue-task.ts`, `src/cli/github-intake.ts`, and
-  `src/cli/run-one-phase.ts` are independent CLI entrypoints that already
-  construct their own `new SqliteTaskStore(dbPath)` at their own top level,
+  current tree, `src/cli/dispatch-outbox.ts`, `src/cli/enqueue-task.ts`,
+  `src/cli/github-intake.ts`, and `src/cli/run-one-phase.ts` are independent
+  CLI entrypoints that construct their own `new SqliteTaskStore(dbPath)`
+  (`dispatch-outbox.ts` inside its dead-letter recorder and the repair
+  sweep that re-derives the same record on a later run, issue #936),
   for the same reason `admin-ui.ts` does — each is its own composition root,
   unrelated to `admin.ts`'s command dispatch, and none of them is a proposed
   admin resource module. This document does not require them to change, and
@@ -685,10 +687,10 @@ machine-checked:
    `admin-ui.ts`'s startup function (§10) — so a future resource module
    cannot silently reintroduce the concrete-adapter dependency this document
    exists to remove. This check is scoped to the admin surface: it must not
-   flag the pre-existing, unrelated `SqliteTaskStore` constructions in
-   `src/cli/enqueue-task.ts`, `src/cli/github-intake.ts`, or
-   `src/cli/run-one-phase.ts`, each its own independent composition root
-   outside this document's charter (§10).
+   flag the unrelated `SqliteTaskStore` constructions in
+   `src/cli/dispatch-outbox.ts`, `src/cli/enqueue-task.ts`,
+   `src/cli/github-intake.ts`, or `src/cli/run-one-phase.ts`, each its own
+   independent composition root outside this document's charter (§10).
 8. **Admin-ui read-path port typing** — a test (or a compile-time check)
    confirming `collectActiveTasks` and the task-detail/event views in
    `admin-ui.ts` are typed against `TaskStore`, not `SqliteTaskStore`, after

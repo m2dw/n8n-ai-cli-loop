@@ -246,6 +246,25 @@ safety checks pass:
 When these conditions hold the dirty state is treated as unfinished work from
 the same issue and the phase continues.
 
+### Who requeues the continuation (issue #934)
+
+The implementation phase runs the configured verification commands before any
+commit/push and repairs an obvious failure inline, once. When verification is
+still failing after that bounded inline attempt, the outcome depends on what
+kind of failure it is:
+
+| Failure | Outcome |
+|---|---|
+| Ordinary nonzero result from a configured command | The task is requeued as `queued` / `implementation`. The worktree, its edits, and the `dirtyContinuation` marker are preserved, and the next run's prompt carries the failing command, its exit code, and its bounded output. Bounded by `DEFAULT_MAX_VERIFICATION_REPAIR_CYCLES` automatic cycles per task; the counter is cleared as soon as verification passes. |
+| Cap reached | `failed` — a deterministic human handoff naming the spent cycles. |
+| Indeterminate CLI probe (issue #897) | Delayed retry on the per-command transient budget; no repair cycle is spent. |
+| Missing executable, undefined script, command the shell cannot find | `failed` — an operator-actionable environment/configuration problem no agent run can fix. |
+
+Nothing is committed or pushed on any of these paths, so a known-broken commit
+never reaches the PR. Automatic requeues publish no per-retry issue comment:
+the task stays inside the implementation lane, and only the terminal handoffs
+are operator-visible state changes.
+
 ### Why dirty continuation is safe for per-issue worktrees
 
 - Each issue owns exactly one worktree, keyed `<session>/issue-<n>`. No other

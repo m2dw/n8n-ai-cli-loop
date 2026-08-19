@@ -68,6 +68,67 @@ export interface ReviewDisputeConfig {
   arbiter?: ReviewDisputeArbiterConfig;
 }
 
+// ---------------------------------------------------------------------------
+// Chain-aware progressive Issue refinement (issue #866/#867,
+// docs/issue-refinement-contract.md §19)
+//
+// Off by default: with `enabled` absent or false, `status:needs-refinement` is
+// an inert label — intake ignores it, no refinement task is created, and an
+// Issue carrying it alongside an executable status is routed exactly as it is
+// today. Enabling the lane changes behavior only for Issues carrying the marker.
+// ---------------------------------------------------------------------------
+
+/**
+ * §8 limits. Session config may only LOWER these; the contract maxima are the
+ * defaults. Six of them additionally reject 0 at session load, because at 0 the
+ * lane would have a state with no next action — see
+ * `ISSUE_REFINEMENT_LIMIT_SPECS` in core/issue-refinement.ts, which owns the
+ * normative table and the validation.
+ */
+export interface IssueRefinementLimitsConfig {
+  /** `MAX_PREDECESSORS_PER_REFINEMENT`. Default 4; must not be lowered below 1. */
+  maxPredecessorsPerRefinement?: number;
+  /** `MAX_REFINEMENT_ROUNDS_PER_ISSUE`. Default 2; must not be lowered below 1. */
+  maxRefinementRoundsPerIssue?: number;
+  /** `MAX_MALFORMED_ATTEMPTS_PER_ROLE`. Default 2; must not be lowered below 1. */
+  maxMalformedAttemptsPerRole?: number;
+  /** `MAX_AGENT_FAILURES_PER_ROLE`. Default 2; 0 escalates on the first process failure. */
+  maxAgentFailuresPerRole?: number;
+  /** `MAX_STALE_RESTARTS_PER_ISSUE`. Default 1; 0 makes the restart unavailable. */
+  maxStaleRestartsPerIssue?: number;
+  /** `MAX_COMMENTS_PER_PREDECESSOR`. Default 5; 0 captures no comment window. */
+  maxCommentsPerPredecessor?: number;
+  /** `MAX_SNAPSHOT_TEXT_BYTES`. Default 8000; must not be lowered below 1. */
+  maxSnapshotTextBytes?: number;
+  /** `MAX_CHANGED_PATHS_PER_PREDECESSOR`. Default 100; must not be lowered below 1. */
+  maxChangedPathsPerPredecessor?: number;
+  /** `MAX_MANAGED_REGION_BYTES`. Default 16000; must not be lowered below 1. */
+  maxManagedRegionBytes?: number;
+}
+
+/**
+ * §7.3/§14 role selection. `refiner`/`critic` are session-level FALLBACKS: the
+ * flow's assignment profile (`refinement` / `refinement_critic`) is the source of
+ * truth per §14 and wins whenever it names a role.
+ */
+export interface IssueRefinementAgentsConfig {
+  /** Fallback agent id for the `refinementAgent` role. */
+  refiner?: string;
+  /** Fallback agent id for the `refinementCriticAgent` role. */
+  critic?: string;
+  /** §7.3: a same-provider (never same-model) critic is allowed only by explicit opt-in. */
+  allowSameProvider?: boolean;
+}
+
+export interface IssueRefinementConfig {
+  /** Master switch. Default false — the whole lane is off. */
+  enabled?: boolean;
+  /** §8 limits; may only be lowered. */
+  limits?: IssueRefinementLimitsConfig;
+  /** §7.3 refiner/critic selection policy. */
+  agents?: IssueRefinementAgentsConfig;
+}
+
 export interface ConflictResolutionLoopConfig {
   /**
    * Maximum number of same-kind verification-failure attempts before escalating
@@ -406,6 +467,18 @@ export interface AssignmentProfile {
   review: AgentId;
   conflict_resolution?: AgentId;
   research?: AgentId;
+  /**
+   * Chain-aware refinement roles (issue #866/#867,
+   * docs/issue-refinement-contract.md §14). Optional: a profile that omits them
+   * falls back to `issueRefinement.agents.refiner` / `.critic`, and a session
+   * that configures neither has no refiner or critic — which the refinement task
+   * records as `null` rather than defaulting to an agent nobody chose.
+   *
+   * These are never expressed as labels: §14 keeps the critic's independence
+   * requirement (§7.3) enforced against the resolved profile.
+   */
+  refinement?: AgentId;
+  refinement_critic?: AgentId;
 }
 
 /**
@@ -718,6 +791,14 @@ export interface SessionConfig {
    * session load rather than clamped (§6.1).
    */
   reviewDispute?: ReviewDisputeConfig;
+  /**
+   * Chain-aware progressive Issue refinement (issue #866/#867,
+   * docs/issue-refinement-contract.md). Optional and disabled by default; a
+   * session without it treats `status:needs-refinement` as an inert label and
+   * behaves exactly as today. Limits that would leave the lane unusable are
+   * rejected at session load rather than clamped (§8).
+   */
+  issueRefinement?: IssueRefinementConfig;
   conflictResolutionLoop?: ConflictResolutionLoopConfig;
   /**
    * Per-issue worktree isolation (issue #400). Optional — only present to

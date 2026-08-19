@@ -2,6 +2,7 @@ import { writeFileSync } from "fs";
 import { join } from "path";
 import type { CommandRunner } from "./command-runner.js";
 import type { VerificationCommands } from "../core/session.js";
+import { matchesConfiguredVerificationCommand } from "../core/tool-request-continuation.js";
 
 // ---------------------------------------------------------------------------
 // Shell tokenizer
@@ -116,19 +117,15 @@ export interface IssueRequiredVerification {
  *    is a runnable form of the compound command `cd frontend && npm test` that the
  *    extractor records. Comparing by inner command prevents compound directory-
  *    scoped checks from being permanently blocked as "not_run".
+ *
+ * The semantics live in core (`matchesConfiguredVerificationCommand`) because
+ * the Tool Request direct-review continuation (issue #722,
+ * `docs/verification-execution-contract.md` §10.2) classifies a resolved
+ * request's command against `session.verification` with EXACTLY this rule; two
+ * copies of it could drift apart and let the two surfaces disagree about what
+ * counts as a configured verification command.
  */
-function matchesRequiredCommand(sessionValue: string, required: string): boolean {
-  const sv = sessionValue.trim();
-  const req = required.trim();
-  if (sv === req) return true;
-  // bash/sh/zsh [-flags] '<cmd>' or "<cmd>"
-  const m = /^(?:bash|sh|zsh)\s+(?:-\w+\s+)*(?:'([^']*)'|"([^"]*)")$/.exec(sv);
-  if (m) {
-    const inner = (m[1] ?? m[2] ?? "").trim();
-    return inner === req;
-  }
-  return false;
-}
+const matchesRequiredCommand = matchesConfiguredVerificationCommand;
 
 /** Evidence of a manually-executed verification command supplied by the operator. */
 export interface ManualVerificationEntry {

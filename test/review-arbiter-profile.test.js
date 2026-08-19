@@ -376,6 +376,7 @@ describe('unusable candidates fail closed with typed reasons', () => {
   test.each([
     ['unsupported-role', 'no-no-tools-invocation'],
     ['cli-unavailable', 'gemini'],
+    ['cli-probe-indeterminate', 'gemini'],
     ['profile-error', 'effort:invalid'],
     ['candidate-not-found', undefined],
   ])('a %s candidate is passed over, never substituted for', (reason, detail) => {
@@ -517,12 +518,22 @@ describe('the default candidate resolver', () => {
   });
 
   test('CLI availability is an injected fact; an unproven CLI rejects', () => {
-    const available = createArbiterCandidateResolver({ env: {}, cliAvailable: () => true });
-    expect(available('claude').ok).toBe(true);
-    for (const answer of [false, undefined]) {
+    for (const answer of [true, 'available']) {
+      const available = createArbiterCandidateResolver({ env: {}, cliAvailable: () => answer });
+      expect(available('claude').ok).toBe(true);
+    }
+    for (const answer of [false, undefined, 'unavailable']) {
       const resolve = createArbiterCandidateResolver({ env: {}, cliAvailable: () => answer });
       expect(resolve('claude')).toEqual({ ok: false, reason: 'cli-unavailable', detail: 'claude' });
     }
+  });
+
+  test('a probe that never answered is its own reason, not a missing CLI (#897)', () => {
+    // The candidate is still refused — an unverified CLI is not an arbiter — but
+    // under a code that says "ask again", not "install something". Collapsing the
+    // two is what let host contention read as a permanent misconfiguration.
+    const resolve = createArbiterCandidateResolver({ env: {}, cliAvailable: () => 'indeterminate' });
+    expect(resolve('claude')).toEqual({ ok: false, reason: 'cli-probe-indeterminate', detail: 'claude' });
   });
 
   test('the role gate precedes availability, so an unsupported agent is never probed', () => {

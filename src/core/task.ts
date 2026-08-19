@@ -6,7 +6,16 @@ export type TaskPhase =
   | "content_research"
   | "content_draft"
   | "content_review"
-  | "planner";
+  | "planner"
+  // Chain-aware progressive Issue refinement (issue #866/#867,
+  // docs/issue-refinement-contract.md). Created by intake from the coarse
+  // `status:needs-refinement` marker and never routed to by `labelsToPhase`.
+  // Executed by the two-agent loop handler (issue #869): run-one-phase
+  // registers `createRefinementHandler` and the generated child workflow
+  // advertises the phase, so an admitted row runs on the normal tick — with no
+  // worktree, no issue lock, and no GitHub side effects until the application
+  // slice exists.
+  | "refinement";
 
 export type TaskStatus =
   | "queued"

@@ -1115,17 +1115,20 @@ describe('the read-only boundary', () => {
     expect(call.opts.env.GITHUB_TOKEN).toBeUndefined();
     expect(call.opts.env.ACTIONS_RUNTIME_TOKEN).toBeUndefined();
     expect(call.opts.env.XDG_CONFIG_HOME).toBeUndefined();
-    expect(call.opts.env.HOME).not.toBe('/Users/real');
-    expect(call.opts.env.GH_CONFIG_DIR).toBe(call.opts.env.HOME);
     expect(call.opts.env.PWD).toBe(call.opts.cwd);
     // Only the SELECTED provider's own credentials survive the strip.
     expect(call.opts.env.ANTHROPIC_API_KEY).toBe('selected-provider');
     expect(call.opts.env.OPENAI_API_KEY).toBeUndefined();
-    // A HOME-backed CLI login stays reachable without un-isolating HOME.
-    expect(call.opts.env.CLAUDE_CONFIG_DIR).toBe('/Users/real');
-    // The throwaway directories do not survive the invocation.
+    // Issue #935: the arbiter's own subscription login is only reachable from
+    // the real home, so an anthropic no-tools turn keeps it — and GitHub stays
+    // unreachable on GH_CONFIG_DIR, which is NOT the home the agent sees.
+    expect(call.opts.env.HOME).toBe('/Users/real');
+    expect(call.opts.env.GH_CONFIG_DIR).not.toBe('/Users/real');
+    expect(call.opts.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    // The throwaway directories do not survive the invocation; the real home,
+    // which was never one of them, is not touched.
     expect(existsSync(call.opts.cwd)).toBe(false);
-    expect(existsSync(call.opts.env.HOME)).toBe(false);
+    expect(existsSync(call.opts.env.GH_CONFIG_DIR)).toBe(false);
   });
 
   test('the checkout is byte-identical after a completed arbitration', () => {

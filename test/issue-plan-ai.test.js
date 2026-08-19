@@ -568,12 +568,11 @@ describe('issue-plan ai-preview — valid planner output', () => {
 
   test('restores the planner provider auth env without re-exposing GitHub credentials', async () => {
     const reader = makeReader(SMALL_CLEAR_ISSUE);
-    // Stub agent that mirrors the real Claude provider's authEnv: it points
-    // CLAUDE_CONFIG_DIR at the caller's real HOME (the dir containing
-    // `.claude.json`) so a HOME-backed login is reachable even though HOME is
-    // isolated.
+    // Stub agent that mirrors the real Claude provider's authEnv (issue #935):
+    // the subscription login is only reachable from the caller's real HOME, so
+    // that is what the provider restores.
     const agent = makeAgent(okRun(JSON.stringify(VALID_PLANNER_RESULT)), 'claude');
-    agent.authEnv = (originalEnv) => ({ CLAUDE_CONFIG_DIR: originalEnv.HOME });
+    agent.authEnv = (originalEnv) => ({ HOME: originalEnv.HOME });
     const args = parseIssuePlanAiArgs(['--session-id', 'addon-dev', '--issue-number', '42', '--sessions-path', sessionsPath]);
     process.env.GH_TOKEN = 'super-secret';
     try {
@@ -583,26 +582,54 @@ describe('issue-plan ai-preview — valid planner output', () => {
     }
     const inv = agent.calls[0];
     // Planner auth/config is restored...
-    expect(inv.env.CLAUDE_CONFIG_DIR).toBe(process.env.HOME);
-    // ...while GitHub isolation stays intact: HOME is still the throwaway dir,
-    // GH_CONFIG_DIR still points there, and the write token is gone.
-    expect(inv.env.HOME).toContain('gh-isolated-');
-    expect(inv.env.GH_CONFIG_DIR).toBe(inv.env.HOME);
+    expect(inv.env.HOME).toBe(process.env.HOME);
+    // ...while GitHub isolation stays intact: GH_CONFIG_DIR is the throwaway
+    // dir and NOT the restored home, and the write token is gone.
+    expect(inv.env.GH_CONFIG_DIR).toContain('gh-isolated-');
+    expect(inv.env.GH_CONFIG_DIR).not.toBe(inv.env.HOME);
+    expect(inv.env.XDG_CONFIG_HOME).toBeUndefined();
     expect(inv.env.GH_TOKEN).toBeUndefined();
+    // The throwaway dir is still the one cleaned up — and it is the GitHub
+    // config dir now, so cleanup is asserted on the directory that was created
+    // rather than on whatever HOME ended up being.
+    expect(existsSync(inv.env.GH_CONFIG_DIR)).toBe(false);
   });
 
-  test('the default claude planner agent re-points CLAUDE_CONFIG_DIR at the real home login', () => {
+  test('a provider auth env cannot hand back the caller GitHub credential store', async () => {
+    const reader = makeReader(SMALL_CLEAR_ISSUE);
+    // The merge happens before GitHub isolation is re-pinned, so a provider that
+    // named GH_CONFIG_DIR — by intent or by copying the whole caller env — must
+    // not be able to restore it. GitHub isolation is not a provider's to relax.
+    const agent = makeAgent(okRun(JSON.stringify(VALID_PLANNER_RESULT)), 'claude');
+    agent.authEnv = (originalEnv) => ({
+      HOME: originalEnv.HOME,
+      GH_CONFIG_DIR: `${originalEnv.HOME}/.config/gh`,
+      XDG_CONFIG_HOME: `${originalEnv.HOME}/.config`,
+    });
+    const args = parseIssuePlanAiArgs(['--session-id', 'addon-dev', '--issue-number', '42', '--sessions-path', sessionsPath]);
+    await capture(() => runIssuePlanAiPreview(args, reader, agent));
+    const inv = agent.calls[0];
+    expect(inv.env.GH_CONFIG_DIR).toContain('gh-isolated-');
+    expect(inv.env.GH_CONFIG_DIR).not.toContain('.config/gh');
+    expect(inv.env.XDG_CONFIG_HOME).toBeUndefined();
+  });
+
+  test('the default claude planner agent restores the real home for the subscription login', () => {
     const agent = createDefaultPlannerAgent('claude');
-    // HOME-backed login: CLAUDE_CONFIG_DIR is the dir CONTAINING `.claude.json`,
-    // which for the standard CLI OAuth login is the real HOME itself (the config
-    // lives at `$HOME/.claude.json`, not `$HOME/.claude/.claude.json`).
-    expect(agent.authEnv({ HOME: '/home/op' })).toEqual({ CLAUDE_CONFIG_DIR: '/home/op' });
-    // Explicit CLAUDE_CONFIG_DIR is honored as-is.
+    // Issue #935: CLAUDE_CONFIG_DIR does not reach a Claude Code subscription
+    // login from a throwaway HOME — not at the real HOME, not at $HOME/.claude,
+    // not with the visible config files copied in. The real HOME is what does.
+    expect(agent.authEnv({ HOME: '/home/op' })).toEqual({ HOME: '/home/op' });
+    // Explicit CLAUDE_CONFIG_DIR is honored as-is, alongside the real home; it
+    // is no longer SYNTHESIZED, because the CLI now resolves its own default.
     expect(agent.authEnv({ HOME: '/home/op', CLAUDE_CONFIG_DIR: '/custom/claude' }))
-      .toEqual({ CLAUDE_CONFIG_DIR: '/custom/claude' });
+      .toEqual({ HOME: '/home/op', CLAUDE_CONFIG_DIR: '/custom/claude' });
     // API-key path passes the Anthropic credential through untouched.
     expect(agent.authEnv({ ANTHROPIC_API_KEY: 'sk-test' }))
       .toEqual({ ANTHROPIC_API_KEY: 'sk-test' });
+    // No HOME to restore is not an unset HOME: nothing is claimed at all, so the
+    // caller's throwaway home stands and a logged-out run fails closed.
+    expect(agent.authEnv({})).toEqual({});
   });
 
   test('temp dirs are cleaned up even when the planner agent throws', async () => {

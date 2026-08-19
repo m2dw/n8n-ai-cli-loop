@@ -210,6 +210,17 @@ A blocker PR is usable when all of the following are true:
 
 If a blocker has no open PR, the dependent issue is still blocked (Gate 1).
 
+The same stack-readiness signal is also the eligibility trigger for chain-aware
+progressive Issue refinement — an optional, default-off lane that refines a
+rough dependent Issue from its predecessors' stack-ready results *before* it
+becomes implementable. Its marker (`status:needs-refinement`) is not an
+executable status and never routes to a phase defined in this document. It does,
+however, place one requirement on the phases that *are* defined here: when that
+marker is on an Issue whose task already exists, the runner must refuse to start
+the phase — and refuse to publish the outward effects of a run already in
+flight — rather than execute against the unrefined Issue. See
+[issue-refinement-contract.md](issue-refinement-contract.md) §3.1 (issue #866).
+
 **Branch start point rule**
 
 When the implementation start gate is satisfied the dependent implementation
@@ -485,6 +496,38 @@ seam, bounding the stderr channel, and splitting `isQuotaExhaustion` into the
 four categories above) is out of scope for this specification issue and must
 be done in a dedicated follow-up implementation issue.
 
+### Indeterminate CLI probes (issue #897)
+
+The categories above describe failures of the **agent** process. A second,
+narrower source of non-code failure is a **CLI availability probe that never
+answered** — `admin session-doctor` spawning `<agent> --version` on a host that
+timed out or refused the fork.
+
+Such a probe establishes nothing about the CLI. It is therefore reported with
+its own typed status (`timeout` / `spawn-error`, `transient: true`) and its
+operator-facing diagnostic is prefixed with the structural marker
+`[cli-probe-indeterminate]`, never with "not found".
+
+When a **review verification command** fails and its captured output carries
+that marker, the failure is evidence about the machine, not about the diff.
+Review takes the **short transient retry policy** — the same backoff
+`rate_limit` and `provider_capacity` take — rather than routing to `needs_fix`.
+Routing it to `needs_fix` would requeue an implementation phase that correctly
+finds nothing to change and then fails for producing no diff.
+
+The delay is bounded (`MAX_TRANSIENT_VERIFICATION_RETRIES` in
+`src/core/review-classifier.ts`), and the bound is **per verification command**:
+each configured command keeps its own counter in the task context, and a
+command that passes releases the budget it had spent. A shared counter would
+let a probe timeout in `test` spend the budget, pass on the retry, and then
+route `package`'s first indeterminate probe to `needs_fix`. Once a command's
+bound is spent, its failure follows
+the ordinary `needs_fix` path so a condition that does not clear still reaches a
+human as the real failure it is. Detection matches the bracketed marker and
+nothing else: verification output quotes the words "timeout", "EAGAIN" and
+"unavailable" for unrelated reasons, and a broader rule would start delaying
+genuine test failures.
+
 ## Complexity Labels
 
 Optional complexity labels control the Claude model, effort, and budget used for
@@ -625,6 +668,9 @@ Success criteria:
 
 - The requested change is implemented in the configured repository.
 - The working tree contains file changes after the agent exits.
+- Configured verification (`session.verification`) passes before
+  commit/push — execution and continuation semantics per
+  [docs/verification-execution-contract.md](verification-execution-contract.md).
 - The handler can commit, push, and create a PR for `ai/issue-<issueNumber>`.
 - The task transitions to review after a successful implementation run.
 
@@ -684,9 +730,11 @@ The evidence-backed review-dispute protocol — structured finding lineage,
 per-finding dispositions (`fixed` / `review_disputed` / `blocked`), reviewer
 reconsideration, bounded arbitration, and human escalation — is specified in
 [review-dispute-contract.md](review-dispute-contract.md) (issue #835). It is
-an approved design, not yet implemented; until it lands (and whenever
-`session.reviewDispute.enabled` is off), a fix run that produces no diff
-fails exactly as described above.
+implemented (issues #836-#849) but ships default-off; whenever
+`session.reviewDispute.enabled` is off, a fix run that produces no diff
+fails exactly as described above. See
+[feature-status.md](feature-status.md#review-dispute) for the operator-facing
+availability summary.
 
 Operational note:
 

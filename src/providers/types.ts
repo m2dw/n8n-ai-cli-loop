@@ -22,11 +22,38 @@ import type { BlockedByEntry } from "../core/github-intake.js";
 
 export type { BlockedByEntry };
 
-/** Outcome of a provider mutation that either succeeds or yields an error. */
-export type ProviderResult = { ok: true } | { ok: false; error: string };
+/**
+ * Outcome of a provider mutation that either succeeds or yields an error.
+ *
+ * `alreadyAbsent` is set on a successful `remove-label` transition when the
+ * provider found the label already gone (e.g. a 404) rather than removing it
+ * itself. Both the GitHub and Gitea providers treat that as `ok: true` since
+ * the end state ("label not on the Issue") is the same either way — but a
+ * caller that must attribute the removal to ITS OWN operation (see
+ * `suspendIssueAutomation` in core/issue-activation.ts, issue #787 review)
+ * needs to tell "I removed this" apart from "someone else already had", so it
+ * never records a label it did not actually remove as restorable.
+ */
+export type ProviderResult = { ok: true; alreadyAbsent?: boolean } | { ok: false; error: string };
 
 /** Outcome of a provider read that yields a value or an error. */
 export type ProviderRead<T> = { ok: true; value: T } | { ok: false; error: string };
+
+/**
+ * Outcome of a dependency-relationship mutation (issue #791).
+ *
+ * Distinct from {@link ProviderResult} because the interesting distinction is
+ * the opposite one: a relationship write is requested against a state the
+ * caller read moments earlier, and the only honest answers are "this call
+ * created/removed it" and "the tracker already held it that way". `changed`
+ * carries exactly that, which is what makes a retry after a partial failure
+ * safe — re-running an edit converges instead of double-writing — and what
+ * keeps `admin chain new|append|prepend` from reporting an edge as applied when
+ * another actor had already drawn it.
+ */
+export type DependencyMutationResult =
+  | { ok: true; changed: boolean }
+  | { ok: false; error: string };
 
 // ---------------------------------------------------------------------------
 // Work items (issues / tickets)
@@ -69,8 +96,67 @@ export interface WorkItemProvider {
   getItem(issueNumber: number): ProviderRead<WorkItemDetails>;
   /** Dependency relationships (`blocked by`). Throws on failure (fail closed). */
   getDependencies(issueNumber: number): Promise<BlockedByEntry[]>;
+  /**
+   * The other direction of the same relationship: the Issues this one BLOCKS
+   * (issue #791 review).
+   *
+   * A dependency edge has two ends, and reading only the `blocked by` end leaves
+   * a whole class of live topology invisible — an Issue that blocks something
+   * outside the set being read looks, from its own blockers alone, like a
+   * downstream end. `admin chain append` is the case that made this a port
+   * method rather than a caller's loop: it may only extend past a head that
+   * nothing depends on, and a head already blocking an unregistered Issue is a
+   * fork the command promises to refuse but could not see.
+   *
+   * Entries describe the BLOCKED Issue (the far end), mirroring
+   * {@link WorkItemProvider.getDependencies}. Throws on failure for the same
+   * reason: a caller that cannot read this must fail closed, never treat an
+   * unread relationship as an absent one.
+   */
+  getDependents(issueNumber: number): Promise<BlockedByEntry[]>;
+  /**
+   * Declare that `blockedIssueNumber` is blocked by `blockerIssueNumber` — the
+   * write counterpart of {@link WorkItemProvider.getDependencies}, expressed in
+   * the tracker's own relationship model rather than as body text, so the same
+   * read that gates the loop sees it (issue #791).
+   *
+   * Idempotent: a relationship the tracker already holds is reported as
+   * `changed: false`, never as an error. Unlike the read side this does NOT
+   * throw — a relationship edit is one step of a multi-Issue mutation whose
+   * caller has to know exactly which steps landed before it can describe a
+   * recovery, and an exception carries none of that.
+   */
+  addDependency(blockedIssueNumber: number, blockerIssueNumber: number): Promise<DependencyMutationResult>;
+  /**
+   * Remove a `blocked by` relationship. Idempotent; see
+   * {@link WorkItemProvider.addDependency}.
+   *
+   * The linear chain commands never call it — they only ever add, which is what
+   * makes "a failed edit cannot destroy a relationship somebody else drew" a
+   * property of the code rather than a promise. It is here because a port that
+   * can create a dependency but not delete one is not a model of the tracker's
+   * relationship API, and an operator-driven topology edit that does remove one
+   * must not have to reach past this interface to do it.
+   */
+  removeDependency(blockedIssueNumber: number, blockerIssueNumber: number): Promise<DependencyMutationResult>;
   /** Post a human-visible comment / audit note. */
   commentItem(issueNumber: number, body: string, idempotencyKey?: string): ProviderResult;
+  /**
+   * Whether the item already carries a comment containing `marker` (issue #936).
+   *
+   * The delivery-side half of an at-most-once comment: the local outbox key
+   * deduplicates the durable row, but only the tracker can answer whether a
+   * previous attempt's POST actually landed before its dispatcher lost the
+   * claim. Callers use it as a precondition, so it must fail (`ok: false`)
+   * rather than guess when the comment history cannot be read — reporting a
+   * comment as absent because the read failed is what produces the duplicate
+   * this exists to prevent.
+   *
+   * Optional: a provider that cannot read its comment history simply does not
+   * implement it, and callers fall back to posting unconditionally (the
+   * behavior every comment had before this seam existed).
+   */
+  hasItemCommentWithMarker?(issueNumber: number, marker: string): ProviderRead<boolean>;
   /** Move the item's coarse workflow state (label add/remove). */
   transitionItem(issueNumber: number, transition: WorkItemTransition): ProviderResult;
 }

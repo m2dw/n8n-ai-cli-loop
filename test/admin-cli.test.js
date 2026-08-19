@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteTaskStore } from '../dist/index.js';
+import { CLI_PROBE_INDETERMINATE_MARKER, CLI_PROBE_STUB_ENV } from '../dist/core/cli-probe.js';
 
 const CLI = new URL('../dist/cli/admin.js', import.meta.url).pathname;
 
@@ -1404,6 +1405,23 @@ describe('admin CLI — session-doctor subcommand', () => {
     return env;
   }
 
+  /**
+   * Answer every agent-CLI probe from the deterministic seam (issue #897).
+   *
+   * Selection policy — which candidate wins, and why — is pure, but reaching it
+   * through `session-doctor` used to require forking throwaway shell scripts and
+   * trusting the host to schedule them promptly. Under concurrent verification
+   * load it did not: a probe that timed out turned `same-provider-model-unknown`
+   * into `cli-unavailable` and failed the review that filed this issue. Tests
+   * about SELECTION therefore stub availability; the tests that are genuinely
+   * about probing a real executable are marked as such and keep spawning.
+   */
+  function probeStub(statuses) {
+    return { [CLI_PROBE_STUB_ENV]: JSON.stringify(statuses) };
+  }
+
+  const ALL_CLIS_AVAILABLE = probeStub({ claude: 'available', codex: 'available', gemini: 'available' });
+
   function doctorChecks(session, extraEnv = {}) {
     writeSession(session);
     const args = [CLI, 'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath];
@@ -1427,7 +1445,7 @@ describe('admin CLI — session-doctor subcommand', () => {
     const checks = doctorChecks({
       defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'], minConfidence: 0.8 } },
-    });
+    }, ALL_CLIS_AVAILABLE);
     expect(checks.arbiterConfig).toMatchObject({ category: 'aiCli', ok: true });
     expect(checks.arbiterConfig.detail).toContain('minConfidence: 0.8');
     expect(checks.arbiterCandidates.ok).toBe(true);
@@ -1474,7 +1492,115 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterSelection.ok).toBe(false);
   });
 
+  // -------------------------------------------------------------------------
+  // Probe classification (issue #897)
+  //
+  // The distinction these pin is the whole issue: "the CLI is missing" is a
+  // finding an operator acts on, "the probe never answered" is a question to
+  // ask again. Before #897 both came out as `cli-unavailable`, so a saturated
+  // host produced a phantom configuration diagnosis — and, through review
+  // verification, a phantom code-quality failure.
+  // -------------------------------------------------------------------------
+
+  const INDETERMINATE_STATUSES = [
+    ['a probe timeout', 'timeout'],
+    ['a refused fork', 'spawn-error'],
+  ];
+
+  test.each(INDETERMINATE_STATUSES)('%s is reported as indeterminate, not as a missing CLI', (_label, status) => {
+    const checks = doctorChecks(
+      {
+        defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+        reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+      },
+      probeStub({ claude: status, codex: 'available' }),
+    );
+    // The role check cannot claim success — nothing was verified — but it says
+    // which of the two things failed, and marks itself as not a finding.
+    expect(checks.claudeCli.ok).toBe(false);
+    expect(checks.claudeCli.transient).toBe(true);
+    expect(checks.claudeCli.error).toContain(CLI_PROBE_INDETERMINATE_MARKER);
+    expect(checks.claudeCli.error).toMatch(/says nothing about whether claude is installed/);
+    expect(checks.claudeCli.error).not.toMatch(/not found on PATH/);
+    // …and the arbiter candidate is refused under its own reason code, with the
+    // remedy being "re-run", not "install something".
+    expect(checks.arbiterCandidates.ok).toBe(false);
+    expect(checks.arbiterCandidates.transient).toBe(true);
+    expect(checks.arbiterCandidates.error).toMatch(/claude\[0\]: cli-probe-indeterminate/);
+    expect(checks.arbiterCandidates.error).toMatch(/Re-run session-doctor when the host is less loaded/);
+    expect(checks.arbiterCandidates.error).not.toMatch(/cli-unavailable/);
+  }, 30_000);
+
+  test('a missing executable is still reported as cli-unavailable', () => {
+    const checks = doctorChecks(
+      {
+        defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+        reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+      },
+      probeStub({ claude: 'not-found', codex: 'available' }),
+    );
+    expect(checks.claudeCli.ok).toBe(false);
+    expect(checks.claudeCli.transient).toBeUndefined();
+    expect(checks.claudeCli.error).toMatch(/claude was not found on PATH \(ENOENT\)/);
+    expect(checks.arbiterCandidates.error).toMatch(/claude\[0\]: cli-unavailable/);
+    expect(checks.arbiterCandidates.transient).toBeUndefined();
+  }, 30_000);
+
+  test('a CLI that ran and exited non-zero is reported as that, and is not transient', () => {
+    const checks = doctorChecks(
+      { defaults: { implementationAgent: 'claude', reviewAgent: 'claude' } },
+      probeStub({ claude: 'non-zero-exit' }),
+    );
+    expect(checks.claudeCli.ok).toBe(false);
+    expect(checks.claudeCli.transient).toBeUndefined();
+    expect(checks.claudeCli.error).toMatch(/claude exited 1/);
+    expect(checks.claudeCli.error).not.toContain(CLI_PROBE_INDETERMINATE_MARKER);
+  }, 30_000);
+
+  test('a stubbed probe is never passed off as a real availability fact', () => {
+    const checks = doctorChecks(
+      { defaults: { implementationAgent: 'claude', reviewAgent: 'claude' } },
+      probeStub({ claude: 'available' }),
+    );
+    expect(checks.claudeCli.ok).toBe(true);
+    expect(checks.claudeCli.detail).toContain('[stubbed probe]');
+  }, 30_000);
+
+  // A stub doctor cannot fully honour must fail the run: silently ignoring it
+  // would let the real probe spawn after all, which is the nondeterminism the
+  // seam exists to remove — and a passing run would hide that it happened. The
+  // typo case is the dangerous one: `claud` parses, stubs nothing, and leaves
+  // the actual `claude` check spawning for real.
+  for (const [label, raw] of [
+    ['unparseable', '{not json'],
+    ['a typo\'d agent key', JSON.stringify({ claud: 'available' })],
+    ['a CLI that is not stubbable', JSON.stringify({ claude: 'available', gh: 'available' })],
+  ]) {
+    test(`a probe stub that is ${label} fails loudly rather than falling back to real spawns`, () => {
+      writeSession({ defaults: { implementationAgent: 'claude', reviewAgent: 'claude' } });
+      const args = [CLI, 'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath];
+      let code = 0;
+      let stdout = '';
+      try {
+        stdout = execFileSync(process.execPath, args, {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: doctorEnv({ [CLI_PROBE_STUB_ENV]: raw }),
+        });
+      } catch (err) {
+        code = err.status ?? 1;
+        stdout = err.stdout ?? '';
+      }
+      expect(code).not.toBe(0);
+      expect(JSON.parse(stdout.trim())).toMatchObject({
+        ok: false, error: expect.stringContaining(CLI_PROBE_STUB_ENV),
+      });
+    }, 30_000);
+  }
+
   test('an unavailable candidate CLI is reported as such, not as a config problem', () => {
+    // Integration: a REAL spawn against a real PATH, kept deliberately so the
+    // typed classification above is anchored to what the OS actually does.
     // A PATH without `claude` on it: the arbiter candidate cannot be invoked.
     const binOnlyGh = join(tmpDir, 'bin-gh');
     mkdirSync(binOnlyGh, { recursive: true });
@@ -1496,17 +1622,21 @@ describe('admin CLI — session-doctor subcommand', () => {
     const checks = doctorChecks({
       defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
-    });
+    }, ALL_CLIS_AVAILABLE);
     expect(checks.arbiterCandidates.ok).toBe(true);
     expect(checks.arbiterSelection.ok).toBe(false);
     expect(checks.arbiterSelection.error).toMatch(/claude\[0\]: same-provider-not-allowed/);
   });
 
   test('explicit same-provider fallback is reported, and says why it cannot be proven here', () => {
+    // The regression that filed issue #897: under host contention this probe
+    // timed out, the answer flipped from `same-provider-model-unknown` to
+    // `cli-unavailable`, and a green branch failed review. Availability is now
+    // an injected fact, so the assertion is about policy only.
     const checks = doctorChecks({
       defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'], allowSameProvider: true } },
-    });
+    }, ALL_CLIS_AVAILABLE);
     expect(checks.arbiterConfig.detail).toContain('allowSameProvider: true');
     expect(checks.arbiterSelection.ok).toBe(false);
     expect(checks.arbiterSelection.error).toMatch(/same-provider-model-unknown/);
@@ -1519,7 +1649,7 @@ describe('admin CLI — session-doctor subcommand', () => {
         defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
         reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
       },
-      { CLAUDE_EFFORT: 'turbo' },
+      { CLAUDE_EFFORT: 'turbo', ...ALL_CLIS_AVAILABLE },
     );
     expect(checks.arbiterCandidates.ok).toBe(false);
     expect(checks.arbiterCandidates.error).toMatch(/claude\[0\]: profile-error \(effort:invalid\)/);
@@ -1580,7 +1710,7 @@ describe('admin CLI — session-doctor subcommand', () => {
     const checks = doctorChecks({
       defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
-    });
+    }, ALL_CLIS_AVAILABLE);
     expect(checks.arbiterSelection.ok).toBe(false);
     const error = checks.arbiterSelection.error;
     // The consequence, stated as a consequence…

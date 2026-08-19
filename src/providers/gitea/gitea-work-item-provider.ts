@@ -4,6 +4,7 @@ import type {
   WorkItem,
   WorkItemDetails,
   WorkItemTransition,
+  DependencyMutationResult,
   ProviderResult,
   ProviderRead,
 } from "../types.js";
@@ -281,6 +282,27 @@ export class GiteaWorkItemProvider implements WorkItemProvider {
    * "no blockers" result on failure.
    */
   async getDependencies(issueNumber: number): Promise<BlockedByEntry[]> {
+    return this.readRelationships(issueNumber, "dependencies");
+  }
+
+  /**
+   * The other end of the same relationship: `GET /repos/{o}/{r}/issues/{n}/blocks`
+   * lists the issues this one blocks (issue #791 review). The path is Gitea's
+   * documented counterpart of `/dependencies` and, like the mutation paths below,
+   * is a PIN — it cannot be exercised against a live Gitea from this repository.
+   */
+  async getDependents(issueNumber: number): Promise<BlockedByEntry[]> {
+    return this.readRelationships(issueNumber, "blocks");
+  }
+
+  /**
+   * One paginated relationship read, in either direction, shared by the two
+   * methods above so both page and fail closed identically.
+   */
+  private async readRelationships(
+    issueNumber: number,
+    endpoint: "dependencies" | "blocks",
+  ): Promise<BlockedByEntry[]> {
     // The Gitea HTTP envelope exposes no headers (no `X-Total-Count`/`Link`), so
     // there is no total to read up front and no `rel="next"` link to follow. Page
     // until an *empty* page proves the list is exhausted. A short (non-empty) page
@@ -291,22 +313,22 @@ export class GiteaWorkItemProvider implements WorkItemProvider {
     // implementation start work on a still-blocked issue.
     const out: BlockedByEntry[] = [];
     for (let page = 1; page <= DEPENDENCY_MAX_PAGES; page++) {
-      const res = this.send("GET", this.repoPath(`/issues/${issueNumber}/dependencies`), {
+      const res = this.send("GET", this.repoPath(`/issues/${issueNumber}/${endpoint}`), {
         query: { page: String(page), limit: String(DEPENDENCY_LIMIT) },
       });
       if (!GiteaWorkItemProvider.is2xx(res)) {
-        throw new Error(this.failure("Gitea issue dependencies read failed", res));
+        throw new Error(this.failure(`Gitea issue ${endpoint} read failed`, res));
       }
       let raw: GiteaIssue[];
       try {
         raw = JSON.parse(res.body) as GiteaIssue[];
       } catch {
         throw new Error(
-          redactGiteaSecrets(`Gitea dependencies returned non-JSON output: ${res.body.slice(0, 200)}`, [this.token]),
+          redactGiteaSecrets(`Gitea ${endpoint} returned non-JSON output: ${res.body.slice(0, 200)}`, [this.token]),
         );
       }
       if (!Array.isArray(raw)) {
-        throw new Error("Gitea dependencies returned a non-array payload");
+        throw new Error(`Gitea ${endpoint} returned a non-array payload`);
       }
       for (const i of raw) {
         if (typeof i.number === "number") {
@@ -326,9 +348,174 @@ export class GiteaWorkItemProvider implements WorkItemProvider {
     // closed rather than return a truncated blocker set that could read as "no
     // open blocker" and let a dependent start work despite an unseen dependency.
     throw new Error(
-      `Gitea issue #${issueNumber} still returns dependencies after ${DEPENDENCY_MAX_PAGES} pages; ` +
+      `Gitea issue #${issueNumber} still returns ${endpoint} after ${DEPENDENCY_MAX_PAGES} pages; ` +
         `refusing to treat a truncated dependency list as complete (fail closed).`,
     );
+  }
+
+  /**
+   * Gitea's native issue-dependency writes, the counterpart of the read above:
+   *
+   *   POST   /repos/{o}/{r}/issues/{index}/dependencies  IssueMeta
+   *   DELETE /repos/{o}/{r}/issues/{index}/dependencies  IssueMeta
+   *
+   * Both name the blocker with an `IssueMeta` body — `{index, owner, repo}` —
+   * where `index` is the repository-scoped issue number, the same number
+   * `getDependencies` reads back, so no database-id lookup is needed. This is
+   * deliberately NOT the GitHub provider's shape: GitHub takes an `issue_id`
+   * (database id) and deletes through `.../dependencies/blocked_by/{issue_id}`,
+   * while Gitea has no such field and no per-dependency delete route — it
+   * answers both writes on the collection and reads the blocker out of the body.
+   * Reusing the GitHub call shape here is exactly what
+   * `docs/gitea-private-work-items.md` ("do not assume Gitea's REST API is
+   * GitHub-compatible") forbids, and Gitea would reject it.
+   *
+   * `owner`/`repo` are sent rather than left off: Gitea resolves the body
+   * against the current repository only when they MATCH it, and otherwise
+   * treats the request as a cross-repository dependency — which it refuses
+   * unless that feature is enabled. Omitting them therefore fails a same-repo
+   * add, which is every edge these chain commands write.
+   *
+   * Like the GitHub provider's pair, the paths and payload are a PIN — they
+   * match Gitea's documented issue-dependency API and cannot be exercised live
+   * from this repository — so the verification below is what keeps a wrong PIN
+   * loud instead of silent.
+   *
+   * A duplicate add (Gitea answers 409 when the dependency already exists) is
+   * the requested end state, not a failure: it reports `changed: false` so a
+   * retry of a half-applied chain edit converges instead of failing on the
+   * steps that already landed.
+   *
+   * A removal answered with 404 is NOT taken at face value. 404 is what this
+   * endpoint returns when the dependency is already gone, but it is equally
+   * what a Gitea that routes the delete differently — or one whose transport
+   * dropped the request body, which several HTTP stacks do for DELETE — returns
+   * for a relationship that is still very much in place (issue #791 review).
+   * Reporting that as the requested end state would let a chain edit record a
+   * removal that never happened, so the claim is checked against the dependency
+   * list before it is believed: `changed: false` only when Gitea itself says
+   * the blocker is no longer there.
+   */
+  private async mutateDependency(
+    blockedIssueNumber: number,
+    blockerIssueNumber: number,
+    mode: "add" | "remove",
+  ): Promise<DependencyMutationResult> {
+    const res = this.send(
+      mode === "add" ? "POST" : "DELETE",
+      this.repoPath(`/issues/${blockedIssueNumber}/dependencies`),
+      { body: { index: blockerIssueNumber, owner: this.owner, repo: this.repo } },
+    );
+    if (GiteaWorkItemProvider.is2xx(res)) {
+      if (mode === "add") return { ok: true, changed: true };
+      // Even a 2xx delete is verified: the endpoint answers on the collection,
+      // so a server that ignored the body would report success having removed
+      // nothing.
+      return this.confirmRemoval(blockedIssueNumber, blockerIssueNumber, res, true);
+    }
+    if (mode === "add" && res.status === 409) return { ok: true, changed: false };
+    if (mode === "remove" && res.status === 404) {
+      return this.confirmRemoval(blockedIssueNumber, blockerIssueNumber, res, false);
+    }
+    return {
+      ok: false,
+      error: this.failure(
+        `Gitea dependency:${mode} failed for #${blockedIssueNumber} blocked by #${blockerIssueNumber}`,
+        res,
+      ),
+    };
+  }
+
+  /**
+   * Read the dependency list back and answer only what it supports: the removal
+   * counts as done when the blocker is absent, and fails — with the original
+   * response quoted — when it is still listed. A read that cannot be completed
+   * is a failure too: an unverifiable removal must not read as a successful one.
+   */
+  private async confirmRemoval(
+    blockedIssueNumber: number,
+    blockerIssueNumber: number,
+    res: GiteaHttpResponse,
+    changed: boolean,
+  ): Promise<DependencyMutationResult> {
+    let blockers: BlockedByEntry[];
+    try {
+      blockers = await this.getDependencies(blockedIssueNumber);
+    } catch (err) {
+      return {
+        ok: false,
+        error: redactGiteaSecrets(
+          `Gitea dependency:remove for #${blockedIssueNumber} blocked by #${blockerIssueNumber} could not be ` +
+            `verified (HTTP ${res.status}): ${err instanceof Error ? err.message : String(err)}`,
+          [this.token],
+        ),
+      };
+    }
+    if (blockers.some((b) => b.issueNumber === blockerIssueNumber)) {
+      return {
+        ok: false,
+        error: this.failure(
+          `Gitea dependency:remove for #${blockedIssueNumber} blocked by #${blockerIssueNumber} did not take ` +
+            "effect: the blocker is still listed",
+          res,
+        ),
+      };
+    }
+    return { ok: true, changed };
+  }
+
+  async addDependency(blockedIssueNumber: number, blockerIssueNumber: number): Promise<DependencyMutationResult> {
+    return this.mutateDependency(blockedIssueNumber, blockerIssueNumber, "add");
+  }
+
+  async removeDependency(blockedIssueNumber: number, blockerIssueNumber: number): Promise<DependencyMutationResult> {
+    return this.mutateDependency(blockedIssueNumber, blockerIssueNumber, "remove");
+  }
+
+  /**
+   * Scan the issue's comment history for `marker` (issue #936).
+   *
+   * Termination keys on an EMPTY page, never a short one — a self-hosted Gitea
+   * clamps `limit` to its configured max page size, so a "full" page can come
+   * back shorter than requested and stopping there would miss a marker on a
+   * later page and duplicate the comment. `MAX_PAGES` is a runaway guard only;
+   * exceeding it is a failure rather than "not found", because the caller uses
+   * this as a delivery precondition and an unread history is not an absent one.
+   */
+  hasItemCommentWithMarker(issueNumber: number, marker: string): ProviderRead<boolean> {
+    const PER_PAGE = 50;
+    const MAX_PAGES = 200;
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const res = this.send("GET", this.repoPath(`/issues/${issueNumber}/comments`), {
+        query: { page: String(page), limit: String(PER_PAGE) },
+      });
+      if (!GiteaWorkItemProvider.is2xx(res)) {
+        return { ok: false, error: this.failure(`Gitea issue comment list failed (page ${page})`, res) };
+      }
+      let comments: Array<{ body?: unknown }>;
+      try {
+        comments = JSON.parse(res.body) as Array<{ body?: unknown }>;
+      } catch {
+        return {
+          ok: false,
+          error: redactGiteaSecrets(
+            `Gitea issue comment list returned non-JSON output (page ${page}): ${res.body.slice(0, 200)}`,
+            [this.token],
+          ),
+        };
+      }
+      if (!Array.isArray(comments)) {
+        return { ok: false, error: `Gitea issue comment list returned a non-array payload (page ${page})` };
+      }
+      if (comments.some((c) => typeof c.body === "string" && c.body.includes(marker))) {
+        return { ok: true, value: true };
+      }
+      if (comments.length === 0) return { ok: true, value: false };
+    }
+    return {
+      ok: false,
+      error: `Gitea issue comment list exceeded ${MAX_PAGES} pages for #${issueNumber}; comment history not fully scanned`,
+    };
   }
 
   commentItem(issueNumber: number, body: string): ProviderResult {
@@ -372,10 +559,14 @@ export class GiteaWorkItemProvider implements WorkItemProvider {
 
     // remove-label: a label that does not exist on the repo is already absent
     // from the issue, so removal is a no-op success (mirroring the GitHub
-    // provider's tolerance of a 404 on remove).
-    if (labelId === undefined) return { ok: true };
+    // provider's tolerance of a 404 on remove). Reported via `alreadyAbsent`
+    // rather than a plain `ok: true` (issue #787 review): a caller that must
+    // attribute the removal to THIS call needs to tell "already gone" apart
+    // from "this call removed it".
+    if (labelId === undefined) return { ok: true, alreadyAbsent: true };
     const res = this.send("DELETE", this.repoPath(`/issues/${issueNumber}/labels/${labelId}`));
-    if (!GiteaWorkItemProvider.is2xx(res) && res.status !== 404) {
+    if (!GiteaWorkItemProvider.is2xx(res)) {
+      if (res.status === 404) return { ok: true, alreadyAbsent: true };
       return { ok: false, error: this.failure("Gitea remove-label failed", res) };
     }
     return { ok: true };

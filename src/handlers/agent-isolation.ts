@@ -6,9 +6,12 @@
  * is invoked with no tool permissions, and the bundle is the entire input" — and
  * both the reviewer's reconsideration and the arbiter's arbitration are held to
  * it. The mechanics of that posture are what live here: a throwaway cwd, an
- * isolated home/config, an environment stripped of every credential that could
- * authenticate a mutation, and artifact reads/writes that refuse to follow a
- * symlink out of the run's own directory.
+ * isolated GitHub config, an environment stripped of every credential that could
+ * authenticate a mutation, a per-provider home policy (issue #935 — see
+ * {@link PROVIDER_HOME_POLICY} for the one provider whose own login is not
+ * reachable from a throwaway home, and for the controls that compensate), and
+ * artifact reads/writes that refuse to follow a symlink out of the run's own
+ * directory.
  *
  * Extracted rather than copied because two copies of a security boundary drift
  * into two different boundaries: a fix applied to one — the `O_NOFOLLOW` on the
@@ -96,15 +99,77 @@ const PROVIDER_AUTH_PASSTHROUGH_KEYS: Readonly<Record<string, readonly string[]>
 /**
  * The config-dir var a provider's CLI reads, pointed back at the REAL home.
  *
- * The throwaway `HOME` below hides a HOME-backed CLI login, so the one directory
- * holding the selected provider's own credentials is named explicitly while
+ * A throwaway `HOME` hides a HOME-backed CLI login, so the one directory holding
+ * the selected provider's own credentials is named explicitly while
  * `GH_CONFIG_DIR` stays pinned to the empty temp dir — GitHub credentials remain
  * unreachable either way.
+ *
+ * For a provider whose {@link PROVIDER_HOME_POLICY} is `inherit` this var is no
+ * longer synthesized from the real HOME: the CLI is reading its real HOME
+ * directly, and pointing its config dir somewhere else would only override the
+ * default it already resolves correctly. An operator who has set the var
+ * explicitly is still honored, for both policies.
  */
 const PROVIDER_CONFIG_DIR_KEYS: Readonly<Record<string, string>> = {
   anthropic: "CLAUDE_CONFIG_DIR",
   openai: "CODEX_HOME",
 };
+
+/**
+ * Where a provider's CLI is allowed to look for its OWN login: a throwaway home
+ * (the default) or the caller's real one.
+ *
+ * `anthropic` is `inherit`, and that is an Anthropic-specific policy with
+ * compensating controls rather than a general relaxation (issue #935). Claude
+ * Code's subscription/OAuth login is not reproducible through
+ * `CLAUDE_CONFIG_DIR`: a local matrix confirmed that a throwaway `HOME` reports
+ * "Not logged in · Please run /login" whether `CLAUDE_CONFIG_DIR` points at the
+ * real HOME, at `$HOME/.claude`, or at a copy of the visible config files, while
+ * the same invocation with the real HOME preserved is authenticated. So the
+ * config-dir passthrough this table used to rely on did not have a fix — it had
+ * a wrong premise, and every Claude no-tool turn (PIR's refiner and critic, the
+ * reviewer's reconsideration, the arbiter) failed as `agent_unavailable` on an
+ * operator machine that was, in fact, logged in.
+ *
+ * What the real HOME does NOT restore, because each is pinned separately below:
+ *   - GitHub credentials — `GH_CONFIG_DIR` still points at the empty temp dir,
+ *     and every write-enabling token var is still stripped. `gh` under this
+ *     environment is unauthenticated with a real HOME exactly as with a fake one.
+ *   - the checkout — the cwd is still a throwaway directory and every
+ *     cwd-bearing var is still deleted.
+ *   - another provider's credentials — the strip/restore below is unchanged.
+ *
+ * What it does expose is the operator's own agent configuration (hooks,
+ * plugins, settings, MCP servers, session files). That surface is closed at the
+ * CLI level, not here: the policy applies ONLY to a `no-tools` invocation (see
+ * {@link IsolatedInvocationOptions.toolPolicy}), and the no-tools argv every
+ * such caller passes carries `--tools ""`, `--strict-mcp-config`, `--safe-mode`
+ * (which disables user/project hooks, plugins, agents, and slash commands) and
+ * `--no-session-persistence`. A tool-capable invocation gets the throwaway home
+ * whatever its provider, so this cannot widen a surface that has no CLI-level
+ * boundary to close it.
+ *
+ * A genuinely logged-out CLI still fails closed: nothing here supplies a
+ * credential, it only stops hiding one that exists.
+ */
+const PROVIDER_HOME_POLICY: Readonly<Record<string, "throwaway" | "inherit">> = {
+  anthropic: "inherit",
+};
+
+/**
+ * The home policy one (provider, tool boundary) pair resolves to.
+ *
+ * Exported so the policy can be asserted — and reported by the local smoke test
+ * of `scripts/agent-isolation-auth-smoke.mjs` — without building an invocation
+ * and its two temp directories.
+ */
+export function resolveHomePolicy(
+  provider: string,
+  toolPolicy: "no-tools" | "tool-capable",
+): "throwaway" | "inherit" {
+  if (toolPolicy !== "no-tools") return "throwaway";
+  return providerEntry(PROVIDER_HOME_POLICY, provider) ?? "throwaway";
+}
 
 /**
  * Own-property lookup over the two provider tables.
@@ -143,6 +208,13 @@ export interface IsolatedInvocationEnv {
   cwd: string;
   /** Directories to remove once the agent has exited, in any outcome. */
   cleanup: string[];
+  /**
+   * Where the provider's CLI was allowed to look for its own login, so a run
+   * record can state the posture it actually ran under rather than the one the
+   * table is assumed to hold. `inherit` means `HOME` is the caller's real home
+   * (see {@link PROVIDER_HOME_POLICY}); GitHub isolation is identical either way.
+   */
+  homePolicy: "throwaway" | "inherit";
 }
 
 export interface IsolatedInvocationOptions {
@@ -153,6 +225,19 @@ export interface IsolatedInvocationOptions {
   prefix: string;
   /** The RESOLVED profile's provider. Only its credentials survive the strip. */
   provider: string;
+  /**
+   * The tool boundary the invocation itself enforces, as the resolved profile
+   * records it.
+   *
+   * Required, and required from the profile rather than defaulted here: it is
+   * the precondition for {@link PROVIDER_HOME_POLICY}'s `inherit` entry, whose
+   * compensating control is the CLI-level no-tools argv a `no-tools` profile
+   * carries. A `tool-capable` caller gets the throwaway home for every provider,
+   * so an agent that CAN run a command never reaches the operator's real home —
+   * which is the boundary `src/cli/issue-discuss.ts` establishes for its own,
+   * tool-capable, agent step.
+   */
+  toolPolicy: "no-tools" | "tool-capable";
 }
 
 /**
@@ -160,7 +245,9 @@ export interface IsolatedInvocationOptions {
  *
  * The two temp directories are the caller's to remove: they are returned in
  * `cleanup` rather than removed here, because the agent has not run yet when
- * this returns.
+ * this returns. Both are created — and both are cleaned up — under either home
+ * policy, because the sandbox home is the GitHub config dir whether or not it is
+ * also `HOME`; the returned `homePolicy` says which of the two it was.
  */
 export function buildIsolatedInvocation(
   source: NodeJS.ProcessEnv,
@@ -170,7 +257,7 @@ export function buildIsolatedInvocation(
   for (const key of WRITE_ENABLING_ENV_KEYS) delete env[key];
   for (const key of CWD_BEARING_ENV_KEYS) delete env[key];
   for (const key of ALL_PROVIDER_ENV_KEYS) delete env[key];
-  const home = mkdtempSync(join(tmpdir(), `${options.prefix}-home-`));
+  const sandboxHome = mkdtempSync(join(tmpdir(), `${options.prefix}-home-`));
   let cwd: string;
   try {
     cwd = mkdtempSync(join(tmpdir(), `${options.prefix}-cwd-`));
@@ -180,29 +267,44 @@ export function buildIsolatedInvocation(
     // TMPDIR) is exactly the condition under which a leaked directory is least
     // affordable, so it is removed here rather than left behind.
     try {
-      rmSync(home, { recursive: true, force: true });
+      rmSync(sandboxHome, { recursive: true, force: true });
     } catch {
       // Nothing better to do: the setup failure below is the reportable fact.
     }
     throw err;
   }
-  env["HOME"] = home;
-  env["GH_CONFIG_DIR"] = home;
+  // The empty temp dir is `gh`'s config dir under BOTH home policies: it is what
+  // makes "GitHub credentials are unreachable" independent of what `HOME` is,
+  // rather than a consequence of `HOME` having been faked.
+  env["GH_CONFIG_DIR"] = sandboxHome;
   delete env["XDG_CONFIG_HOME"];
+  const homePolicy = resolveHomePolicy(options.provider, options.toolPolicy);
+  // `inherit` with no real HOME to inherit is the throwaway home, not an unset
+  // HOME: a provider CLI that resolves `undefined` HOME to `/` or to the process
+  // owner's passwd entry would be reading a directory nobody chose.
+  const inheritedHome = source["HOME"];
+  const effectiveHome = homePolicy === "inherit" && inheritedHome ? inheritedHome : sandboxHome;
+  env["HOME"] = effectiveHome;
   // Pin PWD to the sandbox so the agent's reported cwd matches its actual one.
   env["PWD"] = cwd;
   const configDirKey = providerEntry(PROVIDER_CONFIG_DIR_KEYS, options.provider);
   if (configDirKey !== undefined) {
     if (source[configDirKey]) {
       env[configDirKey] = source[configDirKey];
-    } else if (source["HOME"]) {
+    } else if (homePolicy === "throwaway" && source["HOME"]) {
+      // Only a hidden home needs its config dir named back: with `inherit` the
+      // CLI resolves its own default from the real HOME, and a synthesized value
+      // could only override a default that is already right.
       env[configDirKey] = source["HOME"];
     }
   }
   for (const key of providerEntry(PROVIDER_AUTH_PASSTHROUGH_KEYS, options.provider) ?? []) {
     if (source[key] !== undefined) env[key] = source[key];
   }
-  return { env, cwd, cleanup: [home, cwd] };
+  // Both temp dirs are removed whatever the home policy: with `inherit` the
+  // sandbox home is still created, still the GitHub config dir, and still the
+  // caller's to clean up. The real HOME is never in `cleanup`.
+  return { env, cwd, cleanup: [sandboxHome, cwd], homePolicy };
 }
 
 // ---------------------------------------------------------------------------

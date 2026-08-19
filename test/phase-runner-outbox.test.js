@@ -543,6 +543,74 @@ describe('runNextPhase outbox side effects — implementation blocked', () => {
   });
 });
 
+describe('runNextPhase outbox side effects — implementation needs_fix (verification requeue, issue #934)', () => {
+  const sessionWithLaneLabels = {
+    ...SESSION,
+    labels: {
+      ...SESSION.labels,
+      needsReview: 'status:needs-review',
+      needsImplementation: 'status:needs-implementation',
+      needsFix: 'status:needs-fix',
+      agentReview: 'agent:codex',
+      agentImplementation: 'agent:claude',
+    },
+  };
+
+  test('requeues to implementation and publishes no comment or lane-label churn', async () => {
+    await enqueueTask('implementation', {});
+    const handler = async () => ({
+      result: 'needs_fix',
+      context: { artifactDir: '/tmp/artifacts', verificationRepairCycles: 1 },
+      message: "Verification 'test' failed (exit 1) before commit/push; requeueing implementation",
+    });
+
+    const outcome = await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { implementation: handler },
+      outboxStore,
+      session: sessionWithLaneLabels,
+      now: NOW,
+    });
+
+    expect(outcome.status).toBe('completed');
+    expect(outcome.task).toMatchObject({ status: 'queued', phase: 'implementation' });
+
+    const pending = await outboxStore.listPending();
+    // No routine public comment for an automatic retry: nothing an operator
+    // needs to act on changed.
+    expect(pending.filter(e => e.topic === 'gh:comment')).toHaveLength(0);
+    expect(pending.filter(e => e.topic === 'repohost:pr-comment')).toHaveLength(0);
+    expect(pending.filter(e => e.topic === 'repohost:pr-summary')).toHaveLength(0);
+    // The task never left the implementation lane, so its labels are already
+    // correct — in particular `status:needs-fix` is NOT added to an issue that
+    // may not even have a PR yet.
+    expect(pending.filter(e => e.topic.startsWith('gh:label:'))).toHaveLength(0);
+  });
+
+  test('a review needs_fix still swaps the lane labels (unchanged)', async () => {
+    await enqueueTask('review', { prUrl: 'https://github.com/org/repo/pull/5' });
+    const handler = async () => ({
+      result: 'needs_fix',
+      context: { reviewFeedback: '[P1] fix this', prUrl: 'https://github.com/org/repo/pull/5' },
+    });
+
+    await runNextPhase({
+      store: taskStore,
+      request: REQUEST,
+      handlers: { review: handler },
+      outboxStore,
+      session: sessionWithLaneLabels,
+      now: NOW,
+    });
+
+    const pending = await outboxStore.listPending();
+    const added = pending.filter(e => e.topic === 'gh:label:add').map(e => e.payload.label);
+    expect(added).toContain('status:needs-fix');
+    expect(added).toContain('agent:claude');
+  });
+});
+
 describe('runNextPhase outbox side effects — review success', () => {
   test('enqueues review success comment and readyForHuman label', async () => {
     await enqueueTask('review', { prUrl: 'https://github.com/org/repo/pull/5', branch: 'ai/issue-99' });

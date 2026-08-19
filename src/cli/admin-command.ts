@@ -31,6 +31,11 @@ export const VALID_PHASES: readonly TaskPhase[] = [
   "content_draft",
   "content_review",
   "planner",
+  // Chain-aware refinement (issue #867). Accepted here so an operator can act
+  // on a refinement row through the ordinary recovery commands; since #869 the
+  // generated child workflow also advertises the phase to run-one-phase, which
+  // executes it with the two-agent loop handler.
+  "refinement",
 ];
 
 /**
@@ -227,6 +232,9 @@ export interface CommonOptions {
   /** Raw token maps so commands can read their own extra options. */
   args: Record<string, string>;
   flags: Set<string>;
+  /** Non-option positional arguments, in order. Empty unless the spec set
+   * `allowPositionals`. */
+  positionals: string[];
 }
 
 /**
@@ -262,7 +270,7 @@ export function parseCommonOptions(
     allowPositionals: spec.allowPositionals,
   });
   if ("error" in tokenized) return { error: tokenized.error };
-  const { args, flags } = tokenized;
+  const { args, flags, positionals } = tokenized;
 
   let sessionId = "";
   if (spec.session === "required") {
@@ -303,5 +311,6 @@ export function parseCommonOptions(
     dryRun: flags.has("dry-run"),
     args,
     flags,
+    positionals,
   };
 }
