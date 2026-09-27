@@ -85,6 +85,19 @@ export interface ChainGraphCandidate {
 export interface ChainOwnershipEntry {
   issueNumber: number;
   chainId: string;
+  /**
+   * Session the owning chain belongs to, when the caller knows it.
+   *
+   * An Issue number is unique only inside the repository that issued it (issue
+   * #1045), so a duplicate-ownership finding that names nothing but the number
+   * and the other chain cannot be acted on by an operator whose sessions each
+   * have a `#697`. Carried through to the diagnostic when present, ignored when
+   * absent — the check itself is unaffected, because the caller has already
+   * scoped which chains it collected.
+   */
+  sessionId?: string;
+  /** Human-readable repository the owning chain's Issues live in (`owner/repo`). */
+  repository?: string;
 }
 
 export interface ChainGraphValidationOptions {
@@ -92,6 +105,13 @@ export interface ChainGraphValidationOptions {
    * Existing membership to check the candidate against. Entries naming the
    * candidate's own `chainId` are the chain re-declaring its own members and
    * are ignored; every other entry makes the Issue doubly owned.
+   *
+   * *Which* chains belong here is the caller's decision and deliberately not
+   * this module's: an Issue number is unique only inside its repository (issue
+   * #1045), and only the caller knows which sessions share one. Handing over
+   * entries collected across unrelated repositories is what made a valid chain
+   * look doubly owned; `collectChainOwnership` with a repository-scoped filter
+   * is how a caller avoids it.
    */
   ownership?: readonly ChainOwnershipEntry[];
 }
@@ -166,8 +186,26 @@ export interface ChainGraphDiagnostic {
   expectedEdges: ChainGraphEdge[];
   /** Other chain handles the finding implicates, ascending. */
   chains: string[];
+  /**
+   * Where each handle in `chains` lives, ascending by `chainId`. Absent when
+   * the caller supplied no identity — see {@link ChainOwnershipEntry.sessionId}
+   * for why a bare Issue number is not an identification (issue #1045).
+   */
+  owners?: ChainDiagnosticOwner[];
   /** Deterministic one-line summary, safe to log. */
   message: string;
+}
+
+/**
+ * Identity of one chain named by a diagnostic. Fields are verbatim, never
+ * clipped: this is what a consumer resolves back against the registry, so only
+ * the rendered `message` carries the {@link MAX_DIAGNOSTIC_TOKEN_CHARS} bound.
+ */
+export interface ChainDiagnosticOwner {
+  chainId: string;
+  sessionId?: string;
+  /** Human-readable repository (`owner/repo`) the chain's Issues live in. */
+  repository?: string;
 }
 
 /**
@@ -225,6 +263,19 @@ function describeToken(value: unknown): string {
     return String(value);
   }
   return Object.prototype.toString.call(value);
+}
+
+/**
+ * {@link describeToken}'s bound without its quoting, for a value that is
+ * already known to be a plain identifier — a session id, a repository slug.
+ * They come from an operator-written session file, so they are bounded like any
+ * other echoed value, but quoting them would only make the message harder to
+ * read.
+ */
+function clipToken(value: string): string {
+  return value.length > MAX_DIAGNOSTIC_TOKEN_CHARS
+    ? `${value.slice(0, MAX_DIAGNOSTIC_TOKEN_CHARS)}…`
+    : value;
 }
 
 function renderIssues(issues: readonly number[]): string {
@@ -301,6 +352,7 @@ function diagnostic(
     observedEdges?: readonly ChainGraphEdge[];
     expectedEdges?: readonly ChainGraphEdge[];
     chains?: readonly string[];
+    owners?: readonly ChainDiagnosticOwner[];
   },
 ): ChainGraphDiagnostic {
   return {
@@ -309,6 +361,11 @@ function diagnostic(
     observedEdges: [...(parts?.observedEdges ?? [])].sort(compareEdges),
     expectedEdges: [...(parts?.expectedEdges ?? [])].sort(compareEdges),
     chains: [...(parts?.chains ?? [])].sort(compareStrings),
+    // Set only when a caller supplied identity, so a diagnostic from a caller
+    // that has none keeps exactly the shape it had before issue #1045.
+    ...(parts?.owners && parts.owners.length > 0
+      ? { owners: [...parts.owners].sort((a, b) => compareStrings(a.chainId, b.chainId)) }
+      : {}),
     message,
   };
 }
@@ -741,6 +798,7 @@ function scanOwnership(
   ownership: readonly ChainOwnershipEntry[],
 ): ChainGraphDiagnostic[] {
   const byChain = new Map<string, Set<number>>();
+  const identityByChain = new Map<string, ChainDiagnosticOwner>();
   for (const entry of ownership) {
     if (typeof entry.chainId !== "string" || entry.chainId.length === 0) continue;
     if (chainId !== undefined && entry.chainId === chainId) continue;
@@ -749,6 +807,11 @@ function scanOwnership(
     if (!issues) {
       issues = new Set<number>();
       byChain.set(entry.chainId, issues);
+      // First entry naming a chain fixes its identity: every entry for one
+      // chain comes from that chain's single registry row, so a later one can
+      // only repeat it — and taking the first keeps the rendering independent
+      // of the order the caller collected ownership in.
+      identityByChain.set(entry.chainId, describeOwner(entry));
     }
     issues.add(entry.issueNumber);
   }
@@ -759,15 +822,95 @@ function scanOwnership(
   // and one finding per chain is what tells them how much of it is involved.
   for (const owner of [...byChain.keys()].sort(compareStrings)) {
     const issues = [...byChain.get(owner)!].sort(compareNumbers);
+    const identity = identityByChain.get(owner)!;
+    const qualified = hasOwnerIdentity(identity);
     diagnostics.push(
       diagnostic(
         "duplicate_ownership",
-        `issues ${renderIssues(issues)} already belong to chain ${owner}`,
-        { issues, chains: [owner] },
+        `issues ${renderIssues(issues)} already belong to chain ${owner}` +
+          (qualified ? ` (${formatOwnerIdentity(identity)})` : ""),
+        { issues, chains: [owner], ...(qualified ? { owners: [identity] } : {}) },
       ),
     );
   }
   return diagnostics;
+}
+
+/**
+ * The identity of every chain named by `ownership`, ascending by chain handle —
+ * what a `duplicate_ownership` diagnostic carries as its `owners`.
+ *
+ * Empty when no entry knows anything beyond the chain handle, so a caller can
+ * spread it conditionally and leave a pre-#1045-shaped diagnostic untouched.
+ * Exported because the linear (#791) and advanced (#893) refusals word
+ * duplicate ownership themselves — they say "this is a merge", not "repair the
+ * graph" — and must not re-derive what identifying a chain means.
+ */
+export function chainDiagnosticOwners(
+  ownership: readonly ChainOwnershipEntry[],
+): ChainDiagnosticOwner[] {
+  const byChain = new Map<string, ChainDiagnosticOwner>();
+  for (const entry of ownership) {
+    if (typeof entry.chainId !== "string" || entry.chainId.length === 0) continue;
+    if (!byChain.has(entry.chainId)) byChain.set(entry.chainId, describeOwner(entry));
+  }
+  const owners = [...byChain.values()].sort((a, b) => compareStrings(a.chainId, b.chainId));
+  return owners.some(hasOwnerIdentity) ? owners : [];
+}
+
+/**
+ * `#697 (chain_777) [session ai-cli-loop, repo m2dw/yoda_form_js]` — one
+ * offending Issue, the chain that already owns it, and whatever identity the
+ * caller collected, for a refusal that lists offenders one by one.
+ *
+ * The identity trails the `#697 (chain_777)` token rather than joining it
+ * because that token is the part an operator reads and copies, and it is what
+ * the linear (#791) and advanced (#893) refusals have always printed: #1045
+ * adds to the naming, it does not re-cut it. Falls back to exactly that token
+ * when nothing beyond the handle is known.
+ */
+export function describeChainOwnership(entry: ChainOwnershipEntry): string {
+  const identity = describeOwner(entry);
+  const named = `#${entry.issueNumber} (${identity.chainId})`;
+  return hasOwnerIdentity(identity) ? `${named} [${formatOwnerIdentity(identity)}]` : named;
+}
+
+/**
+ * The identity fields of an ownership entry, dropped when blank.
+ *
+ * Values are carried verbatim: `owners` is the structured half of a diagnostic
+ * and a consumer has to be able to look an identity back up in the registry, so
+ * the {@link MAX_DIAGNOSTIC_TOKEN_CHARS} bound belongs to
+ * {@link formatOwnerIdentity} — the rendered message — and not here. Two
+ * identities sharing their first 32 characters stay distinguishable.
+ */
+function describeOwner(entry: ChainOwnershipEntry): ChainDiagnosticOwner {
+  return {
+    chainId: entry.chainId,
+    ...(typeof entry.sessionId === "string" && entry.sessionId.length > 0
+      ? { sessionId: entry.sessionId }
+      : {}),
+    ...(typeof entry.repository === "string" && entry.repository.length > 0
+      ? { repository: entry.repository }
+      : {}),
+  };
+}
+
+function hasOwnerIdentity(owner: ChainDiagnosticOwner): boolean {
+  return owner.sessionId !== undefined || owner.repository !== undefined;
+}
+
+/**
+ * `session yoda-form-js, repo m2dw/yoda_form_js`, with either half omitted when
+ * unknown. Clipping happens here, on the message, because this is the only
+ * place an identity is echoed into unbounded log text — the structured
+ * `owners` keep the values whole.
+ */
+function formatOwnerIdentity(owner: ChainDiagnosticOwner): string {
+  const parts: string[] = [];
+  if (owner.sessionId !== undefined) parts.push(`session ${clipToken(owner.sessionId)}`);
+  if (owner.repository !== undefined) parts.push(`repo ${clipToken(owner.repository)}`);
+  return parts.join(", ");
 }
 
 /**

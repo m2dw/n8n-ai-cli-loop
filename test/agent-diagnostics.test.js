@@ -86,6 +86,40 @@ describe.each(AGENTS)('$agentId failure diagnostic adapter', ({ agentId, extract
     expect(diagnostic.agentId).toBe(agentId);
     expect(classifyQuotaExhaustion(diagnostic).isQuotaExhaustion).toBe(true);
   });
+
+  // Binary provenance applies to EVERY adapter, not just Gemini (issue #911
+  // review): an `agent-profiles.json` overlay can point any provider at an
+  // operator-supplied executable, whose stderr could be a wrapper's own errors
+  // or relayed/echoed transcript content.
+  test('cmdSource "env" (operator-overridden binary) withholds stderr trust', () => {
+    const diagnostic = extract({ stdout: '', stderr: quotaText, exitCode: 1 }, { cmdSource: 'env' });
+    expect(diagnostic).toBeUndefined();
+    expect(classifyQuotaExhaustion(diagnostic).isQuotaExhaustion).toBe(false);
+    expect(classifyQuotaExhaustion(diagnostic).category).toBe('ordinary_failure');
+  });
+
+  test('cmdSource "catalog-overlay" (overlay-selected binary) withholds stderr trust', () => {
+    const diagnostic = extract({ stdout: '', stderr: quotaText, exitCode: 1 }, { cmdSource: 'catalog-overlay' });
+    expect(diagnostic).toBeUndefined();
+    expect(classifyQuotaExhaustion(diagnostic).isQuotaExhaustion).toBe(false);
+  });
+
+  test('cmdSource "cli-default" and "catalog-builtin" (vetted binaries) still trust stderr', () => {
+    for (const cmdSource of ['cli-default', 'catalog-builtin']) {
+      const diagnostic = extract({ stdout: '', stderr: quotaText, exitCode: 1 }, { cmdSource });
+      expect(diagnostic).toBeDefined();
+      expect(classifyQuotaExhaustion(diagnostic).isQuotaExhaustion).toBe(true);
+    }
+  });
+
+  test('extractAgentFailureDiagnostic propagates cmdSource to this adapter', () => {
+    const diagnostic = extractAgentFailureDiagnostic(
+      agentId,
+      { stdout: '', stderr: quotaText, exitCode: 1 },
+      { cmdSource: 'catalog-overlay' },
+    );
+    expect(diagnostic).toBeUndefined();
+  });
 });
 
 describe('bounded diagnostic retention (issue #671)', () => {
@@ -138,7 +172,7 @@ describe('gemini stderr is untrusted when the binary was operator-overridden (is
     expect(classifyQuotaExhaustion(diagnostic).isQuotaExhaustion).toBe(true);
   });
 
-  test('omitting options entirely (no provenance info) still trusts stderr, matching pre-existing adapters', () => {
+  test('omitting options entirely (no provenance info) still trusts stderr, matching every adapter', () => {
     const diagnostic = extractGeminiDiagnostic({ stdout: '', stderr: 'rate limit exceeded', exitCode: 1 });
     expect(diagnostic).toBeDefined();
   });

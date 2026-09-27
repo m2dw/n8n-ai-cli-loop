@@ -4,18 +4,36 @@ import type { AiTask } from "../core/task.js";
 import type { PhaseHandler, PhaseHandlerContext, PhaseHandlerResult } from "../core/phase-runner.js";
 import { defaultCommandRunner } from "./command-runner.js";
 import type { CommandRunner } from "./command-runner.js";
-import { labelsToComplexity } from "../core/github-intake.js";
-import type { ClaudeConfig } from "../core/session.js";
+import {
+  planAgentPhaseInvocation,
+  resolveAgentPhaseRuntime,
+  runtimeCmdSource,
+  withAgentRuntimeAudit,
+} from "./agent-runtime.js";
+import type { AgentPhaseRuntime } from "./agent-runtime.js";
+import { AGENT_RUNTIME_AUDIT_ARTIFACT_FILENAME, serializeAgentRuntimeAuditRecord } from "../core/agent-runtime-audit.js";
+import type { ResolvedSession } from "../core/session.js";
 import { runArtifactDir, writeAssignmentFailureArtifact, ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "./artifact-dir.js";
 import { agentForPhase, readResolvedAssignment } from "../core/assignment.js";
-import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory } from "../core/quota-classifier.js";
+import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory, resolveTransientRetryDelayMs } from "../core/quota-classifier.js";
 import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
 import { resolveFixPr } from "./pr-helpers.js";
 import { ghRunnerFromCommandRunner } from "../providers/github/gh-runner.js";
 import { resolveSessionRepoHost } from "../providers/repo-host-factory.js";
+import { JsonSessionRegistry } from "../registries/json-session-registry.js";
 import type { SessionRepoHost } from "../providers/repo-host-factory.js";
 import { parseShellTokens, MAX_VERIFICATION_BUFFER_BYTES } from "./verification.js";
-import { ensureEnvironmentPrepared } from "./environment-prepare.js";
+import {
+  nonTestVerificationCommands,
+  resolveTestStageContext,
+  runStage1TestVerification,
+  type Stage1TestRun,
+} from "./test-stage-verification.js";
+import { openStageRunGuard, stage1RecoveryOutcome } from "../core/test-stage-routing.js";
+import { STAGED_VERIFICATION_CONTEXT_KEY, validateStagedVerificationState } from "../core/staged-verification-state.js";
+import { LOOP_STAGE_RECOVERY_CONTEXT_KEY, decideLoopStageRecovery, readLoopStageRecovery } from "../core/stage-recovery.js";
+import { resolveStagedVerificationSettings } from "../core/staged-verification-config.js";
+import { ensureEnvironmentPrepared, environmentPrepareFailureMessage } from "./environment-prepare.js";
 import { resolveIssueWorktree, IssueWorktreeLock, issueLockScope, canonicalizePath, isPathInside } from "./worktree.js";
 import { resolveWorktreeRoot, issueWorktreePath } from "../core/worktree-paths.js";
 import { boundedExcerpt } from "../core/text-sanitize.js";
@@ -27,20 +45,13 @@ import { boundedExcerpt } from "../core/text-sanitize.js";
 // resolved files. It must not run gh commands, or any git command other than
 // status / ls-files / add -- <file>. All repository operations (fetch, checkout,
 // merge, commit, push) are owned by the handler, never the agent.
+//
+// The list itself is owned by the Claude runtime adapter
+// (src/core/claude-runtime-adapter.ts, issue #907), which declares it as this
+// lane's tool boundary; since the lane's cutover (issue #911) the adapter also
+// builds the whole invocation, so this handler no longer restates any part of
+// the argv.
 // ---------------------------------------------------------------------------
-
-const CONFLICT_RESOLUTION_ALLOWED_TOOLS = [
-  "Read",
-  "Edit",
-  "MultiEdit",
-  "Write",
-  "Bash(rg *)",
-  "Bash(sed *)",
-  "Bash(cat *)",
-  "Bash(git status *)",
-  "Bash(git ls-files *)",
-  "Bash(git add -- *)",
-].join(",");
 
 /** Maximum chars stored in the bounded log excerpt for a verification failure. */
 const CONFLICT_VERIFICATION_EXCERPT_CHARS = 3000;
@@ -104,34 +115,68 @@ export interface ResolvedConflictProfile {
   model: string;
   effort: string;
   maxBudgetUsd: string;
+  /**
+   * Binary path source (issue #911 review). The diagnostics boundary reads
+   * this to withhold stderr trust when the catalog overlay (or an env
+   * override) selected an operator-supplied executable.
+   */
+  cmdSource?: "env" | "cli-default" | "catalog-builtin" | "catalog-overlay";
+  /** The catalog profile behind the concrete values above (§13.2, issue #911). */
+  profileName?: string;
+  /** The task's persisted quality request (§8.2). */
+  requestedQuality?: string;
+  /** What this run resolved (§10.3 — this lane offers no escalation floor). */
+  effectiveQuality?: string;
 }
 
-function resolveClaudeConflictProfile(labels: string[], claudeConfig?: ClaudeConfig): ResolvedConflictProfile {
-  const labelProfile = labelsToComplexity(labels, claudeConfig?.complexityProfiles);
-  const model = process.env["CLAUDE_MODEL"] ?? labelProfile.model;
-  const budget = process.env["CLAUDE_MAX_BUDGET_USD"] ?? labelProfile.budget;
-  const effort = process.env["CLAUDE_EFFORT"] ?? labelProfile.effort;
-  const argv = [
-    "-p",
-    "--model", model,
-    "--effort", effort,
-    "--permission-mode", "acceptEdits",
-    "--max-budget-usd", budget,
-    "--allowedTools", CONFLICT_RESOLUTION_ALLOWED_TOOLS,
-  ];
-  return { phase: "conflict_resolution", agentId: "claude", cmd: "claude", argv, model, effort, maxBudgetUsd: budget };
-}
-
-function conflictResolutionCommand(
+/**
+ * Resolve this run's runtime through the provider adapter boundary (issue
+ * #911). The lane's model/effort/budget chain that used to live here was the
+ * conflict-resolution row of docs/agent-runtime-profiles-contract.md §1.2; the
+ * effective catalog now decides the concrete settings and the Claude adapter's
+ * `conflict_resolution` lane entry builds the sanitized argv. The assignment
+ * guard keeps its pre-cutover wording: only Claude serves this lane today, and
+ * the adapters' lane tables refuse the others regardless.
+ */
+function conflictResolutionRuntime(
+  task: AiTask,
+  session: ResolvedSession,
   agentId: string | undefined,
-  labels: string[],
-  claudeConfig?: ClaudeConfig,
-): { profile: ResolvedConflictProfile } | { error: string } {
+  sessionsPath: string | undefined,
+): { runtime: AgentPhaseRuntime; profile: ResolvedConflictProfile } | { error: string } {
   const agent = agentId ?? "claude";
-  if (agent === "claude") {
-    return { profile: resolveClaudeConflictProfile(labels, claudeConfig) };
+  if (agent !== "claude") {
+    return { error: `Unsupported conflict-resolution agent: ${agent}. Supported: claude` };
   }
-  return { error: `Unsupported conflict-resolution agent: ${agent}. Supported: claude` };
+  const resolution = resolveAgentPhaseRuntime({
+    task,
+    session,
+    phase: "conflict_resolution",
+    lane: "conflict_resolution",
+    agentId: agent,
+    // §9.1 (issue #911 review): the default catalog location is
+    // `agent-profiles.json` beside the sessions file this run actually
+    // loaded, not beside the home-directory default.
+    sessionsPath,
+  });
+  if ("error" in resolution) return resolution;
+  const resolved = resolution.runtime.resolved;
+  return {
+    runtime: resolution.runtime,
+    profile: {
+      phase: "conflict_resolution",
+      agentId: agent,
+      cmd: resolution.runtime.command,
+      argv: [...resolution.runtime.argv],
+      model: resolved.model.value ?? "cli-default",
+      effort: resolved.effort.value ?? "n/a",
+      maxBudgetUsd: resolved.budget.value ?? "n/a",
+      cmdSource: runtimeCmdSource(resolved),
+      profileName: resolved.profileName,
+      requestedQuality: resolution.runtime.quality.requested.quality,
+      effectiveQuality: resolution.runtime.quality.quality,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +561,13 @@ export function createConflictResolutionHandler(
   // directly (e.g. in tests) so it acquires and releases the lock as usual.
   phaseLockOwnerId?: string,
 ): PhaseHandler {
-  return async (task: AiTask): Promise<PhaseHandlerResult> => {
+  // The runtime-audit bracket (issue #911): once the runtime resolves, every
+  // outcome of the run carries the §13 audit trail in its context, and the
+  // non-failed outcomes carry the `agent.runtime.resolved` event.
+  const run = async (
+    task: AiTask,
+    setAgentRuntime: (runtime: AgentPhaseRuntime) => void,
+  ): Promise<PhaseHandlerResult> => {
     const { session, runId } = context;
     const artifactDir = runArtifactDir(session.artifactRoot, runId);
     // `cwd` starts at the canonical checkout (`session.repoRoot`); the worktree
@@ -526,10 +577,7 @@ export function createConflictResolutionHandler(
     const baseBranch = session.baseBranch ?? "main";
 
     const agentId = agentForPhase(task, session, "conflictResolution");
-    const taskLabels = Array.isArray(task.context["labels"])
-      ? task.context["labels"] as string[]
-      : [];
-    const cmdSpec = conflictResolutionCommand(agentId, taskLabels, session.claude);
+    const cmdSpec = conflictResolutionRuntime(task, session, agentId, context.sessionsPath);
     if ("error" in cmdSpec) {
       // Skip the artifact write when it would land INSIDE the not-yet-materialized
       // issue worktree (issue #730 review, P1 — mirrors the implementation/review
@@ -570,6 +618,10 @@ export function createConflictResolutionHandler(
       };
     }
     const resolvedProfile = cmdSpec.profile;
+    const agentRuntime = cmdSpec.runtime;
+    // From here on, every outcome of this run persists the §13 audit pieces
+    // (the wrapper below folds them into the returned result).
+    setAgentRuntime(agentRuntime);
 
     // Resolve the session's repo-host provider so the PR lookup routes through the
     // configured backend: GitHub (`gh` executor, resolved as the GitHub App when
@@ -672,8 +724,26 @@ export function createConflictResolutionHandler(
     // before review re-runs. Returns the first failure so the caller can abort
     // the in-progress merge and hand off; the conflict lane contract requires
     // verification to gate the commit/push.
-    const runVerification = (): { name: string; command: string; exitCode: number; output: string } | undefined => {
-      for (const [name, command] of Object.entries(session.verification)) {
+    //
+    // `stage1ContextPatch` is the `stagedVerification` block Stage 1 left (and a
+    // verdict's streak reset), carried by every completion after Stage 1 ran.
+    let stage1ContextPatch: Record<string, unknown> = {};
+    const runVerification = async (): Promise<
+      { name: string; command: string; exitCode: number; output: string; stage1?: Stage1TestRun } | undefined
+    > => {
+      // Issue #1154 (docs/changed-file-verification-contract.md §6 rule 2): with a
+      // suite binding the merged tree never runs the full test suite here. The
+      // non-test checks run over the plan's bytes, then Stage 1 runs the Issue's
+      // changed and retained test files, allocated through the durable store
+      // before anything launches. A code failure aborts the merge exactly as a
+      // failing command does; a non-code result is returned with its run so the
+      // caller keeps its §5 route. An open allocation was already handed off
+      // before any work began (see the claim guard).
+      const testStage = testStageAtClaim;
+      const commands = testStage.status === "ready"
+        ? nonTestVerificationCommands(testStage)
+        : testStage.status === "plan-unresolvable" ? {} : session.verification;
+      for (const [name, command] of Object.entries(commands)) {
         const [verCmd, ...verArgs] = parseShellTokens(command);
         if (!verCmd) continue;
         // Capture with the shared large buffer: a verbose but passing command
@@ -690,6 +760,40 @@ export function createConflictResolutionHandler(
           return { name, command, exitCode: verResult.exitCode, output: (verResult.stdout + verResult.stderr).trim() };
         }
       }
+      if (testStage.status !== "not-applicable") {
+        const suiteKey = testStage.status === "ready" ? testStage.binding.key : "test-suite";
+        const liveSessionsPathForStage = context.sessionsPath;
+        const stage1 = await runStage1TestVerification({
+          runner,
+          session,
+          task,
+          cwd,
+          lane: "conflict-resolution",
+          taskAttempt: typeof task.attempts?.conflict_resolution === "number" ? task.attempts.conflict_resolution : 0,
+          runId,
+          baseBranch,
+          artifactDir,
+          logPrefix: "conflict-resolution-verification",
+          ...(context.taskStore !== undefined ? { store: context.taskStore } : {}),
+          ...(liveSessionsPathForStage !== undefined
+            ? { readLiveSession: async () => new JsonSessionRegistry(liveSessionsPathForStage).getSessionById(session.sessionId) }
+            : {}),
+        });
+        // A verdict about the change (pass or code failure) resets the shipped
+        // non-code streak, exactly as the implementation lane's reset does.
+        stage1ContextPatch = stage1.route === "continue" || stage1.route === "repair"
+          ? { ...stage1.contextPatch, [LOOP_STAGE_RECOVERY_CONTEXT_KEY]: null }
+          : stage1.contextPatch;
+        if (stage1.route !== "continue") {
+          return {
+            name: suiteKey,
+            command: testStage.status === "ready" && testStage.suite.status === "bound" ? testStage.suite.slot.command : suiteKey,
+            exitCode: 1,
+            output: stage1.detail,
+            stage1,
+          };
+        }
+      }
       return undefined;
     };
 
@@ -700,7 +804,17 @@ export function createConflictResolutionHandler(
     // merge is aborted and handed off rather than pushed ahead of review. A
     // commit failure aborts the merge; a push failure happens after the commit
     // lands, when no merge is in progress, so it is reported as-is.
-    const commitAndPush = (opts: { reason: string; conflictedFiles: string[]; clean: boolean; mergeRationale?: MergeRationale }): PhaseHandlerResult => {
+    const commitAndPush = async (
+      opts: { reason: string; conflictedFiles: string[]; clean: boolean; mergeRationale?: MergeRationale },
+    ): Promise<PhaseHandlerResult> => {
+      const outcome = await verifyCommitAndPush(opts);
+      return Object.keys(stage1ContextPatch).length === 0
+        ? outcome
+        : { ...outcome, context: { ...(outcome.context ?? {}), ...stage1ContextPatch } } as PhaseHandlerResult;
+    };
+    const verifyCommitAndPush = async (
+      opts: { reason: string; conflictedFiles: string[]; clean: boolean; mergeRationale?: MergeRationale },
+    ): Promise<PhaseHandlerResult> => {
       // Issue #511: ensure the runtime dependency tree is materialized before
       // running verification. The stamp/skip logic makes this a cheap no-op when
       // the worktree was already prepared by a prior phase. Failure is fail-closed:
@@ -719,10 +833,10 @@ export function createConflictResolutionHandler(
         return {
           result: "failed",
           context: { artifactDir, prUrl, branch: prBranch, conflictedFiles: opts.conflictedFiles, resolvedProfile },
-          error: `Environment preparation failed (exit ${conflictEnvPrepare.exitCode ?? 1}) before merge verification: ${(conflictEnvPrepare.output ?? "").slice(0, 500)}`,
+          error: environmentPrepareFailureMessage(conflictEnvPrepare, "before merge verification"),
         };
       }
-      const verFailure = runVerification();
+      const verFailure = await runVerification();
       if (verFailure) {
         // A failing verification command can still emit untracked artifacts
         // (coverage, build output) before exiting non-zero. merge --abort
@@ -734,8 +848,72 @@ export function createConflictResolutionHandler(
         const dirtyAfterFailure = worktreeDirtyPaths();
         abortMerge();
         cleanResidue(dirtyAfterFailure);
+        // Issue #1154 (§5): a Stage 1 result that is not a code failure keeps
+        // its own route. `rerun`/`host-retry` retry the lane bounded by the
+        // shipped streak (`maxStageRecoveryAttempts`); `park` and an exhausted
+        // streak hand off to a human. Neither is a semantic-conflict failure.
+        const heldStage1 = verFailure.stage1;
+        if (heldStage1 !== undefined && heldStage1.route !== "repair") {
+          const maxStageRecoveryAttempts =
+            resolveStagedVerificationSettings(session.stagedVerification).maxStageRecoveryAttempts;
+          const decision = heldStage1.route === "park"
+            ? undefined
+            : decideLoopStageRecovery({
+                outcome: stage1RecoveryOutcome(heldStage1.route),
+                priorStreak: ((): number | undefined => {
+                  const read = readLoopStageRecovery(task.context);
+                  return read.readable ? read.streak : undefined;
+                })(),
+                maxAttempts: maxStageRecoveryAttempts,
+              });
+          const stage1Result = heldStage1.classification.result;
+          if (decision?.kind === "retry") {
+            writeResult({
+              exitCode: verFailure.exitCode, success: false, step: `verification-stage1:${verFailure.name}`,
+              conflictedFiles: opts.conflictedFiles, testStageResult: stage1Result,
+              delayed: true, stageRecoveryStreak: decision.record.streak,
+            });
+            // A delayed completion replaces the task context, so it carries the
+            // whole context forward with the stage block and the streak.
+            return {
+              result: "delayed",
+              delayKind: "transient_verification",
+              context: {
+                ...task.context,
+                artifactDir, prUrl, branch: prBranch, conflictedFiles: opts.conflictedFiles, resolvedProfile,
+                ...heldStage1.contextPatch,
+                [LOOP_STAGE_RECOVERY_CONTEXT_KEY]: decision.record,
+              },
+              message:
+                `Stage 1 test verification reached no verdict about the merge resolution (${stage1Result}); `
+                + `re-running the conflict resolution ${decision.record.streak}/${maxStageRecoveryAttempts}.`,
+              retryAfterMs: resolveTransientRetryDelayMs(),
+            };
+          }
+          writeResult({
+            exitCode: verFailure.exitCode, success: false, step: `verification-stage1:${verFailure.name}`,
+            conflictedFiles: opts.conflictedFiles, testStageResult: stage1Result, parked: true,
+          });
+          return {
+            result: "blocked",
+            context: {
+              artifactDir, prUrl, branch: prBranch, conflictedFiles: opts.conflictedFiles, resolvedProfile,
+              ...heldStage1.contextPatch,
+              [LOOP_STAGE_RECOVERY_CONTEXT_KEY]: null,
+            },
+            message:
+              `Stage 1 test verification parked for an operator before committing the merge resolution`
+              + `${decision?.kind === "park" ? ` (${decision.reason})` : ""}: ${heldStage1.detail.slice(0, 500)}`,
+          };
+        }
         const verLogExcerpt = boundedExcerpt(verFailure.output, CONFLICT_VERIFICATION_EXCERPT_CHARS);
-        const verFailedTests = extractFailedTestNames(verFailure.output);
+        // A Stage 1 code failure names its failing test files in the record, so
+        // the retry cap below never depends on Jest `●` lines surviving in the
+        // bounded detail; the output is scanned only when no file is recorded.
+        const stage1FailedFiles = verFailure.stage1?.record?.failedFiles ?? [];
+        const verFailedTests = stage1FailedFiles.length > 0
+          ? stage1FailedFiles.slice(0, 20)
+          : extractFailedTestNames(verFailure.output);
         const textConflictsResolved = !opts.clean;
 
         // Repeated same-kind failure detection (issue #536). Compare the current
@@ -886,6 +1064,45 @@ export function createConflictResolutionHandler(
         },
       };
     };
+
+    // Issue #1154 (docs/changed-file-verification-contract.md §5 rule 3, D1): a
+    // test-stage run an earlier claim allocated and never recorded may still
+    // have processes in this worktree, and nothing recorded proves otherwise.
+    // Hand off before the merge, the agent or any verification command touches
+    // the worktree; the handoff commits the allocation closed so an operator's
+    // requeue launches once. The persisted allocations are read regardless of the
+    // current configuration — a staged verification disabled or a suite binding
+    // removed after the allocation never lets new work overlap it. A stored state
+    // that cannot be read fails closed.
+    const testStageAtClaim = resolveTestStageContext({ session, task });
+    if (task.context[STAGED_VERIFICATION_CONTEXT_KEY] !== undefined) {
+      const storedStage = validateStagedVerificationState(task.context[STAGED_VERIFICATION_CONTEXT_KEY]);
+      if (!storedStage.valid) {
+        return {
+          result: "blocked",
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
+          message:
+            `The recorded verification stage state cannot be read (${storedStage.detail}), so nothing proves an earlier `
+            + "test-stage run left no process in this worktree; handing off instead of launching work.",
+        };
+      }
+      const openRun = openStageRunGuard(storedStage.state, new Date().toISOString());
+      if (openRun.kind === "park") {
+        return {
+          result: "blocked",
+          context: {
+            artifactDir,
+            [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true,
+            resolvedProfile,
+            [STAGED_VERIFICATION_CONTEXT_KEY]: openRun.closedState,
+          },
+          message:
+            `Verification stage run ${openRun.stageRunKey} (allocated ${openRun.allocatedAt}) recorded no result, and `
+            + "nothing recorded proves its processes ended (termination-unknown). Handing off instead of launching "
+            + "overlapping work; confirm no test process from that run is still running, then requeue.",
+        };
+      }
+    }
 
     // Step 1: Resolve the open PR for the issue. Use `resolveFixPr` (not the
     // convention-only `findOpenPr`) so a PR whose head is NOT the conventional
@@ -1088,7 +1305,9 @@ export function createConflictResolutionHandler(
       // the base). Committing and pushing it advances the remote branch so
       // review re-runs against the updated branch; aborting here would discard
       // the base update and let the task loop on the stale remote state.
-      return commitAndPush({ reason: "clean-base-merge", conflictedFiles: [], clean: true });
+      // Awaited so the `finally` below releases the issue lock only after the
+      // verification and push finish.
+      return await commitAndPush({ reason: "clean-base-merge", conflictedFiles: [], clean: true });
     }
 
     // Merge failed: distinguish real conflicts from an unexpected merge error.
@@ -1199,7 +1418,7 @@ export function createConflictResolutionHandler(
         return {
           result: "failed",
           context: { artifactDir, prUrl, branch: prBranch, conflictedFiles, resolvedProfile },
-          error: `Environment preparation failed (exit ${preAgentEnvPrepare.exitCode ?? 1}) before conflict-resolution agent: ${(preAgentEnvPrepare.output ?? "").slice(0, 500)}`,
+          error: environmentPrepareFailureMessage(preAgentEnvPrepare, "before conflict-resolution agent"),
         };
       }
     }
@@ -1280,8 +1499,18 @@ export function createConflictResolutionHandler(
           (priorFailedTests !== undefined && priorFailedTests.length > 0),
       },
     }, null, 2), "utf8");
+    // The §13.4 runtime-audit artifact (issue #911), alongside the resolved
+    // assignment, carrying the resolution's full provenance.
+    writeFileSync(
+      join(artifactDir, AGENT_RUNTIME_AUDIT_ARTIFACT_FILENAME),
+      serializeAgentRuntimeAuditRecord(agentRuntime.record),
+      "utf8",
+    );
 
-    const agentResult = runner.run(resolvedProfile.cmd, resolvedProfile.argv, { cwd, stdin: prompt });
+    // Run the agent through the runtime boundary's sanitized plan (issue
+    // #911); the prompt reaches the CLI on stdin exactly as the plan declares.
+    const agentInvocation = planAgentPhaseInvocation(agentRuntime, prompt).invocation;
+    const agentResult = runner.run(agentInvocation.command, [...agentInvocation.args], { cwd, stdin: prompt });
     writeFileSync(join(artifactDir, "conflict-resolution-output.md"), agentResult.stdout || agentResult.stderr, "utf8");
 
     if (agentResult.exitCode !== 0) {
@@ -1297,7 +1526,7 @@ export function createConflictResolutionHandler(
       // Quota/rate-limit exhaustion is recoverable on its own (issue #25): the
       // merge was aborted and the worktree restored, so delay the retry instead
       // of failing the task to a human.
-      const quota = classifyQuotaExhaustion(extractAgentFailureDiagnostic(agentId, agentResult));
+      const quota = classifyQuotaExhaustion(extractAgentFailureDiagnostic(agentId, agentResult, { cmdSource: resolvedProfile.cmdSource }));
       writeResult({
         exitCode: agentResult.exitCode, success: false, step: "agent", conflictedFiles,
         ...(quota.isQuotaExhaustion ? { delayed: true, quotaSignal: quota.signal } : {}),
@@ -1473,12 +1702,20 @@ export function createConflictResolutionHandler(
     const mergeRationale = rationaleResult.rationale;
 
     // Resolution verified — commit and push so review re-runs against the branch.
-    return commitAndPush({ reason: "conflicts-resolved", conflictedFiles, clean: false, mergeRationale });
+    return await commitAndPush({ reason: "conflicts-resolved", conflictedFiles, clean: false, mergeRationale });
     } finally {
       // Release the issue-scoped worktree lock on every return path (and on a thrown
       // error). `releaseLock` is undefined only when `phaseLockOwnerId` is set — the
       // phase runner already acquired the lock and owns releasing it.
       if (releaseLock) releaseLock();
     }
+  };
+
+  return async (task: AiTask): Promise<PhaseHandlerResult> => {
+    let agentRuntime: AgentPhaseRuntime | undefined;
+    const result = await run(task, (resolved) => {
+      agentRuntime = resolved;
+    });
+    return withAgentRuntimeAudit(result, agentRuntime);
   };
 }

@@ -421,6 +421,14 @@ a resumed branch with no committed changes beyond its start point falls back to 
 `produced no file changes` failure, so a genuinely empty branch — or one holding
 only the blocker's dependency changes — never looks done.
 
+This resumed-recovery admission is about a NEW implementation run that resumed a
+recorded branch. The separate case of a FIX turn that answers review or
+verification feedback with no further edit — admitted only on an evidence-backed
+declaration, and always through the runner's own verification — is
+[issue #1125's explained no-change fix turn](phase-contracts.md#explained-no-change-fix-turns-issue-1125).
+The two paths are independent: an unresolved Tool Request refuses a no-change fix
+turn outright, so this section's handoff semantics are unaffected by it.
+
 ---
 
 ## 3. Dependency Sync

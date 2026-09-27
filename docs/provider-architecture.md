@@ -75,6 +75,15 @@ interface RepoHostProvider {
   /** Resolve the open PR/MR that corresponds to a work item, if any. */
   findPullRequestForWorkItem(ref: WorkItemRef): Promise<PullRequest | undefined>;
 
+  /**
+   * Every OPEN PR/MR whose head is exactly `head` (issue #998). Distinct from
+   * the lookup above, which owns the `ai/issue-<n>` convention and resolves a
+   * single result: the retry that adopts an already-created PR supplies the
+   * exact head it pushed and must be able to SEE two PRs on one head in order
+   * to refuse them.
+   */
+  findOpenPullRequestsByHead(head: string): Promise<PullRequest[]>;
+
   /** Open a PR/MR for an already-pushed branch. */
   createPullRequest(input: CreatePullRequestInput): Promise<PullRequest>;
 
@@ -143,6 +152,7 @@ to live in the local task store (see
 | Interface method               | Current implementation                                               |
 | ------------------------------ | -------------------------------------------------------------------- |
 | `findPullRequestForWorkItem`   | `findOpenPr` → `gh pr list --head ai/issue-<n>` (`pr-helpers.ts`)     |
+| `findOpenPullRequestsByHead`   | `gh pr list --head <exact branch> --state open --limit 10` — the caller's branch, and a limit above 1 so a duplicate is visible |
 | `createPullRequest`            | `gh pr create` for an already-pushed head branch (branch push stays a local git operation) |
 | `getPullRequest`               | `gh pr view ... --json mergeable,mergeStateStatus,...`               |
 | `commentPullRequest`           | `gh pr comment` / `gh api .../comments`                              |
@@ -190,6 +200,7 @@ verification obligation). Verified differences the provider absorbs:
 | `RepoHostProvider` method | Gitea v1 call | Difference from GitHub |
 | --- | --- | --- |
 | `findPullRequestForWorkItem` | `GET /repos/{o}/{r}/pulls?state=open` then match `head.ref` client-side | Gitea has **no `--head` list filter**, so the `ai/issue-<n>` convention is matched in the provider |
+| `findOpenPullRequestsByHead` | same listing, matching `head.ref` client-side across **all** pages without stopping at the first match | no `--head` filter (as above); an incomplete scan fails rather than reporting a partial match set |
 | `createPullRequest` | `POST /repos/{o}/{r}/pulls` `{title,head,base,body}` | head branch still pushed by local git first |
 | `getPullRequest` | `GET /repos/{o}/{r}/pulls/{index}` | mergeability degrades (below) |
 | `commentPullRequest` | `POST /repos/{o}/{r}/issues/{index}/comments` | a PR **shares its index with an issue**, so there is no separate PR-comment resource |
@@ -345,8 +356,8 @@ provider may or may not implement.
 
 **Required (every `RepoHostProvider`):**
 
-- `findPullRequestForWorkItem`, `createPullRequest`, `getPullRequest`,
-  `commentPullRequest`
+- `findPullRequestForWorkItem`, `findOpenPullRequestsByHead`,
+  `createPullRequest`, `getPullRequest`, `commentPullRequest`
 
 **Optional / provider-specific:**
 
@@ -774,3 +785,9 @@ REST surface and the mergeability degradation (`mergeable` boolean →
 - [phase-contracts.md](phase-contracts.md) — the per-phase behavioral contract
   the providers serve; phases call providers, they do not call `gh` directly
   once the seams are in place.
+- [agent-runtime-profiles-contract.md](agent-runtime-profiles-contract.md) —
+  the same "trusted data, never a credential" rule applied to the *agent*
+  runtime: a per-provider catalog of named model/effort/budget/binary profiles
+  addressed by four provider-neutral quality levels, held outside
+  `sessions.json`. Work-item/repo-host providers decide where the work lives;
+  that catalog decides how the agent that does it is configured.

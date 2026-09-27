@@ -39,7 +39,7 @@ single n8n workflow as a linear chain:
 [Schedule Trigger] ─┘
 ```
 
-The parent/child split moves the three Execute Command nodes into a **child
+The parent/child split moves those Execute Command nodes into a **child
 workflow** and keeps only the triggers and the Config node in a **parent
 workflow**:
 
@@ -49,7 +49,7 @@ Parent: [Manual Trigger] ──┐
                                                                              │
                                                                    executes child workflow
                                                                              │
-Child:  [When Called by Parent] ──► [GitHub Intake] ──► [Run One Phase] ──► [Dispatch Outbox] ──► [Return Context]
+Child:  [When Called by Parent] ──► [GitHub Intake] ──► [Run One Phase] ──► [ChatOps Scan] ──► [Dispatch Outbox] ──► [Return Context]
 ```
 
 The parent creates a context record (via the **Create Context** node) and passes
@@ -57,16 +57,26 @@ only `contextId` to the child trigger. `contextId` is parsed from the Create
 Context stdout (`{"ok":true,"contextId":"<id>"}`). The child reads `contextId`
 from `$("When Called by Parent")` — the named node reference avoids the `$json`
 overwrite problem (after each Execute Command node, `$json` contains that
-command's stdout, not the original trigger payload). All three child CLI nodes
+command's stdout, not the original trigger payload). All four child CLI nodes
 use only `--context-id`; they resolve `sessionId` from the context store
 internally, so `sessionId` never crosses the workflow boundary.
+
+**ChatOps Scan** runs one bounded ChatOps pass — comment scan, authenticated
+command recognition, cursor/ledger decision, operation dispatch, result
+publication — for the session behind the context. It sits before Dispatch Outbox
+so the claim/acknowledgement/result comments it enqueues leave in the same
+execution. It is unconditional in the shared child workflow because a session
+without `chatOps.enabled` exits `{"ok": true, "outcome": "disabled"}` without
+opening a store or a provider connection; enablement, allowed logins, the verb
+table, and the result shape all live in the session config, never in workflow
+JSON. See `docs/chatops-operations.md`.
 
 ### Node inventory
 
 | Workflow | Nodes |
 |---|---|
 | **Parent** | Manual Trigger, Schedule Trigger, Config (Set), Create Context (Execute Command), Call Phase Runner (Execute Workflow) |
-| **Child** | When Called by Parent (Execute Workflow Trigger), GitHub Intake, Run One Phase, Dispatch Outbox, Return Context (Set) |
+| **Child** | When Called by Parent (Execute Workflow Trigger), GitHub Intake, Run One Phase, ChatOps Scan, Dispatch Outbox, Return Context (Set) |
 
 ---
 
@@ -74,7 +84,7 @@ internally, so `sessionId` never crosses the workflow boundary.
 
 | Reason | Detail |
 |---|---|
-| **Stable parent** | The parent workflow never needs reimporting when CLI logic changes. Only the child changes when the three command strings evolve. |
+| **Stable parent** | The parent workflow never needs reimporting when CLI logic changes. Only the child changes when the command strings evolve or a step is added. |
 | **Isolated runId scope** | The child inlines `$execution.id` directly in the `run-one-phase` command expression. Each child execution has a clean, independent run ID that is not shared with the parent. |
 | **Easier n8n canvas management** | The Config node in the parent remains a single editable location for the session ID, separate from the execution nodes. |
 | **Multi-session deployment** | Each session gets its own parent workflow (derived ID + name, canonical `sessionId` in Config) while all of them share one child. Adding a session means importing one more parent, not a second copy of the whole pipeline. |
@@ -386,6 +396,25 @@ the full output reference. A brief summary:
 { "ok": true, "outcome": "idle", "sessionId": "ai-cli-loop", "supportedPhases": ["implementation", "review", "research"] }
 ```
 
+### chatops-scan (ChatOps not enabled)
+
+```json
+{
+  "ok": true,
+  "outcome": "disabled",
+  "sessionId": "ai-cli-loop",
+  "identity": { "provider": "github-issues", "providerEndpoint": "github.com", "providerOwner": "m2dw", "providerRepo": "n8n-ai-cli-loop" },
+  "epoch": { "database": 0, "witness": null, "verdict": "not-assessed", "detail": "chatOps is not enabled" },
+  "issues": [],
+  "notes": ["chatOps.enabled is not true for this session"]
+}
+```
+
+`outcome` is one of `disabled`, `idle`, `refused`, `processed`, `delayed` (call
+again), or `failed` (a human must look). All six exit 0 — a ChatOps failure is a
+state to report, not a crashed step. Exit 1 means the pass never started (bad
+args, unknown session/context, unusable identity or credentials).
+
 ### dispatch-outbox
 
 ```json
@@ -513,7 +542,10 @@ node dist/cli/dispatch-outbox.js --session-id ai-cli-loop
 2. [ ] Parent's Call Phase Runner node shows green (child executed)
 3. [ ] Child's GitHub Intake: `ok: true` in stdout
 4. [ ] Child's Run One Phase: `ok: true, outcome: "idle"` (queue already drained) — expected
-5. [ ] Child's Dispatch Outbox: `ok: true, dispatched: 0` — expected (already sent)
+5. [ ] Child's ChatOps Scan: `ok: true, outcome: "disabled"` — expected unless the
+   session has `chatOps.enabled` set; an enabled session reports `idle` when no
+   new eligible comment was found
+6. [ ] Child's Dispatch Outbox: `ok: true, dispatched: 0` — expected (already sent)
 
 ### Step 8 — Activate schedule trigger
 
@@ -543,6 +575,7 @@ workflow limitations.
 | `run-one-phase` output | `ok: true`, `outcome: "completed"`, `result: "blocked"` or `"success"` | `ok: false` or `result: "failed"` |
 | Task status in SQLite | `ready_for_human` | `failed` |
 | `dispatch-outbox` output | `ok: true` (even with `failed > 0`) | `ok: false` |
+| `chatops-scan` output | `ok: true` with any `outcome`, including `refused`, `delayed`, and `failed` | `ok: false` (the pass never started) |
 
 ---
 

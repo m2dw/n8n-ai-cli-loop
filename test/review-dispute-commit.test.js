@@ -199,11 +199,11 @@ describe.each(BACKENDS)('commitDisputeTransition — $name', ({ create }) => {
     // The legacy free-form payload is untouched: the block is merged, never
     // written over the whole context (§13).
     expect(stored.context.reviewFeedback).toBe('legacy prose stays put');
-    // §7.1 rule 2's reviewer turn is a reconsideration run, which nothing here
-    // dispatches yet — so the task parks for a human on the phase it is on
-    // rather than being queued to the ordinary review handler.
-    expect(stored.phase).toBe('implementation');
-    expect(stored.status).toBe('ready_for_human');
+    // §7.1 rule 2's reviewer turn is a reconsideration run, and since issue #952
+    // the review phase dispatches it as an internal sub-turn before it builds an
+    // ordinary review prompt — so the turn routes to `review` instead of parking.
+    expect(stored.phase).toBe('review');
+    expect(stored.status).toBe('queued');
     // Routing owns the lifecycle here, so it completes the claim too: a routed
     // or parked task that stayed claimed by the finished run is a task nobody
     // can pick up.
@@ -214,7 +214,8 @@ describe.each(BACKENDS)('commitDisputeTransition — $name', ({ create }) => {
     const transitions = events.filter((e) => e.type === REVIEW_DISPUTE_TRANSITION_EVENT);
     expect(transitions).toHaveLength(1);
     expect(transitions[0].data.applied[0]).toMatchObject({ lineageId: LINEAGE_A, row: 2, toState: 'disputed' });
-    expect(transitions[0].data.undispatchedTurn).toBe('reviewer');
+    // The reviewer turn has a dispatcher (issue #952), so no park is recorded.
+    expect(transitions[0].data.undispatchedTurn).toBeUndefined();
     expect(transitions[0].runId).toBe(RUN_ID);
     // §10.3: literals and counters only.
     expect(JSON.stringify(transitions[0].data)).not.toContain(ARGUMENT);
@@ -243,11 +244,13 @@ describe.each(BACKENDS)('commitDisputeTransition — $name', ({ create }) => {
   }, 30_000);
 
   test('a parked turn is claimable by nobody until a human or a dispatcher acts', async () => {
-    // The other side of the same coin: the reviewer turn must not be picked up
-    // by the ordinary review handler, and it must not be silently runnable at
-    // all. `ready_for_human` is both — visible to an operator, claimed by no
-    // worker (`isRunnable`).
-    const ctx = context({ [LINEAGE_A]: lineage(LINEAGE_A) });
+    // The other side of the same coin: a task §7.1 sent to a human must not be
+    // silently runnable at all. `ready_for_human` is both — visible to an
+    // operator, claimed by no worker (`isRunnable`). A `humanGate` finding is the
+    // park with the shortest fixture: disputing it escalates at admission (rows
+    // 3/7) and rule 1 stops automation, exactly as an undispatchable evidence or
+    // runner turn does.
+    const ctx = context({ [LINEAGE_A]: lineage(LINEAGE_A, { humanGate: true }) });
     await claimedTask(store, ctx);
     const value = applied(ctx, decisionFor(ctx, [disputeRecord(LINEAGE_A)]));
 
@@ -264,7 +267,7 @@ describe.each(BACKENDS)('commitDisputeTransition — $name', ({ create }) => {
     // The lineage keeps the state the protocol gave it, so the debate resumes
     // where it stopped rather than being rolled back or re-decided.
     const stored = await store.getTask(KEY);
-    expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].state).toBe('disputed');
+    expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].state).toBe('escalated_human');
     expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].counters.rebuttals).toBe(1);
   }, 30_000);
 
@@ -415,23 +418,32 @@ describe.each(BACKENDS)('commitDisputeTransition — $name', ({ create }) => {
   });
 });
 
-/** Every §7.1 turn, and whether this codebase has a dispatcher for its run. */
-const UNDISPATCHABLE_TURNS = ['reviewer', 'evidence', 'runner'];
+/**
+ * Every §7.1 turn, and whether this codebase has a dispatcher for its run. The
+ * set is empty since issue #964 — the predicate stays as the standing guard for
+ * a turn added before its dispatcher, and a token pushed here must park again.
+ */
+const UNDISPATCHABLE_TURNS = [];
 
 describe('routingLacksDispatcher', () => {
   test('names exactly the turns whose run nothing here dispatches', () => {
-    // The reviewer turn is a RECONSIDERATION run, not an ordinary review; the
-    // evidence and runner turns have no phase at all. None of the three has a
-    // production caller, so none may be routed into.
+    // Every turn that was ever here left the same way. The reviewer turn left
+    // this set in issue #952 and the runner turn in issue #955 — neither is an
+    // ordinary review; one is a RECONSIDERATION run and the other invokes the
+    // independent ARBITER — and issue #964 closed the set with the evidence
+    // turn's two per-party collection runs, all three dispatched as internal
+    // sub-turns before the generic review prompt is ever built.
     for (const turn of UNDISPATCHABLE_TURNS) {
-      const nextPhase = turn === 'reviewer' ? 'review' : null;
-      expect(routingLacksDispatcher({ readyForHuman: false, nextPhase, turn })).toBe(true);
-      expect(routingRequiresHumanHandoff({ readyForHuman: false, nextPhase, turn })).toBe(true);
+      expect(routingLacksDispatcher({ readyForHuman: false, nextPhase: null, turn })).toBe(true);
+      expect(routingRequiresHumanHandoff({ readyForHuman: false, nextPhase: null, turn })).toBe(true);
     }
+    expect(routingLacksDispatcher({ readyForHuman: false, nextPhase: 'review', turn: 'reviewer' })).toBe(false);
+    expect(routingLacksDispatcher({ readyForHuman: false, nextPhase: 'review', turn: 'evidence' })).toBe(false);
+    expect(routingRequiresHumanHandoff({ readyForHuman: false, nextPhase: 'review', turn: 'evidence' })).toBe(false);
     for (const turn of DISPATCHABLE_DISPUTE_TURNS) {
       expect(routingLacksDispatcher({ readyForHuman: false, nextPhase: null, turn })).toBe(false);
     }
-    expect(DISPATCHABLE_DISPUTE_TURNS).toEqual(['implementer', 're_review', 'none']);
+    expect(DISPATCHABLE_DISPUTE_TURNS).toEqual(['implementer', 'reviewer', 'evidence', 'runner', 're_review', 'none']);
     // Rule 1 is already going to a human on its own terms; this predicate
     // answers only "is the turn's run dispatchable".
     expect(routingLacksDispatcher({ readyForHuman: true, nextPhase: null, turn: 'reviewer' })).toBe(false);
@@ -464,20 +476,35 @@ describe('routingTaskPatch', () => {
   });
 
   test('parks the rule-2 turns this runner cannot dispatch', () => {
-    // The reviewer turn NAMES the review phase, and that is exactly the
-    // destination that must not be queued: the review handler runs an ordinary
-    // review, applies no reconsideration, and could then finish a task whose
-    // dispute is still open. The evidence and runner turns name no phase at all
-    // and have no caller to advance them. All three park for a human — visible,
-    // recoverable, and claimed by nobody — with the claim released.
+    // A turn with no dispatcher parks for a human — visible, recoverable, and
+    // claimed by nobody — with the claim released. The set is empty today; the
+    // loop is what a re-added token must satisfy.
     for (const turn of UNDISPATCHABLE_TURNS) {
-      const nextPhase = turn === 'reviewer' ? 'review' : null;
-      expect(routingTaskPatch({ readyForHuman: false, nextPhase, turn })).toEqual({
+      expect(routingTaskPatch({ readyForHuman: false, nextPhase: null, turn })).toEqual({
         status: 'ready_for_human',
         ownerRunId: undefined,
         leaseExpiresAt: undefined,
       });
     }
+    // The reviewer turn NAMES the review phase and is queued there since issue
+    // #952: the review handler dispatches the reconsideration as an internal
+    // sub-turn, so the destination discharges the dispute instead of finishing
+    // the task around it.
+    expect(routingTaskPatch({ readyForHuman: false, nextPhase: 'review', turn: 'reviewer' })).toEqual({
+      status: 'queued',
+      phase: 'review',
+      ownerRunId: undefined,
+      leaseExpiresAt: undefined,
+    });
+    // The evidence turn joined it in issue #964: each per-party collection run
+    // is an internal review-phase sub-turn, so the round continues where the
+    // dispatcher lives instead of parking.
+    expect(routingTaskPatch({ readyForHuman: false, nextPhase: 'review', turn: 'evidence' })).toEqual({
+      status: 'queued',
+      phase: 'review',
+      ownerRunId: undefined,
+      leaseExpiresAt: undefined,
+    });
   });
 });
 
@@ -486,11 +513,20 @@ describe('routedPhaseCompletion', () => {
 
   test('an undispatchable turn parks on the phase that ran, never on the fallback', () => {
     for (const turn of UNDISPATCHABLE_TURNS) {
-      const nextPhase = turn === 'reviewer' ? 'review' : null;
       expect(
-        routedPhaseCompletion({ readyForHuman: false, nextPhase, turn }, fallback, 'implementation'),
+        routedPhaseCompletion({ readyForHuman: false, nextPhase: null, turn }, fallback, 'implementation'),
       ).toEqual({ status: 'ready_for_human', phase: 'implementation' });
     }
+    // The reviewer turn routes instead (issue #952), and to its OWN destination
+    // rather than the fallback's.
+    expect(
+      routedPhaseCompletion({ readyForHuman: false, nextPhase: 'review', turn: 'reviewer' }, fallback, 'implementation'),
+    ).toEqual({ status: 'queued', phase: 'review' });
+    // As does the evidence turn (issue #964): the round's remaining party run
+    // is a review-phase sub-turn, not a park.
+    expect(
+      routedPhaseCompletion({ readyForHuman: false, nextPhase: 'review', turn: 'evidence' }, fallback, 'implementation'),
+    ).toEqual({ status: 'queued', phase: 'review' });
   });
 
   test('rules 1, 2, 3, and 4 are unchanged', () => {

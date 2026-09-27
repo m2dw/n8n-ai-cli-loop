@@ -223,13 +223,23 @@ export function labelsToComplexity(
   return { ...base, ...overrides?.[tier] };
 }
 
-// NOTE: there is deliberately no "xhigh" review strength. The installed Codex
-// CLI's `model_reasoning_effort` config accepts only low/medium/high (xhigh is a
-// Claude-only effort tier), so the Codex review path tops out at "high". A
-// `review:xhigh` label is therefore NOT a recognized review label: it has no
-// effect rather than being silently mapped down to "high" (issue #243 non-goal).
-// `complexity:xhigh` still derives the highest Codex-supported strength ("high")
-// when no explicit review label is present, matching `complexity:high`.
+// NOTE: there is deliberately no "xhigh" review strength, and this union is a
+// *label vocabulary*, not a claim about any provider's capability surface. It
+// enumerates the review strengths the shipped review lanes resolve today; what a
+// given Codex build's `model_reasoning_effort` accepts is declared per
+// installation by the `openai` capability descriptor in the agent runtime
+// catalog (src/core/agent-profile-catalog.ts, §6.2 of
+// docs/agent-runtime-profiles-contract.md) and consumed by the Codex runtime
+// adapter (src/core/codex-runtime-adapter.ts, issue #908) — an installation
+// whose Codex/model combination accepts a stronger tier declares it there, with
+// no change to this union.
+// A `review:xhigh` label is NOT a recognized review label: it has no effect
+// rather than being silently mapped down to "high" (issue #243 non-goal), and
+// under the runtime-profile contract its intent has a supported spelling —
+// `quality:maximum`, whose answer is whatever the provider's `maximum` binding
+// declares (§6.3, §10.1). `complexity:xhigh` still derives the strongest review
+// strength this vocabulary has ("high") when no explicit review label is
+// present, matching `complexity:high`.
 export type ReviewStrength = "low" | "default" | "high";
 
 /**

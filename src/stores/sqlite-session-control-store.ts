@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
-import { homedir } from "os";
 import { mkdirSync } from "fs";
 import { join } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 import type {
   RunLedgerEntry,
   RunLedgerEntryInput,
@@ -12,7 +12,7 @@ import type {
 } from "../core/session-control.js";
 
 const DEFAULT_DB_PATH = join(
-  homedir(),
+  resolveHomeDir(),
   ".config",
   "n8n-ai-cli-loop",
   "dev_loop.db",

@@ -210,6 +210,21 @@ A blocker PR is usable when all of the following are true:
 
 If a blocker has no open PR, the dependent issue is still blocked (Gate 1).
 
+**What it takes to earn the marker (opt-in, implemented in #1103).**
+Without the opt-in a passing review is the only precondition, so a
+dependent can branch from a head whose full required validation never
+ran.
+[staged-verification-contract.md](staged-verification-contract.md)
+(issue #1094) adds one: for an opted-in session, the marker is granted
+only by a complete, passed **final** verification stage over the entire
+required set, run after the review agent approves and bound to the
+approved head, and enqueued in the same store transaction that records
+its evidence. Any other stage outcome — code failure, timeout,
+interruption, or unknown result — withholds the grant and clears a live
+marker. This gate is default-off and changes nothing above: Gate 2's
+definition of a usable PR, the stack-ready resolver, and the dependent's
+branch-start and PR-target rules are all unchanged.
+
 The same stack-readiness signal is also the eligibility trigger for chain-aware
 progressive Issue refinement — an optional, default-off lane that refines a
 rough dependent Issue from its predecessors' stack-ready results *before* it
@@ -569,6 +584,18 @@ effort.  Labels whose effort already meets or exceeds the escalation target
 label-derived effort (e.g. a session override that raises a tier back to
 `xhigh`) is never silently downgraded.
 
+**Compatibility direction (issue #903).** Under
+[agent-runtime-profiles-contract.md](agent-runtime-profiles-contract.md)
+these labels become **compatibility inputs to a provider-neutral quality
+level**, not literal provider effort names: `complexity:low` → `light`, no
+label → `normal`, `complexity:high` → `strong`, `complexity:xhigh` →
+`maximum`, with the concrete model/effort/budget then resolved from the
+selected agent's provider catalog. Issue #905 landed that mapping
+(`src/core/agent-quality.ts`) and snapshots its answer onto the task at intake,
+where a `quality:<level>` label outranks the complexity family and
+`session.agentRuntime.defaultQuality` supplies the level when no label does.
+Nothing reads the snapshot yet: the table above is still what runs.
+
 `complexity:xhigh` is a Claude implementation tier only. The Codex review path
 has no `xhigh` reasoning effort (`model_reasoning_effort` accepts low/medium/high
 only), so when no explicit `review:*` label is present `complexity:xhigh`
@@ -614,6 +641,22 @@ Claude implementation effort value — `complexity:xhigh` itself resolves to
 set, `complexity:xhigh` and `complexity:high` both derive the strongest
 Codex-supported review strength (`high`), since Codex has no `xhigh`
 reasoning tier.
+
+**Compatibility direction (issue #903).** The `high` ceiling above is a fact
+about the installed Codex CLI at a point in time, currently encoded in a
+TypeScript union (`ReviewStrength`) and a source comment.
+[agent-runtime-profiles-contract.md](agent-runtime-profiles-contract.md)
+moves it into data: a per-provider capability descriptor declares the
+accepted effort values, `review:low`/`review:medium`/`review:high` map to
+`light`/`normal`/`strong`, and `quality:maximum` becomes the supported
+spelling of the intent `review:xhigh` never had — answered by whatever that
+provider's `maximum` binding declares, which may be the same profile as
+`strong` and is recorded as such. A declared shared binding is configuration,
+not a silent downgrade; a runtime clamp stays forbidden either way. Issue #905
+landed that label mapping and the intake snapshot; `review:xhigh` stays an
+unrecognized *label* there too, while a misspelled or contradictory `quality:`
+label refuses the Issue at intake instead of resolving to a nearby level. No
+lane reads the snapshot, so the rules above are what runs today.
 
 ## Codex Model Selection (issue #609)
 
@@ -718,7 +761,68 @@ Failure criteria:
 - No open canonical PR branch exists.
 - The fix request is not present in task context or the prompt.
 - The existing PR branch cannot be checked out or updated.
-- The agent exits non-zero or produces no diff.
+- The agent exits non-zero, or produces no diff and does not supply an admitted
+  no-change declaration (see below).
+
+### Explained no-change fix turns (issue #1125)
+
+A fix turn can legitimately end with no new edit — the reported failure does not
+reproduce, the repair is already committed on the branch, a human finished the
+work, the cause is environmental, or the feedback rests on a mistaken premise.
+Such a run used to die at `step: diff-check` before the runner's own
+verification could say anything, so a PR that may well be correct never returned
+to review.
+
+A zero-diff fix turn is admitted only when ALL of the following hold:
+
+- It is a fix turn on a positively identified open PR (`resolveFixPr`), so the
+  branch and head under this Issue are already resolved and checked out.
+- No structured review findings are awaiting a `§3.1` disposition. When they
+  are, the Review Dispute protocol's own `§3.4` rule owns the zero-change
+  question and this path stands down —
+  [review-dispute-contract.md](review-dispute-contract.md) is authoritative, and
+  this path never bypasses it.
+- No unresolved Tool Request is open for the Issue.
+- The agent emitted exactly one declaration — a fenced `json` object with
+  `noChangeRequired: true`, a `reason` token, a verbatim `addressedFeedback`
+  excerpt of the feedback this turn answered, a bounded `explanation`, and 1–10
+  evidence references, every one of which resolves read-only against the
+  checkout. Exit 0, an empty diff, or a generic "nothing to do" phrase is never
+  enough on its own.
+- The PR head carries commits of this Issue's own beyond its start point. The
+  start point is the recorded `dependencyBase.baseHeadSha` for a
+  dependency-started task, so a branch holding only a predecessor's commits is
+  not mistaken for this Issue's completed implementation. An unanswerable probe
+  is not admitted.
+- Fewer than `MAX_CONSECUTIVE_NO_CHANGE_FIX_TURNS` (2) consecutive no-change
+  turns have already been taken. The counter is reset by any fix turn that
+  commits, and repeated no-change exchanges therefore cannot run unbounded.
+- The revision is PUBLISHED: local `HEAD` equals the freshly fetched PR head on
+  origin. An earlier fix that committed but failed to push leaves the branch
+  ahead of origin, and both the worktree resolver and the `--ff-only` reconcile
+  accept that state — but an admitted no-change turn pushes nothing, so nothing
+  downstream would ever reconcile it, and the reviewer would be handed a
+  revision the PR does not contain. A mismatch, or a PR head that cannot be
+  resolved at all, is refused, the same discipline the Tool Request resume path
+  applies to an ahead-of-origin branch. The admitted revision is the one this
+  probe confirmed, never a separately read local `HEAD`.
+
+An admitted turn runs the configured verification commands exactly as any other
+implementation run does — the declaration is a licence to REACH verification,
+never to skip or pass it, and the agent's own report of a passing command is not
+evidence. On verification success the run skips the commit (no empty commit is
+created) and returns the PR to review with the prior feedback, the explanation,
+the evidence, and the exact verified revision. On verification failure, timeout,
+or an environment/transient classification the existing outcome applies
+unchanged.
+
+Returning to review is not review approval: the run clears no finding,
+synthesizes no `fixed` disposition, emits no stack-ready signal, and its public
+comment says "No additional changes — verified and returned for review" rather
+than "Implementation complete". The reviewer decides whether the explanation
+answers the feedback. Every refusal above falls back to the unchanged
+`produced no file changes` failure, with the reason appended so an operator can
+act on it.
 
 Fix mode is triggered automatically when the review handler returns `needs_fix`.
 The review output is captured as `reviewFeedback` in task context and included
@@ -732,7 +836,8 @@ reconsideration, bounded arbitration, and human escalation — is specified in
 [review-dispute-contract.md](review-dispute-contract.md) (issue #835). It is
 implemented (issues #836-#849) but ships default-off; whenever
 `session.reviewDispute.enabled` is off, a fix run that produces no diff
-fails exactly as described above. See
+fails exactly as described above unless it carries an admitted no-change
+declaration (issue #1125). See
 [feature-status.md](feature-status.md#review-dispute) for the operator-facing
 availability summary.
 

@@ -20,6 +20,9 @@ result code below is reconciled against the current tree:
 store methods, provider ports) is changed here. §11 lists what a later
 implementation issue must add, including the port additions §10 shows do not
 exist yet.
+[`feature-status.md`](feature-status.md#human-gate-no-go-advice-and-disposition-flow)
+tracks this design as `design-only` — it must not be read as a shipped
+command surface until an implementation issue lands the pieces §14 lists.
 
 Related contracts, all of which this document defers to rather than restates:
 

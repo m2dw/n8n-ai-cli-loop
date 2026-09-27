@@ -816,9 +816,9 @@ world across two files. Restoring therefore requires:
    resurrect a dangling DB→artifact reference in the first place — but
    restore treats this as a checked invariant, not a guarantee taken on
    faith. **This check is scoped to task rows' artifact-directory context
-   fields — today exactly five keys are known to name a
-   `<artifactRoot>/runs/<run-id>/` directory, and all five must be
-   validated:**
+   references — today seven scalar keys and two per-lineage records are known
+   to name a `<artifactRoot>/runs/<run-id>/` directory, and all of them must
+   be validated:**
    - `context.artifactDir` — set by every phase handler that produces a run
      artifact directory; the field most handlers overwrite each phase.
    - `context.draftArtifactDir` — content_draft's quota-delay path
@@ -837,14 +837,60 @@ world across two files. Restoring therefore requires:
      implementation retry so a fix-mode prompt build can still find it after
      `artifactDir` has moved on to that retry's own run directory (issue
      #837 review).
+   - `context.disputeArtifactDir` — the implementation handler's fix-run path
+     (`implementation.ts`), a dedicated reference to the run that wrote the
+     review-dispute records (`dispute-<lineageId>.json`), carried forward
+     unchanged so the reviewer's reconsideration turn can still re-admit the
+     rebuttal after `artifactDir` has moved on (issue #952).
+   - `context.reconsiderationArtifactDir` — the review handler's reviewer
+     sub-turn path (`review-reconsideration-turn.ts`), a dedicated reference
+     to the run that wrote the reconsideration records
+     (`reconsideration-<lineageId>.json`), carried forward so a later
+     arbitration sub-turn can still re-present them (issue #955).
+   - `context.reviewDisputeRebuttals.lineages.<lineageId>.artifactDir` and
+     `context.reviewDisputeReconsiderations.lineages.<lineageId>.artifactDir`
+     — the per-lineage halves of the same two records
+     (`core/review-dispute-lineage-provenance.ts`). The two scalar keys above
+     describe only the LAST fix/reviewer run, so on a task with more than one
+     disputed lineage an earlier — still arbitration-pending — lineage's
+     directory is reachable ONLY through its nested entry. Validating just
+     the scalars lets a restore succeed after that directory is gone, and
+     lets a prune pass treat it as unreferenced, either of which parks
+     arbitration the moment it selects that lineage (issue #955 review).
+     Entries the record's own parser drops (malformed, or over the
+     `MAX_LINEAGES_PER_TASK` cap) are skipped here too: no turn can read a
+     record out of them, so failing a restore over them would park a debate
+     that its fall-backs can still resolve.
+   - `context.reviewDisputeArbitrations.lineages.<lineageId>.artifactDir` —
+     the third record on that same per-lineage shape (issue #964), naming the
+     run that minted a lineage's §8.1 verdict record
+     (`arbitration-<lineageId>.json`). A row-16 `insufficient_evidence`
+     verdict opens a §7.1 evidence turn one or more phase runs LATER that
+     re-presents that record to both parties, and no scalar key survives to
+     name it, so it is live for exactly as long as its lineage's entry is.
+   - `context.reviewDisputeEvidenceCollections.<party>.artifactDir` — where
+     each party's evidence-collection run left its §10.2 files
+     (`core/review-dispute-evidence-collections.ts`), keyed by party rather
+     than by lineage because the round covers every requested lineage at
+     once. The re-presented arbitration resolves a party's admitted
+     attachments from this directory and fails closed to a human handoff
+     without it (the context round record keeps only digests), so a restore
+     that accepted a snapshot missing it — or a prune that retired it as
+     unreferenced — would park the debate it was collected for. Read
+     tolerantly, like every other read of this key: an unreadable entry names
+     no directory and is skipped rather than failing the restore.
 
    Plus any future handler-specific key following the same naming pattern
    per `handlers/artifact-dir.ts` — it does not walk `events.run_id`. The
-   implementation must keep this list centralized and explicit (e.g. a
-   single exported array of context-field names in `handlers/artifact-dir.ts`
-   that every restore/prune pass imports) rather than re-deriving it ad hoc
-   per call site, so that adding a new handler-specific key is a one-line
-   addition instead of a silent restore-coverage gap. An
+   implementation must keep this list centralized and explicit — a single
+   exported enumeration in `handlers/artifact-dir.ts`
+   (`ARTIFACT_DIR_CONTEXT_FIELDS` for the scalars,
+   `LINEAGE_ARTIFACT_DIR_CONTEXT_FIELDS` for the per-lineage records, and
+   `collectArtifactDirReferences` walking both plus the per-party
+   evidence-collection record) that every restore/prune pass
+   imports — rather than re-deriving it ad hoc per call site, so that adding
+   a new reference is a one-line addition instead of a silent
+   restore-coverage gap. An
    event's `run_id` only records which phase-runner invocation produced that
    event; `core/phase-runner.ts` stamps `runId: request.runId` on every
    lifecycle event it appends (`phase.started`, `phase.lock.failed`,

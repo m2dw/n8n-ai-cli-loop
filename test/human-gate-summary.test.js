@@ -3,8 +3,15 @@
  * (issue #552).
  */
 
-import { renderHumanGateSummary, HUMAN_GATE_MARKER } from '../dist/core/human-gate-summary.js';
-import { enqueueHumanGateSummaryEffect } from '../dist/core/outbox-effects.js';
+import {
+  renderHumanGateSummary,
+  renderHumanGateAmendmentSupersededSummary,
+  HUMAN_GATE_MARKER,
+} from '../dist/core/human-gate-summary.js';
+import {
+  enqueueHumanGateSummaryEffect,
+  enqueueVerificationAmendmentGateSupersededEffect,
+} from '../dist/core/outbox-effects.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -112,6 +119,22 @@ describe('renderHumanGateSummary — marker and structure', () => {
       runId: 'r',
     });
     expect(body).toContain('Post Human Gate Decision Summary');
+  });
+
+  // The title is rendered above every section, including the verification and
+  // amendment disclosures, so raw HTML in it would comment the rest of the body
+  // out (issue #1044 review, P1).
+  test('renders the issue title HTML-inert', () => {
+    const body = renderHumanGateSummary({
+      issueNumber: 10,
+      issueTitle: 'Fix <!-- the parser',
+      phase: 'review',
+      phaseResult: 'success',
+      runId: 'r',
+    });
+    expect(body).not.toContain('<!-- the parser');
+    expect(body).toContain('&lt;!-- the parser');
+    expect(body).toContain('### Go / No-go Checklist');
   });
 
   test('includes PR number and branch when provided', () => {
@@ -527,6 +550,238 @@ describe('enqueueHumanGateSummaryEffect — phase/result gating', () => {
     expect(s.enqueued[0].payload.marker).toBe(HUMAN_GATE_MARKER);
   });
 
+  // Issue #1044 (§12.2): the amendment projection the review handler recorded
+  // travels into the gate comment. The gate is the last surface before a merge,
+  // and a retirement it does not name is a check a human believes still runs.
+  test('carries the amendment projection from the completion context into the comment', async () => {
+    const s = makeStore();
+    await enqueueHumanGateSummaryEffect(
+      s, makeSession(), makeTask(),
+      'review',
+      {
+        result: 'success',
+        context: {
+          prUrl: 'https://github.com/org/repo/pull/42',
+          verificationAmendment: {
+            revisionCount: 1,
+            latestOrdinal: 1,
+            latestRevisionId: 'vamd-0000000000000001',
+            latestSource: 'admin-cli',
+            latestReason: 'the e2e suite cannot run here',
+            planDigest: 'c'.repeat(64),
+            retiredTotal: 1,
+            retiredLabels: ['npm run e2e'],
+            activeCount: 1,
+          },
+        },
+      },
+      'run-amended', new Date().toISOString(),
+    );
+    expect(s.enqueued).toHaveLength(1);
+    const body = s.enqueued[0].payload.body;
+    expect(body).toContain("This task's verification plan was amended by an operator");
+    expect(body).toContain('the e2e suite cannot run here');
+    expect(body).toContain('Retired — not run, not passed (1)');
+    expect(body).toContain('`npm run e2e`');
+  });
+
+  // Issue #1044 review (P1): a retired label is command BYTES. One holding a
+  // backtick closes the code span the renderer opens around it, and whatever
+  // follows — `<!--` in the worst case — is then Markdown, not code: the "not a
+  // passing result" statement, the merge checklist and the footer all disappear
+  // into an HTML comment while the comment still reads as complete.
+  test('a retired label carrying a backtick cannot hide the disclosures below it', async () => {
+    const s = makeStore();
+    await enqueueHumanGateSummaryEffect(
+      s, makeSession(), makeTask(),
+      'review',
+      {
+        result: 'success',
+        context: {
+          prUrl: 'https://github.com/org/repo/pull/42',
+          verificationAmendment: {
+            revisionCount: 1,
+            latestOrdinal: 1,
+            latestRevisionId: 'vamd-0000000000000003',
+            latestSource: 'admin-cli',
+            latestReason: 'the suite cannot run here',
+            planDigest: 'c'.repeat(64),
+            retiredTotal: 1,
+            retiredLabels: ['npm test` <!--'],
+            activeCount: 1,
+          },
+        },
+      },
+      'run-injected', new Date().toISOString(),
+    );
+    const body = s.enqueued[0].payload.body;
+    // No backtick survives inside the label, so the span closes where the
+    // renderer intended and the `<!--` stays literal text inside code.
+    expect(body).toContain("`npm test' <!--`");
+    expect(body).not.toContain('npm test` <!--');
+    // The count is still the truth, and every mandatory disclosure below the
+    // list is still outside any comment the label could have opened.
+    expect(body).toContain('Retired — not run, not passed (1)');
+    expect(body).toContain('A retired verification command is **not** a passing result');
+    expect(body).toContain('- [ ] Ready to merge');
+  });
+
+  // Issue #1044 review (P1): in a split-provider session the work item lives on
+  // a private tracker and the PR on GitHub. The amendment's reason and its
+  // requirement labels are that private Issue's own text — the existing title
+  // guard does not cover them — so only the public-safe aggregate is published.
+  test('a split-provider session publishes the counts and none of the private text', async () => {
+    const s = makeStore();
+    await enqueueHumanGateSummaryEffect(
+      s,
+      makeSession({
+        workItemProvider: { provider: 'gitea', gitea: { owner: 'internal', repo: 'work' } },
+        repoHostProvider: { provider: 'github' },
+      }),
+      makeTask({ context: { title: 'Private customer escalation', prUrl: 'https://github.com/org/repo/pull/42' } }),
+      'review',
+      {
+        result: 'success',
+        context: {
+          prUrl: 'https://github.com/org/repo/pull/42',
+          verificationAmendment: {
+            revisionCount: 2,
+            latestOrdinal: 2,
+            latestRevisionId: 'vamd-0000000000000002',
+            latestSource: 'admin-cli',
+            latestReason: 'customer ACME cannot expose the staging endpoint',
+            planDigest: 'c'.repeat(64),
+            retiredTotal: 1,
+            retiredLabels: ['npm run acme-staging-e2e'],
+            executionRetiredTotal: 0,
+            executionRetiredLabels: [],
+            activeCount: 1,
+          },
+        },
+      },
+      'run-split', new Date().toISOString(),
+    );
+    const body = s.enqueued[0].payload.body;
+    // The fact of the amendment, and the size of the removal, still reach the
+    // human who merges — that part is a statement about this repository.
+    expect(body).toContain("This task's verification plan was amended by an operator");
+    expect(body).toContain('Retired — not run, not passed (1)');
+    expect(body).toContain('names withheld');
+    expect(body).toContain('- [ ] The operator-retired verification command(s) above are intentionally not run');
+    // None of the private work item's text does.
+    expect(body).not.toContain('npm run acme-staging-e2e');
+    expect(body).not.toContain('ACME');
+    expect(body).not.toContain('Private customer escalation');
+  });
+
+  test('a same-surface session still publishes the amendment names in full', async () => {
+    const s = makeStore();
+    await enqueueHumanGateSummaryEffect(
+      s, makeSession(), makeTask(),
+      'review',
+      {
+        result: 'success',
+        context: {
+          prUrl: 'https://github.com/org/repo/pull/42',
+          verificationAmendment: {
+            revisionCount: 1,
+            latestOrdinal: 1,
+            latestRevisionId: 'vamd-0000000000000001',
+            latestSource: 'admin-cli',
+            latestReason: 'the e2e suite cannot run here',
+            planDigest: 'c'.repeat(64),
+            retiredTotal: 1,
+            retiredLabels: ['npm run e2e'],
+            activeCount: 1,
+          },
+        },
+      },
+      'run-same-surface', new Date().toISOString(),
+    );
+    const body = s.enqueued[0].payload.body;
+    expect(body).toContain('`npm run e2e`');
+    expect(body).toContain('the e2e suite cannot run here');
+    expect(body).not.toContain('names withheld');
+  });
+
+  // Issue #1044 review (P2): a self-hosted session whose work items and pull
+  // requests live in the SAME Gitea repository is not a split surface. Reading
+  // it as one strips every label and reason out of the merge gate and then
+  // tells the reader they were withheld for a privacy boundary that is not
+  // there.
+  const GITEA_AMENDMENT = {
+    revisionCount: 1,
+    latestOrdinal: 1,
+    latestRevisionId: 'vamd-0000000000000001',
+    latestSource: 'admin-cli',
+    latestReason: 'the e2e suite cannot run here',
+    planDigest: 'c'.repeat(64),
+    retiredTotal: 1,
+    retiredLabels: ['npm run e2e'],
+    activeCount: 1,
+  };
+  const giteaSession = (workItemRepo, repoHostRepo) =>
+    makeSession({
+      workItemProvider: { provider: 'gitea-issues', gitea: { baseUrl: 'https://git.example.com/', owner: 'acme', repo: workItemRepo } },
+      repoHostProvider: { provider: 'gitea', gitea: { baseUrl: 'https://git.example.com', owner: 'acme', repo: repoHostRepo } },
+    });
+
+  test('a same-repository Gitea session publishes the amendment names in full', async () => {
+    const s = makeStore();
+    await enqueueHumanGateSummaryEffect(
+      s, giteaSession('loop', 'loop'),
+      makeTask({ context: { title: 'A self-hosted task', prUrl: 'https://git.example.com/acme/loop/pulls/42' } }),
+      'review',
+      {
+        result: 'success',
+        context: {
+          prUrl: 'https://git.example.com/acme/loop/pulls/42',
+          verificationAmendment: GITEA_AMENDMENT,
+        },
+      },
+      'run-gitea-same', new Date().toISOString(),
+    );
+    const body = s.enqueued[0].payload.body;
+    expect(body).toContain('`npm run e2e`');
+    expect(body).toContain('the e2e suite cannot run here');
+    expect(body).not.toContain('names withheld');
+    expect(body).toContain('A self-hosted task');
+  });
+
+  test('a Gitea session whose work items live in another repository still withholds them', async () => {
+    const s = makeStore();
+    await enqueueHumanGateSummaryEffect(
+      s, giteaSession('private-work', 'loop'),
+      makeTask({ context: { title: 'A private task', prUrl: 'https://git.example.com/acme/loop/pulls/42' } }),
+      'review',
+      {
+        result: 'success',
+        context: {
+          prUrl: 'https://git.example.com/acme/loop/pulls/42',
+          verificationAmendment: GITEA_AMENDMENT,
+        },
+      },
+      'run-gitea-split', new Date().toISOString(),
+    );
+    const body = s.enqueued[0].payload.body;
+    expect(body).toContain('Retired — not run, not passed (1)');
+    expect(body).toContain('names withheld');
+    expect(body).not.toContain('npm run e2e');
+    expect(body).not.toContain('the e2e suite cannot run here');
+    expect(body).not.toContain('A private task');
+  });
+
+  test('an unamended review posts the gate comment unchanged', async () => {
+    const s = makeStore();
+    await enqueueHumanGateSummaryEffect(
+      s, makeSession(), makeTask(),
+      'review',
+      { result: 'success', context: { prUrl: 'https://github.com/org/repo/pull/42' } },
+      'run-unamended', new Date().toISOString(),
+    );
+    expect(s.enqueued[0].payload.body).not.toContain('verification plan was amended');
+  });
+
   test('does not enqueue for review needs_fix', async () => {
     const s = makeStore();
     await enqueueHumanGateSummaryEffect(
@@ -797,5 +1052,157 @@ describe('enqueueHumanGateSummaryEffect — sticky-comment (update not duplicate
     const markers = s.enqueued.map(e => e.payload?.marker);
     expect(markers).toContain('<!-- n8n-ai-pr-summary -->');
     expect(markers).toContain(HUMAN_GATE_MARKER);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A record-only amendment supersedes a live handoff (issue #1044 review, P1)
+// ---------------------------------------------------------------------------
+
+const AMENDMENT = {
+  revisionCount: 1,
+  latestOrdinal: 1,
+  latestRevisionId: 'vamd-00112233445566aa',
+  latestSource: 'admin-cli',
+  latestReason: 'the e2e suite cannot run in this environment',
+  planDigest: 'a'.repeat(64),
+  retiredTotal: 1,
+  retiredLabels: ['npm run e2e'],
+  activeCount: 1,
+  activeRequirementCount: 1,
+  activeExecutionCount: 0,
+};
+
+describe('the superseded human-gate body', () => {
+  test('replaces the stale pass with the amendment and what it retired', () => {
+    const body = renderHumanGateAmendmentSupersededSummary({
+      issueNumber: 10,
+      issueTitle: 'Test issue',
+      prNumber: 42,
+      branch: 'ai/issue-10',
+      verificationAmendment: AMENDMENT,
+    });
+    // Same marker as the summary it replaces, so the delivery EDITS the stale
+    // comment instead of appending an invalidation nobody scrolls to.
+    expect(body.startsWith(HUMAN_GATE_MARKER)).toBe(true);
+    expect(body).toContain('superseded by a verification amendment');
+    expect(body).toContain('no review has run against the amended plan');
+    expect(body).toContain('Retired — not run, not passed (1)');
+    expect(body).toContain('`npm run e2e`');
+    expect(body).toContain('the e2e suite cannot run in this environment');
+    // The verification verdict of the superseded plan is not restated anywhere.
+    expect(body).not.toContain('✅ passed');
+  });
+
+  // Markdown passes raw HTML through, so an issue title carrying an unmatched
+  // `<!--` would comment out every line rendered after it — the amended plan,
+  // the retirement disclosures, and the checklist — and leave a reader with a
+  // body that looks complete while precisely the removals are hidden (issue
+  // #1044 review, P1).
+  test('renders the issue title HTML-inert so it cannot hide the disclosures', () => {
+    const body = renderHumanGateAmendmentSupersededSummary({
+      issueNumber: 10,
+      issueTitle: 'Fix <!-- the parser',
+      prNumber: 42,
+      branch: 'ai/issue-10',
+      verificationAmendment: AMENDMENT,
+    });
+    expect(body).not.toContain('<!-- the parser');
+    expect(body).toContain('&lt;!-- the parser');
+    // Everything the amendment must disclose still follows it, unhidden.
+    expect(body).toContain('Retired — not run, not passed (1)');
+    expect(body).toContain('Go / No-go Checklist');
+  });
+
+  test('is enqueued against the task PR, keyed on the revision and not on a run', async () => {
+    const s = makeStore();
+    await enqueueVerificationAmendmentGateSupersededEffect(
+      s,
+      makeSession(),
+      makeTask({ status: 'ready_for_human' }),
+      AMENDMENT,
+      'vamd-00112233445566aa',
+      '2026-01-01T00:00:00Z',
+    );
+    expect(s.enqueued).toHaveLength(1);
+    const [row] = s.enqueued;
+    expect(row.topic).toBe('repohost:pr-summary');
+    expect(row.payload.prNumber).toBe(42);
+    expect(row.payload.marker).toBe(HUMAN_GATE_MARKER);
+    expect(row.idempotencyKey).toBe(
+      'sess:10:vamd-00112233445566aa:repohost:human-gate:superseded',
+    );
+
+    // A re-derived enqueue after a crash produces the identical key.
+    await enqueueVerificationAmendmentGateSupersededEffect(
+      s, makeSession(), makeTask({ status: 'ready_for_human' }), AMENDMENT,
+      'vamd-00112233445566aa', '2026-01-01T00:00:01Z',
+    );
+    expect(s.enqueued).toHaveLength(1);
+  });
+
+  test('a task with no PR has no gate comment to supersede', async () => {
+    const s = makeStore();
+    await enqueueVerificationAmendmentGateSupersededEffect(
+      s,
+      makeSession(),
+      makeTask({ status: 'ready_for_human', context: { title: 'Test issue' } }),
+      AMENDMENT,
+      'vamd-00112233445566aa',
+      '2026-01-01T00:00:00Z',
+    );
+    expect(s.enqueued).toHaveLength(0);
+  });
+
+  // A `gitea` repo host serves a repo declared in its own connection block,
+  // which has no relationship to the session's GitHub coordinates. Addressing
+  // the row with the GitHub tuple would name a repo the configured host does not
+  // serve — and, because the pending-supersede predicate matches on the address,
+  // would leave a still-pending stale gate summary to land on top of this one
+  // (issue #1044 review, P1).
+  test('a gitea repo host is addressed by its configured owner/repo, so it still displaces the stale summary', async () => {
+    const s = makeStore();
+    const session = makeSession({
+      repoHostProvider: {
+        provider: 'gitea',
+        gitea: { baseUrl: 'https://gitea.example.com', owner: 'code', repo: 'loop' },
+      },
+    });
+    const task = makeTask({
+      status: 'ready_for_human',
+      context: { title: 'Test issue', prUrl: 'https://gitea.example.com/code/loop/pulls/42' },
+    });
+
+    // The passing review's sticky summary, still pending delivery.
+    await enqueueHumanGateSummaryEffect(
+      s, session, task, 'review', { result: 'success', context: {} }, 'run-A', '2026-01-01T00:00:00Z',
+    );
+    expect(s.enqueued).toHaveLength(1);
+    expect(s.enqueued[0].payload).toMatchObject({ owner: 'code', repo: 'loop', prNumber: 42 });
+
+    await enqueueVerificationAmendmentGateSupersededEffect(
+      s, session, task, AMENDMENT, 'vamd-00112233445566aa', '2026-01-01T00:01:00Z',
+    );
+    expect(s.enqueued).toHaveLength(1);
+    expect(s.enqueued[0].payload).toMatchObject({ owner: 'code', repo: 'loop', prNumber: 42 });
+    expect(s.enqueued[0].payload.body).toContain('superseded by a verification amendment');
+  });
+
+  test('a split-provider session publishes the counts and withholds the private names', async () => {
+    const s = makeStore();
+    await enqueueVerificationAmendmentGateSupersededEffect(
+      s,
+      makeSession({ workItemProvider: { provider: 'gitea' } }),
+      makeTask({ status: 'ready_for_human' }),
+      AMENDMENT,
+      'vamd-00112233445566aa',
+      '2026-01-01T00:00:00Z',
+    );
+    const [row] = s.enqueued;
+    expect(row.payload.body).toContain('Retired — not run, not passed (1)');
+    expect(row.payload.body).toContain('names withheld');
+    expect(row.payload.body).not.toContain('npm run e2e');
+    expect(row.payload.body).not.toContain('the e2e suite cannot run in this environment');
+    expect(row.payload.body).not.toContain('Test issue');
   });
 });

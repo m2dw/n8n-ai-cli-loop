@@ -126,12 +126,13 @@ export function refinementHandoffCommentMarker(idempotencyKey: string): string {
  *
  * Every entry names something an operator can actually do today: inspect a
  * surface that exists, change a label, change session config, or edit the Issue.
- * None of them names `admin refinement recover`, which §13 specifies but which
- * this build does not implement yet — publishing a command that does not exist
- * would send the reader in a circle, and so would "re-run refinement", which no
- * supported command can do from a terminal state. Each entry therefore covers
- * only what is specific to its reason; how to leave the state at all is stated
- * once, in the shared footer of the rendered comment.
+ * None of them names `admin refinement recover` (issue #980), even though it now
+ * exists: recovery is how you leave the state at all, which is the same sentence
+ * for all eighteen reasons and is therefore stated once, in the shared footer
+ * of the rendered comment. Each entry here covers only what is specific to its
+ * reason — the thing that has to be true BEFORE a recovery is worth running,
+ * since §13's retry re-evaluates from `pending` and simply escalates again if
+ * the condition was not actually fixed.
  */
 export const REFINEMENT_HANDOFF_NEXT_ACTIONS: Record<RefinementHandoffReason, string> = {
   fan_in_exceeded:
@@ -149,7 +150,7 @@ export const REFINEMENT_HANDOFF_NEXT_ACTIONS: Record<RefinementHandoffReason, st
   no_convergence:
     "The refiner and the critic did not converge within the round cap. Refine the Issue by hand, or raise `issueRefinement.limits.maxRefinementRoundsPerIssue`.",
   critique_blocked:
-    "The critic blocked the draft outright. Read the recorded objections with `admin task-status --issue-number <n> --verbose` and address them in the Issue.",
+    "The critic blocked the draft on something only a human can resolve — a missing decision, conflicting authoritative requirements, unavailable evidence, an invalidated premise, or a scope change. Run `admin task-status --issue-number <n> --verbose`: its `critic block:` line names the recorded `blockReason` and the objection literals. Address them in the Issue.",
   stale_inputs:
     "The Issue or one of its predecessors changed while the lane was running. Re-check the inputs before the lane runs again.",
   unexpected_managed_region:
@@ -168,6 +169,8 @@ export const REFINEMENT_HANDOFF_NEXT_ACTIONS: Record<RefinementHandoffReason, st
     "The label transition did not land as expected, so the Issue's labels no longer match what the lane assumed. Restore them: the refinement marker present, and no executable `status:*` label beside it.",
   execution_marker_conflict:
     "The refinement marker was applied to an Issue that was already executing another phase. Remove one of the two markers so the Issue routes to exactly one lane.",
+  evidence_required:
+    "This Issue declares predecessor contract evidence the lane could not capture, so neither agent was run. Read the recorded gaps with `admin task-status --issue-number <n> --verbose`, then either fix the declaration in the Issue body (correct the path, export, or line range; name a direct predecessor; narrow a truncated excerpt; or mark the selection `\"required\": false`) or make the evidence reachable on the predecessor's branch.",
 };
 
 /**
@@ -357,11 +360,79 @@ export function publishableRefinementHandoffFromContext(
 }
 
 /**
+ * The ready-for-human label a block records its outstanding handoff as having
+ * added, or `null` (issue #980 review).
+ *
+ * Read tolerantly, like every other optional §15 field: the block comes back out
+ * of persisted task context, which an older build wrote without this field at
+ * all and a hand edit can have written anything into. Absent means "not
+ * recorded", and the only caller — §13's recovery — falls back to the session's
+ * configured label for exactly that case.
+ */
+export function recordedRefinementHandoffLabel(
+  block: { handoffLabel?: unknown } | undefined,
+): string | null {
+  const value: unknown = block?.handoffLabel;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Record, on the block a completion is about to persist, the ready-for-human
+ * label its handoff is about to add (issue #980 review).
+ *
+ * The add and this record are the two halves of one fact, so they are gated on
+ * the SAME condition ({@link publishableRefinementHandoffFromContext}) and
+ * committed in the same transaction: a completion that publishes a label add
+ * persists the label it used, and a completion that publishes nothing writes
+ * nothing here.
+ *
+ * It has to be persisted rather than re-derived because `labels.readyForHuman`
+ * is session config an operator may rename. §13's recovery enqueues a REMOVAL
+ * compensating for this specific add; a removal that named the currently
+ * configured label after a rename would take the new label off an Issue that is
+ * wearing the old one, and the handoff's own label would stay put forever.
+ *
+ * Returns `context` unchanged when there is nothing to record — no publishable
+ * handoff, no configured label, or a label already recorded as the same value —
+ * so a caller can use it unconditionally when building its patch. Never mutates
+ * its input: the block is cloned, because the same object is the task's live
+ * context on some paths.
+ */
+export function withRecordedRefinementHandoffLabel(
+  issueNumber: number,
+  context: Record<string, unknown> | undefined,
+  readyForHumanLabel: string | undefined,
+): Record<string, unknown> | undefined {
+  if (!readyForHumanLabel) return context;
+  if (publishableRefinementHandoffFromContext(issueNumber, context) === null) return context;
+  const block = readRefinementContextBlock(context);
+  if (!block || recordedRefinementHandoffLabel(block) === readyForHumanLabel) return context;
+  return { ...(context ?? {}), refinement: { ...block, handoffLabel: readyForHumanLabel } };
+}
+
+/**
  * The literal that marks an idempotency key as a handoff effect's, and the only
  * thing {@link refinementHandoffEffectFromKey} recognises a row by. Shared by the
  * builder and the parser so the two can never drift apart.
  */
 const REFINEMENT_HANDOFF_KEY_TOKEN = "refinement-handoff";
+
+/**
+ * The effects one terminal handoff publishes, and the closed set of trailing
+ * segments {@link refinementHandoffEffectFromKey} recognises.
+ *
+ * The first two are §13 items 3–4 — the work-item label and the one public
+ * comment. The third is the session's configured transition notification (issue
+ * #981): a handoff is a `ready_for_human` transition like any other, and the
+ * provider-neutral notifier every other such transition reaches (issue #465)
+ * must hear about this one too, or a stopped lane is discoverable only by a human
+ * who happens to open the Issue. It is NOT a work-item write and carries none of
+ * §16's comment obligations; it is listed here because it shares the handoff's
+ * identity, and therefore its idempotency.
+ */
+export const REFINEMENT_HANDOFF_EFFECTS = ["comment", "label", "notification"] as const;
+
+export type RefinementHandoffEffect = (typeof REFINEMENT_HANDOFF_EFFECTS)[number];
 
 /**
  * The handoff effect an outbox row's idempotency key belongs to, or `null`.
@@ -381,24 +452,37 @@ export function refinementHandoffEffectFromKey(idempotencyKey: string): {
   sessionId: string;
   issueNumber: number;
   reason: RefinementHandoffReason;
-  effect: "comment" | "label";
+  effect: RefinementHandoffEffect;
+  /** §13 recovery ordinal; 0 for the first attempt, whose key carries no segment. */
+  recoveries: number;
 } | null {
   const parts = idempotencyKey.split(":");
   if (parts.length < 5) return null;
   const rawEffect = parts[parts.length - 1];
   const reason = parts[parts.length - 2];
-  const token = parts[parts.length - 3];
-  const issue = parts[parts.length - 4];
-  const sessionId = parts.slice(0, parts.length - 4).join(":");
+  // The recovery segment is OPTIONAL and only present from the first recovery
+  // on, so every key minted before issue #980 parses byte-identically: read the
+  // slot before the reason and accept it either as the token itself (no
+  // recovery) or as the discriminator sitting on top of the token.
+  const maybeToken = parts[parts.length - 3];
+  const recoveryMatch = /^recovery-(\d+)$/.exec(maybeToken);
+  const offset = recoveryMatch ? 1 : 0;
+  const token = offset === 1 ? parts[parts.length - 4] : maybeToken;
+  const issue = parts[parts.length - 4 - offset];
+  const sessionId = parts.slice(0, parts.length - 4 - offset).join(":");
   if (token !== REFINEMENT_HANDOFF_KEY_TOKEN) return null;
-  const effect: "comment" | "label" | null =
-    rawEffect === "comment" ? "comment" : rawEffect === "label" ? "label" : null;
+  const effect: RefinementHandoffEffect | null =
+    (REFINEMENT_HANDOFF_EFFECTS as readonly string[]).includes(rawEffect)
+      ? (rawEffect as RefinementHandoffEffect)
+      : null;
   if (effect === null) return null;
   if (!isRefinementHandoffReason(reason)) return null;
   if (sessionId.length === 0) return null;
   const issueNumber = Number(issue);
   if (!Number.isInteger(issueNumber) || issueNumber <= 0) return null;
-  return { sessionId, issueNumber, reason, effect };
+  const recoveries = recoveryMatch ? Number(recoveryMatch[1]) : 0;
+  if (!Number.isInteger(recoveries) || recoveries < 0) return null;
+  return { sessionId, issueNumber, reason, effect, recoveries };
 }
 
 /**
@@ -415,24 +499,32 @@ export function refinementHandoffEffectFromKey(idempotencyKey: string): {
  * so that a *different* handoff — a later attempt that stopped for a different
  * cause — is still published instead of being swallowed by the first one's key.
  *
- * What the key deliberately does NOT distinguish is a second attempt that
- * stopped for the SAME reason. Today that is unreachable: nothing leaves
- * `escalated_human` automatically (§13), and the recovery command that would
- * return the block to `pending` is specified but not implemented here — so two
- * same-reason handoffs on one Issue cannot occur. When recovery lands it must
- * fold its own attempt discriminator into this key, or the retried attempt's
- * handoff will dedupe against the comment the first one already posted.
+ * A second attempt that stopped for the SAME reason IS distinguished, by
+ * `recoveries` (issue #980). Two same-reason handoffs on one Issue used to be
+ * unreachable — nothing leaves `escalated_human` automatically (§13) — but
+ * `admin refinement recover` now returns the block to `pending`, and the retry
+ * it starts is a new handoff that deserves its own notice. The block's §13
+ * recovery ordinal is therefore folded in, and only from the first recovery on:
+ * an attempt that has never been recovered mints exactly the key it always did,
+ * so no in-flight row from before this change is orphaned or re-published.
  */
 export function refinementHandoffIdempotencyKey(input: {
   sessionId: string;
   issueNumber: number;
   reason: RefinementHandoffReason;
-  effect: "comment" | "label";
+  effect: RefinementHandoffEffect;
+  /** §13 recovery ordinal from the block; omitted or 0 for a never-recovered row. */
+  recoveries?: number | undefined;
 }): string {
+  const recoveries =
+    typeof input.recoveries === "number" && Number.isFinite(input.recoveries) && input.recoveries > 0
+      ? Math.floor(input.recoveries)
+      : 0;
   return [
     input.sessionId,
     String(input.issueNumber),
     REFINEMENT_HANDOFF_KEY_TOKEN,
+    ...(recoveries > 0 ? [`recovery-${recoveries}`] : []),
     input.reason,
     input.effect,
   ].join(":");
@@ -508,9 +600,14 @@ export function renderRefinementHandoffComment(
         + "the Issue out of implementation.",
     "",
     "**No automatic transition leaves this state.** To hand the Issue to implementation yourself: remove the "
-      + "refinement marker **first**, then add `status:needs-implementation` (never both at once), and dispose of "
-      + "this task row with `admin task cancel`. Refining the Issue again is an explicit operator recovery step "
-      + "(§13 of the refinement contract) — nothing re-enters this lane on its own.",
+      + "refinement marker **first**, then add `status:needs-implementation` (never both at once), and move this "
+      + "task row into implementation with `admin recover --session-id <session-id> --issue-number "
+      + `${publication.issueNumber} --from ready_for_human --phase implementation`
+      + "`. **Never cancel this task row** for this: that leaves a terminal `cancelled` row, and ordinary "
+      + "implementation intake only reactivates a `blocked` row — a cancelled one returns `already_exists` "
+      + "forever and the Issue can never reach implementation. To refine the Issue again instead, restore that "
+      + "label shape and run `admin refinement recover` (§13 of the refinement contract), which previews by "
+      + "default and applies with `--yes` — nothing re-enters this lane on its own.",
   ];
   const body = lines.join("\n");
   return body.length > MAX_HANDOFF_COMMENT_CHARS

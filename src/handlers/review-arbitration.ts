@@ -149,6 +149,18 @@ export interface ArbitrationAgentResult {
    * peeled back off before capture instead of being persisted as an arbiter's.
    */
   spawnError?: string;
+  /**
+   * The spawn-level failure was this invocation's own deadline expiring
+   * ({@link CommandRunResult.timedOut}).
+   *
+   * Carried forward rather than inferred downstream: an arbiter that ran out of
+   * time and one that ran and exited nonzero both surface as `agent-failed`, and
+   * only the layer that held the deadline can tell them apart. The reviewer's
+   * reconsideration carries the same fact for the same reason (issue #953), and
+   * `normalizeArbitrationFailure` already takes it as an argument rather than
+   * guessing it from a detail string — it simply had no source for it until now.
+   */
+  timedOut?: boolean;
 }
 
 /** Injectable so tests exercise the whole path without spawning an agent. */
@@ -442,6 +454,12 @@ export interface ArbitrationInvocationSummary {
   excerpts: number;
   unresolvedExcerpts: number;
   exitCode: number | null;
+  /**
+   * The agent's subprocess was killed by this invocation's deadline. False for a
+   * run that never happened, so a reader may treat it as "the deadline is the
+   * reason" and nothing weaker.
+   */
+  timedOut: boolean;
   /** Wall-clock milliseconds the agent's subprocess took, or null if it never ran. */
   durationMs: number | null;
   profile: ArbitrationProfileSummary;
@@ -867,6 +885,7 @@ export function runReviewArbitration(input: ArbitrationInvocationInput): Arbitra
     excerpts: 0,
     unresolvedExcerpts: 0,
     exitCode: null,
+    timedOut: false,
     durationMs: null,
     profile: profileSummary,
     verdict: null,
@@ -1181,7 +1200,12 @@ export function runReviewArbitration(input: ArbitrationInvocationInput): Arbitra
   const stderrCapture = result.stdout !== "" && agentStderr !== "" ? agentStderr : null;
   const stderrArtifact = stderrCapture === null ? null : arbitrationStderrArtifactName(lineageId);
   const runnerErrorArtifact = runnerErrorCapture === null ? null : arbitrationRunnerErrorArtifactName(lineageId);
-  const withRun: ArbitrationInvocationSummary = { ...withBundle, exitCode: result.exitCode, durationMs };
+  const withRun: ArbitrationInvocationSummary = {
+    ...withBundle,
+    exitCode: result.exitCode,
+    timedOut: result.timedOut === true,
+    durationMs,
+  };
   // Re-validated here, not merely at (3): the agent has run since.
   if (!artifactDirStillSafe()) {
     return fail({ kind: "unsafe-artifact-dir", detail: "artifactDir" }, withRun, manifest, [bundleArtifact]);

@@ -11,8 +11,8 @@
  *     read under the protocol's record bound and, for the dispute, re-admitted
  *     against THIS checkout's §3.3 evidence resolver — and a read-only checkout
  *     (`core/review-reconsideration-prompt.ts` renders it);
- *  2. invoke the configured review agent with NO tool surface, in a throwaway
- *     cwd, under a credential-stripped environment;
+ *  2. invoke the configured review agent under the strongest posture that agent's
+ *     CLI supports, in a throwaway cwd, under a credential-stripped environment;
  *  3. preserve the raw output as private local artifacts — one file per stream,
  *     verbatim, with nothing this module or the runner wrote mixed into either
  *     (a spawn-level diagnostic gets its own, differently named, file);
@@ -34,12 +34,33 @@
  * protocol opened, and inventing one would let a reviewer be asked to re-decide
  * a settled debate.
  *
- * ## The read-only boundary
+ * ## Two postures, named apart and never conflated
  *
  * §8.2 states the enforcement point for the arbiter, and the reviewer's
- * reconsideration is held to the same posture: "the runner: the agent is invoked
- * with no tool permissions, and the bundle is the entire input". Three
- * independent layers implement it here, so no single flag is load-bearing:
+ * reconsideration is held to the same posture wherever the CLI can carry it:
+ * "the runner: the agent is invoked with no tool permissions, and the bundle is
+ * the entire input". That is `no-tools`, and `claude` is the one agent this
+ * runner can invoke that way.
+ *
+ * Since issue #1085 there is a SECOND, weaker, separately named posture —
+ * `read-bounded` — for a reviewer whose CLI has no mechanism to empty its tool
+ * surface (today: `codex`). It exists because an operator recorded decision D2 of
+ * `docs/review-dispute-contract.md` §17.6, and it is admitted only for a session
+ * that opts in explicitly ({@link ReconsiderationProfileOptions.readBounded},
+ * `session.reviewDispute.reconsideration.readBounded`, default false). What it
+ * does and does not guarantee is §17.6's table, and the third row is the one that
+ * matters: **reads are available**, bounded only by a throwaway cwd and the
+ * host's own read permissions, so "the bundle is the entire input" is NOT
+ * guaranteed. A temporary cwd is not a read jail. Nothing here claims otherwise,
+ * and the `no-tools` literal is never reused for it (§17.5): the posture travels
+ * on the resolved profile, into the §10.2 record, into the run summary and into
+ * the operator surfaces, so a lineage decided under one is distinguishable
+ * forever from a lineage decided under the other — in both directions, since a
+ * historical `no-tools` record is never re-read as `read-bounded` either.
+ *
+ * ## The `no-tools` boundary
+ *
+ * Three independent layers implement it, so no single flag is load-bearing:
  *
  *  - **No tools at the CLI level.** The agent is invoked with an empty tool set
  *    and an explicit denylist of every write/exec-capable built-in
@@ -54,10 +75,42 @@
  *
  * The checkout is still read — by THIS process, not by the agent — to resolve
  * and excerpt evidence, under the same `evidence-checkout.ts` primitives the
- * review and fix runs share.
+ * review and fix runs share. That is true under both postures: the bundle is
+ * assembled by the runner either way, and the `read-bounded` cwd is a throwaway
+ * temp directory rather than the worktree (§17.7's cwd row), so the checkout is
+ * not what the agent is pointed at.
+ *
+ * ## The `read-bounded` boundary
+ *
+ * The first of the three layers above is the one no other CLI in this repository
+ * has. What `codex exec` can be given instead is enforced by argv and by the
+ * environment, and each row is a real restriction with a real limit:
+ *
+ *  - **no writes and no network for agent-owned commands** — `--sandbox
+ *    read-only` (§17.4 C4, `vendor-documented`). Never a bypass flag; there is no
+ *    switch on this module that produces one.
+ *  - **no operator agent configuration** — `--ignore-user-config` (C5), which is
+ *    load-bearing rather than decorative: the isolated environment points
+ *    `CODEX_HOME` back at the operator's real `~/.codex` so the CLI's own login
+ *    is reachable, and the `config.toml` holding MCP servers and hooks is there.
+ *  - **no operator HOME, no GitHub credential** — the shared isolation layer,
+ *    told `tool-capable` (the conservative translation: only an Anthropic
+ *    `no-tools` turn inherits the real home).
+ *  - **no checkout as cwd** — a throwaway directory, which is why
+ *    `--skip-git-repo-check` is required rather than incidental.
+ *  - **an ENFORCED deadline** — the child runs in its own process group, so a CLI
+ *    that traps the deadline's `SIGTERM` is force-killed with its whole tree.
+ *  - **NOT bounded: reads.** The agent may read files outside the bundle under
+ *    the host's own permissions. This is the acknowledged limit of the posture,
+ *    not an oversight, and it is never reported as impossible.
+ *
+ * `docs/review-dispute-contract.md` §17.12 records why issue #1070 stopped rather
+ * than inventing this, and §17.16 records the operator decision that admitted it
+ * and the exact bounds implemented here.
  */
-import { rmSync } from "fs";
+import { existsSync, mkdtempSync, rmSync } from "fs";
 import { randomBytes } from "crypto";
+import { tmpdir } from "os";
 import { join } from "path";
 import { bothStreamsCommandRunner, defaultCommandRunner, type CommandRunner } from "./command-runner.js";
 import { isSafeArtifactDirAfterRun } from "./artifact-dir.js";
@@ -72,7 +125,16 @@ import {
 } from "./agent-isolation.js";
 import { captureTrackedFiles, createTrackedFileReader } from "./evidence-checkout.js";
 import { evidenceRefKey, excerptEvidenceRef } from "./evidence-excerpt.js";
-import { providerForAgent } from "./codex-context-mode.js";
+import { providerForAgent, resolveCodexModel } from "./codex-context-mode.js";
+// The §17.7 argv rows this lane shares with the review lane of issue #1068. One
+// contract, one constant, one recognition rule for a build that refuses a flag:
+// two copies would eventually pin different boundaries under the same name.
+import {
+  CODEX_STRUCTURED_REVIEW_EXEC_ARGS,
+  codexRefusedCapability,
+} from "./codex-structured-review.js";
+import { CLAUDE_NO_TOOLS_ARGS } from "../core/claude-runtime-adapter.js";
+import type { CodexConfig } from "../core/session.js";
 import {
   MAX_EVIDENCE_REFS_PER_RECORD,
   REVIEW_DISPUTE_DEFAULT_LIMITS,
@@ -88,6 +150,7 @@ import {
   disputeArtifactName,
   isLineageId,
   reconsiderationArtifactName,
+  reconsiderationEventsArtifactName,
   reconsiderationRawArtifactName,
   reconsiderationRunnerErrorArtifactName,
   reconsiderationStderrArtifactName,
@@ -129,25 +192,8 @@ import {
  * the read-only contract. Read tools are denied too — the bundle is the entire
  * input (§8.2), so a reconsideration that reads a file the runner did not
  * resolve is deciding on evidence nobody bounded.
- */
-const RECONSIDERATION_DISALLOWED_TOOLS = [
-  "Bash",
-  "BashOutput",
-  "KillBash",
-  "Edit",
-  "Write",
-  "NotebookEdit",
-  "Read",
-  "Glob",
-  "Grep",
-  "WebFetch",
-  "WebSearch",
-  "Task",
-  "TodoWrite",
-].join(",");
-
-/**
- * The CLI-level half of the read-only boundary, defense in depth:
+ *
+ * The CLI-level half of that boundary, defense in depth:
  *   - `--tools ""` removes every built-in tool from the model's tool set. With
  *     an empty set there is no tool for injected text to invoke, whatever the
  *     allow/deny lists happen to enumerate.
@@ -160,18 +206,206 @@ const RECONSIDERATION_DISALLOWED_TOOLS = [
  *   - `--no-session-persistence` keeps the bundle and the conversation out of
  *     the operator's real config dir; the raw output belongs in the run's own
  *     artifact directory, which this module writes and the session retains.
+ *
+ * The argv is the Claude runtime adapter's `no_tools` lane boundary
+ * (src/core/claude-runtime-adapter.ts, issue #907), aliased rather than
+ * restated: §8.2's arbiter (`ARBITER_CLAUDE_NO_TOOLS_ARGS`) pins the same
+ * boundary, and two literal copies is how they end up differing while both
+ * claim to be the read-only invocation.
  */
-export const RECONSIDERATION_NO_TOOLS_ARGS: readonly string[] = [
-  "--tools",
-  "",
-  "--allowedTools",
-  "",
-  "--disallowedTools",
-  RECONSIDERATION_DISALLOWED_TOOLS,
-  "--strict-mcp-config",
-  "--safe-mode",
-  "--no-session-persistence",
+export const RECONSIDERATION_NO_TOOLS_ARGS: readonly string[] = CLAUDE_NO_TOOLS_ARGS;
+
+// ---------------------------------------------------------------------------
+// The read-bounded agent profile (§17.6 D2, §17.7, §17.16)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `codex exec` flags this lane pins, in argv order — §17.7's argv row, minus
+ * the run-owned file path and the `-c` override.
+ *
+ * Imported from the review lane rather than restated: §17.7 is ONE invocation
+ * contract, and a second literal list under a second name is how two lanes end up
+ * pinning different boundaries while both claim to implement the same row.
+ * `--skip-git-repo-check` is required rather than incidental here — the cwd is a
+ * throwaway directory and not a checkout, so without it the CLI refuses to start.
+ *
+ * What is deliberately NOT here: `--output-schema` (a §4.1 record is not the §2.1
+ * envelope that flag's schema describes, and C6 is `vendor-documented` anyway),
+ * context-mode's `--profile`/`-c` entries (a `--ignore-user-config` turn does not
+ * then reach back for an operator profile), and any bypass flag — there is no
+ * switch on this module that produces `--dangerously-bypass-approvals-and-sandbox`
+ * or `--full-auto`.
+ */
+export const RECONSIDERATION_READ_BOUNDED_ARGS: readonly string[] = CODEX_STRUCTURED_REVIEW_EXEC_ARGS;
+
+/**
+ * Every flag whose refusal by the CLI is an unsupported capability, not a turn.
+ *
+ * A build that refuses one exits nonzero having run nothing, so reporting that as
+ * an agent failure would send an operator looking for a reviewer turn that never
+ * started. This is the §17.11 rule applied to the same argv.
+ */
+export const RECONSIDERATION_READ_BOUNDED_PINNED_FLAGS: readonly string[] = [
+  "--sandbox",
+  "--skip-git-repo-check",
+  "--ignore-user-config",
+  "--json",
+  "--output-last-message",
 ];
+
+/** The posture a resolved profile records. Never one relabelled as the other. */
+export type ReconsiderationToolPolicy = "no-tools" | "read-bounded";
+
+/**
+ * How the runner recovers the reviewer's answer from the process it ran.
+ *
+ * `stdout` is the Claude lane: the answer is the standard output. `final-message`
+ * is the `codex exec --json` lane, where stdout carries JSONL progress events and
+ * the answer is written to the runner-owned `--output-last-message` file — so the
+ * verdict is never recovered by scraping a stream that also carries progress.
+ */
+export type ReconsiderationResponseChannel = "stdout" | "final-message";
+
+/**
+ * Which agents this runner may give a §4.1 reconsideration turn, under which
+ * posture, and — where it may not — the contract row that decides it.
+ *
+ * This is a capability record, not a preference list, and it has exactly two
+ * entries for two different reasons:
+ *
+ *  - **`claude`, always, as `no-tools`.** The only CLI whose tool surface this
+ *    repository can empty at the command line and pin under `npm test`
+ *    ({@link RECONSIDERATION_NO_TOOLS_ARGS}). Nothing about D2 touches it: an
+ *    opted-in session still invokes a Claude reviewer exactly as before, and a
+ *    Claude turn is never relabelled `read-bounded`.
+ *  - **`codex`, only under the D2 opt-in, as `read-bounded`.** What blocked it
+ *    until issue #1085 was not a missing argv: it is
+ *    `docs/review-dispute-contract.md` §17.4 C7, graded `unknown` — no documented
+ *    Codex option is the equivalent of the Claude CLI's `--tools ""` /
+ *    `--allowedTools ""` / `--disallowedTools` triple — and under §17.2 an
+ *    unknown capability evaluates as absent. C7 has NOT moved. What changed is
+ *    that an operator recorded decision D2 (§17.6, §17.16) and accepted the
+ *    weaker posture in writing: writes and network contained, reads available,
+ *    "the bundle is the entire input" not guaranteed. Without the opt-in the
+ *    §17.12 refusal stands unchanged, which is why the answer below depends on
+ *    the session and not only on the agent id.
+ *
+ * `--sandbox read-only` is still not evidence for C7 and is not treated as any
+ * (§17.5 B2), and the `no-tools` literal is still refused for it by name — the
+ * refinement lane's precedent included. The posture has its own name precisely so
+ * that the difference survives in the record.
+ */
+export interface ReconsiderationAgentSupport {
+  /** Whether this runner has an invocation it may give this agent for this turn. */
+  supported: boolean;
+  /** The posture that invocation enforces. Absent when unsupported. */
+  toolPolicy?: ReconsiderationToolPolicy;
+  /** The §17.5 blocker behind an unsupported agent. */
+  blocker?: "B2";
+  /**
+   * The §17.6 operator decision that would have to be recorded first, or — when
+   * it HAS been recorded and this session simply has not opted in — the decision
+   * whose opt-in is missing. {@link ReconsiderationAgentSupport.optIn} tells the
+   * two apart.
+   */
+  pendingDecision?: "D2";
+  /**
+   * The session setting that would admit this agent, when one exists.
+   *
+   * Present only where the block is a session opt-in rather than a capability:
+   * an operator reading "unsupported" needs to know whether there is a decision
+   * to make or nothing to be done.
+   */
+  optIn?: "reviewDispute.reconsideration.readBounded";
+  /** Operator-facing sentence; {@link resolveReconsiderationProfile} builds its error from it. */
+  reason: string;
+}
+
+/**
+ * The agents with a verified §8.2 `no-tools` posture for this turn.
+ *
+ * One entry, and it is not a placeholder: `claude` is the only CLI whose tool
+ * surface this repository can empty at the command line and pin under `npm test`
+ * ({@link RECONSIDERATION_NO_TOOLS_ARGS}). C7 grading `verified` for another CLI
+ * is what would add a second — never the D2 opt-in, which admits a DIFFERENT
+ * posture under a different name.
+ */
+export const RECONSIDERATION_SUPPORTED_AGENTS: readonly string[] = ["claude"];
+
+/**
+ * The agents this runner has a `read-bounded` invocation for (§17.7).
+ *
+ * Being on this list is necessary and not sufficient: the turn is admitted only
+ * for a session that recorded the D2 opt-in.
+ */
+export const RECONSIDERATION_READ_BOUNDED_AGENTS: readonly string[] = ["codex"];
+
+/** What a caller's session settings say about the §17.6 D2 opt-in. */
+export interface ReconsiderationSupportOptions {
+  /**
+   * `session.reviewDispute.reconsideration.readBounded`, resolved. Default false,
+   * and false is the pre-#1085 behavior exactly.
+   */
+  readBounded?: boolean;
+}
+
+/** The capability answer for one agent id under one session's policy. Never spawns anything. */
+export function reconsiderationAgentSupport(
+  agentId: string,
+  options: ReconsiderationSupportOptions = {},
+): ReconsiderationAgentSupport {
+  if (RECONSIDERATION_SUPPORTED_AGENTS.includes(agentId)) {
+    return {
+      supported: true,
+      toolPolicy: "no-tools",
+      reason: "A CLI-level no-tools invocation is defined and covered by `npm test`.",
+    };
+  }
+  if (RECONSIDERATION_READ_BOUNDED_AGENTS.includes(agentId)) {
+    if (options.readBounded === true) {
+      return {
+        supported: true,
+        toolPolicy: "read-bounded",
+        reason:
+          `${agentId} takes this turn under the read-bounded posture (docs/review-dispute-contract.md §17.6 D2, `
+          + "§17.16), which this session opted into with reviewDispute.reconsideration.readBounded. Writes, network, "
+          + "operator agent configuration and GitHub credentials are refused by argv and by the isolated "
+          + "environment; READS are not bounded — the agent may read files outside the runner-supplied bundle "
+          + "under the host's own permissions, so §8.2's \"the bundle is the entire input\" does not hold and the "
+          + "lineage records toolPolicy `read-bounded` permanently.",
+      };
+    }
+    return {
+      supported: false,
+      blocker: "B2",
+      pendingDecision: "D2",
+      optIn: "reviewDispute.reconsideration.readBounded",
+      reason:
+        `Unsupported reconsideration agent: ${agentId}. The reviewer reconsideration runs with no tool surface `
+        + "(docs/review-dispute-contract.md §8.2), and only `claude` has a no-tools invocation defined. "
+        + `Supported without an opt-in: ${RECONSIDERATION_SUPPORTED_AGENTS.join(", ")}. `
+        + `This runner does have a read-bounded invocation for ${agentId} (§17.7), admitted by contract decision `
+        + "D2 (§17.6) — but only for a session that opts in with "
+        + "reviewDispute.reconsideration.readBounded: true, which this session has not. Under that posture reads "
+        + "are NOT bounded and \"the bundle is the entire input\" is not guaranteed; enabling it is an operator's "
+        + "decision to record, not a default.",
+    };
+  }
+  return {
+    supported: false,
+    blocker: "B2",
+    pendingDecision: "D2",
+    reason:
+      `Unsupported reconsideration agent: ${agentId}. The reviewer reconsideration runs with no tool surface `
+      + "(docs/review-dispute-contract.md §8.2), and only `claude` has a no-tools invocation defined. "
+      + `Supported: ${RECONSIDERATION_SUPPORTED_AGENTS.join(", ")}; `
+      + `read-bounded by opt-in (§17.6 D2): ${RECONSIDERATION_READ_BOUNDED_AGENTS.join(", ")}. `
+      + "Read-only sandboxing is not the §8.2 boundary — it bounds writes and network, not reads (§17.5 B2) — so "
+      + "enabling another agent here needs a read-bounded invocation recorded in §17.7, or C7 graded "
+      + "`verified` by the §17.8 smoke check. Neither is recorded for this agent, and "
+      + "neither is a code change on its own.",
+  };
+}
 
 export interface ResolvedReconsiderationProfile {
   phase: "review";
@@ -179,25 +413,82 @@ export interface ResolvedReconsiderationProfile {
   role: "reconsideration";
   agentId: string;
   cmd: string;
-  /** Sanitized argv — the prompt is delivered on stdin and never appears here. */
+  /**
+   * Sanitized argv — the prompt is delivered on stdin and never appears here, and
+   * the run-owned output path of the `read-bounded` lane is spliced in at
+   * invocation time ({@link buildReconsiderationArgv}). A local temp path is not
+   * a fact about the debate.
+   */
   argv: string[];
   model?: string;
-  modelSource: "env" | "default";
+  /** `cli-default` means no `--model` is passed and the CLI's own applies. */
+  modelSource: "env" | "default" | "session-config" | "cli-default";
   effort?: string;
   effortSource: "env" | "default";
   provider: string;
-  /** States the enforced posture in the run metadata, not just in code. */
-  toolPolicy: "no-tools";
+  /** States the ENFORCED posture in the run metadata, not just in code. */
+  toolPolicy: ReconsiderationToolPolicy;
+  /** Where this lane's answer is read from. */
+  responseChannel: ReconsiderationResponseChannel;
+}
+
+/** Run-owned paths spliced into a lane whose answer is not on a stream. */
+export interface ReconsiderationArgvPaths {
+  /** `--output-last-message` target. Absent only in the sanitized argv. */
+  lastMessagePath?: string;
 }
 
 /**
- * Resolve the read-only invocation for the configured review agent.
+ * Compose the argv for one invocation.
  *
- * Only agents with an established CLI-level no-tools boundary in this repository
- * are supported, and that is a fail-closed decision rather than an oversight:
- * §8.2's enforcement point is the runner, so an agent this runner cannot invoke
- * WITHOUT tools cannot be given a reconsideration turn at all. Adding one means
- * adding its no-tools argv here — not relaxing the requirement.
+ * The ordering rule for the `read-bounded` lane is the one every Codex lane in
+ * this codebase follows and is not cosmetic: `--model` is a GLOBAL Codex option
+ * and must precede the subcommand, while `-c` overrides are accepted after it.
+ * Splicing a global after `exec` makes the CLI fail argument parsing before the
+ * turn starts.
+ */
+export function buildReconsiderationArgv(
+  profile: ResolvedReconsiderationProfile,
+  paths: ReconsiderationArgvPaths = {},
+): string[] {
+  if (profile.responseChannel !== "final-message") return [...profile.argv];
+  const argv: string[] = [];
+  if (profile.model !== undefined) argv.push("--model", profile.model);
+  argv.push(...RECONSIDERATION_READ_BOUNDED_ARGS);
+  if (paths.lastMessagePath !== undefined) argv.push("--output-last-message", paths.lastMessagePath);
+  argv.push("-c", `model_reasoning_effort=${profile.effort ?? "high"}`);
+  return argv;
+}
+
+export interface ReconsiderationProfileOptions {
+  /**
+   * The §17.6 D2 opt-in, resolved from
+   * `session.reviewDispute.reconsideration.readBounded`. Default false, which is
+   * the pre-#1085 behavior byte for byte.
+   */
+  readBounded?: boolean;
+  /** `session.codex`, for the read-bounded lane's §17.7 model row. */
+  codex?: CodexConfig;
+}
+
+/**
+ * Resolve the invocation for the configured review agent, under the strongest
+ * posture that agent's CLI supports and this session admits.
+ *
+ * Fail-closed on an agent this runner has no invocation for, and fail-closed on
+ * an agent whose only invocation is `read-bounded` in a session that has not
+ * opted in: §8.2's enforcement point is the runner, so an agent this runner
+ * cannot invoke under an admitted posture gets no reconsideration turn at all.
+ * The answer and the reason both come from {@link reconsiderationAgentSupport},
+ * so the resolver and the contract cannot drift apart.
+ *
+ * Model and effort resolution is each lane's own, unchanged by this function's
+ * widening: a Claude turn reads `CLAUDE_MODEL`/`CLAUDE_EFFORT` and defaults to
+ * `opus`/`high`; a Codex turn reads `CODEX_MODEL`, then `session.codex.model`,
+ * then leaves the model ABSENT (§17.7's model row — an unset model is no model at
+ * all, never a guessed one), with `CODEX_EFFORT` defaulting to `high` and the
+ * three-level tier set of C3. There is no path here that substitutes one
+ * provider for the other.
  *
  * The prompt always travels on stdin, so a large bundle can never overflow the
  * argv length limit and no part of it is visible in a process listing.
@@ -205,14 +496,46 @@ export interface ResolvedReconsiderationProfile {
 export function resolveReconsiderationProfile(
   agentId: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  options: ReconsiderationProfileOptions = {},
 ): { profile: ResolvedReconsiderationProfile } | { error: string } {
   const agent = agentId ?? "claude";
-  if (agent !== "claude") {
-    return {
-      error:
-        `Unsupported reconsideration agent: ${agent}. The reviewer reconsideration runs with no tool surface ` +
-        "(docs/review-dispute-contract.md §8.2), and only `claude` has a no-tools invocation defined. Supported: claude",
+  const support = reconsiderationAgentSupport(agent, {
+    ...(options.readBounded === undefined ? {} : { readBounded: options.readBounded }),
+  });
+  if (!support.supported) {
+    return { error: support.reason };
+  }
+  if (support.toolPolicy === "read-bounded") {
+    // §17.7's model row: `CODEX_MODEL`, then `session.codex.model`, then unset —
+    // and unset stays ABSENT rather than becoming a literal, so the profile
+    // records `cli-default` and no `--model` is passed.
+    const modelResolution = resolveCodexModel(options.codex, env);
+    const envEffort = env["CODEX_EFFORT"];
+    // C3: Codex accepts exactly three levels, so the Claude-only tiers map to
+    // `high`, which is also the no-label default the other dispute turns take.
+    const effort =
+      envEffort === undefined || envEffort === ""
+        ? "high"
+        : envEffort === "low"
+          ? "low"
+          : envEffort === "medium"
+            ? "medium"
+            : "high";
+    const profile: ResolvedReconsiderationProfile = {
+      phase: "review",
+      role: "reconsideration",
+      agentId: agent,
+      cmd: "codex",
+      argv: [],
+      ...(modelResolution.source === "unset" ? {} : { model: modelResolution.model }),
+      modelSource: modelResolution.source === "unset" ? "cli-default" : modelResolution.source,
+      effort,
+      effortSource: envEffort === undefined || envEffort === "" ? "default" : "env",
+      provider: providerForAgent(agent),
+      toolPolicy: "read-bounded",
+      responseChannel: "final-message",
     };
+    return { profile: { ...profile, argv: buildReconsiderationArgv(profile) } };
   }
   const envModel = env["CLAUDE_MODEL"];
   const envEffort = env["CLAUDE_EFFORT"];
@@ -234,6 +557,7 @@ export function resolveReconsiderationProfile(
       effortSource: envEffort ? "env" : "default",
       provider: providerForAgent(agent),
       toolPolicy: "no-tools",
+      responseChannel: "stdout",
     },
   };
 }
@@ -259,12 +583,39 @@ export interface ReconsiderationAgentResult {
    * peeled back off before capture instead of being persisted as a reviewer's.
    */
   spawnError?: string;
+  /**
+   * The spawn-level failure was this invocation's own deadline expiring
+   * ({@link CommandRunResult.timedOut}).
+   *
+   * Carried forward rather than inferred downstream: a reviewer that ran out of
+   * time and a reviewer that ran and exited nonzero are different operational
+   * facts, and only the layer that held the deadline can tell them apart (issue
+   * #953).
+   */
+  timedOut?: boolean;
+  /**
+   * The `read-bounded` lane's answer, read from the runner-owned
+   * `--output-last-message` file. `undefined` on the `no-tools` lane, whose
+   * answer is a stream; `null` when the file was not readable and
+   * {@link ReconsiderationAgentResult.finalMessageFailure} says why.
+   */
+  finalMessage?: string | null;
+  /** Why the final message is absent, when it is. */
+  finalMessageFailure?: ReconsiderationFinalMessageFailure | null;
 }
+
+/** Why a `read-bounded` run produced no answer where its argv said to. */
+export type ReconsiderationFinalMessageFailure = "missing" | "too-large" | "stale";
 
 /** Injectable so tests exercise the whole path without spawning an agent. */
 export type ReconsiderationAgentRunner = (invocation: ReconsiderationAgentInvocation) => ReconsiderationAgentResult;
 
-/** Default agent deadline: a bounded single-finding judgement, not a review. */
+/**
+ * Default agent deadline: a bounded single-finding judgement, not a review.
+ *
+ * §17.7's timeout row pins the same ten minutes for a Codex dispute turn, so both
+ * lanes share this constant rather than each choosing its own.
+ */
 export const DEFAULT_RECONSIDERATION_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Output buffer ceiling for the agent subprocess. */
@@ -272,6 +623,15 @@ const RECONSIDERATION_MAX_BUFFER = 16 * 1024 * 1024;
 
 /** The bound on the raw artifact this module writes (§10.2 stays local, not unbounded). */
 export const MAX_RECONSIDERATION_RAW_BYTES = 1024 * 1024;
+
+/**
+ * The bound on the final-message FILE, applied before any of it is in memory.
+ *
+ * The file sits on disk between the CLI writing it and this process reading it,
+ * so a runaway or replaced one must never be read whole. The §12 record bound
+ * still applies afterwards, in the parser, to what the reviewer actually said.
+ */
+export const MAX_RECONSIDERATION_RESPONSE_BYTES = 1024 * 1024;
 
 /**
  * One agent stream, bounded for local capture at this turn's own byte ceiling.
@@ -284,10 +644,41 @@ function boundRawOutput(text: string): string {
   return boundStream(text, MAX_RECONSIDERATION_RAW_BYTES);
 }
 
+export interface ReconsiderationRunnerOptions {
+  /**
+   * Test seam for the run-owned temp directory that holds the `read-bounded`
+   * lane's final-message file.
+   *
+   * The default is a fresh `mkdtemp` per invocation, which is what makes a stale
+   * final message structurally impossible in production. It is injectable so the
+   * refusal itself can be exercised: without a seam, the only test for "the
+   * output file predates this run" would be one that cannot be written.
+   */
+  makeRunDir?: () => string;
+}
+
 /**
  * The default runner: the resolved profile's command, the prompt on stdin, a
  * throwaway cwd, and a credential-stripped environment. The temp directories are
  * removed on every exit path, including a throwing one.
+ *
+ * Both postures run here and the differences are exactly three, all of them
+ * consequences of the CLI rather than of the protocol:
+ *
+ *  - the isolation layer is told `no-tools` or `tool-capable`. `read-bounded` is
+ *    not a home policy `agent-isolation.ts` knows, and the safe translation is
+ *    the restrictive one — an agent that CAN run a command never reaches the
+ *    operator's real home (§17.10's first property, unchanged here).
+ *  - a `final-message` lane gets a run-owned temp directory and splices
+ *    `--output-last-message` into its argv. The directory is fresh, so the file
+ *    cannot be a leftover — and that is asserted before the CLI is spawned
+ *    rather than assumed, because "the answer is THIS run's" is what everything
+ *    downstream rests on.
+ *  - a `final-message` lane spawns in its own process group, so the deadline is
+ *    enforced rather than requested: `spawnSync`'s timeout sends `SIGTERM` to the
+ *    direct child and then keeps blocking, so a CLI that traps it would make the
+ *    deadline unenforceable, and a Codex run is a process TREE whose children
+ *    would otherwise outlive the temp directory this function is about to remove.
  *
  * @param runner Defaults to `bothStreamsCommandRunner`, NOT `defaultCommandRunner`:
  * `execFileSync` returns only stdout on exit 0 and discards the stderr it buffered,
@@ -299,25 +690,65 @@ export function createReconsiderationAgentRunner(
   profile: ResolvedReconsiderationProfile,
   runner: CommandRunner = bothStreamsCommandRunner,
   env: NodeJS.ProcessEnv = process.env,
+  options: ReconsiderationRunnerOptions = {},
 ): ReconsiderationAgentRunner {
+  const finalMessageLane = profile.responseChannel === "final-message";
+  const makeRunDir = options.makeRunDir ?? (() => mkdtempSync(join(tmpdir(), "ai-reconsider-io-")));
   return (invocation) => {
     const isolated = buildIsolatedInvocation(env, {
       prefix: "ai-reconsider",
       provider: profile.provider,
       // The profile's own record of the boundary its argv enforces; the home
-      // policy of `agent-isolation.ts` is conditioned on it.
-      toolPolicy: profile.toolPolicy,
+      // policy of `agent-isolation.ts` is conditioned on it, and `read-bounded`
+      // takes the throwaway home every tool-capable invocation takes.
+      toolPolicy: profile.toolPolicy === "no-tools" ? "no-tools" : "tool-capable",
     });
+    // Created INSIDE the cleanup scope: `buildIsolatedInvocation` has already
+    // made its directories, so a `makeRunDir` that throws (`ENOSPC`, a vanished
+    // `TMPDIR`) would otherwise leave them behind once per failed setup.
+    let runDir: string | null = null;
     try {
-      return runner.run(profile.cmd, profile.argv, {
+      if (!finalMessageLane) {
+        return runner.run(profile.cmd, profile.argv, {
+          cwd: isolated.cwd,
+          env: isolated.env,
+          stdin: invocation.prompt,
+          timeout: invocation.timeoutMs,
+          maxBuffer: RECONSIDERATION_MAX_BUFFER,
+        });
+      }
+      runDir = makeRunDir();
+      const lastMessagePath = join(runDir, "final-message.txt");
+      if (existsSync(lastMessagePath)) {
+        // Reading it afterwards would report another run's verdict as this one's.
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          finalMessage: null,
+          finalMessageFailure: "stale",
+        };
+      }
+      const result = runner.run(profile.cmd, buildReconsiderationArgv(profile, { lastMessagePath }), {
         cwd: isolated.cwd,
         env: isolated.env,
         stdin: invocation.prompt,
         timeout: invocation.timeoutMs,
         maxBuffer: RECONSIDERATION_MAX_BUFFER,
+        isolateProcessGroup: true,
       });
+      const read = readArtifactUnderBound(lastMessagePath, MAX_RECONSIDERATION_RESPONSE_BYTES);
+      return {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        ...(result.spawnError === undefined ? {} : { spawnError: result.spawnError }),
+        ...(result.timedOut === undefined ? {} : { timedOut: result.timedOut }),
+        finalMessage: read.ok ? read.raw : null,
+        finalMessageFailure: read.ok ? null : read.reason === "too-large" ? "too-large" : "missing",
+      };
     } finally {
-      for (const dir of isolated.cleanup) {
+      for (const dir of [...(runDir === null ? [] : [runDir]), ...isolated.cleanup]) {
         try {
           rmSync(dir, { recursive: true, force: true });
         } catch {
@@ -352,10 +783,18 @@ export const RECONSIDERATION_FAILURE_KINDS = [
   "missing-dispute-artifact",
   /** It is readable but is not the admitted dispute for this lineage/version. */
   "malformed-dispute-artifact",
-  /** No read-only invocation is defined for the configured agent. */
+  /** No admitted invocation is defined for the configured agent under this session's policy. */
   "unsupported-agent",
+  /** The CLI refused a flag this lane pins (§17.4 C4–C7). Never a turn that ran. */
+  "unsupported-capability",
   /** The agent exited nonzero, or never ran because its invocation could not be set up. */
   "agent-failed",
+  /** The run finished but wrote no answer where its argv said to (`read-bounded`). */
+  "missing-output",
+  /** The answer file predates this invocation; it is not this run's answer. */
+  "stale-output",
+  /** The answer file is past the byte bound this module reads under. */
+  "oversized-output",
   /** The agent exited zero and produced nothing to parse. */
   "empty-output",
   /** The output could not be admitted as a §4.1 record (§12). */
@@ -430,6 +869,15 @@ export interface ReconsiderationInvocationInput {
   limits?: ReviewDisputeLimits;
   /** The configured review agent id; defaults to `claude`. */
   agentId?: string;
+  /**
+   * The §17.6 D2 opt-in, resolved from
+   * `session.reviewDispute.reconsideration.readBounded`. Absent is false, which
+   * is the refusal of §17.12 unchanged — so a caller that does not know about
+   * this setting cannot accidentally admit the weaker posture.
+   */
+  readBounded?: boolean;
+  /** `session.codex`, for the read-bounded lane's §17.7 model row. */
+  codex?: CodexConfig;
   /** Bounded diff hunks touching the finding's boundary (§8.2). Optional. */
   diffExcerpt?: string;
   /** Test evidence the runner captured, beyond what the rebuttal cited. */
@@ -451,6 +899,8 @@ export interface ReconsiderationInvocationInput {
   agentRunner?: CommandRunner;
   /** Test seam: replaces the whole isolated subprocess invocation. */
   agent?: ReconsiderationAgentRunner;
+  /** Test seam for the `read-bounded` lane's run-owned temp directory. */
+  makeRunDir?: () => string;
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
 }
@@ -471,6 +921,11 @@ export interface ReconsiderationInvocationSummary {
   /** The separate stderr transcript, written only when both streams carried bytes. */
   stderrArtifact: string | null;
   /**
+   * The `--json` progress stream of a `read-bounded` run, when it carried bytes.
+   * Always `null` on the `no-tools` lane, whose stdout IS the answer.
+   */
+  eventsArtifact: string | null;
+  /**
    * The runner's own diagnostic file, written only when the agent's subprocess
    * failed to run (timeout, buffer overflow, missing command). A name, like the
    * two above — the bytes stay local, and they are kept out of both transcripts.
@@ -480,6 +935,17 @@ export interface ReconsiderationInvocationSummary {
   excerpts: number;
   unresolvedExcerpts: number;
   exitCode: number | null;
+  /**
+   * The agent was killed by this invocation's deadline (§12, issue #953).
+   *
+   * A separate fact from `exitCode`, deliberately: a timed-out child is reported
+   * by the runner as a spawn-level failure with whatever exit status it managed,
+   * so the two are indistinguishable from the code alone — and the sub-turn
+   * adapter routes a deadline as `timeout` rather than as a run that failed.
+   * False whenever the agent was never reached, which is the conservative
+   * direction: an invocation that never started did not run out of time.
+   */
+  timedOut: boolean;
   profile: ResolvedReconsiderationProfile | null;
   /** The bounded #838 record summary, or `null` when nothing was admitted. */
   record: ReconsiderationSummary | null;
@@ -731,11 +1197,13 @@ export function runReviewReconsideration(
     rawOutputBytes: 0,
     rawArtifact: null,
     stderrArtifact: null,
+    eventsArtifact: null,
     runnerErrorArtifact: null,
     recordArtifact: null,
     excerpts: 0,
     unresolvedExcerpts: 0,
     exitCode: null,
+    timedOut: false,
     profile: null,
     record: null,
     failure: null,
@@ -818,10 +1286,15 @@ export function runReviewReconsideration(
   const artifactDirStillSafe = (): boolean =>
     root === undefined || isSafeArtifactDirAfterRun(root, input.artifactDir);
 
-  // (3) The read-only invocation for the configured agent. Resolved before the
-  // checkout is touched: an agent this runner cannot invoke WITHOUT tools gets
-  // no turn at all, and nothing needs to be read to learn that.
-  const profileResult = resolveReconsiderationProfile(input.agentId, input.env ?? process.env);
+  // (3) The bounded invocation for the configured agent. Resolved before the
+  // checkout is touched: an agent this runner cannot invoke under a posture this
+  // session admits gets no turn at all, and nothing needs to be read to learn
+  // that. The D2 opt-in travels from the caller and defaults to absent, so the
+  // stricter answer is the one a caller gets by saying nothing.
+  const profileResult = resolveReconsiderationProfile(input.agentId, input.env ?? process.env, {
+    ...(input.readBounded === undefined ? {} : { readBounded: input.readBounded }),
+    ...(input.codex === undefined ? {} : { codex: input.codex }),
+  });
   if ("error" in profileResult) {
     return fail({ kind: "unsupported-agent", detail: input.agentId ?? "claude" });
   }
@@ -914,6 +1387,7 @@ export function runReviewReconsideration(
       profile,
       input.agentRunner ?? bothStreamsCommandRunner,
       input.env ?? process.env,
+      input.makeRunDir === undefined ? {} : { makeRunDir: input.makeRunDir },
     );
   // A runner reports a failed RUN as a nonzero exit code, but the steps before the
   // subprocess exists can still throw: the isolation sandbox is two `mkdtemp` calls,
@@ -952,9 +1426,20 @@ export function runReviewReconsideration(
         ? result.stderr.slice(0, result.stderr.length - spawnError.length)
         : "";
   const runnerErrorCapture = spawnError === null ? null : spawnErrorIsSuffix ? spawnError : result.stderr;
-  // The stream the PARSER reads: stdout when it said anything, stderr otherwise
-  // (an agent that printed its answer on the wrong stream still gets a turn).
-  const response = result.stdout.trim() !== "" ? result.stdout : agentStderr;
+  // Which channel this lane's answer arrives on (§17.7's response row for the
+  // `read-bounded` lane). Read from the resolved profile rather than inferred
+  // from what the process happened to produce: a `codex exec --json` run that
+  // wrote nothing to its output file has produced NO answer, and scraping its
+  // progress stream for one would admit a record the reviewer never issued.
+  const finalMessageLane = profile.responseChannel === "final-message";
+  // What the PARSER reads. On the stream lane: stdout when it said anything,
+  // stderr otherwise (an agent that printed its answer on the wrong stream still
+  // gets a turn). On the final-message lane: the file, and only the file.
+  const response = finalMessageLane
+    ? (result.finalMessage ?? "")
+    : result.stdout.trim() !== ""
+      ? result.stdout
+      : agentStderr;
 
   // (8) Raw capture BEFORE parsing, so a run that fails to admit anything still
   // leaves the transcript an operator needs to see why (§10.2, local-only).
@@ -973,14 +1458,41 @@ export function runReviewReconsideration(
   // So any non-empty stdout is the raw transcript and pushes a non-empty stderr
   // into its own file; only a truly empty stdout leaves stderr as the sole one,
   // where it is also `response` and the raw artifact already holds it.
-  const rawCapture = result.stdout !== "" ? result.stdout : agentStderr;
-  const stderrCapture = result.stdout !== "" && agentStderr !== "" ? agentStderr : null;
+  //
+  // On the `read-bounded` lane the three files mean the same things and are
+  // filled from different places, because the CLI separates them: the raw
+  // transcript is the FINAL MESSAGE (the reviewer's answer, verbatim), stderr is
+  // the CLI's own diagnostics whether or not the answer arrived, and the `--json`
+  // progress stream — which is agent output but is never the answer — gets a
+  // fourth file of its own rather than being passed off as either.
+  const rawCapture = finalMessageLane
+    ? (result.finalMessage ?? "")
+    : result.stdout !== ""
+      ? result.stdout
+      : agentStderr;
+  const eventsCapture = finalMessageLane && result.stdout !== "" ? result.stdout : null;
+  const eventsArtifact = eventsCapture === null ? null : reconsiderationEventsArtifactName(lineageId);
+  const stderrCapture = finalMessageLane
+    ? agentStderr !== ""
+      ? agentStderr
+      : null
+    : result.stdout !== "" && agentStderr !== ""
+      ? agentStderr
+      : null;
   const stderrArtifact = stderrCapture === null ? null : reconsiderationStderrArtifactName(lineageId);
   const runnerErrorArtifact =
     runnerErrorCapture === null ? null : reconsiderationRunnerErrorArtifactName(lineageId);
+  // The deadline fact, from the only layer that held the deadline. It travels on
+  // every summary built from here on, including the failure ones: a run killed
+  // at its deadline is routed as a `timeout` by the sub-turn adapter, and that
+  // routing must not depend on which of the failure paths below it took.
+  const timedOut = result.timedOut === true;
   // Re-validated here, not merely at (2b): the agent has run since.
   if (!artifactDirStillSafe()) {
-    return fail({ kind: "unsafe-artifact-dir", detail: "artifactDir" }, { ...summary, exitCode: result.exitCode });
+    return fail(
+      { kind: "unsafe-artifact-dir", detail: "artifactDir" },
+      { ...summary, exitCode: result.exitCode, timedOut },
+    );
   }
   // Which file the failure names, when one of the three cannot be written.
   let writing = rawArtifact;
@@ -990,24 +1502,58 @@ export function runReviewReconsideration(
       writing = stderrArtifact;
       writeArtifactFile(input.artifactDir, stderrArtifact, boundRawOutput(stderrCapture));
     }
+    if (eventsCapture !== null && eventsArtifact !== null) {
+      writing = eventsArtifact;
+      writeArtifactFile(input.artifactDir, eventsArtifact, boundRawOutput(eventsCapture));
+    }
     if (runnerErrorCapture !== null && runnerErrorArtifact !== null) {
       writing = runnerErrorArtifact;
       writeArtifactFile(input.artifactDir, runnerErrorArtifact, boundRawOutput(runnerErrorCapture));
     }
   } catch (err) {
-    return fail(writeFailure(err, writing), { ...summary, exitCode: result.exitCode });
+    return fail(writeFailure(err, writing), { ...summary, exitCode: result.exitCode, timedOut });
   }
   const withRaw: ReconsiderationInvocationSummary = {
     ...summary,
     exitCode: result.exitCode,
+    timedOut,
     rawOutputBytes: Buffer.byteLength(rawCapture, "utf8"),
     rawArtifact,
     stderrArtifact,
+    eventsArtifact,
     runnerErrorArtifact,
   };
 
   if (result.exitCode !== 0) {
+    // A build that refused a flag this lane pins exited nonzero having run
+    // nothing, and reporting that as an agent failure would send an operator
+    // looking for a turn that never started. Only asked of a run that was not
+    // killed by the deadline: a timed-out child's stderr says nothing about
+    // argument parsing, and #953's classification owns that case.
+    if (finalMessageLane && !timedOut) {
+      const refused = codexRefusedCapability(result.stderr, RECONSIDERATION_READ_BOUNDED_PINNED_FLAGS);
+      if (refused !== null) {
+        return fail({ kind: "unsupported-capability", detail: refused }, withRaw);
+      }
+    }
     return fail({ kind: "agent-failed", detail: `exit:${result.exitCode}` }, withRaw);
+  }
+  if (finalMessageLane) {
+    // A run that exited zero and wrote nothing where its argv said to has not
+    // produced a reconsideration, whatever it printed on the way. Each of these
+    // is its own operational fact and none of them is a decision.
+    if (result.finalMessageFailure === "stale") {
+      return fail({ kind: "stale-output", detail: null }, withRaw);
+    }
+    if (result.finalMessageFailure === "too-large") {
+      return fail(
+        { kind: "oversized-output", detail: `bound:${MAX_RECONSIDERATION_RESPONSE_BYTES}` },
+        withRaw,
+      );
+    }
+    if (result.finalMessage === null || result.finalMessage === undefined) {
+      return fail({ kind: "missing-output", detail: "--output-last-message" }, withRaw);
+    }
   }
   if (response.trim() === "") {
     return fail({ kind: "empty-output", detail: null }, withRaw);

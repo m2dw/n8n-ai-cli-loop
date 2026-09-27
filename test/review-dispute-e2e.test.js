@@ -18,12 +18,16 @@
  *  - **No agents, no network.** The handlers are fakes that return an
  *    already-computed application. Nothing spawns a CLI, calls GitHub or Slack,
  *    or touches the network.
- *  - **No manual SQLite edits.** Where a lifecycle cannot continue on its own,
- *    it is continued through the same supported store port `admin recover
- *    --from ready_for_human` uses, and the park it resumes from is asserted
- *    first. That park is not a defect in the test: §7.1's reviewer, evidence,
- *    and runner turns have no dispatcher in this codebase yet (contract §15 G2),
- *    so an operator continuation is what the rollout actually looks like today.
+ *  - **No manual SQLite edits.** This suite's handlers are fakes, so a lifecycle
+ *    that the REAL review phase would carry on its own stops here instead; it is
+ *    continued through the same supported store port `admin recover --from
+ *    ready_for_human` uses, and the park it resumes from is asserted first. That
+ *    continuation is a property of THIS driver, not of the protocol: since
+ *    issues #952, #955 and #964 the review phase dispatches every §7.1 turn as
+ *    an internal sub-turn, and `test/review-dispute-qualification.test.js`
+ *    (issue #965) is where that is driven end to end through the real handlers.
+ *    A turn that routes on its own arrives already queued, which `resume` treats
+ *    as the no-op it is.
  *  - **Human escalations stop.** A scenario that escalates is complete when it
  *    parks at `ready_for_human` with the documented reason and `admin dispute
  *    status` reports no authorized action. None of them is nudged onwards.
@@ -426,15 +430,28 @@ async function step(h, { decide, runId, actor = 'implementer', handlerContext = 
 
 /**
  * Continue a task the runner parked because §7.1 named a turn it cannot
- * dispatch (contract §15 G2).
+ * dispatch (contract §15 G2), or hand a task that §7.1 routed itself to the
+ * phase a scenario re-runs it from.
  *
  * This is the SUPPORTED operator path — the same store port `admin recover
- * --from ready_for_human --phase <p>` calls — not a hand edit. Callers assert
- * the park and its reason BEFORE resuming, so a scenario can never silently
- * paper over a stop that should have ended it.
+ * --from <status> --phase <p>` calls — not a hand edit. Callers assert the park
+ * and its reason BEFORE resuming, so a scenario can never silently paper over a
+ * stop that should have ended it.
  */
 async function resume(h, phase) {
   const before = await h.store.getTask(KEY);
+  // A turn §7.1 can route on its own needs no operator: since issue #952 the
+  // reviewer turn is one of those, so the task arrives already queued at the
+  // phase that takes it and this call is a no-op. Every other stop is still the
+  // §9 park an operator recovers from.
+  if (before.status === 'queued') {
+    if (before.phase === phase) return before;
+    // A routed task a scenario deliberately re-runs from another phase (the
+    // duplicate-delivery hazards below): the same store port, from `queued`.
+    const moved = await h.store.recoverHandoff(KEY, { fromStatus: 'queued', phase, now: NOW });
+    expect(moved.ok).toBe(true);
+    return moved.value;
+  }
   expect(before.status).toBe('ready_for_human');
   const result = await h.store.recoverHandoff(KEY, { fromStatus: 'ready_for_human', phase, now: NOW });
   expect(result.ok).toBe(true);
@@ -510,10 +527,12 @@ describe.each(BACKENDS)('review-dispute lifecycles ($name)', ({ create }) => {
       decide: (c) => dispositionsDecision(c, [disputeRecord(LINEAGE_A)], { runId: 'run-impl-1' }),
     });
     expect(blockOf(task).lineages[LINEAGE_A].state).toBe('disputed');
-    // §7.1 rule 2 names the reviewer turn; this codebase cannot dispatch it, so
-    // the task parks rather than handing a `disputed` lineage to a run that
-    // could not discharge it.
-    expect(task.status).toBe('ready_for_human');
+    // §7.1 rule 2 names the reviewer turn, and since issue #952 the review phase
+    // dispatches that reconsideration as an internal sub-turn before it builds an
+    // ordinary review prompt — so the task is queued to `review` rather than
+    // parked, and a `disputed` lineage still never reaches the review agent.
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('review');
     return task;
   }
 
@@ -563,8 +582,11 @@ describe.each(BACKENDS)('review-dispute lifecycles ($name)', ({ create }) => {
       decide: (c) => reconsiderationDecision(c, LINEAGE_A, 'uphold'),
     });
     expect(blockOf(upheld.task).lineages[LINEAGE_A].state).toBe('arbitration_pending');
-    // The runner turn advances arbitration; it too has no dispatcher yet.
-    expect(upheld.task.status).toBe('ready_for_human');
+    // The runner turn advances arbitration, and since issue #955 it has a
+    // dispatcher: the review phase takes it as an internal sub-turn, so §7.1
+    // routes the task back to `review` instead of parking it for a human.
+    expect(upheld.task.status).toBe('queued');
+    expect(upheld.task.phase).toBe('review');
 
     await resume(h, 'review');
     const arbitrated = await step(h, {
@@ -698,7 +720,10 @@ describe.each(BACKENDS)('review-dispute lifecycles ($name)', ({ create }) => {
     expect(l.affectedBoundary).toBe(BOUNDARY);
     const events = await transitionEvents(h);
     expect(events[events.length - 1].data.applied[0]).toMatchObject({ row: 12, auditEvent, versionAfter: 1 });
-    expect(task.status).toBe('ready_for_human');
+    // §7.1's runner turn, dispatched since issue #955: back to `review`, where
+    // the arbitration sub-turn runs before any ordinary review work.
+    expect(task.status).toBe('queued');
+    expect(task.phase).toBe('review');
   });
 
   // --- scenario 6 ---------------------------------------------------------
@@ -720,7 +745,10 @@ describe.each(BACKENDS)('review-dispute lifecycles ($name)', ({ create }) => {
         verdictDecision(c, LINEAGE_A, { verdict: 'insufficient_evidence', confidence: 0.8, runId: 'run-arb-3' }),
     });
     expect(blockOf(requested.task).lineages[LINEAGE_A].state).toBe('evidence_requested');
-    expect(requested.task.status).toBe('ready_for_human');
+    // Since issue #964 the evidence turn routes on its own: the task arrives
+    // queued at the review phase, whose gate dispatches the party runs.
+    expect(requested.task.status).toBe('queued');
+    expect(requested.task.phase).toBe('review');
 
     await resume(h, 'review');
     const collected = await step(h, {
@@ -894,13 +922,29 @@ describe.each(BACKENDS)('review-dispute lifecycles ($name)', ({ create }) => {
       await expectParked(task, { state: 'escalated_human', reason: 'lineage_escalated_human' });
     });
 
-    test('an undispatchable turn is reported as its own stop reason, not as an escalation', async () => {
-      const task = await openDispute();
+    test('an insufficient_evidence verdict with the round available returns the task to review', async () => {
+      // The EVIDENCE turn: row 16 leaves the lineage in `evidence_requested`,
+      // and since issue #964 the two per-party collection runs are internal
+      // sub-turns of the review phase — so the completion queues review for the
+      // first party's run instead of parking. (The reviewer turn was this
+      // test's park fixture until issue #952 gave it a dispatcher, the runner
+      // turn until issue #955, and the evidence turn until issue #964 closed
+      // the set — see `untilArbitration`.)
+      await untilArbitration();
+      const { task } = await step(h, {
+        runId: 'run-arb-3',
+        actor: 'arbiter',
+        decide: (c) =>
+          verdictDecision(c, LINEAGE_A, { verdict: 'insufficient_evidence', confidence: 0.8, runId: 'run-arb-3' }),
+      });
       const summary = summarizeDisputeStatus(task, await h.store.listEvents(KEY));
-      expect(blockOf(task).lineages[LINEAGE_A].state).toBe('disputed');
-      expect(summary.routing.undispatchedTurn).toBe('reviewer');
-      expect(summary.nextAction.authorized).toBe(false);
-      expect(summary.nextAction.reason).toBe('undispatched_turn');
+      expect(blockOf(task).lineages[LINEAGE_A].state).toBe('evidence_requested');
+      expect(task.status).toBe('queued');
+      expect(task.phase).toBe('review');
+      // The turn has a dispatcher, so no undispatched-turn stop is reported
+      // (the summary reads the persisted event back as `null`, never a turn).
+      expect(summary.routing.undispatchedTurn).toBeNull();
+      expect(summary.nextAction.reason).not.toBe('undispatched_turn');
     });
   });
 
@@ -999,9 +1043,10 @@ describe.each(BACKENDS)('review-dispute lifecycles ($name)', ({ create }) => {
 
       const task = second.task;
       expect(blockOf(task)).toEqual(firstBlock);
-      // The retry re-parks the task identically rather than slipping past the
-      // reviewer turn this time.
-      expect(task.status).toBe('ready_for_human');
+      // The retry re-routes the task identically — to the reviewer turn's own
+      // destination — rather than slipping past that turn this time.
+      expect(task.status).toBe('queued');
+      expect(task.phase).toBe('review');
       // One transition event, not two: the replay short-circuits the write.
       expect(await transitionEvents(h)).toHaveLength(1);
       const metrics = aggregateDisputeMetrics({

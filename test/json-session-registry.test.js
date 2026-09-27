@@ -312,6 +312,52 @@ describe('JsonSessionRegistry', () => {
       });
       expectInvalidEntry(/reviewDispute\.limit is not a known review-dispute setting/);
     });
+
+    // Issue #1085: the §17.6 D2 opt-in is the one setting whose misspelling
+    // would silently leave the weaker posture unadmitted — the same
+    // configured-but-inert failure the checks above exist to surface, and here
+    // with an operator decision behind it.
+    test('accepts the reconsideration opt-in and rejects a misspelling or a non-boolean', async () => {
+      writeSessions({
+        ...SESSION_A,
+        reviewDispute: { enabled: true, reconsideration: { readBounded: true } },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.reviewDispute.reconsideration).toEqual({ readBounded: true });
+
+      writeSessions({
+        ...SESSION_A,
+        reviewDispute: { enabled: true, reconsideration: { readbounded: true } },
+      });
+      expectInvalidEntry(/reviewDispute\.reconsideration\.readbounded is not a known reconsideration setting/);
+
+      writeSessions({
+        ...SESSION_A,
+        reviewDispute: { enabled: true, reconsideration: { readBounded: 'true' } },
+      });
+      expectInvalidEntry(/reviewDispute\.reconsideration\.readBounded must be a boolean/);
+    });
+
+    // Issue #1085 review, P2: the block is nested, so a resolved session that
+    // aliased the registry's cached copy would let a local write turn the D2
+    // opt-in on for every LATER read — an opt-in the operator declared `false`
+    // in the file, flipped by a caller that never touched the file.
+    test('does not share the reconsideration block between resolved sessions', async () => {
+      writeSessions({
+        ...SESSION_A,
+        reviewDispute: { enabled: true, reconsideration: { readBounded: false } },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const first = await registry.getSessionById('addon-dev');
+      expect(first.reviewDispute.reconsideration.readBounded).toBe(false);
+
+      first.reviewDispute.reconsideration.readBounded = true;
+
+      const second = await registry.getSessionById('addon-dev');
+      expect(second.reviewDispute.reconsideration.readBounded).toBe(false);
+      expect(second.reviewDispute.reconsideration).not.toBe(first.reviewDispute.reconsideration);
+    });
   });
 
   describe('dependencySync configuration', () => {
@@ -946,6 +992,77 @@ describe('JsonSessionRegistry', () => {
       s1.claude.complexityProfiles.xhigh.model = 'mutated';
       const s2 = await registry.getSessionById('addon-dev');
       expect(s2.claude.complexityProfiles.xhigh.model).toBe('claude-fable-5');
+    });
+  });
+
+  // docs/agent-runtime-profiles-contract.md §9.1: sessions.json carries the
+  // *selection*, and the profile catalog itself never lives here.
+  describe('agentRuntime quality selection (issue #905)', () => {
+    test('agentRuntime is undefined when not configured', async () => {
+      writeSessions(SESSION_A);
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.agentRuntime).toBeUndefined();
+    });
+
+    test('accepts each of the four provider-neutral levels', async () => {
+      for (const defaultQuality of ['light', 'normal', 'strong', 'maximum']) {
+        writeSessions({ ...SESSION_A, agentRuntime: { defaultQuality } });
+        const registry = new JsonSessionRegistry(jsonPath);
+        const session = await registry.getSessionById('addon-dev');
+        expect(session.agentRuntime).toEqual({ defaultQuality });
+      }
+    });
+
+    test('rejects a provider effort value in place of a level', () => {
+      writeSessions({ ...SESSION_A, agentRuntime: { defaultQuality: 'xhigh' } });
+      expectInvalidEntry(/agentRuntime\.defaultQuality must be one of: light, normal, strong, maximum/);
+    });
+
+    test('accepts profilesPath now that the write-capable cutover reads it (issue #911)', async () => {
+      writeSessions({ ...SESSION_A, agentRuntime: { profilesPath: '/cfg/agent-profiles.json' } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.agentRuntime).toEqual({ profilesPath: '/cfg/agent-profiles.json' });
+    });
+
+    test('accepts per-agent profile pins (issue #911, §8.1 layer 3)', async () => {
+      writeSessions({ ...SESSION_A, agentRuntime: { pins: { claude: 'claude-strong' } } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.agentRuntime).toEqual({ pins: { claude: 'claude-strong' } });
+    });
+
+    test('rejects an empty pins record: an explicit block that pins nothing is a mistake', () => {
+      writeSessions({ ...SESSION_A, agentRuntime: { pins: {} } });
+      expectInvalidEntry(/agentRuntime\.pins pins nothing/);
+    });
+
+    test('rejects a pin whose profile name is not a string', () => {
+      writeSessions({ ...SESSION_A, agentRuntime: { pins: { claude: 7 } } });
+      expectInvalidEntry(/agentRuntime\.pins\.claude/);
+    });
+
+    test('rejects a setting this build does not read', () => {
+      // Fail closed rather than accept-and-ignore: an operator who writes a
+      // setting learns immediately whether this build honors it. A model name
+      // here is the §9.1 split violation — models live in the profile catalog.
+      writeSessions({ ...SESSION_A, agentRuntime: { model: 'opus' } });
+      expectInvalidEntry(/agentRuntime\.model is not a recognized agentRuntime setting/);
+    });
+
+    test('rejects a catalog inlined into sessions.json', () => {
+      writeSessions({ ...SESSION_A, providers: { anthropic: { profiles: {} } } });
+      expectInvalidEntry(/providers is not a session key: the agent runtime profile catalog lives in/);
+    });
+
+    test('resolved agentRuntime config is an independent copy (no aliasing)', async () => {
+      writeSessions({ ...SESSION_A, agentRuntime: { defaultQuality: 'strong' } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const s1 = await registry.getSessionById('addon-dev');
+      s1.agentRuntime.defaultQuality = 'light';
+      const s2 = await registry.getSessionById('addon-dev');
+      expect(s2.agentRuntime.defaultQuality).toBe('strong');
     });
   });
 
@@ -1688,6 +1805,127 @@ describe('JsonSessionRegistry', () => {
       s1.audit.acknowledge['verification-commands'] = 'mutated';
       const s2 = await registry.getSessionById('addon-dev');
       expect(s2.audit.acknowledge).toEqual({ 'verification-commands': 'why' });
+    });
+  });
+
+  describe('reviewLoop configuration (issue #1090)', () => {
+    test('accepts a verificationTimeoutMs override alongside maxCycles', async () => {
+      writeSessions({ ...SESSION_A, reviewLoop: { maxCycles: 2, verificationTimeoutMs: 45_000 } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.reviewLoop).toEqual({ maxCycles: 2, verificationTimeoutMs: 45_000 });
+    });
+
+    test('verificationTimeoutMs is undefined when not configured', async () => {
+      writeSessions({ ...SESSION_A, reviewLoop: { maxCycles: 2 } });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.reviewLoop.verificationTimeoutMs).toBeUndefined();
+    });
+
+    test('rejects a non-integer verificationTimeoutMs', () => {
+      writeSessions({ ...SESSION_A, reviewLoop: { verificationTimeoutMs: 1.5 } });
+      expectInvalidEntry(/reviewLoop\.verificationTimeoutMs must be a positive integer/);
+    });
+
+    test('rejects a zero verificationTimeoutMs', () => {
+      writeSessions({ ...SESSION_A, reviewLoop: { verificationTimeoutMs: 0 } });
+      expectInvalidEntry(/reviewLoop\.verificationTimeoutMs must be a positive integer/);
+    });
+  });
+
+  describe('stagedVerification configuration (issue #1097)', () => {
+    test('loads a valid staged block', async () => {
+      writeSessions({
+        ...SESSION_A,
+        stagedVerification: {
+          enabled: true,
+          environmentIdentity: 'node20-macos-arm64',
+          testSuite: { test: { adapter: 'jest', argumentSeparator: '--' } },
+        },
+      });
+      const registry = new JsonSessionRegistry(jsonPath);
+      const session = await registry.getSessionById('addon-dev');
+      expect(session.stagedVerification).toEqual({
+        enabled: true,
+        environmentIdentity: 'node20-macos-arm64',
+        testSuite: { test: { adapter: 'jest', argumentSeparator: '--' } },
+      });
+    });
+
+    // Issue #1155 removed the group-selection settings from the closed field
+    // set with the policy they configured. There is no migration and no
+    // deprecation notice: the session does not load, and the operator removes
+    // the setting.
+    test('a retired group-selection setting refuses the session', () => {
+      writeSessions({
+        ...SESSION_A,
+        stagedVerification: {
+          enabled: true,
+          testSuite: { test: { adapter: 'jest' } },
+          resultAdapters: { jest: 'npx jest --json' },
+        },
+      });
+      expectInvalidEntry(
+        /sessions\[0\]\.stagedVerification\.resultAdapters is not a known stagedVerification setting/,
+      );
+    });
+
+    // Issue #1152 (docs/changed-file-verification-contract.md §6 rule 5).
+    test('an enabled block without a suite binding refuses the session', () => {
+      writeSessions({ ...SESSION_A, stagedVerification: { enabled: true } });
+      expectInvalidEntry(/sessions\[0\]\.stagedVerification\.testSuite is required/);
+    });
+
+    // A `stagedVerification` block written as raw text, so a duplicate key
+    // survives to the loader — `JSON.stringify` could never produce one.
+    const writeRawStagedVerification = (rawBlock) => {
+      const base = JSON.stringify(SESSION_A).slice(0, -1);
+      writeFileSync(jsonPath, `{"sessions":[${base},"stagedVerification":${rawBlock}}]}`, 'utf8');
+    };
+
+    test('a literally duplicated suite binding key refuses rather than collapsing into one', () => {
+      // `JSON.parse` keeps the last of two identical keys and drops the first
+      // silently, so the refusal has to be made over the file's text —
+      // otherwise two identical keys would parse into one binding, hiding that
+      // the operator wrote two.
+      writeRawStagedVerification(
+        '{"testSuite":{"test":{"adapter":"jest"},"test":{"adapter":"jest","setupCommand":"npm run build"}}}',
+      );
+      expectInvalidEntry(
+        /sessions\[0\]\.stagedVerification\.testSuite must name exactly one session\.verification key; it declares "test" twice/,
+      );
+    });
+
+    test('an escaped spelling of a duplicated suite binding key still refuses', () => {
+      writeRawStagedVerification(
+        '{"testSuite":{"test":{"adapter":"jest"},"\\u0074est":{"adapter":"jest"}}}',
+      );
+      expectInvalidEntry(
+        /sessions\[0\]\.stagedVerification\.testSuite must name exactly one session\.verification key; it declares "test" twice/,
+      );
+    });
+
+    test('a duplicated testSuite property refuses rather than keeping the last block', () => {
+      // The collapse also happens one level up: two `testSuite` properties in
+      // the same `stagedVerification` object leave only the last binding, so
+      // the whole first binding disappears with no trace in the parsed value.
+      writeRawStagedVerification(
+        '{"testSuite":{"test":{"adapter":"jest"}},"testSuite":{"e2e":{"adapter":"jest"}}}',
+      );
+      expectInvalidEntry(
+        /sessions\[0\]\.stagedVerification must declare the suite binding once; it declares "testSuite" twice/,
+      );
+    });
+
+    test('the same suite binding key in two different sessions is not a duplicate', async () => {
+      writeSessions(
+        { ...SESSION_A, stagedVerification: { testSuite: { test: { adapter: 'jest' } } } },
+        { ...SESSION_B, stagedVerification: { testSuite: { test: { adapter: 'jest' } } } },
+      );
+      const registry = new JsonSessionRegistry(jsonPath);
+      expect(registry.getDiagnostics()).toEqual([]);
+      expect(await registry.listSessions()).toHaveLength(2);
     });
   });
 });

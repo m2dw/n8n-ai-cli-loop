@@ -88,21 +88,34 @@ export interface AgentCommandOutput {
 
 /**
  * Provenance of the invocation itself, threaded in by the caller alongside
- * the raw command output. Some agent CLIs (Gemini/Antigravity via
- * `ANTIGRAVITY_BIN`) can be pointed at an operator-supplied executable path
- * instead of the vetted CLI binary. When that override is in effect, this
- * module has no way to show that a given invocation's stderr originated from
- * the provider CLI's own diagnostic output rather than a wrapper script's own
- * errors or its relayed/echoed subprocess output — the same provenance gap
- * the contract already closes off for a verbose/debug mode that echoes the
- * agent transcript to stderr (docs/phase-contracts.md "Stderr: a bounded,
- * provider-owned diagnostic channel"). `cmdSource: "env"` therefore withholds
- * trust from stderr for that invocation; `"cli-default"` (or omitting the
- * option entirely, for adapters with no override mechanism) trusts it as
- * before.
+ * the raw command output. Any agent CLI here can be pointed at an
+ * operator-supplied executable path instead of the vetted CLI binary — via an
+ * environment override (e.g. `ANTIGRAVITY_BIN`) or an `agent-profiles.json`
+ * overlay that sets `binary` (issue #911). When such an override is in
+ * effect, this module has no way to show that a given invocation's stderr
+ * originated from the provider CLI's own diagnostic output rather than a
+ * wrapper script's own errors or its relayed/echoed subprocess output — the
+ * same provenance gap the contract already closes off for a verbose/debug
+ * mode that echoes the agent transcript to stderr (docs/phase-contracts.md
+ * "Stderr: a bounded, provider-owned diagnostic channel"). `cmdSource: "env"`
+ * and `"catalog-overlay"` therefore withhold trust from stderr for that
+ * invocation, in every adapter below; `"cli-default"`, `"catalog-builtin"`
+ * (no built-in profile names a binary), or omitting the option entirely
+ * trusts it as before.
  */
 export interface AgentDiagnosticOptions {
-  cmdSource?: "env" | "cli-default";
+  cmdSource?: "env" | "cli-default" | "catalog-builtin" | "catalog-overlay";
+}
+
+/**
+ * True when the invocation's binary cannot be shown to be the vetted provider
+ * CLI (see {@link AgentDiagnosticOptions}): an operator-supplied executable's
+ * stderr is not provably the provider's own diagnostic output, so every
+ * adapter below yields no diagnostic for such an invocation rather than
+ * classifying it.
+ */
+function binaryProvenanceUntrusted(options?: AgentDiagnosticOptions): boolean {
+  return options?.cmdSource === "env" || options?.cmdSource === "catalog-overlay";
 }
 
 /**
@@ -125,20 +138,34 @@ function stderrDiagnostic(
 /**
  * Claude CLI adapter. The Claude CLI invocations in this codebase
  * (`claude -p ...`) do not currently request a structured/JSON output mode,
- * so this falls back to the bounded stderr channel. If a future invocation
- * adds a documented machine-readable error surface, extend this adapter to
- * prefer it over the stderr fallback (see the module contract above).
+ * so this falls back to the bounded stderr channel — but only when the
+ * invocation actually ran the vetted `claude` binary: an `agent-profiles.json`
+ * overlay (or an env override) can substitute an operator-supplied executable
+ * (issue #911), whose stderr is not provably the provider CLI's own
+ * diagnostic output, so those invocations yield no diagnostic. If a future
+ * invocation adds a documented machine-readable error surface, extend this
+ * adapter to prefer it over the stderr fallback (see the module contract
+ * above).
  */
-export function extractClaudeDiagnostic(result: AgentCommandOutput): AgentFailureDiagnostic | undefined {
+export function extractClaudeDiagnostic(
+  result: AgentCommandOutput,
+  options?: AgentDiagnosticOptions,
+): AgentFailureDiagnostic | undefined {
+  if (binaryProvenanceUntrusted(options)) return undefined;
   return stderrDiagnostic("claude", result);
 }
 
 /**
  * Codex CLI adapter. Same rationale as Claude above: the `codex review`
  * invocation used by this codebase does not request structured output, so
- * classification falls back to the bounded stderr channel.
+ * classification falls back to the bounded stderr channel, withheld the same
+ * way when the binary was operator-overridden.
  */
-export function extractCodexDiagnostic(result: AgentCommandOutput): AgentFailureDiagnostic | undefined {
+export function extractCodexDiagnostic(
+  result: AgentCommandOutput,
+  options?: AgentDiagnosticOptions,
+): AgentFailureDiagnostic | undefined {
+  if (binaryProvenanceUntrusted(options)) return undefined;
   return stderrDiagnostic("codex", result);
 }
 
@@ -147,17 +174,17 @@ export function extractCodexDiagnostic(result: AgentCommandOutput): AgentFailure
  * request structured output, so classification falls back to the bounded
  * stderr channel — but only when the invocation actually ran the vetted `agy`
  * binary. When the caller reports `cmdSource: "env"` (the operator pointed
- * `ANTIGRAVITY_BIN` at a different executable), that process's stderr is not
- * provably the provider CLI's own diagnostic output — it could be a wrapper
- * script's own errors, or content the wrapper relays/echoes from elsewhere —
- * so this adapter withholds trust and yields no diagnostic rather than
- * classifying it.
+ * `ANTIGRAVITY_BIN` at a different executable) or `"catalog-overlay"`, that
+ * process's stderr is not provably the provider CLI's own diagnostic output —
+ * it could be a wrapper script's own errors, or content the wrapper
+ * relays/echoes from elsewhere — so this adapter withholds trust and yields
+ * no diagnostic rather than classifying it.
  */
 export function extractGeminiDiagnostic(
   result: AgentCommandOutput,
   options?: AgentDiagnosticOptions,
 ): AgentFailureDiagnostic | undefined {
-  if (options?.cmdSource === "env") return undefined;
+  if (binaryProvenanceUntrusted(options)) return undefined;
   return stderrDiagnostic("gemini", result);
 }
 

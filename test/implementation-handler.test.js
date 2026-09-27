@@ -5,8 +5,9 @@ import { execFileSync } from 'child_process';
 import { createImplementationHandler as _createImplementationHandler } from '../dist/handlers/implementation.js';
 import { resolveIssueWorktree, canonicalizePath } from '../dist/handlers/worktree.js';
 import { issueWorktreePath } from '../dist/core/worktree-paths.js';
-import { SqliteTaskStore, runNextPhase, TOOL_REQUEST_OPEN, TOOL_REQUEST_CLOSE, applyTaskPatch, IssueWorktreeLock } from '../dist/index.js';
+import { SqliteTaskStore, runNextPhase, TOOL_REQUEST_OPEN, TOOL_REQUEST_CLOSE, applyTaskPatch, IssueWorktreeLock, deriveStageSelectionDigest, stageRunKey } from '../dist/index.js';
 import { emptyReviewDisputeContext } from '../dist/core/review-dispute.js';
+import { planFinalStageRepair } from '../dist/core/final-stage-repair.js';
 import { DEFAULT_MAX_VERIFICATION_REPAIR_CYCLES } from '../dist/core/implementation-verification.js';
 import { MAX_TRANSIENT_VERIFICATION_RETRIES } from '../dist/core/review-classifier.js';
 import { CLI_PROBE_INDETERMINATE_MARKER } from '../dist/core/cli-probe.js';
@@ -579,15 +580,19 @@ describe('implementation handler — command execution', () => {
     expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('20');
   });
 
-  test('session claude.complexityProfiles override retargets the xhigh model', async () => {
+  test('session claude.complexityProfiles is no longer read by the cut-over lane (issue #911, §10.4)', async () => {
+    // Pre-cutover this override retargeted the xhigh model; the write-capable
+    // cutover deleted the per-lane chain, so the catalog's own binding runs and
+    // the override is expressed as an agent-profiles.json overlay instead.
     const runner = happyRunner();
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:claude', 'status:needs-implementation', 'complexity:xhigh'] } });
     const context = CONTEXT({ session: SESSION({ claude: { complexityProfiles: { xhigh: { model: 'claude-fable-5' } } } }) });
     await createImplementationHandler(context, runner)(task);
     const { args } = runner.calls[CLAUDE_IDX];
-    expect(args[args.indexOf('--model') + 1]).toBe('claude-fable-5');
+    expect(args[args.indexOf('--model') + 1]).toBe('fable');
     expect(args[args.indexOf('--effort') + 1]).toBe('xhigh');
     expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('20');
+    expect(args).not.toContain('claude-fable-5');
   });
 
   test('Claude CLI rejecting an unavailable/unauthenticated Fable 5 model fails closed with the CLI error and no fallback', async () => {
@@ -655,7 +660,7 @@ describe('implementation handler — command execution', () => {
     expect(args[args.indexOf('--effort') + 1]).toBe('high');
   });
 
-  test('escalatedEffort is ignored when label effort is already high', async () => {
+  test('escalatedEffort on the unlabeled default resolves the whole strong profile (issue #911, §10.4)', async () => {
     const runner = happyRunner();
     const task = makeTask({
       context: {
@@ -666,8 +671,12 @@ describe('implementation handler — command execution', () => {
     });
     await createImplementationHandler(CONTEXT(), runner)(task);
     const { args } = runner.calls[CLAUDE_IDX];
-    // effort is already high from label defaults — escalation is a no-op
+    // The escalation handoff is a quality floor of `strong` since the cutover:
+    // the run resolves that binding's whole profile (opus/high/$10), not a raw
+    // effort raise over the default sonnet/high/$5 — the documented §10.4 change.
     expect(args[args.indexOf('--effort') + 1]).toBe('high');
+    expect(args[args.indexOf('--model') + 1]).toBe('opus');
+    expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('10');
   });
 
   test('escalatedEffort is a no-op on complexity:xhigh (already at the top rank)', async () => {
@@ -5071,6 +5080,17 @@ describe('implementation handler — phase transition', () => {
 describe('run-one-phase CLI — implementation gating', () => {
   let sessionsPath;
   let dbPath;
+  // The per-issue worktree lock these CLI runs take (run-one-phase's
+  // `acquireIssuePhaseLock`) is the one store addressed by neither `--db-path`
+  // nor `--sessions-path`: `IssueWorktreeLock` falls back to
+  // `$HOME/.local/state/n8n-ai-cli-loop/worktree-locks`. The suite-wide isolated
+  // HOME (test/helpers/test-home.js, issue #1063) already keeps that off the
+  // operator's machine, but it is shared by every concurrently running worker,
+  // and these fixtures use fixed scopes (`addon-dev::issue-101`). A HOME inside
+  // this test's own `tmpDir` makes the lock dir private to the test and disposed
+  // of with it, so no run can be contended by — or leak a lock to — another.
+  let homeDir;
+  let lockDir;
 
   const SESSION_OBJ = {
     sessionId: 'addon-dev',
@@ -5094,6 +5114,10 @@ describe('run-one-phase CLI — implementation gating', () => {
         encoding: 'utf8',
         env: {
           ...process.env,
+          // Both spellings: the child resolves its home the way Node does, and
+          // that is USERPROFILE on Windows (see src/core/home-dir.ts).
+          HOME: homeDir,
+          USERPROFILE: homeDir,
           ANTIGRAVITY_BIN: join(tmpDir, 'fake-agy'),
           PATH: `${join(tmpDir, 'bin')}:${process.env.PATH}`,
           ...envOverride,
@@ -5108,6 +5132,13 @@ describe('run-one-phase CLI — implementation gating', () => {
   beforeEach(() => {
     sessionsPath = join(tmpDir, 'sessions.json');
     dbPath = join(tmpDir, 'cli.db');
+    // See the `homeDir` declaration above: this is where the CLI's DEFAULT
+    // worktree-lock directory lands, so the default wiring is still the code
+    // path under test — it just cannot see, or be seen by, anything outside
+    // this test.
+    homeDir = join(tmpDir, 'home');
+    lockDir = join(homeDir, '.local', 'state', 'n8n-ai-cli-loop', 'worktree-locks');
+    mkdirSync(homeDir, { recursive: true });
     const binDir = join(tmpDir, 'bin');
     mkdirSync(binDir, { recursive: true });
     // The canonical checkout must exist on disk before the CLI runs: every
@@ -5216,12 +5247,13 @@ describe('run-one-phase CLI — implementation gating', () => {
     });
     store.close();
 
-    // This CLI run acquires the SAME default (production) issue worktree lock
-    // used outside this test's tmpDir (see the "serializes the SAME issue"
-    // test below for why). Force-clear any lock a prior crashed run left
-    // behind on this scope so a fresh acquire here is not spuriously
-    // contended.
-    new IssueWorktreeLock().forceRelease('addon-dev', 101);
+    // This CLI run takes the issue worktree lock through its DEFAULT wiring
+    // (no `--lock-dir`), which `runCli`'s per-test HOME puts inside `tmpDir`.
+    // Nothing has to be force-released first: the directory is created fresh
+    // for this test, so `addon-dev::issue-101` cannot already be held by a
+    // crashed earlier run — or by the operator (issue #1063; this fixture used
+    // to clear the real `~/.local/state/...` lock of that scope).
+    expect(new IssueWorktreeLock(lockDir).inspect('addon-dev', 101).locked).toBe(false);
 
     const r = runCli(
       '--session-id', 'addon-dev', '--run-id', 'r2',
@@ -5261,29 +5293,21 @@ describe('run-one-phase CLI — implementation gating', () => {
 
     // A concurrent run already owns this issue's worktree lock — the same
     // *default* lock store `run-one-phase.ts` uses in production (no
-    // `--lock-dir` override is exercised here or below). That default
-    // resolves under `~/.local/state/...`, which is unwritable in
-    // restricted/hermetic test environments (issue #732 review, P1), so
-    // point `HOME` at a writable directory inside this test's own tmpDir for
-    // both this process's lock object and the CLI child process below —
-    // both then resolve `DEFAULT_WORKTREE_LOCK_DIR` to the SAME isolated
-    // directory, still exercising the real default-wiring code path. Force-
-    // clear any lock a prior crashed run left behind on this scope before
-    // asserting a fresh acquire succeeds — and do the acquire itself inside
-    // the try so a failed assertion still runs the `finally` release below
-    // instead of leaking the lock for the 24h TTL.
-    const isolatedHome = join(tmpDir, 'home');
-    mkdirSync(isolatedHome, { recursive: true });
-    const isolatedLockDir = join(isolatedHome, '.local', 'state', 'n8n-ai-cli-loop', 'worktree-locks');
-    const lock = new IssueWorktreeLock(isolatedLockDir);
-    lock.forceRelease('addon-dev', 103);
+    // `--lock-dir` override is exercised here or below). `runCli` hands the
+    // child the per-test HOME, so its `DEFAULT_WORKTREE_LOCK_DIR` resolves to
+    // the SAME `lockDir` this lock object is pointed at, still exercising the
+    // real default wiring. The lock object needs `lockDir` passed explicitly
+    // because this process captured its own default at import time, before the
+    // per-test HOME existed. The acquire is inside the `try` so a failed
+    // assertion still runs the `finally` release instead of leaking the lock
+    // for the 24h stale TTL.
+    const lock = new IssueWorktreeLock(lockDir);
     try {
       expect(lock.acquire('other-run', 'addon-dev', 103).locked).toBe(true);
       const r = runCli(
         '--session-id', 'addon-dev', '--run-id', 'r3',
         '--sessions-path', sessionsPath, '--db-path', dbPath,
         '--supported-phases', 'implementation',
-        { HOME: isolatedHome },
       );
       expect(r.code).toBe(0);
       const out = JSON.parse(r.stdout.trim());
@@ -5857,6 +5881,42 @@ describe('implementation handler — fix mode (status:needs-fix)', () => {
     expect(claudeCall.opts.stdin).toContain('Review Feedback To Address');
     expect(claudeCall.opts.stdin).toContain(REVIEW_FEEDBACK);
     expect(claudeCall.opts.stdin).toContain('Fix Task');
+  });
+
+  test('fix mode prompt carries a failing final stage\'s exact check id and tested revision (issue #1104)', async () => {
+    const testedRevision = 'd'.repeat(40);
+    const plan = planFinalStageRepair({
+      stageRunId: { taskAttempt: 1, lane: 'review', stage: 'final', stageOrdinal: 0 },
+      planDigest: 'plan-digest-1',
+      headSha: testedRevision,
+      outcome: 'code-failed',
+      checks: [
+        { checkId: 'exec:test', name: 'test', commandDigest: 'x', verdict: 'failed', exitCode: 1, outputTail: 'FAIL test/auth.test.js' },
+      ],
+    });
+    expect(plan.kind).toBe('repair');
+    const task = makeFixTask();
+    const runner = happyFixRunner();
+    const result = await createImplementationHandler(CONTEXT(), runner)({
+      ...task,
+      context: {
+        ...task.context,
+        labels: ['agent:claude', 'status:needs-review'],
+        prUrl: EXISTING_PR_URL,
+        reviewFeedback: plan.feedback,
+        verificationFeedback: plan.feedback,
+        verificationFailure: plan.verificationFailure,
+        finalStageRepair: plan.record,
+      },
+    });
+    const prompt = runner.calls.find((c) => c.cmd === 'claude').opts.stdin;
+    expect(prompt).toContain('Review Feedback To Address');
+    expect(prompt).toContain('`exec:test` (test) — failed, exit 1');
+    expect(prompt).toContain(`Tested revision: \`${testedRevision}\``);
+    expect(prompt).toContain('FAIL test/auth.test.js');
+    // The working changes are continued on the existing PR branch, never discarded.
+    expect(runner.calls.some((c) => c.cmd === 'git' && (c.args[0] === 'reset' || c.args[0] === 'clean'))).toBe(false);
+    expect(result.result).toBe('success');
   });
 
   test('fix mode triggered by reviewFeedback alone (auto-requeue path, no status:needs-fix label)', async () => {
@@ -7172,6 +7232,81 @@ describe('implementation handler — dispute persistence (issue #844)', () => {
       disputedLineageIds: [LINEAGE_A],
       routing: 'pending_reconsideration',
     });
+    // Issue #952: the reviewer's turn re-reads `dispute-<lineageId>.json` from
+    // here, so the key names the directory the record was actually written into
+    // — never a run directory that holds no record.
+    expect(result.context.disputeArtifactDir).toBe(join(artifactRoot, 'runs', 'run-impl-1'));
+    expect(existsSync(join(result.context.disputeArtifactDir, `dispute-${LINEAGE_A}.json`))).toBe(true);
+    // Issue #955 review (P1): §8.3 measures a candidate arbiter against the runs
+    // that produced the debate, and arbitration happens phases later. The
+    // persisted assignment can have been reconfigured since, so the run that
+    // actually rebutted records WHICH agent it was.
+    expect(result.context.reviewDisputeParties.implementation).toEqual({ agentId: 'claude' });
+    // The id and nothing else: a provider or a model persisted here could not be
+    // told apart from one an altered task supplied, and a believed forgery is
+    // exactly how a party's own provider would arbitrate its dispute. The
+    // provider is re-derived from the id downstream; the model stays unknown.
+    expect(Object.keys(result.context.reviewDisputeParties.implementation)).toEqual(['agentId']);
+  });
+
+  test('the fix run half of the party provenance does not evict the review run half (issue #955 review)', async () => {
+    writeEvidenceFile();
+    const dir = writeFindingsArtifact([findingRecord(LINEAGE_A)]);
+    const runner = noDiffDisputeRunner(dispositionBlock([disputed(LINEAGE_A)]), PASSING_ZERO_CHANGE_TAIL);
+    const stored = { review: { agentId: 'codex', provider: 'openai', model: 'gpt-5' } };
+    const task = fixTask({ [LINEAGE_A]: lineage(LINEAGE_A) }, dir);
+    task.context.reviewDisputeParties = stored;
+    const result = await createImplementationHandler(disputeSession(), runner)(task);
+
+    expect(result.result).toBe('success');
+    // Task context merges shallowly, so writing only this run's half would drop
+    // the reviewer's — and §8.3 needs BOTH to measure independence. The half
+    // carried forward is re-canonicalized on the way through: the stored
+    // provider and model are untrusted, so only the id survives the merge.
+    expect(result.context.reviewDisputeParties.review).toEqual({ agentId: 'codex' });
+    expect(result.context.reviewDisputeParties.implementation).toEqual({ agentId: 'claude' });
+  });
+
+  test('the rebuttal directory and implementer are recorded PER LINEAGE (issue #955 review)', async () => {
+    writeEvidenceFile();
+    const dir = writeFindingsArtifact([findingRecord(LINEAGE_A)]);
+    const runner = noDiffDisputeRunner(dispositionBlock([disputed(LINEAGE_A)]), PASSING_ZERO_CHANGE_TAIL);
+    const result = await createImplementationHandler(disputeSession(), runner)(
+      fixTask({ [LINEAGE_A]: lineage(LINEAGE_A) }, dir),
+    );
+
+    expect(result.result).toBe('success');
+    // The two single-valued keys above describe the LAST fix run, but the
+    // protocol can rebut different lineages in different runs. So the same two
+    // facts travel keyed by lineage, for the lineages THIS run wrote a record
+    // for — the id alone, exactly as the parties key carries it.
+    expect(result.context.reviewDisputeRebuttals.lineages[LINEAGE_A]).toEqual({
+      version: 1,
+      artifactDir: join(artifactRoot, 'runs', 'run-impl-1'),
+      agentId: 'claude',
+    });
+  });
+
+  test('a later fix run does not evict an earlier lineage\'s rebuttal record (issue #955 review)', async () => {
+    writeEvidenceFile();
+    const dir = writeFindingsArtifact([findingRecord(LINEAGE_A)]);
+    const runner = noDiffDisputeRunner(dispositionBlock([disputed(LINEAGE_A)]), PASSING_ZERO_CHANGE_TAIL);
+    // What an earlier fix run recorded for the sibling lineage it rebutted.
+    const earlier = {
+      lineages: { [LINEAGE_B]: { version: 1, artifactDir: '/artifacts/runs/run-impl-0', agentId: 'codex' } },
+    };
+    const task = fixTask({ [LINEAGE_A]: lineage(LINEAGE_A) }, dir);
+    task.context.reviewDisputeRebuttals = earlier;
+    const result = await createImplementationHandler(disputeSession(), runner)(task);
+
+    expect(result.result).toBe('success');
+    // Task context merges shallowly, so returning only this run's lineage would
+    // drop the sibling's — and the sibling's arbitration would then read its
+    // rebuttal from THIS run's directory, which never held it.
+    expect(result.context.reviewDisputeRebuttals.lineages[LINEAGE_B])
+      .toEqual({ version: 1, artifactDir: '/artifacts/runs/run-impl-0', agentId: 'codex' });
+    expect(result.context.reviewDisputeRebuttals.lineages[LINEAGE_A])
+      .toMatchObject({ artifactDir: join(artifactRoot, 'runs', 'run-impl-1'), agentId: 'claude' });
   });
 
   test('the full dispute record is written as a local artifact (§10.2)', async () => {
@@ -7293,6 +7428,18 @@ describe('implementation handler — dispute persistence (issue #844)', () => {
     expect(result.context.reviewDisputePersistence).toBeUndefined();
     expect(task.context.reviewDispute).toEqual(stored);
     expect(existsSync(disputeArtifactPath(LINEAGE_A))).toBe(false);
+    // Issue #952: no record was written here, so the reviewer's pointer is left
+    // as it was — a run directory holding no `dispute-<lineageId>.json` would
+    // send a still-open debate's reviewer turn looking for a rebuttal that was
+    // never there.
+    expect(result.context.disputeArtifactDir).toBeUndefined();
+    // Issue #955 review: a run that rebutted nothing is not a party to anything,
+    // so it records no provenance either — leaving whatever an earlier fix run
+    // recorded in place for a debate that is still open.
+    expect(result.context.reviewDisputeParties).toBeUndefined();
+    // …and no per-lineage entry either, for the same reason: an entry pointing
+    // at a directory with no record in it is the park this key exists to avoid.
+    expect(result.context.reviewDisputeRebuttals).toBeUndefined();
     // §7 rows 1/5/23 still apply, through #840's transition: the run hands the
     // phase runner the application that moves the lineage to `resolved_fixed`,
     // and the runner commits it with this completion. Before that wiring existed
@@ -7707,7 +7854,69 @@ describe('implementation handler — dependency-aware start point (issue #208, #
       // review can diff against it instead of the session base.
       baseHeadSha: BLOCKER_HEAD_SHA,
     });
+    // No acceptance is attested from the stack-ready LABEL alone (issue #1165
+    // D5): a label is not bound to a commit, so the fetched head stays a head
+    // the changed-file Issue base may not advance onto.
+    expect(result.context?.dependencyBase?.baseHeadAccepted).toBeUndefined();
   });
+
+  // Issue #1165, decision D5.
+  test('one usable blocker PR: the fetched head is attested as accepted only when the blocker recorded its stack-ready grant at that exact commit', async () => {
+    const GRANTING_RUN_ID = { taskAttempt: 0, lane: 'review', stage: 'final', stageOrdinal: 0 };
+    const blockerTask = (headSha) => ({
+      ...makeTask({ issueNumber: 50 }),
+      context: {
+        stagedVerification: {
+          version: 2,
+          ordinals: [],
+          runs: [],
+          loopBundles: [],
+          finalBundles: [{
+            stageRunId: GRANTING_RUN_ID,
+            planDigest: 'plan-1',
+            ...(headSha !== undefined ? { headSha } : {}),
+            selection: { checkIds: [], selectionDigest: deriveStageSelectionDigest([]), full: true },
+            outcome: 'passed',
+            complete: true,
+            checks: [],
+            startedAt: '2026-06-07T00:00:00.000Z',
+            recordedAt: '2026-06-07T00:00:00.000Z',
+          }],
+          // The grant this predecessor published, pinned to that bundle.
+          grantingStageRunKey: stageRunKey(GRANTING_RUN_ID),
+        },
+      },
+    });
+    const accepted = async (store) => {
+      const result = await createImplementationHandler(
+        CONTEXT({ taskStore: store }), stackedHappyRunner(), oneOpenBlockerDepChecker,
+      )(makeTask());
+      expect(result.result).toBe('success');
+      return result.context?.dependencyBase?.baseHeadAccepted;
+    };
+
+    // The grant the blocker published names exactly the head this run fetched.
+    const lookups = [];
+    expect(await accepted({
+      getTask: async (key) => {
+        lookups.push(key);
+        return blockerTask(BLOCKER_HEAD_SHA);
+      },
+    })).toEqual({ sha: BLOCKER_HEAD_SHA, evidence: 'stack-ready' });
+    // Read from the BLOCKER's row in this session, never the dependent's own.
+    expect(lookups).toEqual([{ sessionId: 'addon-dev', issueNumber: 50 }]);
+
+    // A blocker PR force-pushed after its review passed keeps the stack-ready
+    // label, but its recorded grant still names the reviewed commit — so the
+    // head this run fetched is attested by nothing.
+    expect(await accepted({ getTask: async () => blockerTask('9'.repeat(40)) })).toBeUndefined();
+    // A grant whose bundle recorded no head attests no commit either.
+    expect(await accepted({ getTask: async () => blockerTask(undefined) })).toBeUndefined();
+    // Neither does a blocker with no recorded grant, or no row at all.
+    expect(await accepted({ getTask: async () => makeTask({ issueNumber: 50 }) })).toBeUndefined();
+    expect(await accepted({ getTask: async () => undefined })).toBeUndefined();
+    expect(await accepted({ getTask: async () => { throw new Error('store down'); } })).toBeUndefined();
+  }, 30_000);
 
   test('one usable blocker PR: dependency base metadata is persisted to result.json', async () => {
     const runner = stackedHappyRunner();
@@ -7722,6 +7931,7 @@ describe('implementation handler — dependency-aware start point (issue #208, #
       basePrUrl: BLOCKER_PR_URL,
       baseHeadSha: BLOCKER_HEAD_SHA,
     });
+    expect(result.dependencyBase.baseHeadAccepted).toBeUndefined();
   });
 
   test('canonical fetch of the blocker head uses an explicit force-updating remote-tracking refspec, never FETCH_HEAD (issue #458 review, #732)', async () => {
@@ -8110,30 +8320,32 @@ describe('implementation handler — resolved profile metadata', () => {
     });
   });
 
-  test('session claude.complexityProfiles override on complexity:xhigh records source=session-config', async () => {
+  test('session claude.complexityProfiles no longer feeds the resolved profile (issue #911, §10.4)', async () => {
+    // Pre-cutover this recorded source=session-config; the cut-over lane no
+    // longer reads the key, so the catalog's own label-derived binding runs.
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:claude', 'status:needs-implementation', 'complexity:xhigh'] } });
     const context = CONTEXT({ session: SESSION({ claude: { complexityProfiles: { xhigh: { model: 'claude-fable-5' } } } }) });
     await createImplementationHandler(context, happyRunner())(task);
     const ctx = JSON.parse(readFileSync(join(dir(), 'implementation-context.json'), 'utf8'));
     expect(ctx.resolvedProfile).toMatchObject({
-      model: 'claude-fable-5', modelSource: 'session-config',
+      model: 'fable', modelSource: 'label',
       effort: 'xhigh', effortSource: 'label',
       maxBudgetUsd: '20', budgetSource: 'label',
     });
   });
 
-  test('session claude.complexityProfiles override on the default tier (no complexity label) records source=session-config', async () => {
+  test('session claude.complexityProfiles on the default tier is ignored too (issue #911, §10.4)', async () => {
     const context = CONTEXT({ session: SESSION({ claude: { complexityProfiles: { default: { model: 'opus', effort: 'low', budget: '3' } } } }) });
     await createImplementationHandler(context, happyRunner())(makeTask());
     const ctx = JSON.parse(readFileSync(join(dir(), 'implementation-context.json'), 'utf8'));
     expect(ctx.resolvedProfile).toMatchObject({
-      model: 'opus', modelSource: 'session-config',
-      effort: 'low', effortSource: 'session-config',
-      maxBudgetUsd: '3', budgetSource: 'session-config',
+      model: 'sonnet', modelSource: 'default',
+      effort: 'high', effortSource: 'default',
+      maxBudgetUsd: '5', budgetSource: 'default',
     });
   });
 
-  test('escalatedEffort still wins over a session-config effort override (source=escalation)', async () => {
+  test('escalatedEffort still outranks the label profile (source=escalation)', async () => {
     const task = makeTask({
       context: {
         ...makeTask().context,
@@ -8141,6 +8353,8 @@ describe('implementation handler — resolved profile metadata', () => {
         escalatedEffort: 'high',
       },
     });
+    // The retired session override is present to show it changes nothing on
+    // the cut-over lane (issue #911, §10.4); the escalation floor decides.
     const context = CONTEXT({ session: SESSION({ claude: { complexityProfiles: { low: { effort: 'low' } } } }) });
     await createImplementationHandler(context, happyRunner())(task);
     const ctx = JSON.parse(readFileSync(join(dir(), 'implementation-context.json'), 'utf8'));
@@ -8343,20 +8557,25 @@ describe('implementation handler — Gemini/Antigravity agent', () => {
     const runner = happyGeminiRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeGeminiTask());
     const agyCall = runner.calls[AGY_IDX];
-    // Contract: agy --print "<prompt>", mirroring the research handler
-    expect(agyCall.args[0]).toBe('--print');
-    expect(agyCall.args[1]).toContain('Implementation Task');
-    expect(agyCall.args[1]).toContain('77');
+    // Contract: agy --print "<prompt>", mirroring the research handler; the
+    // prompt is the operand immediately after --print.
+    const printIdx = agyCall.args.indexOf('--print');
+    expect(printIdx).toBeGreaterThanOrEqual(0);
+    expect(agyCall.args[printIdx + 1]).toContain('Implementation Task');
+    expect(agyCall.args[printIdx + 1]).toContain('77');
   });
 
-  test('passes prompt via both --print arg and stdin', async () => {
+  test('passes prompt via both --print arg and stdin, with the catalog print timeout (issue #911, §10.4)', async () => {
     const runner = happyGeminiRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeGeminiTask());
     const agyCall = runner.calls[AGY_IDX];
     expect(typeof agyCall.opts.stdin).toBe('string');
     expect(agyCall.opts.stdin).toContain('77');
-    // Prompt appears as positional arg after --print (research lane contract)
-    expect(agyCall.args).toEqual(['--print', agyCall.opts.stdin]);
+    // Every built-in google profile carries printTimeout 15m, so the cut-over
+    // lane passes --print-timeout ahead of --print and no longer runs under
+    // agy's own five-minute print-mode default; the prompt stays the operand
+    // right after --print (research lane contract).
+    expect(agyCall.args).toEqual(['--print-timeout', '15m', '--print', agyCall.opts.stdin]);
   });
 
   test('uses the issue worktree as cwd', async () => {
@@ -8408,7 +8627,7 @@ describe('implementation handler — Gemini/Antigravity agent', () => {
       agentId: 'gemini',
       cmd: '/usr/local/bin/my-agy',
       cmdSource: 'env',
-      argv: ['--print'],
+      argv: ['--print-timeout', '15m', '--print'],
     });
   });
 
@@ -8424,7 +8643,7 @@ describe('implementation handler — Gemini/Antigravity agent', () => {
     const runner = happyGeminiRunner();
     await createImplementationHandler(CONTEXT(), runner)(makeGeminiTask());
     const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-context.json'), 'utf8'));
-    expect(ctx.resolvedProfile.argv).toEqual(['--print']);
+    expect(ctx.resolvedProfile.argv).toEqual(['--print-timeout', '15m', '--print']);
     const argvStr = ctx.resolvedProfile.argv.join(' ');
     expect(argvStr).not.toContain('Implementation Task');
     expect(argvStr).not.toContain('77');
@@ -9975,20 +10194,20 @@ describe('implementation handler — codex model selection', () => {
     expect(readProfile()).toMatchObject({ model: 'cli-default', modelSource: 'default' });
   });
 
-  test('session.codex.model: --model precedes the exec subcommand, metadata records session-config', async () => {
+  test('session.codex.model is no longer read by the cut-over lane (issue #911, §10.4)', async () => {
+    // Pre-cutover this spliced --model before exec; the write-capable cutover
+    // deleted the per-lane chain, so the model comes from an openai profile in
+    // agent-profiles.json or the CODEX_MODEL break-glass variable instead.
     const session = codexSession({ codex: { model: 'gpt-5-codex' } });
     const runner = happyCodexRunner();
     await createImplementationHandler(CONTEXT({ session }), runner)(makeCodexTask());
     const { args } = runner.calls[CODEX_IDX];
-    const mIdx = args.indexOf('--model');
-    const execIdx = args.indexOf('exec');
-    expect(mIdx).toBeGreaterThanOrEqual(0);
-    expect(args[mIdx + 1]).toBe('gpt-5-codex');
-    expect(mIdx).toBeLessThan(execIdx);
-    expect(readProfile()).toMatchObject({ model: 'gpt-5-codex', modelSource: 'session-config' });
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('gpt-5-codex');
+    expect(readProfile()).toMatchObject({ model: 'cli-default', modelSource: 'default' });
   });
 
-  test('CODEX_MODEL env var overrides session.codex.model', async () => {
+  test('CODEX_MODEL env var still splices --model before the exec subcommand', async () => {
     process.env['CODEX_MODEL'] = 'o1-preview';
     const session = codexSession({ codex: { model: 'gpt-5-codex' } });
     const runner = happyCodexRunner();
@@ -9999,7 +10218,10 @@ describe('implementation handler — codex model selection', () => {
     }
     const { args } = runner.calls[CODEX_IDX];
     const mIdx = args.indexOf('--model');
+    const execIdx = args.indexOf('exec');
+    expect(mIdx).toBeGreaterThanOrEqual(0);
     expect(args[mIdx + 1]).toBe('o1-preview');
+    expect(mIdx).toBeLessThan(execIdx);
     expect(readProfile()).toMatchObject({ model: 'o1-preview', modelSource: 'env' });
   });
 
@@ -10261,4 +10483,825 @@ describe('implementation handler — environmentPrepare baseline exclusion (issu
     const prepareCalls = runner.calls.filter(c => c.cmd === 'echo' && c.args[0] === 'ok');
     expect(prepareCalls).toHaveLength(2);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Post-create PR reconciliation (issue #998)
+//
+// PR creation is an external side effect; persisting `prUrl`/`branch` into task
+// context is a separate, later boundary. Issue #975 was interrupted between the
+// two: PR #997 was live on `ai/issue-975` while the task remembered nothing, so
+// the retry re-ran `gh pr create`, got "a pull request for branch ... already
+// exists", and failed terminally.
+//
+// The retry now asks the repo host — with the exact head it pushed — whether one
+// matching open PR is already there, adopts it, and continues through the SAME
+// success transition. Anything short of a single open, same-repository PR on the
+// expected head into the configured base fails closed.
+// ---------------------------------------------------------------------------
+
+describe('implementation handler — adopting an already-created PR (issue #998)', () => {
+  const EXISTING_PR_URL = 'https://github.com/m2dw/test-repo/pull/99';
+
+  // The exact `gh pr create` failure observed on issue #975. Its wording is
+  // deliberately NOT what drives the recovery — see the "provider data" test.
+  const ALREADY_EXISTS = {
+    stdout: '',
+    stderr: 'a pull request for branch "ai/issue-77" into branch "main" already exists',
+    exitCode: 1,
+  };
+
+  const livePr = (overrides = {}) => ({
+    number: 99,
+    url: EXISTING_PR_URL,
+    headRefName: 'ai/issue-77',
+    state: 'OPEN',
+    baseRefName: 'main',
+    ...overrides,
+  });
+
+  // Same sequence as `worktreeHappyRunner`, except `gh pr create` fails and the
+  // exact-head lookup that follows it answers with `listing`.
+  function runnerWithExistingPr(createResult, listing) {
+    return sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                      // git fetch origin main (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                      // git status --porcelain (worktree)
+      { stdout: 'Implemented changes.', stderr: '', exitCode: 0 },  // claude
+      { stdout: '2 files changed', stderr: '', exitCode: 0 },       // git diff --stat HEAD
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                  // verification (npm test)
+      { stdout: 'src/foo.ts\0', stderr: '', exitCode: 0 },          // git ls-files -z
+      { stdout: '', stderr: '', exitCode: 0 },                      // git add -- <paths>
+      { stdout: '', stderr: '', exitCode: 0 },                      // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                      // git push
+      createResult,                                                 // gh pr create
+      listing,                                                      // gh pr list --head <exact branch>
+      { stdout: '', stderr: '', exitCode: 0 },                      // git worktree remove (success only)
+    ]);
+  }
+
+  const listed = (prs) => ({ stdout: JSON.stringify(prs), stderr: '', exitCode: 0 });
+
+  function reconciliationArtifact() {
+    const path = join(artifactRoot, 'runs', 'run-impl-1', 'pr-reconciliation.json');
+    return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
+  }
+
+  test('adopts the one matching open PR and transitions forward without a duplicate', async () => {
+    const runner = runnerWithExistingPr(ALREADY_EXISTS, listed([livePr()]));
+    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+
+    expect(result.result).toBe('success');
+    // Task context records the canonical PR identity the interrupted run never persisted.
+    expect(result.context.prUrl).toBe(EXISTING_PR_URL);
+    expect(result.context.branch).toBe('ai/issue-77');
+    // Exactly one creation attempt: the recovery adopts, it never re-creates.
+    expect(runner.calls.filter((c) => c.cmd === 'gh' && c.args.includes('create'))).toHaveLength(1);
+  });
+
+  test('the reconciliation lookup uses the exact pushed head and the open-state filter', async () => {
+    const runner = runnerWithExistingPr(ALREADY_EXISTS, listed([livePr()]));
+    await createImplementationHandler(CONTEXT(), runner)(makeTask());
+
+    const list = runner.calls.find((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'list');
+    expect(list).toBeDefined();
+    expect(list.args[list.args.indexOf('--head') + 1]).toBe('ai/issue-77');
+    expect(list.args[list.args.indexOf('--state') + 1]).toBe('open');
+    expect(list.args[list.args.indexOf('--repo') + 1]).toBe('m2dw/test-repo');
+  });
+
+  test('adoption is decided from provider data, not from the CLI failure prose', async () => {
+    // A creation failure whose text says nothing about an existing PR still
+    // adopts, because the provider reports one. The converse — prose claiming
+    // the PR exists while the provider reports none — fails closed below.
+    const runner = runnerWithExistingPr(
+      { stdout: '', stderr: 'gh: something else went wrong', exitCode: 1 },
+      listed([livePr()]),
+    );
+    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('success');
+    expect(result.context.prUrl).toBe(EXISTING_PR_URL);
+  });
+
+  test('records the adoption in a pr-reconciliation.json artifact', async () => {
+    const runner = runnerWithExistingPr(ALREADY_EXISTS, listed([livePr()]));
+    await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    expect(reconciliationArtifact()).toMatchObject({
+      issueNumber: 77,
+      head: 'ai/issue-77',
+      base: 'main',
+      repo: 'm2dw/test-repo',
+      outcome: 'adopted',
+      adoptedPrUrl: EXISTING_PR_URL,
+    });
+  });
+
+  test('honors a non-default configured base when validating the live PR', async () => {
+    const session = SESSION({ baseBranch: 'develop' });
+    const runner = runnerWithExistingPr(ALREADY_EXISTS, listed([livePr({ baseRefName: 'develop' })]));
+    const result = await createImplementationHandler(CONTEXT({ session }), runner)(makeTask());
+    expect(result.result).toBe('success');
+    expect(result.context.prUrl).toBe(EXISTING_PR_URL);
+  });
+
+  // -------------------------------------------------------------------------
+  // Fail-closed refusals
+  // -------------------------------------------------------------------------
+
+  async function refuse(listing) {
+    const runner = runnerWithExistingPr(ALREADY_EXISTS, listing);
+    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    return { runner, result };
+  }
+
+  test('a closed PR on the expected head fails closed', async () => {
+    const { result } = await refuse(listed([livePr({ state: 'CLOSED' })]));
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/not open/);
+    expect(reconciliationArtifact()).toMatchObject({ outcome: 'refused', refusalReason: 'not-open' });
+  });
+
+  test('a PR targeting the wrong base fails closed', async () => {
+    const { result } = await refuse(listed([livePr({ baseRefName: 'release/1.x' })]));
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/release\/1\.x/);
+    expect(reconciliationArtifact()).toMatchObject({ refusalReason: 'base-mismatch' });
+  });
+
+  test('two open PRs on the head fail closed as ambiguous', async () => {
+    const { result } = await refuse(listed([
+      livePr(),
+      livePr({ number: 100, url: 'https://github.com/m2dw/test-repo/pull/100' }),
+    ]));
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/ambiguous/);
+    expect(reconciliationArtifact()).toMatchObject({ refusalReason: 'ambiguous' });
+  });
+
+  test('an inaccessible lookup fails closed instead of assuming no PR exists', async () => {
+    const { result, runner } = await refuse({ stdout: '', stderr: 'gh: rate limited', exitCode: 1 });
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/rate limited/);
+    expect(reconciliationArtifact()).toMatchObject({ refusalReason: 'lookup-failed' });
+    // No second creation attempt was made off the back of an unreadable listing.
+    expect(runner.calls.filter((c) => c.cmd === 'gh' && c.args.includes('create'))).toHaveLength(1);
+  });
+
+  test('a mismatched head fails closed', async () => {
+    const { result } = await refuse(listed([livePr({ headRefName: 'ai/issue-78' })]));
+    expect(result.result).toBe('failed');
+    expect(reconciliationArtifact()).toMatchObject({ refusalReason: 'head-mismatch' });
+  });
+
+  test('a fork head fails closed', async () => {
+    const { result } = await refuse(listed([livePr({ isCrossRepository: true })]));
+    expect(result.result).toBe('failed');
+    expect(reconciliationArtifact()).toMatchObject({ refusalReason: 'cross-repository' });
+  });
+
+  test('a PR URL in another repository fails closed', async () => {
+    const { result } = await refuse(listed([livePr({ url: 'https://github.com/someone/fork/pull/99' })]));
+    expect(result.result).toBe('failed');
+    expect(reconciliationArtifact()).toMatchObject({ refusalReason: 'repository-mismatch' });
+  });
+
+  test('a genuine creation failure with no live PR still reports the original error', async () => {
+    const runner = runnerWithExistingPr({ stdout: '', stderr: 'gh: auth error', exitCode: 1 }, listed([]));
+    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('failed');
+    // The host's own message survives the reconciliation attempt unchanged.
+    expect(result.error).toMatch(/gh: auth error/);
+    expect(reconciliationArtifact()).toMatchObject({ refusalReason: 'no-match' });
+  });
+
+  test('the normal path creates the PR and never issues a reconciliation lookup', async () => {
+    const runner = worktreeHappyRunner();
+    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('success');
+    expect(result.context.prUrl).toBe(EXISTING_PR_URL);
+    expect(runner.calls.some((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args[1] === 'list')).toBe(false);
+    expect(reconciliationArtifact()).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Catalog placement + binary provenance (issue #911 review)
+//
+// Finding 1: with no AGENT_PROFILES_FILE / session profilesPath, the default
+// catalog location is `agent-profiles.json` beside the sessions file the run
+// actually loaded (docs/agent-runtime-profiles-contract.md §9.1) — threaded to
+// runtime resolution via `context.sessionsPath` — not beside the
+// home-directory default.
+//
+// Finding 2: an overlay can select an operator-supplied executable for ANY
+// provider. Such a binary's stderr has no provider provenance
+// (docs/phase-contracts.md "Stderr: a bounded, provider-owned diagnostic
+// channel"), so a wrapper echoing transcript text like "usage limit reached"
+// must not convert an ordinary failure into an automatic quota delay.
+// ---------------------------------------------------------------------------
+
+describe('implementation handler — sibling catalog + binary provenance (issue #911 review)', () => {
+  function writeSiblingCatalog(document) {
+    const sessionsDir = join(tmpDir, 'custom-config');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'agent-profiles.json'), JSON.stringify(document), 'utf8');
+    return join(sessionsDir, 'sessions.json');
+  }
+
+  test('resolves the default catalog beside context.sessionsPath (custom --sessions-path)', async () => {
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { anthropic: { profiles: { 'claude-normal': { model: 'custom-model-x' } } } },
+    });
+    const runner = happyRunner();
+    await createImplementationHandler(CONTEXT({ sessionsPath }), runner)(makeTask());
+    expect(runner.calls[3].args).toContain('custom-model-x');
+    const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile.model).toBe('custom-model-x');
+    expect(ctx.resolvedProfile.modelSource).toBe('catalog-overlay');
+  });
+
+  test('without context.sessionsPath the sibling file is not consulted (built-in catalog applies)', async () => {
+    writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { anthropic: { profiles: { 'claude-normal': { model: 'custom-model-x' } } } },
+    });
+    const runner = happyRunner();
+    await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    expect(runner.calls[3].args).not.toContain('custom-model-x');
+  });
+
+  test('an overlay-selected claude binary runs and is recorded as cmdSource catalog-overlay', async () => {
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { anthropic: { profiles: { 'claude-normal': { binary: '/opt/claude-wrapper' } } } },
+    });
+    const runner = happyRunner();
+    await createImplementationHandler(CONTEXT({ sessionsPath }), runner)(makeTask());
+    expect(runner.calls[3].cmd).toBe('/opt/claude-wrapper');
+    const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({ cmd: '/opt/claude-wrapper', cmdSource: 'catalog-overlay' });
+  });
+
+  test('claude cmdSource is cli-default when nothing overrides the binary', async () => {
+    const runner = happyRunner();
+    await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile.cmdSource).toBe('cli-default');
+  });
+
+  test('an overlay that only rebinds a quality level still attributes settings to catalog-overlay', async () => {
+    // The overlay rewrites the `normal` binding to the builtin claude-maximum
+    // profile without touching any profile settings: the inherited values keep
+    // their catalog-builtin sources, but the run only uses them because the
+    // operator's overlay rebound the level — the metadata must say so instead
+    // of folding the attribution into `default`.
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { anthropic: { qualityBindings: { normal: 'claude-maximum' } } },
+    });
+    const runner = happyRunner();
+    await createImplementationHandler(CONTEXT({ sessionsPath }), runner)(makeTask());
+    expect(runner.calls[3].args).toContain('fable');
+    const ctx = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile).toMatchObject({
+      profileName: 'claude-maximum',
+      model: 'fable', modelSource: 'catalog-overlay',
+      effort: 'xhigh', effortSource: 'catalog-overlay',
+      maxBudgetUsd: '20', budgetSource: 'catalog-overlay',
+    });
+  });
+
+  test('quota-shaped stderr from an overlay-selected claude binary fails instead of delaying', async () => {
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { anthropic: { profiles: { 'claude-normal': { binary: '/opt/claude-wrapper' } } } },
+    });
+    const result = await createImplementationHandler(
+      CONTEXT({ sessionsPath }),
+      fakeFail('Claude usage limit reached. Your limit will reset at 5pm.'),
+    )(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/usage limit reached/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Explained no-change fix turns (issue #1125)
+//
+// A fix turn answering review or verification feedback can legitimately end
+// with no new edit. Before this issue it died at `step: diff-check`, BEFORE the
+// runner's own verification could say anything, so a correct PR never returned
+// to review (observed on m2dw/yoda_form_js#766). These tests pin the whole
+// admitted path — declaration, branch checks, verification, no commit, review
+// continuation — and every refusal that must still fail exactly as it did.
+// ---------------------------------------------------------------------------
+
+describe('implementation handler — explained no-change fix turn (issue #1125)', () => {
+  const EVIDENCE_PATH = 'src/hosts.ts';
+  const TRACKED_INDEX = `100644 1111111111111111111111111111111111111111 0\t${EVIDENCE_PATH}\n`;
+  const HEAD_SHA = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
+  const DEP_SHA = 'f'.repeat(40);
+  // A verification-failure requeue, the shape review.ts records for the #766
+  // sequence: the review ran `npm test`, it exited 1, and implementation was
+  // requeued in fix mode with that output as its feedback.
+  const VERIFICATION_FEEDBACK =
+    "Verification 'test' failed (exit 1):\nFAIL test/hostname.test.js — expected the staging hostname mapping to be present";
+  const EXPLANATION =
+    'The staging hostname mapping is already present in src/hosts.ts and covered by the existing suite; the ' +
+    'reported failure came from a run whose host could not resolve DNS and does not reproduce on this revision.';
+
+  function declaration(overrides = {}) {
+    return {
+      noChangeRequired: true,
+      reason: 'not_reproducing',
+      addressedFeedback: 'expected the staging hostname mapping to be present',
+      explanation: EXPLANATION,
+      evidenceRefs: [{ kind: 'file', path: EVIDENCE_PATH, startLine: 2, endLine: 6 }],
+      ...overrides,
+    };
+  }
+
+  function agentSaysNoChange(value = declaration()) {
+    return (
+      'I ran the suite and it passes; no further edit is needed.\n\n' +
+      '```json\n' + JSON.stringify(value, null, 2) + '\n```\n'
+    );
+  }
+
+  /** Materialize the cited file so the read-only evidence resolver sees a real range. */
+  function writeEvidenceFile(lines = 40) {
+    const wt = defaultWorktreePath();
+    mkdirSync(join(wt, 'src'), { recursive: true });
+    writeFileSync(
+      join(wt, EVIDENCE_PATH),
+      Array.from({ length: lines }, (_, i) => `// line ${i + 1}`).join('\n') + '\n',
+      'utf8',
+    );
+  }
+
+  function noChangeFixTask(extraContext = {}) {
+    return makeFixTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        labels: ['agent:claude', 'status:needs-fix'],
+        reviewFeedback: VERIFICATION_FEEDBACK,
+        prUrl: EXISTING_PR_URL,
+        branch: EXISTING_BRANCH,
+        ...extraContext,
+      },
+    });
+  }
+
+  // The fix-mode prefix every run below shares: PR lookup, branch probe, both
+  // clean-tree preflights, the `--ff-only` reconcile, then the agent and the
+  // empty-diff checks.
+  function fixPrefix(agentStdout) {
+    return [
+      { stdout: PR_LIST_JSON, stderr: '', exitCode: 0 },              // gh pr list
+      { stdout: 'refs/heads/ai/issue-77', stderr: '', exitCode: 0 },  // git rev-parse --verify (local branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain (worktree)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git pull origin ai/issue-77 --ff-only
+      { stdout: agentStdout, stderr: '', exitCode: 0 },               // claude
+      { stdout: '', stderr: '', exitCode: 0 },                        // git diff --stat HEAD (EMPTY)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git ls-files --others (EMPTY)
+    ];
+  }
+
+  // The admission steps: the evidence index, the issue-commits probe, and the
+  // publication probe — which both confirms the PR head on origin and yields the
+  // revision the declaration is tied to.
+  function admissionSteps({ commitsProbeExit = 1, fetchExit = 0, publishedSha = HEAD_SHA } = {}) {
+    const steps = [
+      { stdout: TRACKED_INDEX, stderr: '', exitCode: 0 },             // git ls-files -s (evidence index)
+      { stdout: '', stderr: '', exitCode: commitsProbeExit },         // git diff --quiet origin/main...HEAD
+    ];
+    // Each probe is spent only once the cheaper ones admit: an unanswered or
+    // empty branch probe never reaches the remote.
+    if (commitsProbeExit !== 1) return steps;
+    steps.push({ stdout: '', stderr: '', exitCode: fetchExit });      // git fetch origin ai/issue-77
+    if (fetchExit !== 0) return steps;
+    steps.push(
+      { stdout: `${publishedSha}\n`, stderr: '', exitCode: 0 },       // git rev-parse FETCH_HEAD (published PR head)
+      { stdout: `${HEAD_SHA}\n`, stderr: '', exitCode: 0 },           // git rev-parse HEAD (local)
+    );
+    return steps;
+  }
+
+  const PASSING_TAIL = [
+    { stdout: 'PASS 233 files, 7465 tests', stderr: '', exitCode: 0 }, // verification (npm test)
+    { stdout: '', stderr: '', exitCode: 0 },                           // git ls-files -z (stageable — EMPTY)
+    { stdout: '', stderr: '', exitCode: 0 },                           // git worktree remove (canonical)
+  ];
+
+  function admittedRunner(agentStdout = agentSaysNoChange(), tail = PASSING_TAIL) {
+    return sequenceRunner([...fixPrefix(agentStdout), ...admissionSteps(), ...tail]);
+  }
+
+  const staged = (runner, sub) => runner.calls.some((c) => c.cmd === 'git' && c.args[0] === sub);
+
+  // --- 1. The #766 sequence, end to end -----------------------------------
+
+  test('an explained no-change fix turn reaches verification and returns the PR to review', async () => {
+    writeEvidenceFile();
+    const runner = admittedRunner();
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+
+    expect(result.result).toBe('success');
+    expect(result.error).toBeUndefined();
+    expect(result.context.prUrl).toBe(EXISTING_PR_URL);
+    expect(result.context.branch).toBe(EXISTING_BRANCH);
+    // The runner's own verification ran; the agent's report of a green suite is
+    // not what admitted this run.
+    expect(runner.calls.some((c) => c.cmd === 'npm' && c.args[0] === 'test')).toBe(true);
+    // No empty commit: nothing was staged, committed, or pushed.
+    expect(staged(runner, 'add')).toBe(false);
+    expect(staged(runner, 'commit')).toBe(false);
+    expect(staged(runner, 'push')).toBe(false);
+    // And the reviewer gets the continuation context, bound to the verified revision.
+    expect(result.context.implementationNoChange).toMatchObject({
+      reason: 'not_reproducing',
+      addressedFeedback: 'expected the staging hostname mapping to be present',
+      explanation: EXPLANATION,
+      revision: HEAD_SHA,
+      turn: 1,
+      feedback: VERIFICATION_FEEDBACK,
+    });
+    expect(result.context.noChangeFixTurns).toBe(1);
+    // That revision was confirmed against the freshly fetched PR head rather
+    // than read from local HEAD alone, so it is a revision the PR really shows.
+    expect(
+      runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'fetch' && c.args[2] === EXISTING_BRANCH),
+    ).toBe(true);
+    // Returning to review is not approval: no disposition is synthesized.
+    expect(result.context.fixDispositions).toBeUndefined();
+    expect(result.context.reviewDispute).toBeUndefined();
+  });
+
+  test('the run records the decision as its own artifact and result step', async () => {
+    writeEvidenceFile();
+    await createImplementationHandler(CONTEXT(), admittedRunner())(noChangeFixTask());
+    const dir = join(artifactRoot, 'runs', 'run-impl-1');
+    const artifact = JSON.parse(readFileSync(join(dir, 'implementation-no-change.json'), 'utf8'));
+    expect(artifact.admitted).toBe(true);
+    expect(artifact.reason).toBe('not_reproducing');
+    expect(artifact.revision).toBe(HEAD_SHA);
+    const resultArtifact = JSON.parse(readFileSync(join(dir, 'implementation-result.json'), 'utf8'));
+    expect(resultArtifact.success).toBe(true);
+    expect(resultArtifact.explainedNoChanges).toMatchObject({ reason: 'not_reproducing', revision: HEAD_SHA, turn: 1 });
+    // Distinct from the Tool Request resumed-recovery marker.
+    expect(resultArtifact.resumedNoChanges).toBeUndefined();
+  });
+
+  test('the fix prompt carries the no-change contract', async () => {
+    writeEvidenceFile();
+    await createImplementationHandler(CONTEXT(), admittedRunner())(noChangeFixTask());
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-prompt.md'), 'utf8');
+    expect(prompt).toContain('## If No Further Change Is Needed');
+    expect(prompt).toContain('"noChangeRequired": true');
+    expect(prompt).toContain('Do NOT claim a verification command passed as your evidence');
+  });
+
+  test('a fresh implementation prompt never offers the no-change contract', async () => {
+    await createImplementationHandler(CONTEXT(), happyRunner())(makeTask());
+    const prompt = readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-prompt.md'), 'utf8');
+    expect(prompt).not.toContain('## If No Further Change Is Needed');
+  });
+
+  // --- 2. The agent's PASS is not the runner's ----------------------------
+
+  test('a declared no-change turn whose runner verification FAILS never becomes success', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      ...admissionSteps(),
+      { stdout: 'FAIL 1 test failed', stderr: '', exitCode: 1 },      // verification (npm test) — RED
+      { stdout: 'Looked again; still nothing to change.', stderr: '', exitCode: 0 }, // bounded repair agent
+      { stdout: 'FAIL 1 test failed', stderr: '', exitCode: 1 },      // verification re-run — still RED
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status --porcelain -z (dirty capture)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git diff HEAD (patch capture)
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).not.toBe('success');
+    expect(staged(runner, 'push')).toBe(false);
+    expect(staged(runner, 'commit')).toBe(false);
+  });
+
+  test('an environment-classified verification failure keeps its existing classified outcome', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      ...admissionSteps(),
+      { stdout: '', stderr: 'npm ERR! Missing script: "test"', exitCode: 1 },  // verification — environment
+      { stdout: 'Nothing to repair.', stderr: '', exitCode: 0 },               // bounded repair agent
+      { stdout: '', stderr: 'npm ERR! Missing script: "test"', exitCode: 1 },  // verification re-run
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git status --porcelain -z
+      { stdout: '', stderr: '', exitCode: 0 },                                 // git diff HEAD
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/environment or/);
+    expect(result.context.implementationNoChange).toBeUndefined();
+  });
+
+  // --- 4. Refusals that must still fail exactly as before -----------------
+
+  test('a no-change fix turn with no declaration fails as "produced no file changes"', async () => {
+    const runner = sequenceRunner(fixPrefix('Everything already passes; nothing to do.'));
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/produced no file changes/);
+    expect(result.error).toMatch(/no admissible explanation/);
+    // Fail-closed spends neither the evidence capture nor the branch probe.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'ls-files' && c.args[1] === '-s')).toBe(false);
+    expect(
+      runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'diff' && c.args.includes('--quiet')),
+    ).toBe(false);
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-no-change.json'), 'utf8'),
+    );
+    expect(artifact.admitted).toBe(false);
+    expect(artifact.refusal).toBe('declaration-refused');
+    expect(artifact.declarationFailure.reason).toBe('absent');
+  });
+
+  test('a declaration whose evidence does not resolve is refused', async () => {
+    // The index lists the path but no such file exists in the worktree, so the
+    // cited range cannot be confirmed — unverified does not resolve.
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      { stdout: TRACKED_INDEX, stderr: '', exitCode: 0 },
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/produced no file changes/);
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-no-change.json'), 'utf8'),
+    );
+    expect(artifact.declarationFailure.reason).toBe('unresolvable-evidence');
+  });
+
+  test('a declaration quoting feedback this turn was never given is refused', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner(
+      fixPrefix(agentSaysNoChange(declaration({ addressedFeedback: 'the reviewer approved this PR already' }))),
+    );
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('failed');
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-no-change.json'), 'utf8'),
+    );
+    expect(artifact.declarationFailure.reason).toBe('feedback-not-quoted');
+  });
+
+  test('a FRESH implementation that emits the same declaration still fails', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner([
+      { stdout: '', stderr: '', exitCode: 0 },                        // git fetch base (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status (canonical)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status (worktree)
+      { stdout: agentSaysNoChange(), stderr: '', exitCode: 0 },       // claude
+      { stdout: '', stderr: '', exitCode: 0 },                        // git diff --stat HEAD (EMPTY)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git ls-files --others (EMPTY)
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/produced no file changes/);
+    // No no-change artifact at all: a fresh run never engaged the contract.
+    expect(existsSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-no-change.json'))).toBe(false);
+  });
+
+  test('a branch carrying only predecessor commits is not mistaken for a completed implementation', async () => {
+    writeEvidenceFile();
+    // `git diff --quiet <predecessor>...HEAD` exits 0 — nothing of this issue's
+    // own beyond the recorded dependency start point.
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      ...admissionSteps({ commitsProbeExit: 0 }),
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(
+      noChangeFixTask({
+        dependencyBase: { baseIssueNumber: 70, baseHeadRefName: 'ai/issue-70', baseHeadSha: DEP_SHA },
+      }),
+    );
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/no commits of this issue's own/);
+    // The probe compared against the RECORDED predecessor head, not the session base.
+    const probe = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'diff' && c.args.includes('--quiet'));
+    expect(probe.args).toEqual(['diff', '--quiet', `${DEP_SHA}...HEAD`]);
+  });
+
+  test('an unanswerable branch probe is refused rather than read as empty', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      ...admissionSteps({ commitsProbeExit: 128 }),
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/could not be answered/);
+  });
+
+  // An earlier fix that committed but whose push failed leaves the branch ahead
+  // of origin, and BOTH the worktree resolver and `git pull --ff-only` accept
+  // that state. This turn pushes nothing, so admitting it would verify and
+  // review commits the PR does not contain.
+  test('a branch holding local-only commits is refused, not verified and returned for review', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      ...admissionSteps({ publishedSha: 'b'.repeat(40) }),
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/produced no file changes/);
+    expect(result.error).toMatch(/not the PR head on origin/);
+    // Nothing downstream ran: no verification, no continuation, no review.
+    expect(runner.calls.some((c) => c.cmd === 'npm')).toBe(false);
+    expect(result.context.implementationNoChange).toBeUndefined();
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-no-change.json'), 'utf8'),
+    );
+    expect(artifact.admitted).toBe(false);
+    expect(artifact.refusal).toBe('revision-unpublished');
+    expect(artifact.detail).toContain(HEAD_SHA.slice(0, 12));
+  });
+
+  test('a PR head that cannot be resolved on origin is refused', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      ...admissionSteps({ fetchExit: 1 }),
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/could not be resolved/);
+    expect(runner.calls.some((c) => c.cmd === 'npm')).toBe(false);
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-no-change.json'), 'utf8'),
+    );
+    expect(artifact.refusal).toBe('published-revision-probe-failed');
+  });
+
+  // A narrow clone's fetch refspec can leave `refs/remotes/origin/<head>`
+  // unwritten, so FETCH_HEAD is preferred and the tracking ref is the fallback.
+  test('the published head falls back to the remote-tracking ref when FETCH_HEAD is absent', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      { stdout: TRACKED_INDEX, stderr: '', exitCode: 0 },             // git ls-files -s
+      { stdout: '', stderr: '', exitCode: 1 },                        // git diff --quiet (has issue commits)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git fetch origin ai/issue-77
+      { stdout: '', stderr: 'unknown revision', exitCode: 128 },      // git rev-parse FETCH_HEAD — absent
+      { stdout: `${HEAD_SHA}\n`, stderr: '', exitCode: 0 },           // git rev-parse refs/remotes/origin/ai/issue-77
+      { stdout: `${HEAD_SHA}\n`, stderr: '', exitCode: 0 },           // git rev-parse HEAD
+      ...PASSING_TAIL,
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('success');
+    expect(result.context.implementationNoChange.revision).toBe(HEAD_SHA);
+  });
+
+  test('a closed or missing PR fails before the agent ever runs', async () => {
+    const runner = sequenceRunner([{ stdout: '[]', stderr: '', exitCode: 0 }]); // gh pr list — none
+    const result = await createImplementationHandler(CONTEXT(), runner)(
+      makeFixTask({
+        context: {
+          title: 'Add login rate limiting',
+          labels: ['agent:claude', 'status:needs-fix'],
+          reviewFeedback: VERIFICATION_FEEDBACK,
+        },
+      }),
+    );
+    expect(result.result).toBe('failed');
+    expect(runner.calls.some((c) => c.cmd === 'claude')).toBe(false);
+  });
+
+  // --- 5. No bypass of the Review Dispute protocol ------------------------
+
+  test('a declaration does not admit a zero-diff run while findings await a disposition', async () => {
+    writeEvidenceFile();
+    const LINEAGE = 'ln-cccccccccccc';
+    const reviewDir = join(artifactRoot, 'runs', 'review-run-1');
+    mkdirSync(reviewDir, { recursive: true });
+    writeFileSync(
+      join(reviewDir, 'review-findings.json'),
+      JSON.stringify({
+        findings: [{
+          lineageId: LINEAGE,
+          version: 1,
+          severity: 'P1',
+          violatedContract: 'Auth handler must reject a null session before use',
+          preconditions: 'A request arrives with no session cookie',
+          failureScenario: 'handler.ts:42 dereferences session.user without a null check',
+          affectedBoundary: EVIDENCE_PATH,
+          requiredOutcome: 'The handler returns 401 for a missing session',
+          evidenceRefs: [{ kind: 'file', path: EVIDENCE_PATH, startLine: 2, endLine: 6 }],
+          humanGate: false,
+          reviewerMeta: { agentId: 'codex', reviewRunId: 'review-run-1', timestamp: '2026-08-03T00:00:00.000Z' },
+        }],
+      }),
+      'utf8',
+    );
+    const runner = sequenceRunner(fixPrefix(agentSaysNoChange()));
+    const result = await createImplementationHandler(
+      CONTEXT({ session: SESSION({ reviewDispute: { enabled: true } }) }),
+      runner,
+    )(
+      noChangeFixTask({
+        reviewDispute: {
+          version: 1,
+          reviewStructure: 'structured',
+          lineages: {
+            [LINEAGE]: {
+              lineageId: LINEAGE,
+              state: 'open',
+              version: 1,
+              counters: { rebuttals: 0, reconsiderations: 0, arbitrationPasses: 0, malformedArbiterAttempts: 0, evidenceRoundsUsed: 0 },
+              rebuttedVersions: [],
+              humanGate: false,
+              severity: 'P1',
+              affectedBoundary: EVIDENCE_PATH,
+            },
+          },
+        },
+        reviewArtifactDir: reviewDir,
+      }),
+    );
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/produced no file changes/);
+    expect(result.error).toMatch(/Review Dispute protocol/);
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-no-change.json'), 'utf8'),
+    );
+    expect(artifact.refusal).toBe('structured-dispositions-pending');
+  });
+
+  // --- 6. Handoff semantics preserved -------------------------------------
+
+  test('an unresolved Tool Request refuses the no-change turn', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner(fixPrefix(agentSaysNoChange()));
+    const result = await createImplementationHandler(CONTEXT(), runner)(
+      noChangeFixTask({
+        toolRequest: { command: 'npm install left-pad@^1.3.0', reason: 'needed', resolved: false },
+      }),
+    );
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/unresolved Tool Request/);
+  });
+
+  // --- 7. A repair that produces a diff finalizes normally ----------------
+
+  test('a verification repair that creates a diff commits and withdraws the no-change record', async () => {
+    writeEvidenceFile();
+    const runner = sequenceRunner([
+      ...fixPrefix(agentSaysNoChange()),
+      ...admissionSteps(),
+      { stdout: 'FAIL', stderr: '', exitCode: 1 },                    // verification — RED
+      { stdout: 'Fixed the failing assertion.', stderr: '', exitCode: 0 }, // repair agent
+      { stdout: 'PASS', stderr: '', exitCode: 0 },                    // verification re-run — GREEN
+      { stdout: 'src/hosts.ts\0', stderr: '', exitCode: 0 },          // git ls-files -z (stageable — NON-EMPTY)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git add
+      { stdout: '', stderr: '', exitCode: 0 },                        // git commit
+      { stdout: '', stderr: '', exitCode: 0 },                        // git push
+      { stdout: '', stderr: '', exitCode: 0 },                        // git worktree remove
+    ]);
+    const result = await createImplementationHandler(CONTEXT(), runner)(noChangeFixTask());
+    expect(result.result).toBe('success');
+    expect(staged(runner, 'commit')).toBe(true);
+    expect(staged(runner, 'push')).toBe(true);
+    // The run committed, so "no additional changes" is no longer true of it.
+    expect(result.context.implementationNoChange).toBeUndefined();
+    expect(result.context.noChangeFixTurns).toBeUndefined();
+    const artifact = JSON.parse(
+      readFileSync(join(artifactRoot, 'runs', 'run-impl-1', 'implementation-no-change.json'), 'utf8'),
+    );
+    expect(artifact.admitted).toBe(false);
+    expect(artifact.refusal).toBe('superseded-by-verification-repair');
+  });
+
+  // --- 8. Repeated no-change exchanges stay bounded -----------------------
+
+  test('a second no-change turn counts up, and the turn after the cap is refused', async () => {
+    writeEvidenceFile();
+    const second = await createImplementationHandler(CONTEXT(), admittedRunner())(
+      noChangeFixTask({ noChangeFixTurns: 1 }),
+    );
+    expect(second.result).toBe('success');
+    expect(second.context.noChangeFixTurns).toBe(2);
+
+    const runner = sequenceRunner(fixPrefix(agentSaysNoChange()));
+    const third = await createImplementationHandler(CONTEXT({ runId: 'run-impl-2' }), runner)(
+      noChangeFixTask({ noChangeFixTurns: 2 }),
+    );
+    expect(third.result).toBe('failed');
+    expect(third.error).toMatch(/produced no file changes/);
+    expect(third.error).toMatch(/consecutive no-change fix turns/);
+    // The cap is reached before anything is parsed or probed.
+    expect(runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'ls-files' && c.args[1] === '-s')).toBe(false);
+  });
+
 });

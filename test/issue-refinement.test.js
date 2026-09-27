@@ -73,9 +73,15 @@ describe('issue-refinement — §1 canonical vocabulary', () => {
       'no_implementation_agent',
       'predecessor_not_ready',
     ]);
-    expect(REFINEMENT_HANDOFF_REASONS).toHaveLength(17);
+    expect(REFINEMENT_HANDOFF_REASONS).toHaveLength(18);
     expect(REFINEMENT_HANDOFF_REASONS).toEqual(
-      expect.arrayContaining(['execution_marker_conflict', 'agent_unavailable', 'marker_precondition_failed']),
+      expect.arrayContaining([
+        'execution_marker_conflict',
+        'agent_unavailable',
+        'marker_precondition_failed',
+        // §5.2 (issue #1003): the one handoff raised before either agent runs.
+        'evidence_required',
+      ]),
     );
   });
 
@@ -338,6 +344,23 @@ describe('issue-refinement — §10 managed region scan', () => {
     const body = `Body\n${BEGIN}\ntext\n`;
     // The elision is undefined for a malformed region, so the raw body stands.
     expect(scanManagedRegion(body).sourceBody).toBe(body);
+  });
+
+  test('trailing whitespace is stripped from the source body (issue #1191)', () => {
+    expect(scanManagedRegion('  Body text\n\n \t\r\n  ').sourceBody).toBe('  Body text');
+    expect(scanManagedRegion(`Body\n\n${BEGIN}\ntext\n${END}\n \t\n`).sourceBody).toBe('Body');
+    expect(scanManagedRegion(' \n\t ').sourceBody).toBe('');
+  });
+
+  test('a long whitespace run before a non-whitespace character is scanned in linear time (issue #1191)', () => {
+    // A `/\s+$/` regex retries from every whitespace start here, which is
+    // quadratic and would stall far beyond the test timeout.
+    const run = ' \t'.repeat(100_000);
+    expect(scanManagedRegion(`${run}x`).sourceBody).toBe(`${run}x`);
+    expect(scanManagedRegion(`${run}x${run}`).sourceBody).toBe(`${run}x`);
+    const present = scanManagedRegion(`Body\n\n${BEGIN}\ntext\n${END}\n${run}x`);
+    expect(present.shape).toBe('present');
+    expect(present.sourceBody).toBe(`Body\n${run}x`);
   });
 });
 

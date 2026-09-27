@@ -171,6 +171,25 @@ describe('planLinearChainEdit — new', () => {
     expect(result.message).toContain('#11 (chain_500)');
     expect(result.remediation).toContain('#893');
     expect(result.diagnostics[0].code).toBe('duplicate_ownership');
+    // Nothing was known about chain_500 beyond its handle, so the finding keeps
+    // its pre-#1045 shape.
+    expect(result.diagnostics[0].owners).toBeUndefined();
+  });
+
+  test('it names the session and repository of the owning chain when the caller knows them', () => {
+    // An Issue number is unique only inside its repository (issue #1045): the
+    // refusal has to say WHICH #11 already belongs somewhere.
+    const result = plan({
+      ownership: [
+        { issueNumber: 11, chainId: 'chain_500', sessionId: 'yoda-form-js', repository: 'm2dw/yoda_form_js' },
+      ],
+    });
+    // The `#11 (chain_500)` token the refusal has always printed is left whole:
+    // the identity trails it rather than joining it.
+    expect(result.message).toContain('#11 (chain_500) [session yoda-form-js, repo m2dw/yoda_form_js]');
+    expect(result.diagnostics[0].owners).toEqual([
+      { chainId: 'chain_500', sessionId: 'yoda-form-js', repository: 'm2dw/yoda_form_js' },
+    ]);
   });
 });
 

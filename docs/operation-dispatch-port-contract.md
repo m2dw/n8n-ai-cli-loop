@@ -7,8 +7,19 @@ is invoked across, not which operations exist.
 
 This "implemented" status is component-level, not end-to-end: see
 [feature-status.md](feature-status.md) for ChatOps's overall availability,
-which stays `foundation-only` until comment ingestion, dispatch, and result
-publication are connected.
+which is `config-gated` on `session.chatOps.enabled` (default off) now that
+comment ingestion, dispatch, and result publication are connected end to end
+by `src/cli/chatops-scan.ts` (issue #1024). §11.2's per-operation core
+extraction has run for **both** mapped operations — **`tool-request.run`**
+(issue #1029, `src/core/tool-request-run.ts`) and **`tool-request.resolve`**
+(issue #1030, `src/core/tool-request-resolve.ts`): each is a callable
+`{ request, context } → OperationResult` core with an injected context, and
+`createToolRequestRunDescriptor` / `createToolRequestResolveDescriptor` bind
+them to this port. Issue #1031 registered both in
+`src/core/chatops-operations.ts`, so an authorized ChatOps command now reaches
+the same core the admin CLI calls. The catalog is closed at those two: any
+other operation id is still answered `rejected` / `unknown-operation` by this
+port, which §7 defines as definite and effect-free.
 
 This is issue #783, the successor `docs/chatops-execution-ledger-contract.md`
 §19 names: "the callable interface an attempt invokes between §8's steps 1 and

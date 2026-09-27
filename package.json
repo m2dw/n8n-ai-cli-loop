@@ -4,7 +4,9 @@
   "type": "module",
   "license": "Apache-2.0",
   "private": true,
-  "workspaces": ["n8n-node"],
+  "workspaces": [
+    "n8n-node"
+  ],
   "scripts": {
     "build": "npm run build:lib && npm run build:parent-child-workflow && npm run build:n8n-node",
     "build:lib": "tsc -p tsconfig.json",
@@ -12,22 +14,56 @@
     "build:n8n-node": "npm -w n8n-nodes-ai-cli-loop run build",
     "pretest": "npm run build",
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test:files": "node --experimental-vm-modules node_modules/.bin/jest",
     "package": "npm run build",
     "build:parent-child-workflow": "node scripts/build-parent-child-workflow.mjs",
     "metrics": "npm run build && node scripts/metrics.mjs",
+    "mutation:preflight": "node scripts/mutation-pilot.mjs --preflight",
+    "mutation:dry-run": "node scripts/mutation-pilot.mjs --dry-run",
+    "mutation:dry-run:start": "node scripts/mutation-pilot.mjs --dry-run --background",
+    "mutation:dry-run:report": "node scripts/mutation-pilot.mjs --dry-run --report",
+    "mutation:smoke": "node scripts/mutation-pilot.mjs --smoke",
+    "mutation:smoke:start": "node scripts/mutation-pilot.mjs --smoke --background",
+    "mutation:smoke:report": "node scripts/mutation-pilot.mjs --smoke --report",
+    "mutation:pilot": "node scripts/mutation-pilot.mjs --pilot",
+    "mutation:pilot:start": "node scripts/mutation-pilot.mjs --pilot --background",
+    "mutation:pilot:report": "node scripts/mutation-pilot.mjs --pilot --report",
     "copybara:export": "node scripts/copybara-export.mjs",
     "copybara:validate": "node scripts/copybara-validate.mjs",
     "public:export": "node scripts/public-export.mjs",
     "public:publish": "node scripts/public-export.mjs --publish"
   },
   "devDependencies": {
+    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/jest-runner": "^10.0.0",
     "@types/better-sqlite3": "^7.6.13",
     "jest": "^29.7.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "n8n-workflow": {
+      "form-data": "^4.0.4"
+    }
   },
   "jest": {
     "testEnvironment": "node",
-    "transform": {}
+    "transform": {},
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "<rootDir>/\\.mutation/",
+      "<rootDir>/(.*/)?stryker-tmp/sandbox-[^/]*/"
+    ],
+    "modulePathIgnorePatterns": [
+      "<rootDir>/\\.mutation/",
+      "<rootDir>/(.*/)?stryker-tmp/sandbox-[^/]*/"
+    ],
+    "globalSetup": "<rootDir>/test/helpers/test-home-global-setup.cjs",
+    "globalTeardown": "<rootDir>/test/helpers/test-home-global-teardown.cjs",
+    "setupFiles": [
+      "<rootDir>/test/helpers/test-home-setup.js"
+    ]
   },
   "dependencies": {
     "@clack/prompts": "^1.6.0",

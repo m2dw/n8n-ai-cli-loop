@@ -212,6 +212,22 @@ export interface CreatePullRequestInput {
 export interface RepoHostProvider {
   /** Resolve the open PR that corresponds to a work item (by head-branch convention). */
   findPullRequestForWorkItem(issueNumber: number): FindPullRequestResult;
+  /**
+   * Every OPEN pull request in the configured repository whose head is exactly
+   * `head` (issue #998).
+   *
+   * Deliberately distinct from {@link RepoHostProvider.findPullRequestForWorkItem},
+   * which owns the `ai/issue-<n>` convention and answers "the" PR — it resolves a
+   * single result and so cannot report that two PRs share a head. The retry path
+   * that adopts an already-created PR needs both properties this one adds: the
+   * caller supplies the EXACT head branch it pushed (never a derived one), and
+   * ambiguity is observable, because adopting one of two candidates would attach
+   * this run's commits to an arbitrarily chosen review.
+   *
+   * Returns an error rather than an empty list when the listing cannot be read:
+   * "no PR exists" must never be inferred from a failed lookup.
+   */
+  findOpenPullRequestsByHead(head: string): ProviderRead<PullRequest[]>;
   /** Open a PR for an already-pushed branch. */
   createPullRequest(input: CreatePullRequestInput): ProviderRead<PullRequest>;
   /** Fetch a PR by selector (PR number or branch), including base ref and mergeability. */

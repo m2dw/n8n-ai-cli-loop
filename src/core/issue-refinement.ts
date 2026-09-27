@@ -109,6 +109,7 @@ export const REFINEMENT_HANDOFF_REASONS = [
   "agent_unavailable",
   "marker_precondition_failed",
   "execution_marker_conflict",
+  "evidence_required",
 ] as const;
 export type RefinementHandoffReason = (typeof REFINEMENT_HANDOFF_REASONS)[number];
 
@@ -676,8 +677,11 @@ export function scanManagedRegion(body: string | undefined): ManagedRegionScan {
   };
 }
 
+// `trimEnd()` strips the same `\s` set as `/\s+$/` in linear time; the regex
+// is quadratic on a long whitespace run followed by a non-whitespace character
+// (issue #1191).
 function stripTrailingWhitespace(text: string): string {
-  return text.replace(/\s+$/, "");
+  return text.trimEnd();
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +891,31 @@ export interface RefinementContextBlock {
   markerLabel: string;
   /** §15 the handoff reason when escalated; `null` otherwise. */
   handoffReason: RefinementHandoffReason | null;
+  /**
+   * §13 item 3: the ready-for-human label this handoff actually ADDED, recorded
+   * in the same transaction that raised it. `null`/absent when no handoff is
+   * outstanding, or on a block written before issue #980.
+   *
+   * Recorded rather than re-read from session config because `labels.readyForHuman`
+   * is session-configurable and can be renamed between the handoff and the §13
+   * recovery that undoes it. The removal recovery enqueues is a COMPENSATION for
+   * a specific add, so it has to name the label that add used — deriving it from
+   * current config would leave the delivered old label on the Issue and take the
+   * new one off instead (issue #980 review).
+   */
+  handoffLabel?: string | null;
+  /**
+   * §13: how many operator recoveries (row 36) this row has taken. Absent on
+   * every block written before issue #980, and absent means zero.
+   *
+   * NOT a §8 counter, and deliberately not inside `counters`: recovery CLEARS
+   * the §8 counters, and this is the one number that must survive the reset. It
+   * is what discriminates the retried attempt from the one before it — the
+   * handoff a second attempt raises for the SAME reason would otherwise dedupe
+   * against the first attempt's already-posted comment (see
+   * `refinementHandoffIdempotencyKey`).
+   */
+  recoveries?: number;
   admittedAt: string;
   updatedAt: string;
 }

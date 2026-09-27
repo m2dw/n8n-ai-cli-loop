@@ -40,9 +40,10 @@
  */
 
 import Database from "better-sqlite3";
-import { homedir, hostname } from "os";
+import { hostname } from "os";
 import { mkdirSync } from "fs";
 import { join } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 import {
   allocateChainId,
   chainGraphFingerprint,
@@ -112,7 +113,7 @@ import {
 import { sqliteBackendId } from "./sqlite-backend-id.js";
 
 export const DEFAULT_CHAIN_REGISTRY_DB_PATH = join(
-  homedir(),
+  resolveHomeDir(),
   ".config",
   "n8n-ai-cli-loop",
   "dev_loop.db",
@@ -221,6 +222,42 @@ function editLockOwnerLiveness(row: EditLockRow): ChainEditLockOwnerLiveness {
 interface MemberOwnerRow {
   issue_number: number;
   chain_id: string;
+  session_id: string;
+}
+
+/**
+ * SQL clauses and bound parameters for a {@link ChainListFilter}, with `alias`
+ * naming the `dependency_chain` row in the statement being built.
+ *
+ * Shared by every filtered read and by the exclusive-ownership lookup so the
+ * scope a caller plans against and the scope the store claims inside its write
+ * are the same predicate, not two spellings of it. An empty `sessionIds` yields
+ * a never-true clause, as the port requires: the caller asked for "any of these
+ * sessions" and named none.
+ */
+function chainFilterClauses(
+  filter: ChainListFilter | undefined,
+  alias: string,
+): { clauses: string[]; params: unknown[] } {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (filter?.sessionId !== undefined) {
+    clauses.push(`${alias}.session_id = ?`);
+    params.push(filter.sessionId);
+  }
+  if (filter?.sessionIds !== undefined) {
+    if (filter.sessionIds.length === 0) {
+      clauses.push("0");
+    } else {
+      clauses.push(`${alias}.session_id IN (${filter.sessionIds.map(() => "?").join(", ")})`);
+      params.push(...filter.sessionIds);
+    }
+  }
+  if (filter?.syncStatus !== undefined) {
+    clauses.push(`${alias}.sync_status = ?`);
+    params.push(filter.syncStatus);
+  }
+  return { clauses, params };
 }
 
 function rowToChain(row: ChainRow): ChainRecord {
@@ -390,16 +427,7 @@ export class SqliteChainRegistryStore
   ): ChainMemberOwner[] {
     if (issueNumbers.length === 0) return [];
 
-    const scopeClauses: string[] = [];
-    const scopeParams: unknown[] = [];
-    if (scope.sessionId !== undefined) {
-      scopeClauses.push("c.session_id = ?");
-      scopeParams.push(scope.sessionId);
-    }
-    if (scope.syncStatus !== undefined) {
-      scopeClauses.push("c.sync_status = ?");
-      scopeParams.push(scope.syncStatus);
-    }
+    const { clauses: scopeClauses, params: scopeParams } = chainFilterClauses(scope, "c");
 
     const owners: ChainMemberOwner[] = [];
     for (let start = 0; start < issueNumbers.length; start += MEMBER_OWNER_QUERY_CHUNK) {
@@ -411,14 +439,18 @@ export class SqliteChainRegistryStore
       ];
       const rows = this.#db
         .prepare(
-          `SELECT m.issue_number AS issue_number, c.chain_id AS chain_id
+          `SELECT m.issue_number AS issue_number, c.chain_id AS chain_id, c.session_id AS session_id
              FROM dependency_chain_member m
              JOIN dependency_chain c ON c.chain_id = m.chain_id
             WHERE ${clauses.join(" AND ")}`,
         )
         .all(...batch, chainId, ...scopeParams) as MemberOwnerRow[];
       for (const row of rows) {
-        owners.push({ issueNumber: row.issue_number, chainId: row.chain_id });
+        owners.push({
+          issueNumber: row.issue_number,
+          chainId: row.chain_id,
+          sessionId: row.session_id,
+        });
       }
     }
 
@@ -527,19 +559,10 @@ export class SqliteChainRegistryStore
   }
 
   async listChains(filter?: ChainListFilter): Promise<ChainRecord[]> {
-    const clauses: string[] = [];
-    const params: unknown[] = [];
-    if (filter?.sessionId !== undefined) {
-      clauses.push("session_id = ?");
-      params.push(filter.sessionId);
-    }
-    if (filter?.syncStatus !== undefined) {
-      clauses.push("sync_status = ?");
-      params.push(filter.syncStatus);
-    }
+    const { clauses, params } = chainFilterClauses(filter, "c");
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.#db
-      .prepare(`SELECT * FROM dependency_chain${where} ORDER BY chain_id`)
+      .prepare(`SELECT c.* FROM dependency_chain c${where} ORDER BY c.chain_id`)
       .all(...params) as ChainRow[];
     return rows.map(rowToChain);
   }
@@ -548,16 +571,9 @@ export class SqliteChainRegistryStore
     issueNumber: number,
     filter?: ChainListFilter,
   ): Promise<ChainRecord[]> {
-    const clauses: string[] = ["m.issue_number = ?"];
-    const params: unknown[] = [issueNumber];
-    if (filter?.sessionId !== undefined) {
-      clauses.push("c.session_id = ?");
-      params.push(filter.sessionId);
-    }
-    if (filter?.syncStatus !== undefined) {
-      clauses.push("c.sync_status = ?");
-      params.push(filter.syncStatus);
-    }
+    const scope = chainFilterClauses(filter, "c");
+    const clauses: string[] = ["m.issue_number = ?", ...scope.clauses];
+    const params: unknown[] = [issueNumber, ...scope.params];
     const rows = this.#db
       .prepare(
         `SELECT c.* FROM dependency_chain c
@@ -722,6 +738,18 @@ export class SqliteChainRegistryStore
     const edges: ChainEdgeInput[] = (input.edges ?? []).map((e) => ({ ...e }));
     const now = input.now ?? new Date().toISOString();
 
+    // A scope naming no session claims the members against no chain at all,
+    // which would let the write through exactly as if no claim had been asked
+    // for. Refused outside the transaction: nothing about it depends on stored
+    // state, and a caller that computed an empty scope has a bug to fix rather
+    // than a race to retry.
+    if (input.exclusiveMemberScope?.sessionIds?.length === 0) {
+      return fail(
+        "invalid_input",
+        "exclusiveMemberScope.sessionIds is empty, which would claim the members against no chain",
+      );
+    }
+
     const run = this.#db.transaction((): ChainRegistryResult<ChainGraph> => {
       const current = this.#readChain(input.chainId);
       if (!current) return fail("not_found", `no such chain: ${input.chainId}`);
@@ -753,8 +781,13 @@ export class SqliteChainRegistryStore
         if (owners.length > 0) {
           const first = owners[0]!;
           const rest = owners.length - 1;
+          // The session is named because an Issue number identifies an Issue
+          // only within one repository (issue #1045): "issue 697 already
+          // belongs to chain_777" is unreadable to an operator holding two
+          // sessions that each have a #697.
           const detail =
             `issue ${first.issueNumber} already belongs to chain ${first.chainId}` +
+            (first.sessionId === undefined ? "" : ` (session ${first.sessionId})`) +
             (rest === 0 ? "" : ` (and ${rest} further claim${rest === 1 ? "" : "s"})`);
           return { ok: false, code: "conflict", detail, owners };
         }

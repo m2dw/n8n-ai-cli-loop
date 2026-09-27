@@ -50,7 +50,7 @@ export class AiCliLoop implements INodeType {
     group: ['transform'],
     version: 1,
     description:
-      'Executes AI Dev Loop operations (Create Context, Acquire Repo Lock, Release Repo Lock, GitHub Intake, Run One Phase, Dispatch Outbox)',
+      'Executes AI Dev Loop operations (Create Context, Acquire Repo Lock, Release Repo Lock, GitHub Intake, Run One Phase, ChatOps Scan, Dispatch Outbox)',
     defaults: {
       name: 'AI CLI Loop',
     },
@@ -92,6 +92,13 @@ export class AiCliLoop implements INodeType {
             value: 'runOnePhase',
             description: 'Execute the next pending phase for a task in the given context',
             action: 'Run one phase',
+          },
+          {
+            name: 'ChatOps Scan',
+            value: 'chatopsScan',
+            description:
+              'Run one bounded ChatOps scan/dispatch/publish pass for the session behind the given context',
+            action: 'ChatOps scan',
           },
           {
             name: 'Dispatch Outbox',
@@ -136,7 +143,14 @@ export class AiCliLoop implements INodeType {
         default: '',
         displayOptions: {
           show: {
-            operation: ['acquireRepoLock', 'releaseRepoLock', 'githubIntake', 'runOnePhase', 'dispatchOutbox'],
+            operation: [
+              'acquireRepoLock',
+              'releaseRepoLock',
+              'githubIntake',
+              'runOnePhase',
+              'chatopsScan',
+              'dispatchOutbox',
+            ],
           },
         },
         description: 'The context ID for this operation',
@@ -343,6 +357,39 @@ export class AiCliLoop implements INodeType {
         throw new NodeOperationError(
           this.getNode(),
           `Run One Phase returned non-JSON output: ${stdout}`
+        );
+      }
+
+      return [items.map(() => ({ json: result as IDataObject }))];
+    }
+
+    if (operation === 'chatopsScan') {
+      const contextId = this.getNodeParameter('contextId', 0) as string;
+
+      if (!contextId) {
+        throw new NodeOperationError(this.getNode(), 'Context ID must not be empty');
+      }
+
+      const cliBase = resolveCliBase();
+      const script = resolve(cliBase, 'chatops-scan.js');
+
+      let stdout: string;
+      try {
+        ({ stdout } = await execPromise(
+          `node '${shellEscapeArg(script)}' --context-id '${shellEscapeArg(contextId)}'`
+        ));
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new NodeOperationError(this.getNode(), `ChatOps Scan CLI failed: ${message}`);
+      }
+
+      let result: unknown;
+      try {
+        result = JSON.parse(stdout);
+      } catch {
+        throw new NodeOperationError(
+          this.getNode(),
+          `ChatOps Scan returned non-JSON output: ${stdout}`
         );
       }
 

@@ -60,6 +60,67 @@ describe('GhRepoHostProvider — findPullRequestForWorkItem', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Exact-head listing used by post-create PR reconciliation (issue #998)
+// ---------------------------------------------------------------------------
+
+describe('GhRepoHostProvider — findOpenPullRequestsByHead', () => {
+  test('lists open PRs for the EXACT head given by the caller, with a limit above 1', () => {
+    const pr = {
+      number: 997,
+      url: 'https://github.com/m2dw/test-repo/pull/997',
+      headRefName: 'ai/issue-975',
+      state: 'OPEN',
+      baseRefName: 'main',
+    };
+    const gh = fakeGh([{ exitCode: 0, stdout: JSON.stringify([pr]), stderr: '' }]);
+    const host = new GhRepoHostProvider(gh, REPO, CWD);
+
+    const result = host.findOpenPullRequestsByHead('ai/issue-975');
+
+    expect(result).toEqual({ ok: true, value: [pr] });
+    const args = gh.calls[0].args;
+    expect(args.slice(0, 2)).toEqual(['pr', 'list']);
+    // The head is the caller's exact branch — never derived from an issue number here.
+    expect(args[args.indexOf('--head') + 1]).toBe('ai/issue-975');
+    expect(args[args.indexOf('--repo') + 1]).toBe(REPO);
+    expect(args[args.indexOf('--state') + 1]).toBe('open');
+    // A `--limit 1` query could never reveal a second open PR on the head, which
+    // is the ambiguity the reconciliation must be able to refuse.
+    expect(Number(args[args.indexOf('--limit') + 1])).toBeGreaterThan(1);
+  });
+
+  test('returns every match so ambiguity is visible to the caller', () => {
+    const prs = [
+      { number: 1, url: 'https://github.com/m2dw/test-repo/pull/1', headRefName: 'ai/issue-9', state: 'OPEN', baseRefName: 'main' },
+      { number: 2, url: 'https://github.com/m2dw/test-repo/pull/2', headRefName: 'ai/issue-9', state: 'OPEN', baseRefName: 'main' },
+    ];
+    const gh = fakeGh([{ exitCode: 0, stdout: JSON.stringify(prs), stderr: '' }]);
+    const host = new GhRepoHostProvider(gh, REPO, CWD);
+    expect(host.findOpenPullRequestsByHead('ai/issue-9')).toEqual({ ok: true, value: prs });
+  });
+
+  test('an empty match set is ok:true with an empty list (a real "no PR" answer)', () => {
+    const gh = fakeGh([{ exitCode: 0, stdout: '[]', stderr: '' }]);
+    const host = new GhRepoHostProvider(gh, REPO, CWD);
+    expect(host.findOpenPullRequestsByHead('ai/issue-9')).toEqual({ ok: true, value: [] });
+  });
+
+  test('a failed lookup is an error, never an empty match set', () => {
+    const gh = fakeGh([{ exitCode: 1, stdout: '', stderr: 'auth error' }]);
+    const host = new GhRepoHostProvider(gh, REPO, CWD);
+    const result = host.findOpenPullRequestsByHead('ai/issue-9');
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/gh pr list failed/);
+  });
+
+  test('non-JSON and non-array payloads fail rather than resolve to no matches', () => {
+    const host = (stdout) => new GhRepoHostProvider(fakeGh([{ exitCode: 0, stdout, stderr: '' }]), REPO, CWD);
+    expect(host('not json').findOpenPullRequestsByHead('h').error).toMatch(/non-JSON/);
+    expect(host('{"number":1}').findOpenPullRequestsByHead('h').error).toMatch(/non-array/);
+  });
+});
+
 describe('GhRepoHostProvider — createPullRequest', () => {
   test('opens a PR and derives the number from the printed URL', () => {
     const gh = fakeGh([{ exitCode: 0, stdout: 'https://github.com/m2dw/test-repo/pull/7\n', stderr: '' }]);

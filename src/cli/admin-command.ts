@@ -54,10 +54,35 @@ export interface TokenizeSpec {
   allowPositionals?: boolean;
 }
 
+/**
+ * One recognized `--flag` as it appeared in argv, in order.
+ *
+ * `args`/`flags` collapse repetition — the last `--reason` wins, and a boolean
+ * flag is present or absent. That is the right shape for almost every command
+ * and the wrong one for a grammar whose meaning depends on ORDER and on
+ * repetition: `admin task-verification amend` binds each `--command` and
+ * `--op-reason` to the operation flag it follows
+ * (docs/verification-amendment-contract.md §11 rule 3), and accepts several
+ * operations in one invocation.
+ *
+ * Rather than let such a command hand-roll an argv scan — which §11 rule 2
+ * forbids precisely because a hand-rolled scan does not inherit the
+ * unknown/abbreviated-flag guarantee — the tokenizer also records what it
+ * already saw. Validation stays here; only the reading of the sequence moves.
+ */
+export interface FlagOccurrence {
+  /** The flag name without its leading `--`. */
+  name: string;
+  /** The consumed value; absent for a boolean flag. */
+  value?: string;
+}
+
 export interface TokenizedArgs {
   args: Record<string, string>;
   flags: Set<string>;
   positionals: string[];
+  /** Every recognized flag in argv order, including repeats. */
+  occurrences: FlagOccurrence[];
 }
 
 /** Levenshtein edit distance, used only to suggest the closest valid flag. */
@@ -123,6 +148,7 @@ export function tokenizeArgs(
   const args: Record<string, string> = {};
   const flags = new Set<string>();
   const positionals: string[] = [];
+  const occurrences: FlagOccurrence[] = [];
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
     if (!tok.startsWith("--")) {
@@ -135,6 +161,7 @@ export function tokenizeArgs(
     const name = tok.slice(2);
     if (boolSet.has(name)) {
       flags.add(name);
+      occurrences.push({ name });
       continue;
     }
     if (valueSet.has(name)) {
@@ -143,12 +170,13 @@ export function tokenizeArgs(
         return { error: `--${name} requires a value` };
       }
       args[name] = next;
+      occurrences.push({ name, value: next });
       i++;
       continue;
     }
     return { error: unknownFlagError(name, known) };
   }
-  return { args, flags, positionals };
+  return { args, flags, positionals, occurrences };
 }
 
 /**

@@ -23,7 +23,9 @@
  *
  *   ANTIGRAVITY_CLI_SMOKE=1 npx jest test/antigravity-cli-smoke.test.js
  *
- * It uses the REAL global settings store, because that is the file `agy` reads.
+ * It uses the REAL global settings store, because that is the file `agy` reads,
+ * and spawns the CLI with the restored operator environment so the store this
+ * test prepares is the store the CLI loads (`agySpawnOptions`).
  * The §2.5 lifecycle is what makes that safe, and assertion 4 is what proves it:
  * the run's entries are released, and the trust entry the test registers for its
  * temporary workspace is removed again in teardown.
@@ -39,6 +41,12 @@ import {
   releaseAntigravityWorkspaceSettings,
 } from '../dist/handlers/antigravity-workspace.js';
 import { withoutTrustEntries } from '../dist/core/antigravity-workspace-settings.js';
+import { resolveHomeDir } from '../dist/core/home-dir.js';
+import {
+  useOperatorEnv,
+  OPERATOR_ENV_SNAPSHOT_ENV,
+  TEST_HOME_ROOT_ENV,
+} from './helpers/test-home.js';
 
 const ENABLED = process.env['ANTIGRAVITY_CLI_SMOKE'] === '1';
 const describeSmoke = ENABLED ? describe : describe.skip;
@@ -78,14 +86,32 @@ function git(args, cwd) {
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, stdio: 'ignore' });
 }
 
-/** One headless `agy` turn inside the approved workspace. */
-function runAgy(prompt) {
-  return spawnSync('agy', ['--print', prompt], {
+/**
+ * The `spawnSync` options every CLI turn shares.
+ *
+ * `env` is passed explicitly rather than inherited. A child spawned without it
+ * gets the *real* worker environment, which `globalSetup` pinned at the run's
+ * isolated home (issue #1063); Jest hands the test file only a COPY of
+ * `process.env`, so `useOperatorEnv()` restores what this file reads while
+ * leaving what a child inherits untouched. That split would have the test
+ * prepare the operator's global settings store and then run `agy` under a
+ * different home — without those settings, and without the operator's
+ * HOME-backed login. The `git` helpers above deliberately keep inheriting the
+ * isolated environment: they pin identity and branch on the command line and
+ * never need operator state.
+ */
+function agySpawnOptions() {
+  return {
     cwd: workspace,
     encoding: 'utf8',
     timeout: TURN_TIMEOUT_MS - 10_000,
-    input: prompt,
-  });
+    env: operatorEnv,
+  };
+}
+
+/** One headless `agy` turn inside the approved workspace. */
+function runAgy(prompt) {
+  return spawnSync('agy', ['--print', prompt], { ...agySpawnOptions(), input: prompt });
 }
 
 const combined = (result) => `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
@@ -93,8 +119,27 @@ const combined = (result) => `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
 const deniedHeadlessly = (result) =>
   /permission|not allowed|denied/i.test(combined(result));
 
+/** Undo for {@link useOperatorEnv}; see the call below. */
+let restoreIsolatedEnv;
+/** The restored operator environment, as handed to every CLI subprocess. */
+let operatorEnv;
+/** The operator's home — where the store this test prepares actually lives. */
+let operatorHome;
+/** The run's isolated home, captured before it is handed back. */
+let isolatedHome;
+
 beforeAll(() => {
   if (!ENABLED) return;
+  isolatedHome = resolveHomeDir(process.env);
+  // The rest of the suite runs under a test-owned HOME (issue #1063). This file
+  // is the deliberate exception: it drives the INSTALLED CLI against the one
+  // global settings file that CLI reads, which is resolved from the operator's
+  // home — under the isolated one it would prepare a store `agy` never looks at,
+  // and `agy` itself would run without the operator's login. Taking the real
+  // environment back has to happen before anything below reads it: the
+  // ANTIGRAVITY_CLI_SETTINGS guard is checking the operator's shell, and
+  // `defaultGlobalSettingsPath()` resolves per call.
+  restoreIsolatedEnv = useOperatorEnv();
   if (process.env['ANTIGRAVITY_CLI_SETTINGS']) {
     // Preparation refuses this combination itself (`global-settings-not-canonical`,
     // §3.5) because the runner would prepare one store while the CLI reads
@@ -102,6 +147,15 @@ beforeAll(() => {
     // leaving a refusal to be diagnosed.
     throw new Error('ANTIGRAVITY_CLI_SETTINGS must be unset for the real-CLI smoke test');
   }
+  // Snapshotted here, once the operator's values are back, and handed to every
+  // CLI subprocess explicitly — see `agySpawnOptions`. The isolation's own
+  // bookkeeping is dropped so the CLI runs in the operator's environment rather
+  // than in one carrying the harness's internals; the cleared service
+  // credentials stay cleared, because nothing here should reach GitHub.
+  operatorEnv = { ...process.env };
+  delete operatorEnv[TEST_HOME_ROOT_ENV];
+  delete operatorEnv[OPERATOR_ENV_SNAPSHOT_ENV];
+  operatorHome = resolveHomeDir(operatorEnv);
   tmpDir = mkdtempSync(join(tmpdir(), 'antigravity-smoke-'));
   workspace = join(tmpDir, 'workspace');
   mkdirSync(workspace, { recursive: true });
@@ -148,9 +202,40 @@ afterAll(() => {
     writeFileSync(globalSettingsPath, globalSettingsBefore);
   }
   rmSync(tmpDir, { recursive: true, force: true });
+  // Last: everything above resolves paths from the operator's home, and the
+  // isolated one goes back only once none of it needs the real environment.
+  if (restoreIsolatedEnv) restoreIsolatedEnv();
 });
 
 describeSmoke('installed agy — bounded research profile (issues #830, #832)', () => {
+  test('spawns the CLI under the operator environment, not the isolated test home', () => {
+    // The store preparation wrote is the one a CLI running under `operatorHome`
+    // loads — the same home, resolved the same way (§3.5, `ANTIGRAVITY_CLI_SETTINGS`
+    // is refused above, so the canonical path is the only one in play).
+    expect(globalSettingsPath).toBe(join(operatorHome, '.gemini', 'antigravity-cli', 'settings.json'));
+    expect(agySpawnOptions().env).toBe(operatorEnv);
+    expect(operatorHome).not.toBe(isolatedHome);
+
+    // The propagation itself, observed by a child spawned exactly the way
+    // `runAgy` spawns: `os.homedir()` asks libuv, which reads the environment
+    // the child was GIVEN — so this is the home `agy` resolves its settings and
+    // its login from.
+    const script = 'process.stdout.write(require("os").homedir())';
+    const probed = spawnSync(process.execPath, ['-e', script], { ...agySpawnOptions(), timeout: 30_000 });
+    expect(probed.error).toBeUndefined();
+    expect(probed.stdout.trim()).toBe(operatorHome);
+
+    // And what it would have inherited without the explicit `env`: the run's
+    // isolated home, i.e. a store `agy` never reads. This is the regression.
+    const inherited = spawnSync(process.execPath, ['-e', script], {
+      cwd: workspace,
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+    expect(inherited.error).toBeUndefined();
+    expect(inherited.stdout.trim()).toBe(isolatedHome);
+  });
+
   test('the installed CLI is a version this schema was reconciled against', () => {
     expect(prepared.cliVersion).toMatch(/^1\.\d+\.\d+$/);
     expect(prepared.globalOverlay.installed).toBe(true);

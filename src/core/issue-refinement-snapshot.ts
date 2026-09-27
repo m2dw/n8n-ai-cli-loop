@@ -53,6 +53,20 @@
  * comment window would be a policy change owed to the document first, so the
  * target side implements §5 verbatim. Predecessor comment windows — the ones §5
  * does specify — are captured in full.
+ *
+ * **Declared predecessor contract evidence (issue #983, §5.1).** An Issue may
+ * carry ONE fenced `refinement-evidence` block naming exact predecessor
+ * files, exports, or line ranges; the capture resolves each selection against
+ * the predecessor's authoritative commit — the head SHA of its stack-ready PR,
+ * or its merge commit — through one more optional READ on the port, and places
+ * the bounded, sanitized result (or a recorded omission) in the snapshot both
+ * agents receive. A selection that cannot be captured never guesses: it is
+ * stored as an `omitted` entry whose reason literal is exactly what the
+ * `evidence_required` preflight of issue #1003 gates on, and no agent is
+ * invoked here on its behalf. A snapshot with no declaration carries an empty
+ * evidence list and HASHES byte-identically to a pre-#983 snapshot (see
+ * {@link computePredecessorFingerprint}), so recorded fingerprints of
+ * undeclared Issues do not move.
  */
 
 import { createHash } from "crypto";
@@ -67,6 +81,12 @@ import type {
   RefinementPredecessorRecord,
 } from "./issue-refinement.js";
 import { computeIssueSourceDigest, scanManagedRegion } from "./issue-refinement.js";
+import {
+  DEFAULT_DENY_GLOBS,
+  matchEvidenceGlob,
+  normalizeEvidencePath,
+  parseEvidenceGlob,
+} from "./repository-evidence.js";
 import { redactApiKeys, sanitizeBody } from "./text-sanitize.js";
 
 // ---------------------------------------------------------------------------
@@ -175,6 +195,56 @@ export interface RefinementReviewSummaryRead {
 }
 
 /**
+ * One §5.1 evidence read: a single file at a single, explicit commit.
+ *
+ * The commit is chosen by the CORE, never by the adapter: it is the
+ * predecessor's authoritative result under the stacked-branch contract — the
+ * head commit SHA of its stack-ready PR for the `open_stack_ready` shape, the
+ * merge commit SHA for `merged` — taken from the same identity §4 classified
+ * usable and §15 persists. An adapter must read at exactly that commit; a
+ * branch name is not an acceptable substitute, because a branch can move
+ * between the identity check and the read.
+ */
+export interface RefinementEvidenceFileRequest {
+  /** The predecessor Issue the selection names. */
+  issueNumber: number;
+  /** Its stack-ready PR, for adapters that resolve content through the PR. */
+  prNumber: number;
+  /** The PR's head ref name — context only; never an addressing substitute for the SHA. */
+  headRefName: string;
+  /** The exact commit to read at. The core verifies the echo below against this. */
+  commitSha: string;
+  /** Normalized repo-relative path, already shape-checked by the declaration parser. */
+  path: string;
+  /**
+   * Read cap in UTF-8 bytes. The core asks for one more byte than it will
+   * scan, so an adapter that honours the cap exactly still reveals
+   * truncation; an adapter may return the whole file and the core re-bounds.
+   */
+  maxBytes: number;
+}
+
+/**
+ * The three answers an evidence read can give without throwing.
+ *
+ * `missing_path` is a fact about the commit (no such file there), and
+ * `unavailable` is a fact about the adapter's reach (a commit it cannot
+ * resolve, a content form it cannot read) — both are recorded omissions, not
+ * capture failures, because retrying cannot change them. A transient provider
+ * failure is a THROW, never one of these: an unread file must not be recorded
+ * as a missing one.
+ *
+ * `resolvedCommitSha` is the commit the content was actually read at. The core
+ * refuses content whose echo differs from the request — an adapter that
+ * resolved a branch name, a cache, or the wrong remote must fail closed rather
+ * than smuggle in bytes from a commit §4 never certified.
+ */
+export type RefinementEvidenceFileLookup =
+  | { kind: "found"; content: string; resolvedCommitSha: string }
+  | { kind: "missing_path" }
+  | { kind: "unavailable"; detail?: string };
+
+/**
  * §4 condition 5: does the observed predecessor set agree with the chain's
  * accepted revision?
  *
@@ -238,6 +308,17 @@ export interface RefinementSnapshotSource {
   readReviewSummary(issueNumber: number): Promise<RefinementReviewSummaryRead | null>;
   /** §5: the local `issue-plan` artifact CONTENT for the target Issue, or `null`. Never a path. */
   readIssuePlan(issueNumber: number): Promise<string | null>;
+  /**
+   * §5.1 (issue #983), optional by design: read ONE file at ONE explicit
+   * predecessor commit, for a declared evidence selection. Absent means "no
+   * evidence resolver wired", which records every declared selection as an
+   * `resolver_unavailable` omission rather than failing the capture — the
+   * same landable-without-the-adapter seam `readChainAgreement` uses. Throws
+   * only on a transient provider failure.
+   */
+  readPredecessorEvidence?(
+    request: RefinementEvidenceFileRequest,
+  ): Promise<RefinementEvidenceFileLookup>;
   /**
    * §4 condition 5, optional by design: absent means "no chain registry wired",
    * which reads as `unregistered` and takes no side. This is the seam the
@@ -445,6 +526,136 @@ export interface RefinementSnapshotPredecessor {
   comments: RefinementSnapshotComment[];
 }
 
+// ---------------------------------------------------------------------------
+// §5.1 declared predecessor contract evidence (issue #983)
+// ---------------------------------------------------------------------------
+
+/** The info string of the one operator-authored declaration block §5.1 reads. */
+export const REFINEMENT_EVIDENCE_BLOCK_TAG = "refinement-evidence";
+
+/**
+ * §5.1 bound on the number of evidence entries a snapshot records.
+ *
+ * A snapshot-local constant for the reason the label caps are: it is a floor
+ * of the capture itself, far above any legitimate declaration, so a hostile
+ * body listing ten thousand selections cannot mint ten thousand snapshot
+ * entries. Selections past it are represented by ONE `selection_capped`
+ * omission naming the declared total — recorded, never silently dropped.
+ */
+export const REFINEMENT_MAX_EVIDENCE_SELECTIONS = 8;
+
+/**
+ * §5.1 bound on how much of a source file the capture will scan, chosen to
+ * match the read-request scan cap of the repository-evidence resolver
+ * (issue #806). A selection is extracted from at most this many bytes; an
+ * export or line range that lies wholly past it is an omission that SAYS the
+ * source was truncated, never a partial capture presented as exact.
+ */
+export const REFINEMENT_MAX_EVIDENCE_SOURCE_BYTES = 262_144;
+
+/**
+ * §5.1 bound for a selection's stored path, sized so a path the declaration
+ * parser admitted (at most `PATH_MAX_LENGTH` = 1024 UTF-16 code units, so at
+ * most 4096 UTF-8 bytes) is never cut — a truncated path is not a shorter
+ * path, it is a wrong one. Bounded and charged like the PR identity strings,
+ * for the same reason: it is operator-controlled agent-visible text.
+ */
+export const REFINEMENT_MAX_EVIDENCE_PATH_BYTES = 4_096;
+
+/** §5.1 bound for an export name, in UTF-16 code units; enforced at parse. */
+export const REFINEMENT_MAX_EVIDENCE_EXPORT_CHARS = 128;
+
+/**
+ * Why one declared selection is not in the captured evidence (§5.1).
+ *
+ * Every reason is decided deterministically at capture, without invoking any
+ * agent; the set is CLOSED because issue #1003's `evidence_required` preflight
+ * dispositions on these literals. The first three are declaration facts, the
+ * middle four are resolution facts, and the last three are selection facts
+ * about the file that was actually read.
+ */
+export const REFINEMENT_EVIDENCE_OMISSION_REASONS = [
+  "malformed_declaration",
+  "invalid_selection",
+  "denied_path",
+  "selection_capped",
+  "unknown_predecessor",
+  "resolver_unavailable",
+  "source_unavailable",
+  "missing_path",
+  "identity_mismatch",
+  "export_not_found",
+  "line_range_out_of_bounds",
+] as const;
+export type RefinementEvidenceOmissionReason =
+  (typeof REFINEMENT_EVIDENCE_OMISSION_REASONS)[number];
+
+/** One parsed §5.1 selection: which predecessor, which file, which slice of it. */
+export interface RefinementEvidenceSelector {
+  /** The predecessor Issue whose authoritative branch the content must come from. */
+  issueNumber: number;
+  /** Normalized repo-relative path. */
+  path: string;
+  /** Exactly one of these two refines the selection; both `null` selects the whole file. */
+  exportName: string | null;
+  lines: { start: number; end: number } | null;
+  /** Operator-declared per-selection byte cap; the §8 prose cap still applies on top. */
+  maxBytes: number | null;
+  /**
+   * §5.2: whether the refinement may proceed without this evidence.
+   *
+   * `true` unless the declaration says `"required": false`, because an Issue
+   * that names a predecessor's exported contract is asserting that its own
+   * contract depends on it — the whole point of §5.1 — and a default of
+   * "optional" would let exactly the #951 failure through under a declaration
+   * that looks like it prevented it. An entry marked optional is captured when
+   * it can be and recorded as an omission when it cannot, and never stops the
+   * lane; issue #1003's preflight reads this field and nothing else to tell the
+   * two apart.
+   */
+  required: boolean;
+}
+
+/**
+ * §5.1 immutable provenance: where captured evidence came from, pinned to the
+ * predecessor identity §4 certified — never to a branch name alone.
+ */
+export interface RefinementEvidenceProvenance {
+  issueNumber: number;
+  prNumber: number;
+  shape: RefinementPredecessorShape;
+  /** Bounded by {@link REFINEMENT_MAX_PR_IDENTITY_BYTES} — provider text like any other. */
+  headRefName: string;
+  /** The exact commit the content was read at: head SHA (open) or merge commit SHA (merged). */
+  commitSha: string;
+}
+
+/**
+ * One §5.1 evidence entry, captured or omitted — the snapshot records BOTH,
+ * in declaration order, so the refiner, the critic, and issue #1003's
+ * preflight all see the same account of what was asked for and what
+ * happened to it. Content is bounded, sanitized, and hashed exactly like
+ * every other captured text field.
+ */
+export interface RefinementSnapshotEvidence {
+  /** 0-based position in the declaration — the declaration order IS the §5.1 capture order. */
+  index: number;
+  /** `null` only when the declaration itself could not name a selection (malformed / capped). */
+  selector: RefinementEvidenceSelector | null;
+  status: "captured" | "omitted";
+  omissionReason: RefinementEvidenceOmissionReason | null;
+  /** A literal-only elaboration, or a sanitized adapter detail. Bounded prose. */
+  detail: string | null;
+  /** Present once the selection resolved to a usable predecessor, captured or not. */
+  source: RefinementEvidenceProvenance | null;
+  /** The bounded, sanitized selection content; `null` when omitted. */
+  content: string | null;
+  /** The byte cap the content was bounded to; `null` when omitted. */
+  maxBytesApplied: number | null;
+  /** True when content was cut — by its cap, or by the source scan bound for a whole-file selection. */
+  truncated: boolean;
+}
+
 /**
  * Runner-side bookkeeping about the capture. Deliberately NOT hashed: §6 says
  * the truncation record needs no separate digest because every text digest is
@@ -469,9 +680,11 @@ export interface RefinementSnapshotManifest {
    * captured.
    */
   totalTextBytes: number;
-  /** The provable upper bound for this predecessor count (see {@link refinementSnapshotByteBudget}). */
+  /** The provable upper bound for this predecessor and evidence count (see {@link refinementSnapshotByteBudget}). */
   maxTotalTextBytes: number;
   predecessorCount: number;
+  /** §5.1: entries recorded in {@link RefinementSnapshot.evidence}, captured and omitted alike. */
+  evidenceCount: number;
 }
 
 export interface RefinementSnapshot {
@@ -479,6 +692,8 @@ export interface RefinementSnapshot {
   target: RefinementSnapshotTarget;
   /** Ascending Issue number (§5, §6). */
   predecessors: RefinementSnapshotPredecessor[];
+  /** §5.1 declared evidence in declaration order; empty when the body declares none. */
+  evidence: RefinementSnapshotEvidence[];
   manifest: RefinementSnapshotManifest;
   /** §6 SHA-256 over every input the snapshot hands the agents. */
   predecessorFingerprint: string;
@@ -493,7 +708,8 @@ export type RefinementSnapshotFailureStage =
   | "changed_paths"
   | "comments"
   | "review_summary"
-  | "issue_plan";
+  | "issue_plan"
+  | "evidence";
 
 /**
  * The outcome of one capture attempt, in §4's own vocabulary.
@@ -760,6 +976,16 @@ const PREDECESSOR_SHAPE_VOCABULARY: Record<RefinementPredecessorShape, null> = {
 const LINEAGE_STATE_VOCABULARY: Record<LineageState, null> = Object.fromEntries(
   LINEAGE_STATES.map((s) => [s, null] as const),
 ) as Record<LineageState, null>;
+const EVIDENCE_STATUS_VOCABULARY: Record<RefinementSnapshotEvidence["status"], null> = {
+  captured: null,
+  omitted: null,
+};
+// Derived from the closed reason list, like the lineage states above.
+const EVIDENCE_OMISSION_VOCABULARY: Record<RefinementEvidenceOmissionReason, null> =
+  Object.fromEntries(REFINEMENT_EVIDENCE_OMISSION_REASONS.map((r) => [r, null] as const)) as Record<
+    RefinementEvidenceOmissionReason,
+    null
+  >;
 
 /** A SHA-256 rendered as lowercase hex, which is what §6's fingerprint always is. */
 const REFINEMENT_DIGEST_BYTES = 64;
@@ -784,6 +1010,15 @@ const REFINEMENT_PREDECESSOR_LITERAL_BYTES =
   longestLiteral(PR_STATE_VOCABULARY) +
   longestLiteral(REVIEW_OUTCOME_VOCABULARY) +
   LINEAGE_STATES.length * longestLiteral(LINEAGE_STATE_VOCABULARY);
+
+/**
+ * One §5.1 evidence entry's literals: its status, at most one omission
+ * reason, and at most one provenance shape literal.
+ */
+const REFINEMENT_EVIDENCE_LITERAL_BYTES =
+  longestLiteral(EVIDENCE_STATUS_VOCABULARY) +
+  longestLiteral(EVIDENCE_OMISSION_VOCABULARY) +
+  longestLiteral(PREDECESSOR_SHAPE_VOCABULARY);
 
 /**
  * The provable upper bound on a snapshot's total text size, in bytes.
@@ -819,10 +1054,19 @@ const REFINEMENT_PREDECESSOR_LITERAL_BYTES =
  * truncated-field ids — is outside the total by definition: it describes the
  * capture rather than being content handed to the agents, and its ids are
  * derived from fields already counted.
+ *
+ * Each §5.1 evidence entry (issue #983) contributes its own term: two
+ * prose-capped fields (content and detail — no entry carries both at once, so
+ * this over-counts, which a bound may), its path at
+ * {@link REFINEMENT_MAX_EVIDENCE_PATH_BYTES}, three identity strings (export
+ * name, head ref name, commit SHA) at {@link REFINEMENT_MAX_PR_IDENTITY_BYTES}
+ * each, and its literals. `evidenceCount` defaults to zero so every pre-#983
+ * caller and every undeclared snapshot publishes the bound it always did.
  */
 export function refinementSnapshotByteBudget(
   limits: IssueRefinementLimits,
   predecessorCount: number,
+  evidenceCount = 0,
 ): number {
   const perPredecessor =
     4 + limits.maxCommentsPerPredecessor + limits.maxChangedPathsPerPredecessor;
@@ -840,11 +1084,18 @@ export function refinementSnapshotByteBudget(
         REFINEMENT_MAX_COMMENT_IDENTITY_BYTES);
   const literalBytes =
     REFINEMENT_SNAPSHOT_LITERAL_BYTES + predecessorCount * REFINEMENT_PREDECESSOR_LITERAL_BYTES;
+  const evidenceBytes =
+    evidenceCount *
+    (2 * limits.maxSnapshotTextBytes +
+      REFINEMENT_MAX_EVIDENCE_PATH_BYTES +
+      3 * REFINEMENT_MAX_PR_IDENTITY_BYTES +
+      REFINEMENT_EVIDENCE_LITERAL_BYTES);
   return (
     limits.maxSnapshotTextBytes * (4 + predecessorCount * perPredecessor) +
     labelBytes +
     identityBytes +
-    literalBytes
+    literalBytes +
+    evidenceBytes
   );
 }
 
@@ -995,6 +1246,420 @@ function identitiesEqual(
 }
 
 // ---------------------------------------------------------------------------
+// §5.1 the evidence declaration and its selectors (issue #983)
+// ---------------------------------------------------------------------------
+
+/** One §5.1 declaration entry after parsing: a usable selector, or why not. */
+export type RefinementEvidenceParsedEntry =
+  | { kind: "valid"; index: number; selector: RefinementEvidenceSelector }
+  | {
+      kind: "invalid";
+      index: number;
+      reason: Extract<RefinementEvidenceOmissionReason, "invalid_selection" | "denied_path">;
+      /** A parser literal (`unknown_key`, `bad_path`, …), never operator prose. */
+      detail: string;
+    };
+
+/**
+ * The whole declaration: absent, malformed as a unit, or entry-by-entry.
+ *
+ * `malformed` is deliberately all-or-nothing — an unterminated block, a second
+ * block, or a body that is not a JSON array leaves no principled way to say
+ * WHICH selections the operator meant, and guessing a subset would capture
+ * evidence the declaration never deterministically named.
+ */
+export type RefinementEvidenceDeclarationParse =
+  | { kind: "none" }
+  | { kind: "malformed"; detail: string }
+  | { kind: "declared"; entries: RefinementEvidenceParsedEntry[] };
+
+const EVIDENCE_ENTRY_KEYS = new Set([
+  "issue",
+  "path",
+  "export",
+  "lines",
+  "maxBytes",
+  "required",
+]);
+
+// The deny floor of the repository-evidence resolver (issue #806), parsed once:
+// the same secret-shaped paths its read operation refuses are refused here, so
+// a snapshot cannot expose what an evidence turn could not. The globs are code
+// constants; a hypothetical unparsable one is skipped rather than silently
+// admitting everything (parse failures are its module's tests' concern).
+const EVIDENCE_DENY_GLOBS: string[][] = DEFAULT_DENY_GLOBS.flatMap((glob) => {
+  const parsed = parseEvidenceGlob(glob);
+  return parsed.ok ? [parsed.segments] : [];
+});
+
+function evidenceDenied(rel: string): boolean {
+  const lower = rel.toLowerCase();
+  return EVIDENCE_DENY_GLOBS.some((segments) => matchEvidenceGlob(segments, lower));
+}
+
+function parseEvidenceEntry(value: unknown, index: number): RefinementEvidenceParsedEntry {
+  const invalid = (
+    detail: string,
+    reason: "invalid_selection" | "denied_path" = "invalid_selection",
+  ): RefinementEvidenceParsedEntry => ({ kind: "invalid", index, reason, detail });
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return invalid("not_an_object");
+  }
+  const rec = value as Record<string, unknown>;
+  // The schema is closed, like every agent-facing schema in this lane: an
+  // unknown key is a selection this parser would silently half-honour, and a
+  // half-honoured selection is not deterministic from the operator's view.
+  for (const key of Object.keys(rec)) {
+    if (!EVIDENCE_ENTRY_KEYS.has(key)) return invalid("unknown_key");
+  }
+  const issue = rec["issue"];
+  if (typeof issue !== "number" || !Number.isSafeInteger(issue) || issue <= 0) {
+    return invalid("bad_issue");
+  }
+  const pathRaw = rec["path"];
+  if (typeof pathRaw !== "string") return invalid("bad_path");
+  const norm = normalizeEvidencePath(pathRaw);
+  if (!norm.ok || norm.rel === "") return invalid("bad_path");
+  if (evidenceDenied(norm.rel)) return invalid("deny_floor", "denied_path");
+  let exportName: string | null = null;
+  if (rec["export"] !== undefined) {
+    const e = rec["export"];
+    if (
+      typeof e !== "string" ||
+      e.length > REFINEMENT_MAX_EVIDENCE_EXPORT_CHARS ||
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(e)
+    ) {
+      return invalid("bad_export");
+    }
+    exportName = e;
+  }
+  let lines: { start: number; end: number } | null = null;
+  if (rec["lines"] !== undefined) {
+    const l = rec["lines"];
+    const pair = Array.isArray(l) && l.length === 2 ? l : null;
+    const start = pair?.[0];
+    const end = pair?.[1];
+    if (
+      typeof start !== "number" ||
+      typeof end !== "number" ||
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
+      start < 1 ||
+      end < start
+    ) {
+      return invalid("bad_lines");
+    }
+    lines = { start, end };
+  }
+  if (exportName !== null && lines !== null) return invalid("conflicting_selectors");
+  let maxBytes: number | null = null;
+  if (rec["maxBytes"] !== undefined) {
+    const m = rec["maxBytes"];
+    // Zero is rejected like the §8 zero-rejections are: a zero-byte selection
+    // has no next action that is not better spelled by omitting the entry.
+    if (typeof m !== "number" || !Number.isSafeInteger(m) || m < 1) {
+      return invalid("bad_max_bytes");
+    }
+    maxBytes = m;
+  }
+  // §5.2: only the literal `false` opts a selection out of the required-evidence
+  // preflight. Anything else — a string "false", a 0, a null — is a declaration
+  // this parser would have to interpret, and an interpreted requirement is not
+  // an explicit one.
+  let required = true;
+  if (rec["required"] !== undefined) {
+    const r = rec["required"];
+    if (typeof r !== "boolean") return invalid("bad_required");
+    required = r;
+  }
+  return {
+    kind: "valid",
+    index,
+    selector: { issueNumber: issue, path: norm.rel, exportName, lines, maxBytes, required },
+  };
+}
+
+/**
+ * One line of a Markdown code fence: up to three spaces of indent, a run of
+ * three or more backticks or tildes, then the info string. A backtick fence's
+ * info string may not itself contain a backtick (CommonMark) — such a line is
+ * ordinary text, not a fence.
+ */
+function parseMarkdownFenceLine(
+  line: string,
+): { char: "`" | "~"; length: number; info: string } | null {
+  const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  if (match === null) return null;
+  const marker = match[1]!;
+  const char = marker[0] === "`" ? ("`" as const) : ("~" as const);
+  const info = match[2]!;
+  if (char === "`" && info.includes("`")) return null;
+  return { char, length: marker.length, info: info.trim() };
+}
+
+/**
+ * Parse the §5.1 declaration out of the target's SOURCE body — the operator's
+ * own text, with the lane-written managed region already elided, so the lane
+ * cannot declare evidence to itself. The FULL source body is scanned, not the
+ * bounded snapshot copy: a declaration near the end of a long body must not
+ * stop parsing because the body's snapshot copy was truncated.
+ *
+ * Exported for issue #1003, whose `evidence_required` preflight must see the
+ * same declaration this capture sees, parsed the same way.
+ */
+export function parseRefinementEvidenceDeclaration(
+  sourceBody: string,
+): RefinementEvidenceDeclarationParse {
+  const blocks: string[][] = [];
+  // Markdown fences do not nest, so one open fence is tracked at a time. A
+  // `refinement-evidence` opener inside some OTHER fence (an example quoted in
+  // a ````markdown block, say) is literal text, not a live declaration, and a
+  // fence only closes on a same-character fence at least as long as its opener
+  // — so a triple-backtick line inside a four-backtick block stays content.
+  let fence: { char: "`" | "~"; length: number; evidence: string[] | null } | null = null;
+  for (const line of sourceBody.split(/\r?\n/)) {
+    const parsed = parseMarkdownFenceLine(line);
+    if (fence === null) {
+      if (parsed !== null) {
+        fence = {
+          char: parsed.char,
+          length: parsed.length,
+          evidence:
+            parsed.char === "`" && parsed.info === REFINEMENT_EVIDENCE_BLOCK_TAG ? [] : null,
+        };
+      }
+      continue;
+    }
+    if (
+      parsed !== null &&
+      parsed.char === fence.char &&
+      parsed.length >= fence.length &&
+      parsed.info === ""
+    ) {
+      if (fence.evidence !== null) blocks.push(fence.evidence);
+      fence = null;
+    } else if (fence.evidence !== null) {
+      fence.evidence.push(line);
+    }
+  }
+  // An unterminated evidence fence is one ambiguity the operator must resolve.
+  // An unterminated OTHER fence just runs to the end of the body, exactly as
+  // Markdown renders it, and everything inside it stayed literal.
+  if (fence !== null && fence.evidence !== null) {
+    return { kind: "malformed", detail: "unterminated_block" };
+  }
+  if (blocks.length === 0) return { kind: "none" };
+  // Two blocks are one ambiguity, not two declarations: there is no rule that
+  // could deterministically say which one is authoritative.
+  if (blocks.length > 1) return { kind: "malformed", detail: "multiple_blocks" };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(blocks[0]!.join("\n"));
+  } catch {
+    return { kind: "malformed", detail: "invalid_json" };
+  }
+  if (!Array.isArray(raw)) return { kind: "malformed", detail: "not_an_array" };
+  return { kind: "declared", entries: raw.map((value, index) => parseEvidenceEntry(value, index)) };
+}
+
+type LexMode = "code" | "block_comment" | "single" | "double" | "template";
+
+/**
+ * Lexer state threaded across lines. `templateExpr` has one counter per
+ * enclosing template-literal `${…}` expression, innermost last, holding the
+ * unmatched `{` opened inside that expression — so a nested template's closing
+ * backtick resumes the expression, not top-level code, and only the `}` that
+ * balances a `${` resumes its template. "code" mode with a non-empty stack is
+ * still lexically inside a template literal.
+ */
+interface LexState {
+  mode: LexMode;
+  templateExpr: number[];
+}
+
+/**
+ * One non-whitespace character consumed in code position: its column, and
+ * whether the lexer was settled — "code" mode, no open template expression,
+ * bracket depth at zero — immediately AFTER consuming it. Only a settled `;`
+ * or `}` can terminate a declaration, and its column is where the capture
+ * must stop.
+ */
+interface LexCodeChar {
+  index: number;
+  char: string;
+  settled: boolean;
+}
+
+/**
+ * Advance the extractor's lexer across one line: skip comment and string
+ * bodies, and (when `track` is given) count bracket depth and record each
+ * code character as a {@link LexCodeChar} in `track.codeChars`. Mutates
+ * `state` to where the next line begins.
+ */
+function lexLine(
+  line: string,
+  state: LexState,
+  track: { depth: number; codeChars: LexCodeChar[] } | null,
+): void {
+  for (let j = 0; j < line.length; j++) {
+    const ch = line[j]!;
+    const next = line[j + 1];
+    if (state.mode === "block_comment") {
+      if (ch === "*" && next === "/") {
+        state.mode = "code";
+        j++;
+      }
+      continue;
+    }
+    if (state.mode === "single" || state.mode === "double" || state.mode === "template") {
+      if (ch === "\\") {
+        j++;
+      } else if (state.mode === "template" && ch === "$" && next === "{") {
+        state.templateExpr.push(0);
+        state.mode = "code";
+        j++;
+      } else if (
+        (state.mode === "single" && ch === "'") ||
+        (state.mode === "double" && ch === '"') ||
+        (state.mode === "template" && ch === "`")
+      ) {
+        state.mode = "code";
+      }
+      continue;
+    }
+    // state.mode === "code"
+    if (ch === "/" && next === "/") break; // rest of the line is a comment
+    if (ch === "/" && next === "*") {
+      state.mode = "block_comment";
+      j++;
+      continue;
+    }
+    if (ch === "'") state.mode = "single";
+    else if (ch === '"') state.mode = "double";
+    else if (ch === "`") state.mode = "template";
+    else if (
+      ch === "}" &&
+      state.templateExpr.length > 0 &&
+      state.templateExpr[state.templateExpr.length - 1] === 0
+    ) {
+      // This `}` balances a `${`, not a block: the interrupted template
+      // resumes. Its `{` was consumed in template mode and never counted, so
+      // `track.depth` stays untouched here too.
+      state.templateExpr.pop();
+      state.mode = "template";
+      continue;
+    } else {
+      if (state.templateExpr.length > 0) {
+        if (ch === "{") state.templateExpr[state.templateExpr.length - 1]!++;
+        else if (ch === "}") state.templateExpr[state.templateExpr.length - 1]!--;
+      }
+      if (track !== null) {
+        if (ch === "{" || ch === "(" || ch === "[") track.depth++;
+        else if (ch === "}" || ch === ")" || ch === "]") track.depth--;
+      }
+    }
+    if (track !== null && !/\s/.test(ch)) {
+      track.codeChars.push({
+        index: j,
+        char: ch,
+        settled: state.mode === "code" && state.templateExpr.length === 0 && track.depth <= 0,
+      });
+    }
+  }
+}
+
+/**
+ * Extract one exported declaration from TypeScript/JavaScript source, by name,
+ * deterministically: the same bytes in always yield the same bytes out.
+ *
+ * This is a bounded lexical scan, not a parser. It finds the first line that
+ * both begins outside comments and strings and opens an `export`ed declaration
+ * of the name (const/let/var/function/
+ * class/interface/type/enum, with the usual modifiers), then accumulates
+ * source up to the declaration's own terminator: the first `;`, or the first
+ * `}` not continued by a union/intersection/member token, reached with every
+ * brace/bracket/paren opened outside strings and comments closed. The capture
+ * ends AT that terminator, so a second statement sharing its physical line —
+ * which may be source the Issue never selected — is never captured with the
+ * declaration. That covers the declaration
+ * shapes this repository writes — the #950/#951 failure this section exists
+ * for was an exported selector result type — and a source whose shape defeats
+ * the scan yields `null` (an `export_not_found` omission), never a partial
+ * slice presented as the declaration.
+ */
+export function extractExportedDeclaration(source: string, exportName: string): string | null {
+  // The name was validated as an identifier at parse; the lookahead replaces
+  // `\b` because `$` is not a word character and may legally end the name.
+  const escaped = exportName.replace(/\$/g, "\\$");
+  const startRe = new RegExp(
+    "^\\s*export\\s+(?:declare\\s+)?(?:abstract\\s+)?(?:async\\s+)?" +
+      "(?:const\\s+enum\\s+|const\\s+|let\\s+|var\\s+|function\\s*\\*?\\s*|class\\s+|interface\\s+|type\\s+|enum\\s+)" +
+      escaped +
+      "(?![A-Za-z0-9_$])",
+  );
+  const lines = source.split("\n");
+  // The start line must itself BEGIN in code: a documentation comment or a
+  // multiline template literal can quote `export type …` at column zero, and
+  // matching there would capture prose as the authoritative declaration. The
+  // pre-scan advances the same lexer over every earlier line so the regex is
+  // only consulted where a declaration could actually occur.
+  const pre: LexState = { mode: "code", templateExpr: [] };
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (pre.mode === "code" && pre.templateExpr.length === 0 && startRe.test(lines[i]!)) {
+      start = i;
+      break;
+    }
+    lexLine(lines[i]!, pre, null);
+  }
+  if (start === -1) return null;
+
+  const state: LexState = { mode: "code", templateExpr: [] };
+  const track: { depth: number; codeChars: LexCodeChar[] } = { depth: 0, codeChars: [] };
+  const collected: string[] = [];
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i]!;
+    track.codeChars = [];
+    lexLine(line, state, track);
+    for (let c = 0; c < track.codeChars.length; c++) {
+      const cc = track.codeChars[c]!;
+      if (!cc.settled || (cc.char !== ";" && cc.char !== "}")) continue;
+      if (cc.char === ";") {
+        // The declaration's own statement terminator: the capture ends AT it,
+        // so a second statement sharing the physical line — source the Issue
+        // never selected — does not ride into the evidence.
+        collected.push(line.slice(0, cc.index + 1));
+        return collected.join("\n");
+      }
+      // A balanced `}`. A union or intersection member can end balanced
+      // (`| { … }`) with the declaration still open — the very shape the #950
+      // selector result type has — so the declaration continues while the next
+      // code character (rest of this line, else the next non-blank line) is a
+      // continuation token. A `;` next is the declaration's own terminator:
+      // scanning on lets the `;` arm above end the capture at it.
+      const next = track.codeChars[c + 1];
+      if (next !== undefined) {
+        if (next.char === "|" || next.char === "&" || next.char === "." || next.char === ";") {
+          continue;
+        }
+        collected.push(line.slice(0, cc.index + 1));
+        return collected.join("\n");
+      }
+      let k = i + 1;
+      while (k < lines.length && lines[k]!.trim() === "") k++;
+      if (k >= lines.length || !/^[|&.]/.test(lines[k]!.trim())) {
+        collected.push(line.slice(0, cc.index + 1));
+        return collected.join("\n");
+      }
+    }
+    collected.push(line);
+  }
+  // Never terminated: truncated source or a shape the scan cannot bound. An
+  // incomplete declaration must not be captured as if it were exact.
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // §6 the fingerprint
 // ---------------------------------------------------------------------------
 
@@ -1023,11 +1688,21 @@ function sha256(value: string): string {
  * itself (§6): the managed region of the target body — elided by the capture —
  * and the two lane-owned labels, removed by the target-side digest.
  * `capturedAt` is not an agent input at all and is not hashed either.
+ *
+ * §5.1 evidence is hashed IN FULL — every entry, captured or omitted, with its
+ * selector, provenance, content digest, and truncation flag — because every
+ * one of those fields is agent-visible input, and §6's one-to-one rule admits
+ * no exception for it. The evidence part is appended ONLY when at least one
+ * entry exists: an empty evidence list serializes byte-identically to a
+ * pre-#983 snapshot, so recorded fingerprints of Issues that declare nothing —
+ * including every fingerprint embedded in a live managed-region marker — do
+ * not move, and the lane does not burn its one stale restart on a code deploy.
  */
 export function computePredecessorFingerprint(
   target: RefinementSnapshotTarget,
   predecessors: readonly RefinementSnapshotPredecessor[],
   laneLabels: RefinementLabels,
+  evidence: readonly RefinementSnapshotEvidence[] = [],
 ): string {
   const targetDigest = computeIssueSourceDigest({
     issueNumber: target.issueNumber,
@@ -1062,17 +1737,56 @@ export function computePredecessorFingerprint(
     sha256(JSON.stringify(p.comments.map((c) => [c.id, c.updatedAt, sha256(c.body)]))),
   ]);
 
-  return sha256(
-    JSON.stringify([
-      REFINEMENT_SNAPSHOT_VERSION,
-      targetDigest,
-      // Qualifies the label set inside `targetDigest`, for the same reason
-      // `changedPathsCapped` is hashed above.
-      target.labelsCapped,
-      target.issuePlan === null ? "absent" : sha256(target.issuePlan),
-      predecessorParts,
-    ]),
-  );
+  const parts: unknown[] = [
+    REFINEMENT_SNAPSHOT_VERSION,
+    targetDigest,
+    // Qualifies the label set inside `targetDigest`, for the same reason
+    // `changedPathsCapped` is hashed above.
+    target.labelsCapped,
+    target.issuePlan === null ? "absent" : sha256(target.issuePlan),
+    predecessorParts,
+  ];
+  if (evidence.length > 0) {
+    parts.push(
+      evidence.map((e) => [
+        e.index,
+        e.selector === null
+          ? "absent"
+          : [
+              e.selector.issueNumber,
+              e.selector.path,
+              e.selector.exportName ?? "absent",
+              e.selector.lines === null ? "absent" : [e.selector.lines.start, e.selector.lines.end],
+              e.selector.maxBytes ?? "absent",
+              // §5.2 requiredness is a declared input like every other selector
+              // field: flipping a selection from optional to required changes
+              // what the lane does with the same bytes, and §6 admits no
+              // unhashed input. Only DECLARING Issues are affected — a body
+              // that declares nothing still hashes the pre-evidence
+              // serialization, so no live managed-region fingerprint moves.
+              e.selector.required,
+            ],
+        e.status,
+        e.omissionReason ?? "absent",
+        e.detail === null ? "absent" : sha256(e.detail),
+        e.source === null
+          ? "absent"
+          : [
+              e.source.issueNumber,
+              e.source.prNumber,
+              e.source.shape,
+              e.source.headRefName,
+              e.source.commitSha,
+            ],
+        e.content === null ? "absent" : sha256(e.content),
+        e.maxBytesApplied ?? "absent",
+        // Hashed for the reason `changedPathsCapped` is: a source file that
+        // grows past a cap leaves the CAPTURED bytes identical while this flips.
+        e.truncated,
+      ]),
+    );
+  }
+  return sha256(JSON.stringify(parts));
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1941,276 @@ function failure(
     issueNumber,
     error: redactTokensPreservingShas(redactApiKeys(sanitizeBody(message))),
   };
+}
+
+// ---------------------------------------------------------------------------
+// §5.1 evidence capture (issue #983)
+// ---------------------------------------------------------------------------
+
+/**
+ * Bound and charge a selector's operator-controlled strings. The path has its
+ * own cap ({@link REFINEMENT_MAX_EVIDENCE_PATH_BYTES}) and the export name
+ * rides the PR identity cap — both far above what the parser admits, so a
+ * value that reaches here is never actually cut; the charge is what matters.
+ */
+function chargeEvidenceSelector(
+  ledger: CaptureLedger,
+  index: number,
+  selector: RefinementEvidenceSelector,
+): RefinementEvidenceSelector {
+  return {
+    issueNumber: selector.issueNumber,
+    path: ledger.identityField(
+      `evidence.${index}.selector.path`,
+      selector.path,
+      REFINEMENT_MAX_EVIDENCE_PATH_BYTES,
+    ),
+    exportName:
+      selector.exportName === null
+        ? null
+        : ledger.identityField(`evidence.${index}.selector.export`, selector.exportName),
+    lines: selector.lines === null ? null : { ...selector.lines },
+    maxBytes: selector.maxBytes,
+    required: selector.required,
+  };
+}
+
+/** Bound and charge one entry's provenance strings, like the PR identity strings they mirror. */
+function chargeEvidenceProvenance(
+  ledger: CaptureLedger,
+  index: number,
+  source: RefinementEvidenceProvenance,
+): RefinementEvidenceProvenance {
+  return {
+    issueNumber: source.issueNumber,
+    prNumber: source.prNumber,
+    shape: ledger.literal(source.shape),
+    headRefName: ledger.identityField(`evidence.${index}.source.headRefName`, source.headRefName),
+    commitSha: ledger.identityField(`evidence.${index}.source.commitSha`, source.commitSha),
+  };
+}
+
+/** One omitted §5.1 entry, its literals charged where they are stored. */
+function omittedEvidence(
+  ledger: CaptureLedger,
+  index: number,
+  selector: RefinementEvidenceSelector | null,
+  reason: RefinementEvidenceOmissionReason,
+  detail: string | null,
+  source: RefinementEvidenceProvenance | null,
+): RefinementSnapshotEvidence {
+  return {
+    index,
+    selector: selector === null ? null : chargeEvidenceSelector(ledger, index, selector),
+    status: ledger.literal("omitted"),
+    omissionReason: ledger.literal(reason),
+    detail: detail === null ? null : ledger.field(`evidence.${index}.detail`, detail),
+    source: source === null ? null : chargeEvidenceProvenance(ledger, index, source),
+    content: null,
+    maxBytesApplied: null,
+    truncated: false,
+  };
+}
+
+/**
+ * Resolve the §5.1 declaration against the usable predecessor set, in
+ * declaration order.
+ *
+ * Runs AFTER every predecessor was captured and BEFORE their identities are
+ * re-verified, so a predecessor whose head moves while its file is being read
+ * invalidates the whole attempt (the existing drift hold) rather than leaving
+ * evidence from a commit the sealed snapshot no longer certifies. Only a
+ * THROWN read fails the capture; every deterministic disappointment — an
+ * unknown predecessor, a missing path, an export the file does not have — is
+ * recorded as an omission for issue #1003 to disposition, because re-reading
+ * cannot change it and inventing content would be worse.
+ */
+async function captureDeclaredEvidence(
+  source: RefinementSnapshotSource,
+  sourceBody: string,
+  usable: readonly RefinementUsablePredecessor[],
+  limits: IssueRefinementLimits,
+  ledger: CaptureLedger,
+): Promise<
+  | { evidence: RefinementSnapshotEvidence[] }
+  | Extract<RefinementSnapshotResult, { kind: "failed" }>
+> {
+  const declaration = parseRefinementEvidenceDeclaration(sourceBody);
+  if (declaration.kind === "none") return { evidence: [] };
+  if (declaration.kind === "malformed") {
+    return {
+      evidence: [omittedEvidence(ledger, 0, null, "malformed_declaration", declaration.detail, null)],
+    };
+  }
+
+  const byIssue = new Map(usable.map((u) => [u.issue.number, u] as const));
+  const evidence: RefinementSnapshotEvidence[] = [];
+  for (const entry of declaration.entries.slice(0, REFINEMENT_MAX_EVIDENCE_SELECTIONS)) {
+    if (entry.kind === "invalid") {
+      evidence.push(omittedEvidence(ledger, entry.index, null, entry.reason, entry.detail, null));
+      continue;
+    }
+    const selector = entry.selector;
+    const predecessor = byIssue.get(selector.issueNumber);
+    if (!predecessor) {
+      // Not one of the target's direct, usable predecessors. §5.1 resolves
+      // evidence ONLY from the authoritative predecessor set the relationship
+      // edges selected — any other Issue's branch is unselected repository
+      // content, however plausible the number looks.
+      evidence.push(
+        omittedEvidence(ledger, entry.index, selector, "unknown_predecessor", null, null),
+      );
+      continue;
+    }
+    const identity = predecessor.identity;
+    const provenance: RefinementEvidenceProvenance = {
+      issueNumber: predecessor.issue.number,
+      prNumber: identity.prNumber,
+      shape: predecessor.shape,
+      headRefName: identity.headRefName,
+      // The authoritative commit of the stacked-branch contract: the merge
+      // commit once merged, the stack-ready PR head while open.
+      commitSha: predecessor.shape === "merged" ? identity.mergeCommitSha : identity.headSha,
+    };
+    if (!source.readPredecessorEvidence) {
+      evidence.push(
+        omittedEvidence(ledger, entry.index, selector, "resolver_unavailable", null, provenance),
+      );
+      continue;
+    }
+
+    let lookup: RefinementEvidenceFileLookup;
+    try {
+      lookup = await source.readPredecessorEvidence({
+        issueNumber: provenance.issueNumber,
+        prNumber: provenance.prNumber,
+        headRefName: provenance.headRefName,
+        commitSha: provenance.commitSha,
+        path: selector.path,
+        // One more than the scan bound, as a truncation probe (see the
+        // changed-path read for why the cap alone cannot reveal truncation).
+        maxBytes: REFINEMENT_MAX_EVIDENCE_SOURCE_BYTES + 1,
+      });
+    } catch (err) {
+      return failure("evidence", selector.issueNumber, err);
+    }
+    if (lookup.kind === "missing_path") {
+      evidence.push(
+        omittedEvidence(ledger, entry.index, selector, "missing_path", null, provenance),
+      );
+      continue;
+    }
+    if (lookup.kind === "unavailable") {
+      evidence.push(
+        omittedEvidence(
+          ledger,
+          entry.index,
+          selector,
+          "source_unavailable",
+          lookup.detail ?? null,
+          provenance,
+        ),
+      );
+      continue;
+    }
+    if (lookup.resolvedCommitSha !== provenance.commitSha) {
+      // The adapter read SOMETHING, but not the commit §4 certified. Content
+      // from a moved branch, a cache, or the wrong remote must not enter a
+      // snapshot whose provenance claims otherwise.
+      evidence.push(
+        omittedEvidence(
+          ledger,
+          entry.index,
+          selector,
+          "identity_mismatch",
+          `expected=${provenance.commitSha} resolved=${lookup.resolvedCommitSha}`,
+          provenance,
+        ),
+      );
+      continue;
+    }
+
+    const sourceTruncated =
+      byteLength(lookup.content) > REFINEMENT_MAX_EVIDENCE_SOURCE_BYTES;
+    const scan = boundSnapshotText(lookup.content, REFINEMENT_MAX_EVIDENCE_SOURCE_BYTES).text;
+    let raw: string | null = null;
+    let omission: RefinementEvidenceOmissionReason | null = null;
+    let detail: string | null = null;
+    if (selector.exportName !== null) {
+      raw = extractExportedDeclaration(scan, selector.exportName);
+      if (raw === null) {
+        omission = "export_not_found";
+        detail = sourceTruncated ? "source_truncated" : null;
+      }
+    } else if (selector.lines !== null) {
+      // Split on `\n` alone so a CRLF file's bytes survive unaltered — line
+      // COUNTS agree either way, and the captured bytes stay the file's own.
+      const sourceLines = scan.split("\n");
+      // When the byte-capped scan ended mid-file, its final element is not
+      // known to be a whole source line: a range that reaches it was not fully
+      // read, and must be an omission rather than a capture presented as exact.
+      const fullLines = sourceTruncated ? sourceLines.length - 1 : sourceLines.length;
+      if (selector.lines.end > fullLines) {
+        omission = "line_range_out_of_bounds";
+        detail = sourceTruncated ? "source_truncated" : `lines=${sourceLines.length}`;
+      } else {
+        raw = sourceLines.slice(selector.lines.start - 1, selector.lines.end).join("\n");
+      }
+    } else {
+      raw = scan;
+    }
+    if (omission !== null || raw === null) {
+      evidence.push(
+        omittedEvidence(
+          ledger,
+          entry.index,
+          selector,
+          omission ?? "invalid_selection",
+          detail,
+          provenance,
+        ),
+      );
+      continue;
+    }
+
+    // The operator's cap can only LOWER the §8 prose cap, never widen it.
+    const cap = Math.min(
+      selector.maxBytes ?? limits.maxSnapshotTextBytes,
+      limits.maxSnapshotTextBytes,
+    );
+    const prepared = ledger.prepare(raw, cap);
+    const wholeFile = selector.exportName === null && selector.lines === null;
+    const truncated = prepared.truncated || (wholeFile && sourceTruncated);
+    evidence.push({
+      index: entry.index,
+      selector: chargeEvidenceSelector(ledger, entry.index, selector),
+      status: ledger.literal("captured"),
+      omissionReason: null,
+      detail: null,
+      source: chargeEvidenceProvenance(ledger, entry.index, provenance),
+      content: ledger.commit(`evidence.${entry.index}.content`, {
+        text: prepared.text,
+        truncated,
+      }),
+      maxBytesApplied: cap,
+      truncated,
+    });
+  }
+  if (declaration.entries.length > REFINEMENT_MAX_EVIDENCE_SELECTIONS) {
+    // Recorded, never silently dropped: one entry says how much was declared,
+    // so the operator sees the cut and #1003 can refuse to proceed on it.
+    evidence.push(
+      omittedEvidence(
+        ledger,
+        REFINEMENT_MAX_EVIDENCE_SELECTIONS,
+        null,
+        "selection_capped",
+        `declared=${declaration.entries.length}`,
+        null,
+      ),
+    );
+  }
+  return { evidence };
 }
 
 /**
@@ -1540,6 +2524,20 @@ export async function buildRefinementSnapshot(
     });
   }
 
+  // ---- §5.1 declared predecessor contract evidence (issue #983) -------------
+  // After the predecessors are captured (the declaration resolves against
+  // their certified identities) and before those identities are re-verified,
+  // so a head that moves during an evidence read holds the attempt.
+  const evidenceResult = await captureDeclaredEvidence(
+    source,
+    region.sourceBody,
+    usable,
+    limits,
+    ledger,
+  );
+  if ("kind" in evidenceResult) return evidenceResult;
+  const evidence = evidenceResult.evidence;
+
   // ---- Re-verify identity: a predecessor that MOVED during capture holds ----
   // Capture is several reads long, and a predecessor can merge, re-open, or get
   // a new head SHA inside that window. A snapshot half-taken from before the
@@ -1624,20 +2622,22 @@ export async function buildRefinementSnapshot(
   // are computed here rather than inline in the object literal below.
   const version = ledger.literal(REFINEMENT_SNAPSHOT_VERSION);
   const predecessorFingerprint = ledger.literal(
-    computePredecessorFingerprint(targetSnapshot, captured, laneLabels),
+    computePredecessorFingerprint(targetSnapshot, captured, laneLabels, evidence),
   );
 
   const snapshot: RefinementSnapshot = {
     version,
     target: targetSnapshot,
     predecessors: captured,
+    evidence,
     manifest: {
       capturedAt: now,
       limits: { ...limits },
       truncatedFields: [...ledger.truncatedFields],
       totalTextBytes: ledger.totalTextBytes,
-      maxTotalTextBytes: refinementSnapshotByteBudget(limits, captured.length),
+      maxTotalTextBytes: refinementSnapshotByteBudget(limits, captured.length, evidence.length),
       predecessorCount: captured.length,
+      evidenceCount: evidence.length,
     },
     predecessorFingerprint,
   };
@@ -1658,4 +2658,16 @@ export function refinementPredecessorRecords(
     headSha: p.pullRequest.headSha,
     state: p.pullRequest.state,
   }));
+}
+
+/**
+ * The §5.1 evidence entries that were declared but not captured — the exact
+ * set issue #1003's `evidence_required` preflight dispositions on. This slice
+ * only RECORDS the failures; deciding whether they park the Issue for a human
+ * is deliberately not its call.
+ */
+export function refinementEvidenceOmissions(
+  snapshot: RefinementSnapshot,
+): RefinementSnapshotEvidence[] {
+  return snapshot.evidence.filter((e) => e.status === "omitted");
 }

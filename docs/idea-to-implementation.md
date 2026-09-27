@@ -312,7 +312,7 @@ whether to open a new implementation issue. No code is written.
 ## Step 3 — Automation Picks It Up
 
 The n8n workflow runs on a five-minute schedule (or immediately on manual
-trigger). Each execution runs three CLI steps in sequence:
+trigger). Each execution runs four CLI steps in sequence:
 
 ### GitHub Intake
 
@@ -331,6 +331,14 @@ Issues that pass both checks are inserted into the SQLite queue as tasks.
 
 `run-one-phase` claims one task from the queue and dispatches it to the
 appropriate handler. Only one phase runs per execution.
+
+### ChatOps Scan
+
+`chatops-scan` runs one bounded ChatOps pass for the session: it scans the
+work items' comments, recognizes and authorizes any `/verb` command, dispatches
+it at most once, and enqueues the acknowledgement and result comments. A session
+without `chatOps.enabled` reports `outcome: "disabled"` and does nothing, which
+is the default. See [chatops-operations.md](chatops-operations.md).
 
 ### Dispatch Outbox
 

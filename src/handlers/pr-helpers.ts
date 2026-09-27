@@ -1,5 +1,17 @@
 import type { AiTask } from "../core/task.js";
 import type { RepoHostProvider } from "../providers/types.js";
+import {
+  reconcileExistingPullRequest,
+  type PrReconciliationExpectation,
+  type PrReconciliationRefusal,
+} from "../core/pr-reconciliation.js";
+// The branch-naming convention and the two task-context readers are pure and
+// are also needed by `core/` modules, so they live in `core/pr-context.ts`
+// (see its header) and are re-exported here unchanged for this module's
+// existing importers.
+import { branchName, extractPrNumber, resolvePrContext } from "../core/pr-context.js";
+
+export { branchName, extractPrNumber, resolvePrContext } from "../core/pr-context.js";
 
 export interface PrInfo {
   url: string;
@@ -11,18 +23,6 @@ export interface PrInfo {
    * (issue #456 review). Absent → not a fork (the conventional same-repo case).
    */
   isCrossRepository?: boolean;
-}
-
-export function branchName(issueNumber: number): string {
-  return `ai/issue-${issueNumber}`;
-}
-
-export function resolvePrContext(task: AiTask): { prUrl?: string; branch?: string } {
-  const ctx = task.context as Record<string, unknown>;
-  return {
-    prUrl: typeof ctx.prUrl === "string" ? ctx.prUrl : undefined,
-    branch: typeof ctx.branch === "string" ? ctx.branch : undefined,
-  };
 }
 
 // Distinguishes a successful "no open PR exists" result (a state callers may
@@ -129,10 +129,47 @@ export function resolveFixPr(
   };
 }
 
-// Extract a PR number from a GitHub (`/pull/<n>`) or Gitea (`/pulls/<n>`) URL.
-// Mirrors the extraction other callers (outbox-effects, conflict-resolution) apply
-// to `task.context.prUrl` so the selector handed to a provider is backend-neutral.
-export function extractPrNumber(prUrl: string): number | undefined {
-  const m = prUrl.match(/\/pulls?\/(\d+)/);
-  return m ? parseInt(m[1], 10) : undefined;
+// Outcome of trying to adopt an already-created PR after `createPullRequest`
+// refused (issue #998). `refused` carries the reason so callers can report why
+// the live PR was not usable instead of only that creation failed.
+export type AdoptExistingPrResult =
+  | { kind: "adopted"; url: string; headRefName: string; number?: number }
+  | { kind: "refused"; reason: PrReconciliationRefusal | "lookup-failed"; error: string };
+
+// Resolve the pull request an interrupted earlier run may already have opened
+// for `expected.head`, and decide whether this run may adopt it (issue #998).
+//
+// The order matters and is the whole point: creation is attempted first and this
+// runs only on its failure, so the normal path — no PR yet — is untouched and
+// costs no extra call. The failure is then answered with PROVIDER DATA rather
+// than with the CLI's error prose: any create failure triggers the same
+// exact-head lookup, and a failure that was NOT "already exists" simply finds no
+// PR and falls through to the original error. Nothing here reads, matches, or
+// depends on the wording of the host's message.
+//
+// A lookup that cannot be read is a refusal, never a "no PR exists": inferring
+// absence from a transient failure is what would create the duplicate PR.
+export function adoptExistingPrForHead(
+  host: RepoHostProvider,
+  expected: PrReconciliationExpectation,
+): AdoptExistingPrResult {
+  const listed = host.findOpenPullRequestsByHead(expected.head);
+  if (!listed.ok) {
+    return {
+      kind: "refused",
+      reason: "lookup-failed",
+      error: `could not list open pull requests for head "${expected.head}": ${listed.error}`,
+    };
+  }
+
+  const decision = reconcileExistingPullRequest(listed.value, expected);
+  if (decision.kind === "adopt") {
+    return {
+      kind: "adopted",
+      url: decision.url,
+      headRefName: decision.headRefName,
+      ...(decision.number !== undefined ? { number: decision.number } : {}),
+    };
+  }
+  return { kind: "refused", reason: decision.reason, error: decision.message };
 }

@@ -225,6 +225,26 @@ describe('enqueue-task CLI — successful enqueue', () => {
     });
   });
 
+  // Quality request snapshot (issue #905, agent-runtime-profiles-contract §9.3)
+  test('persists a quality request resolved from the context labels', () => {
+    const r = run(...baseArgs(), '--context-json', '{"labels":["complexity:high","review:low"]}');
+    expect(r.code).toBe(0);
+    const store = new SqliteTaskStore(dbPath);
+    return store.getTask({ sessionId: 'addon-dev', issueNumber: 134 }).then((task) => {
+      expect(task?.context?.requestedQuality).toMatchObject({
+        implementation: { quality: 'strong', source: 'compat-label', label: 'complexity:high' },
+        review: { quality: 'light', source: 'compat-label', label: 'review:low' },
+      });
+      store.close();
+    });
+  });
+
+  test('a malformed quality label exits non-zero instead of defaulting', () => {
+    const r = run(...baseArgs(), '--context-json', '{"labels":["quality:xhigh"]}');
+    expect(r.code).not.toBe(0);
+    expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('quality:xhigh') });
+  });
+
   test('context-json is stored on the task', () => {
     const r = run(...baseArgs(), '--context-json', '{"prNumber":42}');
     expect(r.code).toBe(0);

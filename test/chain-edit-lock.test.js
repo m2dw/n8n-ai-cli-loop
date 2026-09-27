@@ -9,9 +9,12 @@ import {
   chainEditLockIsTakeable,
   chainEditAliasLockScope,
   chainEditIssueLockScope,
+  chainEditRepositoryIssueLockScope,
   chainEditLockScopeKind,
   chainEditLockScopes,
+  chainRepositoryKey,
   describeChainEditLockScope,
+  describeChainEditLockScopes,
 } from '../dist/index.js';
 
 test('an issue scope is session-scoped, because execution labels are', () => {
@@ -25,6 +28,113 @@ test('a session id containing the separator cannot be read as another issue', ()
   // would be indistinguishable strings.
   expect(chainEditIssueLockScope('a:11', 12)).toBe('issue:a%3A11:12');
   expect(chainEditIssueLockScope('a', 12)).not.toBe(chainEditIssueLockScope('a:11', 12));
+});
+
+describe('the repository-scoped issue claim (issue #1045)', () => {
+  const key = (owner, repo) =>
+    chainRepositoryKey({ provider: 'github-issues', endpoint: 'github.com', owner, repo });
+
+  test('two sessions on one repository claim the same scope', () => {
+    // The whole point: their session-scoped claims differ by construction, so
+    // without this one they would edit the same GitHub Issue concurrently.
+    expect(chainEditRepositoryIssueLockScope(key('m2dw', 'shared'), 697)).toBe(
+      chainEditRepositoryIssueLockScope(key('m2dw', 'shared'), 697),
+    );
+    // Case-insensitively, because GitHub resolves the slug that way.
+    expect(chainEditRepositoryIssueLockScope(key('M2DW', 'Shared'), 697)).toBe(
+      chainEditRepositoryIssueLockScope(key('m2dw', 'shared'), 697),
+    );
+  });
+
+  test('the same number in another repository is another claim', () => {
+    expect(chainEditRepositoryIssueLockScope(key('m2dw', 'yoda_form_js'), 697)).not.toBe(
+      chainEditRepositoryIssueLockScope(key('m2dw', 'n8n-ai-cli-loop-ai'), 697),
+    );
+  });
+
+  test('a repository key containing the separator cannot be read as another issue', () => {
+    expect(chainEditRepositoryIssueLockScope('a:11', 12)).toBe('repo-issue:a%3A11:12');
+    expect(chainEditRepositoryIssueLockScope('a', 12)).not.toBe(
+      chainEditRepositoryIssueLockScope('a:11', 12),
+    );
+  });
+
+  test('an edit claims both spellings, so an older build still collides with it', () => {
+    const repositoryKey = key('m2dw', 'shared');
+    expect(chainEditLockScopes({ sessionId: 'addon-dev', issueNumbers: [11], repositoryKey })).toEqual(
+      [
+        chainEditIssueLockScope('addon-dev', 11),
+        chainEditRepositoryIssueLockScope(repositoryKey, 11),
+      ].sort(),
+    );
+    // Two sessions on one repository overlap on the repository claim...
+    const mine = chainEditLockScopes({ sessionId: 'addon-dev', issueNumbers: [11], repositoryKey });
+    const theirs = chainEditLockScopes({ sessionId: 'other', issueNumbers: [11], repositoryKey });
+    expect(mine.filter((scope) => theirs.includes(scope))).toEqual([
+      chainEditRepositoryIssueLockScope(repositoryKey, 11),
+    ]);
+    // ...and two sessions on different repositories overlap on nothing.
+    const elsewhere = chainEditLockScopes({
+      sessionId: 'other',
+      issueNumbers: [11],
+      repositoryKey: key('m2dw', 'elsewhere'),
+    });
+    expect(mine.filter((scope) => elsewhere.includes(scope))).toEqual([]);
+  });
+
+  test('the session spelling is claimed for every session in the repository scope', () => {
+    // A rolling upgrade: the older process edits #11 through `other`, and knows
+    // only the session spelling. Claiming the anchor's alone would leave the two
+    // sets disjoint and let both relabel the Issue at once.
+    const repositoryKey = key('m2dw', 'shared');
+    const scope = { sessionIds: ['addon-dev', 'other'], repositoryKey };
+    const mine = chainEditLockScopes({ sessionId: 'addon-dev', issueNumbers: [11], ...scope });
+    expect(mine).toEqual(
+      [
+        chainEditIssueLockScope('addon-dev', 11),
+        chainEditIssueLockScope('other', 11),
+        chainEditRepositoryIssueLockScope(repositoryKey, 11),
+      ].sort(),
+    );
+    // The older build's claim — session spelling only — is now inside this set.
+    const older = chainEditLockScopes({ sessionId: 'other', issueNumbers: [11] });
+    expect(older).toEqual([chainEditIssueLockScope('other', 11)]);
+    expect(mine.filter((s) => older.includes(s))).toEqual(older);
+
+    // A session in another repository is in no scope of ours, so still nothing
+    // overlaps: the bug this whole module change is scoped by (issue #1045).
+    const elsewhere = chainEditLockScopes({
+      sessionId: 'yoda-form-js',
+      issueNumbers: [11],
+      sessionIds: ['yoda-form-js'],
+      repositoryKey: key('m2dw', 'elsewhere'),
+    });
+    expect(mine.filter((s) => elsewhere.includes(s))).toEqual([]);
+  });
+
+  test('the anchor session is claimed even when the resolved scope omits it', () => {
+    // `sessionIds` always carries the anchor today; the claim does not depend on
+    // it, because dropping the anchor's own scope is the one thing that could
+    // let an older build of THIS session interleave with it.
+    expect(
+      chainEditLockScopes({ sessionId: 'addon-dev', issueNumbers: [11], sessionIds: ['other'] }),
+    ).toEqual(['issue:addon-dev:11', 'issue:other:11']);
+  });
+
+  test('a session with no repository identity claims exactly what it always did', () => {
+    expect(chainEditLockScopes({ sessionId: 'addon-dev', issueNumbers: [11] })).toEqual([
+      'issue:addon-dev:11',
+    ]);
+    // A one-session scope — the fallback `resolveChainOwnershipScope` returns —
+    // adds nothing either.
+    expect(
+      chainEditLockScopes({
+        sessionId: 'addon-dev',
+        issueNumbers: [11],
+        sessionIds: ['addon-dev'],
+      }),
+    ).toEqual(['issue:addon-dev:11']);
+  });
 });
 
 test('a name scope is global, because chain IDs and aliases share one namespace', () => {
@@ -50,12 +160,28 @@ test('the scope set is deduplicated and ordered, so two edits claim in the same 
 
 test('a scope reports what it names, and an unknown shape is passed through verbatim', () => {
   expect(chainEditLockScopeKind('issue:addon-dev:11')).toBe('issue');
+  expect(chainEditLockScopeKind('repo-issue:%5B%22a%22%5D:11')).toBe('issue');
   expect(chainEditLockScopeKind('alias:auth-work')).toBe('alias');
   expect(chainEditLockScopeKind('something-else')).toBe('unknown');
 
   expect(describeChainEditLockScope('issue:addon-dev:11')).toBe('issue #11');
+  // Both spellings read the same to an operator: the Issue is claimed either
+  // way, and which of the two claims collided is an implementation detail.
+  expect(describeChainEditLockScope('repo-issue:%5B%22a%22%5D:11')).toBe('issue #11');
   expect(describeChainEditLockScope('alias:auth-work')).toBe('the chain name "auth-work"');
   expect(describeChainEditLockScope('something-else')).toBe('something-else');
+});
+
+test('a set of scopes is phrased once per Issue, not once per claim on it', () => {
+  // An Issue is held under both spellings, and both read as "issue #11": the
+  // operator is told about the Issue, not about the fence (issue #1045).
+  expect(
+    describeChainEditLockScopes([
+      'issue:addon-dev:11',
+      'repo-issue:%5B%22a%22%5D:11',
+      'alias:auth-work',
+    ]),
+  ).toBe('issue #11, the chain name "auth-work"');
 });
 
 test('the staleness window is long enough for a slow edit and short enough to retry after a crash', () => {

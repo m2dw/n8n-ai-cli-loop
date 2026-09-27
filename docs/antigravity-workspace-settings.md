@@ -1012,7 +1012,13 @@ re-serialising whatever the run left, so the trust entry it registers for its
 temporary workspace goes with it and a developer's real configuration is neither
 reformatted nor created by running the test. It launches the CLI, so preparation holds it to
 that store anyway (§3.5) — a `ANTIGRAVITY_CLI_SETTINGS` left set is refused
-rather than quietly turning the test into one that proves nothing.
+rather than quietly turning the test into one that proves nothing. The rest of
+the suite runs under a test-owned home (issue #1063), so this file takes the
+operator environment back for its duration **and passes it to the CLI it
+spawns**: a child spawned bare would inherit the isolated home, leaving the test
+preparing one store while `agy` read another — and running without the
+operator's home-backed login. `test/test-home-isolation.test.js` pins that
+propagation in the ordinary suite.
 
 ```bash
 ANTIGRAVITY_CLI_SMOKE=1 npx jest test/antigravity-cli-smoke.test.js

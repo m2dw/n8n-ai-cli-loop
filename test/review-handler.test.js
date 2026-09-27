@@ -2,7 +2,15 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, lstatSync, symlinkSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createReviewHandler as _createReviewHandler } from '../dist/handlers/review.js';
-import { SqliteTaskStore, runNextPhase } from '../dist/index.js';
+import {
+  SqliteTaskStore,
+  runNextPhase,
+  deriveRequirementCommandId,
+  deriveSessionBaselineDigest,
+  resolveEffectiveVerificationPlan,
+  reconcileVerificationPlan,
+  VERIFICATION_AMENDMENTS_CONTEXT_KEY,
+} from '../dist/index.js';
 import {
   REVIEW_FINDINGS_END_MARKER,
   REVIEW_FINDINGS_MARKER,
@@ -71,7 +79,7 @@ function fakeLock(acquireResult = { ok: true, locked: true, contextId: 'run-revi
 // pass their own fakes as the 3rd/4th args, which this wrapper leaves
 // untouched. `resolveRepoHost` (5th) and `phaseLockOwnerId` (6th) are plain
 // pass-through — the real defaults from review.ts apply when omitted.
-function createReviewHandler(context, runner, resolveWorktree, issueLock, resolveRepoHost, phaseLockOwnerId) {
+function createReviewHandler(context, runner, resolveWorktree, issueLock, resolveRepoHost, phaseLockOwnerId, seams) {
   return _createReviewHandler(
     context,
     runner,
@@ -79,7 +87,37 @@ function createReviewHandler(context, runner, resolveWorktree, issueLock, resolv
     issueLock ?? fakeLock(),
     resolveRepoHost,
     phaseLockOwnerId,
+    // Issue #1069: an enabled session with a `codex` reviewer takes the §17.11
+    // `codex exec` lane, whose subprocess does NOT go through the `runner` above
+    // — the adapter owns its own, and its production default spawns the real
+    // CLI. Every such test passes its own; the default here is undefined so a
+    // test that forgets one fails loudly on a missing binary rather than
+    // quietly billing a turn.
+    seams ?? {},
   );
+}
+
+/**
+ * A `CommandRunner` stand-in for the `codex exec` subprocess of the §17.11 lane.
+ *
+ * Honors the one part of the contract the handler depends on — the final message
+ * is written to the path named by `--output-last-message`, never printed — so
+ * the adapter's real argv, prompt, temp directory and bounded file read all run.
+ * The dedicated lane suite (`review-codex-structured-lane.test.js`) drives the
+ * same path through a real `/bin/sh` executable; this lighter fake is for the
+ * routing assertions in this file, which are not about the subprocess.
+ */
+function fakeStructuredCodexRunner(response, { exitCode = 0, stderr = '' } = {}) {
+  const calls = [];
+  return {
+    calls,
+    run(cmd, args, opts) {
+      calls.push({ cmd, args, opts });
+      const at = args.indexOf('--output-last-message');
+      if (at !== -1 && response !== null) writeFileSync(args[at + 1], response, 'utf8');
+      return { stdout: '', stderr, exitCode };
+    },
+  };
 }
 
 const SESSION = (overrides = {}) => ({
@@ -477,7 +515,7 @@ describe('review handler — command execution', () => {
     expect(cmds[8]).toContain('build');
   });
 
-  test('invokes codex review with --base origin/main and --title', async () => {
+  test('invokes codex review with --base origin/main and the brief on stdin', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
     const codexCall = runner.calls.find((c) => c.cmd === 'codex');
@@ -487,7 +525,11 @@ describe('review handler — command execution', () => {
     // The worktree review diffs against the freshly-fetched origin/<base>, never
     // local main (a worktree session never advances local main; issue #456).
     expect(codexCall.args).toContain('origin/main');
-    expect(codexCall.args).toContain('--title');
+    // Since issue #912 the brief rides stdin (§7.3's one prompt channel for
+    // every Codex lane) — never a `--title` argv element, which is prompt
+    // content and belongs off the loggable argv.
+    expect(codexCall.args).not.toContain('--title');
+    expect(codexCall.opts.stdin).toContain('Review Instructions');
   });
 });
 
@@ -824,55 +866,56 @@ describe('review handler — dependency review base across agents (issue #667)',
 // Review input — issue/task requirement context (issue #174)
 // ---------------------------------------------------------------------------
 
-function titleArgOf(codexCall) {
-  const i = codexCall.args.indexOf('--title');
-  return i >= 0 ? codexCall.args[i + 1] : undefined;
+// Since issue #912 the codex review brief travels on stdin (§7.3's one prompt
+// channel for every Codex lane), never as a `--title` argv element.
+function briefStdinOf(codexCall) {
+  return codexCall.opts?.stdin;
 }
 
 describe('review handler — requirement context in review input', () => {
-  test('--title carries the issue body under an Issue Requirements heading', async () => {
+  test('the brief carries the issue body under an Issue Requirements heading', async () => {
     const runner = happyRunner();
     const task = makeTask({
       context: { ...makeTask().context, body: 'Acceptance criteria: throttle login to 5 attempts/min per IP.' },
     });
     await createReviewHandler(CONTEXT(), runner)(task);
-    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
-    expect(title).toContain('## Issue Requirements');
-    expect(title).toContain('Acceptance criteria: throttle login to 5 attempts/min per IP.');
+    const brief = briefStdinOf(runner.calls.find((c) => c.cmd === 'codex'));
+    expect(brief).toContain('## Issue Requirements');
+    expect(brief).toContain('Acceptance criteria: throttle login to 5 attempts/min per IP.');
   });
 
-  test('--title carries issue number, title, url, labels and PR url', async () => {
+  test('the brief carries issue number, title, url, labels and PR url', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
-    expect(title).toContain('Issue #77: Add login rate limiting');
-    expect(title).toContain('https://github.com/m2dw/test-repo/issues/77');
-    expect(title).toContain('status:needs-review');
-    expect(title).toContain('https://github.com/m2dw/test-repo/pull/99');
+    const brief = briefStdinOf(runner.calls.find((c) => c.cmd === 'codex'));
+    expect(brief).toContain('Issue #77: Add login rate limiting');
+    expect(brief).toContain('https://github.com/m2dw/test-repo/issues/77');
+    expect(brief).toContain('status:needs-review');
+    expect(brief).toContain('https://github.com/m2dw/test-repo/pull/99');
   });
 
-  test('--title instructs the reviewer to check requirement fit and code quality', async () => {
+  test('the brief instructs the reviewer to check requirement fit and code quality', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
-    expect(title).toMatch(/Requirement fit/i);
-    expect(title).toMatch(/acceptance criteri/i);
-    expect(title).toMatch(/code quality/i);
+    const brief = briefStdinOf(runner.calls.find((c) => c.cmd === 'codex'));
+    expect(brief).toMatch(/Requirement fit/i);
+    expect(brief).toMatch(/acceptance criteri/i);
+    expect(brief).toMatch(/code quality/i);
   });
 
-  test('--title lists passing verification results', async () => {
+  test('the brief lists passing verification results', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
-    expect(title).toContain('## Verification Results');
-    expect(title).toContain('- test: passed');
+    const brief = briefStdinOf(runner.calls.find((c) => c.cmd === 'codex'));
+    expect(brief).toContain('## Verification Results');
+    expect(brief).toContain('- test: passed');
   });
 
-  test('--title omits Issue Requirements heading when no body present', async () => {
+  test('the brief omits Issue Requirements heading when no body present', async () => {
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(makeTask());
-    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
-    expect(title).not.toContain('## Issue Requirements');
+    const brief = briefStdinOf(runner.calls.find((c) => c.cmd === 'codex'));
+    expect(brief).not.toContain('## Issue Requirements');
   });
 
   test('writes review-prompt.md artifact containing the issue body', async () => {
@@ -891,9 +934,9 @@ describe('review handler — requirement context in review input', () => {
     const hugeBody = 'B'.repeat(20_000);
     const task = makeTask({ context: { ...makeTask().context, body: hugeBody } });
     await createReviewHandler(CONTEXT(), runner)(task);
-    const title = titleArgOf(runner.calls.find((c) => c.cmd === 'codex'));
-    expect(title).toContain('…(issue body truncated for review context)');
-    expect(title.length).toBeLessThan(hugeBody.length);
+    const brief = briefStdinOf(runner.calls.find((c) => c.cmd === 'codex'));
+    expect(brief).toContain('…(issue body truncated for review context)');
+    expect(brief.length).toBeLessThan(hugeBody.length);
   });
 
   test('a review finding that misses an acceptance criterion is treated as needs_fix', async () => {
@@ -1238,6 +1281,288 @@ describe('review handler — failure cases', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Review-verification deadline and process-tree isolation (issue #1090)
+//
+// A hanging verification command (or a descendant it spawned) must not hold
+// the review worker indefinitely. `sequenceRunner` lets a stub step assert
+// what `opts` review.ts passed AND return the timeout/signal facts
+// `defaultCommandRunner` would report for a runner-owned deadline kill.
+// ---------------------------------------------------------------------------
+
+describe('review handler — verification deadline (issue #1090)', () => {
+  function verificationStepRunner(verificationStepResult) {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view (validate recorded branch)
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse (branch exists)
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-verification, issue #506)
+      verificationStepResult,                               // npm test
+    ]);
+  }
+
+  test('wires a bounded, process-group-isolated deadline into the verification call', async () => {
+    const runner = happyRunner();
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('success');
+    const npmCall = runner.calls.find((c) => c.cmd === 'npm');
+    expect(npmCall.opts).toMatchObject({ timeout: 600_000, isolateProcessGroup: true });
+  });
+
+  test('an operator override replaces the default deadline', async () => {
+    const runner = happyRunner();
+    const context = CONTEXT({ session: SESSION({ reviewLoop: { verificationTimeoutMs: 45_000 } }) });
+    const result = await createReviewHandler(context, runner)(makeTask());
+    expect(result.result).toBe('success');
+    const npmCall = runner.calls.find((c) => c.cmd === 'npm');
+    expect(npmCall.opts.timeout).toBe(45_000);
+  });
+
+  test('a runner deadline is escalated to a human, never requeued as a code defect', async () => {
+    const runner = verificationStepRunner({
+      stdout: 'Jest did not exit one second after the test run completed.\n',
+      stderr: '',
+      exitCode: 1,
+      timedOut: true,
+      deadlineEscalated: true,
+      signal: 'SIGTERM',
+      durationMs: 600_257,
+      processTreeCleanup: {
+        pid: 4242,
+        processGroupTerminated: true,
+        terminatedDescendants: [4243, 4244],
+        forceKilled: [4244],
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.result).not.toBe('needs_fix');
+    expect(result.result).not.toBe('delayed');
+    expect(result.retryAfterMs).toBeUndefined();
+    expect(result.message).toMatch(/timed out after 600000 ms/);
+    expect(result.message).toMatch(/not a code defect/);
+    expect(result.message).toMatch(/force-killed after it ignored the deadline/);
+    expect(result.context?.verificationFailedStep).toBe('test');
+    expect(result.context?.verificationStopReason).toBe('timeout');
+    expect(result.context?.verificationFailure).toMatchObject({ name: 'test', exitCode: 1 });
+
+    // Local diagnostics preserve the typed facts and cleanup outcome even
+    // though the human-facing message is a prose summary.
+    const diagnostics = JSON.parse(readFileSync(
+      join(artifactRoot, 'runs', 'run-review-1', 'review-verification-test-stop.json'), 'utf8',
+    ));
+    expect(diagnostics.stopReason).toBe('timeout');
+    expect(diagnostics.timedOut).toBe(true);
+    expect(diagnostics.deadlineEscalated).toBe(true);
+    expect(diagnostics.signal).toBe('SIGTERM');
+    expect(diagnostics.timeoutMs).toBe(600_000);
+    expect(diagnostics.durationMs).toBe(600_257);
+    expect(diagnostics.processTreeCleanup).toMatchObject({
+      processGroupTerminated: true,
+      terminatedDescendants: [4243, 4244],
+      forceKilled: [4244],
+    });
+
+    const reviewResult = JSON.parse(readFileSync(
+      join(artifactRoot, 'runs', 'run-review-1', 'review-result.json'), 'utf8',
+    ));
+    expect(reviewResult.success).toBe(false);
+    expect(reviewResult.stopReason).toBe('timeout');
+  });
+
+  test('an external signal termination is distinguishable from a deadline but still escalated', async () => {
+    const runner = verificationStepRunner({
+      stdout: '', stderr: 'Killed', exitCode: 1, signal: 'SIGKILL', durationMs: 4_012,
+    });
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/terminated by signal SIGKILL/);
+    expect(result.message).not.toMatch(/timed out/);
+    expect(result.context?.verificationStopReason).toBe('signal');
+
+    const diagnostics = JSON.parse(readFileSync(
+      join(artifactRoot, 'runs', 'run-review-1', 'review-verification-test-stop.json'), 'utf8',
+    ));
+    expect(diagnostics.stopReason).toBe('signal');
+    expect(diagnostics.timedOut).toBe(false);
+    expect(diagnostics.signal).toBe('SIGKILL');
+  });
+
+  test('a normal nonzero exit with no timeout/signal facts is unaffected (still needs_fix)', async () => {
+    const runner = verificationStepRunner({ stdout: '', stderr: '3 tests failed', exitCode: 1 });
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+    expect(result.result).toBe('needs_fix');
+    expect(result.context?.verificationStopReason).toBeUndefined();
+  });
+
+  test('a timed-out command whose SIGTERM handler exits zero is still escalated, not counted as success (review, P2)', async () => {
+    // Confirmed with a real subprocess: `defaultCommandRunner` can report
+    // `exitCode: 0` alongside `timedOut: true` / `spawnErrorCode: "ETIMEDOUT"`
+    // when the killed command's own SIGTERM handler exits successfully.
+    // Classification must read the timeout facts independently of exitCode —
+    // reading them only inside a nonzero-exit guard would count this as a
+    // passing verification and let review proceed to approval.
+    const runner = verificationStepRunner({
+      stdout: '', stderr: '', exitCode: 0,
+      timedOut: true, spawnErrorCode: 'ETIMEDOUT', durationMs: 600_133,
+    });
+    const result = await createReviewHandler(CONTEXT(), runner)(makeTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.result).not.toBe('success');
+    expect(result.message).toMatch(/timed out after 600000 ms/);
+    expect(result.context?.verificationFailedStep).toBe('test');
+    expect(result.context?.verificationStopReason).toBe('timeout');
+
+    const diagnostics = JSON.parse(readFileSync(
+      join(artifactRoot, 'runs', 'run-review-1', 'review-verification-test-stop.json'), 'utf8',
+    ));
+    expect(diagnostics.stopReason).toBe('timeout');
+    expect(diagnostics.timedOut).toBe(true);
+  });
+
+  test('releases the issue worktree lock on a deadline escalation, same as any other terminal handoff', async () => {
+    const wt = worktreePath();
+    const resolver = fakeWorktreeResolver(wt);
+    const lock = fakeLock();
+    const runner = verificationStepRunner({
+      stdout: '', stderr: '', exitCode: 1, timedOut: true, durationMs: 600_010,
+    });
+
+    const result = await createReviewHandler(CONTEXT(), runner, resolver.resolve, lock)(makeTask());
+
+    expect(result.result).toBe('blocked');
+    expect(lock.calls.acquire).toHaveLength(1);
+    expect(lock.calls.release).toHaveLength(1);
+  });
+
+  // P2 (issue #1090 review): a verification-timeout/signal handoff on a SYNTHETIC
+  // `ai/pr-<n>` review worktree must not force-delete evidence the (killed)
+  // verification command wrote before it was stopped. This is an OPERATIONAL
+  // handoff to a human, not an automatic implementation fix, so the worktree is
+  // preserved (like the Step 0/1 early-blocked handoffs) rather than run through
+  // `releaseSyntheticWorktreeForFix`'s unconditional `git worktree remove --force
+  // --force`.
+  function syntheticVerificationRunner(verificationStepResult, postVerificationDirtyCheck, ...extraSteps) {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', state: 'OPEN', baseRefName: 'main' }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic per-PR name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (Step 1 preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },                  // git diff origin/main...HEAD (pre-verification diff classification)
+      verificationStepResult,                                   // npm test — times out / is signalled
+      postVerificationDirtyCheck,                               // git status --porcelain (dirty check inside withSyntheticWorktreeReleased)
+      ...extraSteps,
+    ]);
+  }
+
+  function syntheticVerificationTask() {
+    return makeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:codex', 'status:needs-review'],
+        // no `branch` recorded — the PR head is non-conventional, so review runs on
+        // the SYNTHETIC `ai/pr-99` worktree.
+      },
+    });
+  }
+
+  test('preserves a dirty synthetic ai/pr-<n> worktree (and its partial evidence) on a verification timeout instead of force-removing it', async () => {
+    const wt = worktreePath();
+    const runner = syntheticVerificationRunner(
+      { stdout: 'partial output before the deadline\n', stderr: '', exitCode: 1, timedOut: true, durationMs: 600_200 },
+      { stdout: ' M partial-result.txt\n', stderr: '', exitCode: 0 }, // DIRTY: the killed command wrote evidence
+    );
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+
+    const result = await createReviewHandler(
+      CONTEXT(), runner, resolver.resolve, lock,
+    )(syntheticVerificationTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/timed out/);
+    expect(result.message).toMatch(/left in place/);
+    expect(result.message).toContain(wt);
+    // Critically: no `git worktree remove` was ever issued — the partial evidence
+    // the timed-out command wrote is preserved for human inspection.
+    const removed = runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(removed).toBe(false);
+    expect(lock.calls.release.length).toBeGreaterThan(0);
+  });
+
+  test('preserves a dirty synthetic ai/pr-<n> worktree on external signal termination during verification', async () => {
+    const wt = worktreePath();
+    const runner = syntheticVerificationRunner(
+      { stdout: '', stderr: 'Killed', exitCode: 1, signal: 'SIGKILL', durationMs: 4_012 },
+      { stdout: '?? leftover.log\n', stderr: '', exitCode: 0 }, // DIRTY
+    );
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+
+    const result = await createReviewHandler(
+      CONTEXT(), runner, resolver.resolve, lock,
+    )(syntheticVerificationTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/terminated by signal SIGKILL/);
+    expect(result.message).toMatch(/left in place/);
+    const removed = runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(removed).toBe(false);
+    expect(lock.calls.release.length).toBeGreaterThan(0);
+  });
+
+  test('preserves the synthetic worktree when the post-verification cleanliness probe itself fails (a failed probe is not proof of clean)', async () => {
+    const wt = worktreePath();
+    const runner = syntheticVerificationRunner(
+      { stdout: '', stderr: '', exitCode: 1, timedOut: true, durationMs: 600_050 },
+      { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }, // the probe itself FAILS
+    );
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+
+    const result = await createReviewHandler(
+      CONTEXT(), runner, resolver.resolve, lock,
+    )(syntheticVerificationTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.message).toMatch(/could not be confirmed clean/);
+    const removed = runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(removed).toBe(false);
+    expect(lock.calls.release.length).toBeGreaterThan(0);
+  });
+
+  test('still removes a synthetic ai/pr-<n> worktree on a verification timeout when it is confirmed clean', async () => {
+    const wt = worktreePath();
+    const runner = syntheticVerificationRunner(
+      { stdout: '', stderr: '', exitCode: 1, timedOut: true, durationMs: 600_050 },
+      { stdout: '', stderr: '', exitCode: 0 }, // CONFIRMED CLEAN
+      { stdout: '', stderr: '', exitCode: 0 }, // git worktree remove --force --force <wt> (the clean-removal branch)
+    );
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const lock = fakeLock();
+
+    const result = await createReviewHandler(
+      CONTEXT(), runner, resolver.resolve, lock,
+    )(syntheticVerificationTask());
+
+    expect(result.result).toBe('blocked');
+    expect(result.message).not.toMatch(/left in place/);
+    const removed = runner.calls.some((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(removed).toBe(true);
+    expect(lock.calls.release.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Review-admission preflight (issue #681)
 //
 // A single check gates entry into the handler before any side effect — repo-
@@ -1337,6 +1662,158 @@ describe('review handler — quota delay (issue #672)', () => {
     // #672 review). The long, reset-oriented delay comes from the runner itself.
     expect(result.retryAfterMs).toBeUndefined();
     expect(result.message).toMatch(/usage quota/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Final-stage resume (issue #1103 review, P2)
+// ---------------------------------------------------------------------------
+
+describe('review handler — final-stage resume (issue #1103)', () => {
+  const APPROVED_HEAD = 'a'.repeat(40);
+  const MOVED_HEAD = 'c'.repeat(40);
+  const PR_VIEW = JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false });
+
+  // Answers by command rather than by position, so the assertions below can say
+  // which steps ran. `npm` answers are consumed one call at a time.
+  function stagedRunner({ head = APPROVED_HEAD, npm = [], livePrHead = () => head } = {}) {
+    const calls = [];
+    let npmIndex = 0;
+    return {
+      calls,
+      run(cmd, args, opts) {
+        calls.push({ cmd, args, opts });
+        const ok = (stdout = '') => ({ stdout, stderr: '', exitCode: 0 });
+        if (cmd === 'gh') return ok(PR_VIEW);
+        // The PR's live head on origin (issue #1103 review, P1).
+        if (cmd === 'git' && args[0] === 'ls-remote') return ok(`${livePrHead()}\t${args[2]}\n`);
+        if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === '--verify') return ok('ai/issue-77-run-impl-1');
+        if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${head}\n`);
+        if (cmd === 'git' && args[0] === 'rev-list') return ok('0');
+        if (cmd === 'codex') return ok('No P1/P2 findings.');
+        if (cmd === 'npm') {
+          const answer = npm[npmIndex] ?? ok('All tests passed.');
+          npmIndex += 1;
+          return answer;
+        }
+        return ok();
+      },
+    };
+  }
+
+  const stagedContext = (runId) => CONTEXT({ runId, session: SESSION({ stagedVerification: { enabled: true } }) });
+
+  test('a host failure in the final stage persists the approval, withdraws the marker, and resumes without the reviewer', async () => {
+    // Step 4's `npm test` passes; the final stage's own `npm test` loses its host.
+    const first = stagedRunner({ npm: [undefined, { stdout: '', stderr: 'spawn npm ENOENT', exitCode: 1 }] });
+    const delayed = await createReviewHandler(stagedContext('run-review-1'), first)(makeTask());
+
+    expect(delayed.result).toBe('delayed');
+    expect(delayed.withdrawStackReady).toBe(true);
+    expect(delayed.context.finalStageApproval).toMatchObject({
+      headSha: APPROVED_HEAD,
+      approval: { classification: { classification: 'success' } },
+    });
+    expect(first.calls.filter((call) => call.cmd === 'codex')).toHaveLength(1);
+
+    const second = stagedRunner();
+    const resumed = await createReviewHandler(stagedContext('run-review-2'), second)(
+      makeTask({ context: delayed.context }),
+    );
+
+    expect(resumed.result).toBe('success');
+    expect(second.calls.find((call) => call.cmd === 'codex')).toBeUndefined();
+    // Only the final stage's full required set ran — Step 4 was not repeated.
+    expect(second.calls.filter((call) => call.cmd === 'npm')).toHaveLength(1);
+    expect(resumed.context.finalStageGrant).toMatchObject({ runId: 'run-review-2', headSha: APPROVED_HEAD });
+    // Consumed: a later review at this head does not skip its agent again.
+    expect(resumed.context.finalStageApproval).toBeNull();
+  });
+
+  // Issue #1103 review, P1: the worktree HEAD stays put when someone pushes to the
+  // PR branch, so only the live origin ref reveals the move.
+  test('a push to the PR branch during the final stage withholds stack-ready', async () => {
+    let live = APPROVED_HEAD;
+    let npmCount = 0;
+    const runner = stagedRunner({ livePrHead: () => live });
+    const run = runner.run.bind(runner);
+    runner.run = (cmd, args, opts) => {
+      if (cmd === 'npm') {
+        npmCount += 1;
+        // Step 4's `npm test` is the first; the final stage's is the second.
+        if (npmCount === 2) live = MOVED_HEAD;
+      }
+      return run(cmd, args, opts);
+    };
+    const result = await createReviewHandler(stagedContext('run-review-1'), runner)(makeTask());
+
+    expect(result.context.finalStageGrant ?? null).toBeNull();
+    expect(result.result).not.toBe('success');
+    expect(runner.calls.some((call) => call.cmd === 'git' && call.args[0] === 'ls-remote')).toBe(true);
+  });
+
+  test('an approval recorded at a head that has since moved runs the full review', async () => {
+    const runner = stagedRunner({ head: MOVED_HEAD });
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        finalStageApproval: {
+          headSha: APPROVED_HEAD,
+          approval: { classification: { classification: 'success', reason: 'ok' }, findingsContext: {} },
+        },
+      },
+    });
+    const result = await createReviewHandler(stagedContext('run-review-3'), runner)(task);
+
+    expect(runner.calls.filter((call) => call.cmd === 'codex')).toHaveLength(1);
+    expect(result.context.finalStageApproval).toBeNull();
+  });
+
+  // Issue #1104: a failing final stage returns to implementation with the exact
+  // failed check and the revision it was tested at.
+  test('a code failure in the final stage requeues implementation with the failing check id and tested revision', async () => {
+    // Step 4's `npm test` passes; the final stage's own `npm test` fails.
+    const runner = stagedRunner({ npm: [undefined, { stdout: 'FAIL test/auth.test.js', stderr: '', exitCode: 1 }] });
+    const result = await createReviewHandler(stagedContext('run-review-1'), runner)(makeTask());
+
+    expect(result.result).toBe('needs_fix');
+    expect(result.context.finalStageRepair).toMatchObject({
+      testedRevision: APPROVED_HEAD,
+      outcome: 'code-failed',
+      failing: [{ checkId: 'exec:test', name: 'test', verdict: 'failed', exitCode: 1 }],
+    });
+    expect(result.context.verificationFailure).toEqual({ name: 'test', checkId: 'exec:test', exitCode: 1 });
+    expect(result.context.reviewFeedback).toContain('`exec:test` (test) — failed, exit 1');
+    expect(result.context.reviewFeedback).toContain(`Tested revision: \`${APPROVED_HEAD}\``);
+    expect(result.context.reviewFeedback).toContain('FAIL test/auth.test.js');
+    // Existing accounting: one review cycle, under the lane's cap.
+    expect(result.context.reviewCycles).toBe(1);
+    // Never a grant, and nothing in the worktree is reset or cleaned away.
+    expect(result.context.finalStageGrant).toBeNull();
+    expect(runner.calls.some((call) => call.cmd === 'git' && (call.args[0] === 'reset' || call.args[0] === 'clean'))).toBe(false);
+  });
+
+  test('a final-stage code failure at the review loop cap hands off to a human, not another requeue', async () => {
+    const runner = stagedRunner({ npm: [undefined, { stdout: 'FAIL', stderr: '', exitCode: 1 }] });
+    const task = makeTask({ context: { ...makeTask().context, reviewCycles: 99 } });
+    const result = await createReviewHandler(stagedContext('run-review-1'), runner)(task);
+
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewLoopCapReached).toBe(true);
+    expect(result.context.finalStageRepair.failing[0].checkId).toBe('exec:test');
+    expect(result.context.finalStageGrant).toBeNull();
+  });
+
+  test('an environment failure in the final stage is not handed to the fix loop', async () => {
+    const runner = stagedRunner({
+      npm: [undefined, { stdout: '', stderr: 'npm ERR! Missing script: "test"', exitCode: 1 }],
+    });
+    const result = await createReviewHandler(stagedContext('run-review-1'), runner)(makeTask());
+
+    expect(result.result).not.toBe('needs_fix');
+    expect(result.context.reviewCycles).toBeUndefined();
+    expect(result.context.finalStageRepair ?? null).toBeNull();
+    expect(result.context.finalStageGrant ?? null).toBeNull();
   });
 });
 
@@ -1983,19 +2460,22 @@ describe('review handler — resolved profile metadata', () => {
     expect(ctx.resolvedProfile).toMatchObject({ phase: 'review', agentId: 'codex', cmd: 'codex' });
   });
 
-  test('review-context.json resolvedProfile records modelSource as cli-default', async () => {
+  test('review-context.json resolvedProfile records an unset model as model cli-default, modelSource default', async () => {
     await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
     const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
-    expect(ctx.resolvedProfile.modelSource).toBe('cli-default');
+    expect(ctx.resolvedProfile.model).toBe('cli-default');
+    expect(ctx.resolvedProfile.modelSource).toBe('default');
   });
 
-  test('review-context.json resolvedProfile argv excludes --title value (prompt content)', async () => {
+  test('review-context.json resolvedProfile argv excludes the brief (prompt content)', async () => {
     await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
     const ctx = JSON.parse(readFileSync(join(dir(), 'review-context.json'), 'utf8'));
     const argv = ctx.resolvedProfile.argv;
     expect(argv).toContain('review');
     expect(argv).toContain('--base');
-    // --title value (review brief) must not appear in sanitized argv
+    // The review brief travels on stdin (issue #912) and must not appear in
+    // the sanitized argv.
+    expect(argv).not.toContain('--title');
     const argvStr = argv.join(' ');
     expect(argvStr).not.toContain('Issue Requirements');
     expect(argvStr).not.toContain('Review Instructions');
@@ -2128,22 +2608,25 @@ describe('review handler — review strength Codex CLI args', () => {
     expect(argStr).toContain('model_reasoning_effort=low');
   });
 
-  // Issue #609: review:medium now always requests an explicit medium effort
-  // instead of silently falling through to the CLI's own global default.
-  test('review:medium label -> codex receives -c model_reasoning_effort=medium', async () => {
+  // Issue #912 (§9.2 divergence): an explicit review:medium maps to the shared
+  // resolver's `normal`, whose built-in openai binding targets codex-high — so
+  // it now resolves the same explicit `high` effort as the no-label default,
+  // instead of the pre-cutover per-lane `medium`. Rebinding `normal` in
+  // agent-profiles.json restores a medium tier without a source change.
+  test('review:medium label -> codex receives -c model_reasoning_effort=high (normal binding)', async () => {
     const runner = happyRunner();
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:medium'] } });
     await createReviewHandler(CONTEXT(), runner)(task);
     const codexCall = runner.calls[CODEX_IDX];
-    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=medium');
+    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=high');
   });
 
-  test('review:medium + complexity:high -> model_reasoning_effort=medium (label beats complexity)', async () => {
+  test('review:medium + complexity:high -> the explicit label still beats complexity (normal binding)', async () => {
     const runner = happyRunner();
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:medium', 'complexity:high'] } });
     await createReviewHandler(CONTEXT(), runner)(task);
     const codexCall = runner.calls[CODEX_IDX];
-    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=medium');
+    expect(codexCall.args.join(' ')).toContain('model_reasoning_effort=high');
   });
 
   test('review:low + complexity:high -> model_reasoning_effort=low (explicit label overrides complexity)', async () => {
@@ -2636,16 +3119,19 @@ describe('review handler — Gemini/Antigravity review agent', () => {
     await createReviewHandler(geminiContext(), runner)(makeGeminiTask());
     const agyCall = runner.calls[AGY_IDX];
     expect(agyCall.cmd).toBe('agy');
-    // Antigravity contract: `agy --print "<prompt>"` with the prompt as the
-    // positional argument AND on stdin, matching the research lane. Some `agy`
-    // builds read only the positional arg, so stdin-only would run without the
-    // brief/diff.
-    expect(agyCall.args).toHaveLength(2);
-    expect(agyCall.args[0]).toBe('--print');
-    expect(agyCall.args[1]).toContain('Review Instructions');
-    expect(agyCall.args[1]).toContain('## PR Diff');
-    expect(agyCall.args[1]).toContain('-old');
-    expect(agyCall.opts.stdin).toBe(agyCall.args[1]);
+    // Antigravity contract: `agy --print-timeout 15m --print "<prompt>"` with
+    // the prompt as the positional argument AND on stdin, matching the research
+    // lane (the built-in google profile carries the 15m print timeout since the
+    // issue #912 cutover). Some `agy` builds read only the positional arg, so
+    // stdin-only would run without the brief/diff.
+    expect(agyCall.args).toHaveLength(4);
+    expect(agyCall.args[0]).toBe('--print-timeout');
+    expect(agyCall.args[1]).toBe('15m');
+    expect(agyCall.args[2]).toBe('--print');
+    expect(agyCall.args[3]).toContain('Review Instructions');
+    expect(agyCall.args[3]).toContain('## PR Diff');
+    expect(agyCall.args[3]).toContain('-old');
+    expect(agyCall.opts.stdin).toBe(agyCall.args[3]);
   });
 
   test('Gemini uses ANTIGRAVITY_BIN when set', async () => {
@@ -2804,7 +3290,7 @@ describe('review handler — Gemini/Antigravity review agent', () => {
     // worktree; only the live-mergeability query (`--json mergeable,...`) is
     // gated on the truncation check, so assert on its distinctive args rather
     // than any `gh ... view` call.
-    expect(runner.calls[AGY_IDX].args[1]).toContain('…(diff truncated)');
+    expect(runner.calls[AGY_IDX].args[3]).toContain('…(diff truncated)');
     expect(runner.calls.some((c) => c.cmd === 'gh' && (c.args || []).includes('mergeable,mergeStateStatus'))).toBe(false);
   });
 
@@ -2961,24 +3447,25 @@ describe('review handler — codex model selection', () => {
     const { args } = runner.calls[REVIEW_IDX];
     expect(args).not.toContain('--model');
     const profile = readReviewProfile();
-    expect(profile).toMatchObject({ model: 'cli-default', modelSource: 'cli-default' });
+    expect(profile).toMatchObject({ model: 'cli-default', modelSource: 'default' });
   });
 
-  test('session.codex.model: --model precedes the review subcommand, metadata records session-config', async () => {
+  test('session.codex.model is no longer read by the cut-over lane (issue #912)', async () => {
+    // Pre-cutover this spliced --model before the review subcommand; the
+    // read-only cutover deleted the per-lane chain, so the model comes from an
+    // openai profile in agent-profiles.json or the CODEX_MODEL break-glass
+    // variable instead. Session config keeps only the context-mode form (#376).
     const session = SESSION({ codex: { model: 'gpt-5-codex' } });
     const runner = happyRunner();
     await createReviewHandler(CONTEXT({ session }), runner)(makeTask());
     const { args } = runner.calls[REVIEW_IDX];
-    const mIdx = args.indexOf('--model');
-    const reviewIdx = args.indexOf('review');
-    expect(mIdx).toBeGreaterThanOrEqual(0);
-    expect(args[mIdx + 1]).toBe('gpt-5-codex');
-    expect(mIdx).toBeLessThan(reviewIdx);
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('gpt-5-codex');
     const profile = readReviewProfile();
-    expect(profile).toMatchObject({ model: 'gpt-5-codex', modelSource: 'session-config' });
+    expect(profile).toMatchObject({ model: 'cli-default', modelSource: 'default' });
   });
 
-  test('CODEX_MODEL env var overrides session.codex.model', async () => {
+  test('CODEX_MODEL env var still splices --model before the review subcommand', async () => {
     process.env['CODEX_MODEL'] = 'o1-preview';
     const session = SESSION({ codex: { model: 'gpt-5-codex' } });
     const runner = happyRunner();
@@ -3017,11 +3504,14 @@ describe('review handler — codex model selection', () => {
   });
 
   test('resolvedProfile records explicit effort/effortSource for review:medium', async () => {
+    // Issue #912 (§9.2 divergence): review:medium maps to `normal`, whose
+    // built-in openai binding is codex-high — the label is still what chose the
+    // level, so the source stays `label` while the value reads `high`.
     const task = makeTask({ context: { ...makeTask().context, labels: ['agent:codex', 'status:needs-review', 'review:medium'] } });
     const runner = happyRunner();
     await createReviewHandler(CONTEXT(), runner)(task);
     const profile = readReviewProfile();
-    expect(profile).toMatchObject({ effort: 'medium', effortSource: 'label' });
+    expect(profile).toMatchObject({ effort: 'high', effortSource: 'label' });
   });
 });
 
@@ -4980,7 +5470,7 @@ describe('review handler — predecessor context in review brief (issue #505)', 
       },
     });
     await createReviewHandler(CONTEXT(), runner)(task);
-    // For Codex the brief is written to review-prompt.md as the --title artifact.
+    // For Codex the brief is written to review-prompt.md (it travels on stdin).
     const prompt = readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'), 'utf8');
     expect(prompt).toContain('## Predecessor Issues');
     expect(prompt).toContain('Issue #42');
@@ -5110,12 +5600,17 @@ describe('review handler — conflict-specific review (issue #540)', () => {
 // ---------------------------------------------------------------------------
 
 describe('review handler — issue-required verification', () => {
+  // Reviewed HEAD returned by the Step 4.5 `git rev-parse HEAD` probe (issue
+  // #1040 evidence binding).
+  const REVIEWED_HEAD = 'f'.repeat(40);
+
   // Runner for the setup + verification steps without a review agent call.
   // Used when Step 4.5 is expected to block before the review agent runs.
   // Actual order (worktree-only, issue #456/#699): gh pr view → fetch base →
   //               rev-parse branch exists → pull --ff-only → rev-list --count →
   //               git status (preflight) → git diff (pre-classification) →
-  //               npm test (verification) [Step 4.5 blocks — no review agent call]
+  //               npm test (verification) → git rev-parse HEAD (issue #1040
+  //               evidence binding) [Step 4.5 blocks — no review agent call]
   function preReviewRunner() {
     return sequenceRunner([
       { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99 (validate recorded branch)
@@ -5126,8 +5621,43 @@ describe('review handler — issue-required verification', () => {
       { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
       { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-classification, issue #506)
       { stdout: '', stderr: '', exitCode: 0 },              // npm test (verification passes)
+      { stdout: REVIEWED_HEAD + '\n', stderr: '', exitCode: 0 }, // git rev-parse HEAD (issue #1040 evidence binding)
       // Step 4.5 returns blocked — no review agent call follows
     ]);
+  }
+
+  // Happy-path runner with the Step 4.5 evidence-binding probe: used when
+  // recorded manual evidence must be validated before the gate passes.
+  function evidenceReviewRunner() {
+    return sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },              // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse --verify --quiet refs/heads/<branch>
+      { stdout: '', stderr: '', exitCode: 0 },              // git pull origin <branch> --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },             // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (preflight) — clean
+      { stdout: '', stderr: '', exitCode: 0 },              // git diff origin/main...HEAD (pre-classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 }, // npm test (verification)
+      { stdout: REVIEWED_HEAD + '\n', stderr: '', exitCode: 0 }, // git rev-parse HEAD (issue #1040 evidence binding)
+      { stdout: 'No P1/P2 findings.', stderr: '', exitCode: 0 }, // codex review
+      { stdout: '', stderr: '', exitCode: 0 },              // git status --porcelain (post-review) — clean
+    ]);
+  }
+
+  // A fully bound manual evidence entry for `command` (issue #1040).
+  function boundEvidence(command, commandId, overrides = {}) {
+    return {
+      command,
+      exitCode: 0,
+      output: 'ok',
+      recordedAt: '2026-01-01T00:00:00.000Z',
+      source: 'operator_input',
+      headSha: REVIEWED_HEAD,
+      planDigest: 'e'.repeat(64),
+      planRevisionOrdinal: 0,
+      commandId,
+      ...overrides,
+    };
   }
 
   test('all required commands passed — succeeds and includes issueRequiredVerifications in context', async () => {
@@ -5254,6 +5784,400 @@ describe('review handler — issue-required verification', () => {
     expect(result.result).toBe('success');
     expect(result.context?.issueRequiredVerifications).toBeUndefined();
   });
+
+  // -------------------------------------------------------------------------
+  // Evidence binding (issue #1040): a manual evidence entry satisfies the
+  // gate only for the plan revision, slot identity, and reviewed HEAD it was
+  // recorded against; legacy unbound evidence is conservatively rejected.
+  // -------------------------------------------------------------------------
+
+  test('bound passing evidence for the missing command satisfies the gate (issue #1040)', async () => {
+    const commandId = deriveRequirementCommandId('npm run test:e2e');
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        manualVerificationEvidence: [boundEvidence('npm run test:e2e', commandId)],
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), evidenceReviewRunner())(task);
+    expect(result.result).toBe('success');
+    const verifications = result.context?.issueRequiredVerifications;
+    expect(verifications).toHaveLength(1);
+    expect(verifications[0]).toMatchObject({ command: 'npm run test:e2e', status: 'passed' });
+  });
+
+  test('evidence bound to a different HEAD fails closed and blocks (issue #1040)', async () => {
+    const commandId = deriveRequirementCommandId('npm run test:e2e');
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        manualVerificationEvidence: [
+          boundEvidence('npm run test:e2e', commandId, { headSha: '0'.repeat(40) }),
+        ],
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.message).toContain('head_mismatch');
+    const verifications = result.context?.issueRequiredVerifications;
+    expect(verifications[0].status).toBe('not_run');
+    expect(verifications[0].evidenceRejections).toContain('head_mismatch');
+    // The escalation records the binding block for the resolve surface,
+    // anchored on the HEAD this run actually reviewed.
+    expect(result.context?.verificationEvidenceBinding).toMatchObject({
+      headSha: REVIEWED_HEAD,
+      planRevisionOrdinal: 0,
+      commandIds: { 'npm run test:e2e': commandId },
+    });
+    expect(result.context?.verificationEvidenceBinding.planDigest).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('legacy evidence without binding no longer satisfies the gate (issue #1040)', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        manualVerificationEvidence: [{
+          command: 'npm run test:e2e',
+          exitCode: 0,
+          output: 'ok',
+          recordedAt: '2026-01-01T00:00:00.000Z',
+          source: 'operator_input',
+        }],
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    const verifications = result.context?.issueRequiredVerifications;
+    expect(verifications[0].status).toBe('not_run');
+    expect(verifications[0].evidenceRejections).toContain('legacy_unbound');
+  });
+
+  test('evidence recorded for a different slot identity is rejected (issue #1040)', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        manualVerificationEvidence: [
+          // Byte-matching command, but bound to some OTHER slot's identity —
+          // e.g. evidence recorded before the requirement was re-added.
+          boundEvidence('npm run test:e2e', deriveRequirementCommandId('npm run other')),
+        ],
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.issueRequiredVerifications[0].evidenceRejections).toContain('identity_mismatch');
+  });
+
+  test('failed recorded evidence never satisfies the gate and is surfaced (issue #1040)', async () => {
+    const commandId = deriveRequirementCommandId('npm run test:e2e');
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        manualVerificationEvidence: [
+          boundEvidence('npm run test:e2e', commandId, { exitCode: 1 }),
+        ],
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.issueRequiredVerifications[0].evidenceRejections).toContain('failed_exit');
+  });
+
+  test('escalation with no recorded evidence still records the binding block (issue #1040)', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    const block = result.context?.verificationEvidenceBinding;
+    expect(block).toBeDefined();
+    expect(block.headSha).toBe(REVIEWED_HEAD);
+    expect(block.commandIds).toMatchObject({
+      'npm run test:e2e': deriveRequirementCommandId('npm run test:e2e'),
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Effective requirement layer (issue #1043): Step 4.5 gates on the resolved
+  // plan, so an applied amendment changes what the review demands.
+  // -------------------------------------------------------------------------
+
+  // A well-formed applied amendment block: one revision carrying `operations`,
+  // in the shape `applyVerificationAmendmentRevision` persists. The checkpoint
+  // digest is recomputed from the block's own inputs (`requirements` must
+  // mirror what the task's pinned body extracts), because the gate reconciles
+  // the stored digest rather than trusting it structurally (issue #1043
+  // review, P2) — a digest no recorded input reproduces now blocks, exercised
+  // by its own test below.
+  function amendmentBlockFor(operations, requirements = []) {
+    const baseline = [{ name: 'test', command: 'npm test' }];
+    const block = {
+      revisions: [
+        {
+          revisionId: 'vamd-0000000000000001',
+          revisionOrdinal: 1,
+          requestKey: 'k1',
+          scope: 'task',
+          source: 'admin-cli',
+          actor: { kind: 'operator', id: 'admin' },
+          reason: 'correcting the requirement after intake',
+          operations,
+          basePlanDigest: 'a'.repeat(64),
+          planDigest: 'b'.repeat(64),
+          sessionBaselineDigest: deriveSessionBaselineDigest(baseline),
+          continuation: 'review',
+          createdAt: '2026-09-02T00:00:00.000Z',
+          observedTaskRevision: 0,
+        },
+      ],
+      checkpoint: {
+        planDigest: 'b'.repeat(64),
+        sessionBaseline: baseline,
+        sessionBaselineDigest: deriveSessionBaselineDigest(baseline),
+        appliedThroughOrdinal: 1,
+        updatedAt: '2026-09-02T00:00:00.000Z',
+        updatedBy: 'revision',
+      },
+    };
+    const resolved = resolveEffectiveVerificationPlan({
+      sessionVerification: { test: 'npm test' },
+      issueRequirements: requirements,
+      amendments: block,
+    });
+    expect(resolved.status).toBe('resolved');
+    block.revisions[0].planDigest = resolved.plan.planDigest;
+    block.checkpoint.planDigest = resolved.plan.planDigest;
+    return block;
+  }
+
+  test('an amended replace corrects the demanded bytes — the fresh review run passes the gate (issue #1043)', async () => {
+    // The Issue pinned a command session.verification never runs; the operator
+    // replaced it with `npm test`, which Step 4 executes. Pre-#1043 the gate
+    // read the raw pinned bytes and re-parked this task on every run.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: amendmentBlockFor(
+          [{ kind: 'replace', commandId: deriveRequirementCommandId('npm run test:e2e'), command: 'npm test', reason: 'typo' }],
+          ['npm run test:e2e'],
+        ),
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(task);
+    expect(result.result).toBe('success');
+    const verifications = result.context?.issueRequiredVerifications;
+    expect(verifications).toHaveLength(1);
+    expect(verifications[0]).toMatchObject({ command: 'npm test', status: 'passed' });
+  });
+
+  // Issue #1044 (§12.2): the review that passes an amended task carries the
+  // amendment forward into the completion context, which is what the human gate
+  // summary states before a human merges. Without it a pass would be reported
+  // over a plan the reader of the Issue never saw change.
+  test('a passing review on an amended task records the run-summary amendment projection', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: amendmentBlockFor(
+          [{ kind: 'retire', commandId: deriveRequirementCommandId('npm run test:e2e'), reason: 'requirement withdrawn' }],
+          ['npm run test:e2e'],
+        ),
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(task);
+    expect(result.result).toBe('success');
+    expect(result.context?.verificationAmendment).toMatchObject({
+      revisionCount: 1,
+      latestOrdinal: 1,
+      latestSource: 'admin-cli',
+      latestReason: 'correcting the requirement after intake',
+      retiredTotal: 1,
+      retiredLabels: ['npm run test:e2e'],
+    });
+  });
+
+  test('an unamended task records no amendment projection at all', async () => {
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(makeTask());
+    expect(result.context?.verificationAmendment).toBeUndefined();
+  });
+
+  // Issue #1044 review (P2): session defaults can drift after the last
+  // amendment, and the gate then reads the RECONCILED live plan. The summary
+  // must publish that plan's digest — labelling the latest revision's older
+  // checkpoint digest as "the effective plan" beside counts taken from a
+  // different plan is the same class of misstatement §12.2 exists to prevent.
+  test('the projected digest is the reconciled plan the gate read, not the revision checkpoint', async () => {
+    const amendments = amendmentBlockFor(
+      [{ kind: 'retire', commandId: deriveRequirementCommandId('npm run test:e2e'), reason: 'requirement withdrawn' }],
+      ['npm run test:e2e'],
+    );
+    // The live session default moved since the checkpoint was written, so the
+    // reconciliation rebases and resolves a plan with a different digest.
+    const session = SESSION({ verification: { test: 'npm test --silent' } });
+    const reconciled = reconcileVerificationPlan({
+      sessionVerification: session.verification,
+      issueRequirements: ['npm run test:e2e'],
+      amendments,
+    });
+    expect(reconciled.status).toBe('drifted');
+    expect(reconciled.plan.planDigest).not.toBe(amendments.checkpoint.planDigest);
+
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: amendments,
+      },
+    });
+    const result = await createReviewHandler(CONTEXT({ session }), happyRunner())(task);
+    expect(result.result).toBe('success');
+    expect(result.context?.verificationAmendment.planDigest).toBe(reconciled.plan.planDigest);
+    expect(result.context?.verificationAmendment.planDigest).not.toBe(
+      amendments.revisions[0].planDigest,
+    );
+  });
+
+  test('a retired requirement is excluded from the gate and reported retired, never passed (issue #1043, §8.4)', async () => {
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: amendmentBlockFor(
+          [{ kind: 'retire', commandId: deriveRequirementCommandId('npm run test:e2e'), reason: 'requirement withdrawn' }],
+          ['npm run test:e2e'],
+        ),
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), happyRunner())(task);
+    expect(result.result).toBe('success');
+    const verifications = result.context?.issueRequiredVerifications;
+    expect(verifications).toHaveLength(1);
+    expect(verifications[0]).toMatchObject({ command: 'npm run test:e2e', status: 'retired' });
+  });
+
+  test('an amendment-added requirement gates even where the pinned body demanded nothing (issue #1043)', async () => {
+    // A raw-inputs gate would skip outright (the task carries no body
+    // commands); the effective layer demands the added command, so its
+    // absence blocks.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: amendmentBlockFor([
+          { kind: 'add', layer: 'requirement', command: 'npm run smoke', reason: 'operator added a gate' },
+        ]),
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.missingVerificationCommands).toEqual(['npm run smoke']);
+    expect(result.message).toContain('npm run smoke');
+  });
+
+  test('a malformed amendment record blocks the review outright — never gated on the raw inputs (issue #1043 review, P1)', async () => {
+    // Falling back to the raw pinned requirements would treat them as the
+    // complete requirement layer, silently dropping anything the (unreadable)
+    // amendments introduced. Persisted malformed amendment state fails closed.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: { revisions: 'not a chain' },
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.verificationPlanUnresolvable).toMatchObject({ reason: 'amendment_state' });
+    expect(result.context?.missingVerificationCommands).toBeUndefined();
+    expect(result.message).toContain('admin task-verification');
+  });
+
+  test('a malformed amendment record blocks even where the pinned body demanded nothing (issue #1043 review, P1)', async () => {
+    // The exact escape the fallback allowed: no raw requirements, so the raw
+    // gate was empty and Step 5 could pass — while the unreadable amendments
+    // may have been the only carrier of a requirement.
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: { revisions: 'not a chain' },
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.verificationPlanUnresolvable).toMatchObject({ reason: 'amendment_state' });
+  });
+
+  test('an amendment record whose checkpoint digest no recorded input reproduces blocks the review (issue #1043 review, P2)', async () => {
+    // A structurally valid chain whose stored digest derives from nothing
+    // recorded — an incorrect low-level write, a hand edit — must not have
+    // its operations trusted: this one retires the only required check, so a
+    // resolve-only gate would run an empty gate and pass. The gate reconciles
+    // (§6.4 rule 3) and fails closed on `unreconciled` instead.
+    const block = amendmentBlockFor(
+      [{ kind: 'retire', commandId: deriveRequirementCommandId('npm run test:e2e'), reason: 'requirement withdrawn' }],
+      ['npm run test:e2e'],
+    );
+    block.revisions[0].planDigest = 'f'.repeat(64);
+    block.checkpoint.planDigest = 'f'.repeat(64);
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run test:e2e`\n',
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: block,
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    expect(result.context?.verificationPlanUnresolvable).toMatchObject({ reason: 'unreconciled' });
+    expect(result.context?.issueRequiredVerifications).toBeUndefined();
+    expect(result.message).toContain('admin task-verification');
+  });
+
+  test('two active slots left byte-identical by a replace keep distinct identities in the gate (issue #1043 review, P1)', async () => {
+    // The body pins two requirements; a replace rewrites the first slot's
+    // bytes to equal the second's. Evidence bound to the SECOND slot's
+    // identity satisfies that slot alone — a byte-keyed lookup would judge
+    // both slots against the second slot's identity and pass the first too.
+    const alphaId = deriveRequirementCommandId('npm run alpha');
+    const betaId = deriveRequirementCommandId('npm run beta');
+    const task = makeTask({
+      context: {
+        ...makeTask().context,
+        body: '## Verification\n\n- `npm run alpha`\n- `npm run beta`\n',
+        [VERIFICATION_AMENDMENTS_CONTEXT_KEY]: amendmentBlockFor(
+          [{ kind: 'replace', commandId: alphaId, command: 'npm run beta', reason: 'converged on one command' }],
+          ['npm run alpha', 'npm run beta'],
+        ),
+        manualVerificationEvidence: [boundEvidence('npm run beta', betaId)],
+      },
+    });
+    const result = await createReviewHandler(CONTEXT(), preReviewRunner())(task);
+    expect(result.result).toBe('blocked');
+    const verifications = result.context?.issueRequiredVerifications;
+    expect(verifications).toHaveLength(2);
+    // Plan order preserves the body order: the replaced alpha slot first.
+    expect(verifications[0]).toMatchObject({ command: 'npm run beta', status: 'not_run' });
+    expect(verifications[0].evidenceRejections).toContain('identity_mismatch');
+    expect(verifications[1]).toMatchObject({ command: 'npm run beta', status: 'passed' });
+    expect(result.context?.missingVerificationCommands).toEqual(['npm run beta']);
+    // Issue #1043 review (P2): the escalation's binding block cannot map the
+    // shared bytes to a single §5.1 identity — they are excluded from the
+    // byte-keyed map and reported ambiguous, so the resolve surface refuses
+    // explicitly instead of binding evidence to whichever slot survived a
+    // byte-keyed overwrite.
+    const bindingBlock = result.context?.verificationEvidenceBinding;
+    expect(bindingBlock?.ambiguousCommands).toEqual(['npm run beta']);
+    expect(bindingBlock?.commandIds?.['npm run beta']).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -5353,20 +6277,156 @@ describe('review handler — structured finding envelope (issue #841)', () => {
     expect(prompt).toContain('Structured Finding Output (required)');
   });
 
-  test('a review agent that cannot emit the schema takes the explicit compatibility path', async () => {
-    // Codex composes its own review report from a `--title` brief, so it is never
-    // asked for an envelope and its absence is a configuration fact, not a
-    // malformed-output diagnostic. Routing stays exactly today's.
-    const context = CONTEXT({ session: SESSION({ reviewDispute: { enabled: true } }) });
-    const result = await createReviewHandler(context, happyRunner())(makeTask());
+  test('with the protocol OFF a codex reviewer still runs `codex review`, and no findings state is written', async () => {
+    // §13's default-off guarantee, and the bound decision D1 was taken under
+    // (contract §17.11): a disabled session is byte-identical to before the
+    // protocol existed. No structured-review seam is supplied, and none is
+    // needed — nothing on this path spawns `codex exec`.
+    const runner = happyRunner();
+    const context = CONTEXT({ session: SESSION({ reviewDispute: { enabled: false } }) });
+    const result = await createReviewHandler(context, runner)(makeTask());
     expect(result.result).toBe('success');
-    expect(promptText()).not.toContain(REVIEW_FINDINGS_MARKER);
-    expect(result.context?.reviewFindings).toMatchObject({
-      mode: 'unsupported',
-      agentId: 'codex',
-      compatibility: 'prompt-not-agent-authored',
-    });
+    const agentCall = runner.calls.find((c) => c.cmd === 'codex');
+    expect(agentCall.args.slice(0, 3)).toEqual(['review', '--base', 'origin/main']);
+    // The brief rides stdin since issue #912; the disabled session still runs
+    // the native `codex review` lane, never `codex exec`.
+    expect(agentCall.args).not.toContain('--title');
+    expect(agentCall.opts.stdin).toContain('Review Instructions');
+    expect(result.context?.reviewFindings).toBeUndefined();
     expect(result.context?.reviewDispute).toBeUndefined();
+  });
+
+  test('with the protocol ON a codex reviewer takes the §17.11 `codex exec` lane, not the compatibility path', async () => {
+    // Issue #1069 / decision D1: `codex review` composes its own report and has
+    // no seam for the output contract (§17.4 C9), so an enabled session resolves
+    // the review through the runner-authored `codex exec` invocation instead.
+    // The old `mode: "unsupported"` outcome was the record of that gap; it is now
+    // reachable only for an agent this runner has no structured lane for at all.
+    const structured = fakeStructuredCodexRunner(
+      `${REVIEW_FINDINGS_MARKER}\n${JSON.stringify({ version: 1, status: 'success' })}\n${REVIEW_FINDINGS_END_MARKER}\n`,
+    );
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },                        // git fetch
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 },  // git rev-parse
+      { stdout: '', stderr: '', exitCode: 0 },                        // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                       // git rev-list --count
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git diff (classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },       // npm test
+      { stdout: 'diff --git a/src/a.ts b/src/a.ts\n+const a = 1;\n', stderr: '', exitCode: 0 }, // git diff (prompt)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status (post-review)
+    ]);
+    const context = CONTEXT({ session: SESSION({ reviewDispute: { enabled: true } }) });
+    const result = await createReviewHandler(context, runner, undefined, undefined, undefined, undefined, {
+      structuredReviewRunner: structured,
+    })(makeTask());
+
+    expect(result.result).toBe('success');
+    // The review agent was never spawned through the handler's own runner: the
+    // adapter owns that subprocess.
+    expect(runner.calls.some((c) => c.cmd === 'codex')).toBe(false);
+    expect(structured.calls).toHaveLength(1);
+    expect(structured.calls[0].cmd).toBe('codex');
+    expect(structured.calls[0].args).toEqual(
+      expect.arrayContaining(['exec', '--sandbox', 'read-only', '--ignore-user-config', '--output-last-message']),
+    );
+    expect(structured.calls[0].args).not.toContain('review');
+    // The prompt is runner-authored, carries the envelope contract and the diff,
+    // and travels on stdin rather than in argv.
+    expect(structured.calls[0].opts.stdin).toContain('Structured Finding Output (required)');
+    expect(structured.calls[0].opts.stdin).toContain('## PR Diff');
+    expect(structured.calls[0].args.join(' ')).not.toContain('Structured Finding Output');
+    // And the outcome is a real admission, not the compatibility record.
+    expect(result.context?.reviewFindings).toMatchObject({
+      mode: 'admitted',
+      agentId: 'codex',
+      invocation: 'codex-structured',
+      status: 'success',
+    });
+    expect(result.context?.reviewDispute).toBeDefined();
+  });
+
+  test('a mid-phase catalog edit cannot split the invoked lane from the recorded profile (issue #912 review)', async () => {
+    // §9.3: the catalog is read once per phase execution. The overlay names
+    // model-a when the phase starts; an edit lands during preparation
+    // (modelled on the prompt-diff capture — after the phase-start resolution,
+    // before the structured lane resolves). The reviewer invoked and the §13
+    // record must both still describe model-a: the alternative is a run whose
+    // dispute-party metadata claims model A while model B actually reviewed.
+    const profilesPath = join(tmpDir, 'agent-profiles.json');
+    const catalogNaming = (model) => JSON.stringify({
+      schemaVersion: 1,
+      providers: { openai: { profiles: { 'codex-high': { model, effort: 'high' } } } },
+    });
+    writeFileSync(profilesPath, catalogNaming('model-a'), 'utf8');
+    const structured = fakeStructuredCodexRunner(
+      `${REVIEW_FINDINGS_MARKER}\n${JSON.stringify({ version: 1, status: 'success' })}\n${REVIEW_FINDINGS_END_MARKER}\n`,
+    );
+    const base = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },                        // git fetch
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 },  // git rev-parse
+      { stdout: '', stderr: '', exitCode: 0 },                        // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                       // git rev-list --count
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status (preflight)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git diff (classification)
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },       // npm test
+      { stdout: 'diff --git a/src/a.ts b/src/a.ts\n+const a = 1;\n', stderr: '', exitCode: 0 }, // git diff (prompt)
+      { stdout: '', stderr: '', exitCode: 0 },                        // git status (post-review)
+    ]);
+    let diffCalls = 0;
+    const runner = {
+      calls: base.calls,
+      run(cmd, args, opts) {
+        if (cmd === 'git' && args[0] === 'diff' && ++diffCalls === 2) {
+          writeFileSync(profilesPath, catalogNaming('model-b'), 'utf8');
+        }
+        return base.run(cmd, args, opts);
+      },
+    };
+    const context = CONTEXT({
+      session: SESSION({ reviewDispute: { enabled: true }, agentRuntime: { profilesPath } }),
+    });
+    const result = await createReviewHandler(context, runner, undefined, undefined, undefined, undefined, {
+      structuredReviewRunner: structured,
+    })(makeTask());
+
+    expect(result.result).toBe('success');
+    const modelAt = structured.calls[0].args.indexOf('--model');
+    expect(modelAt).not.toBe(-1);
+    expect(structured.calls[0].args[modelAt + 1]).toBe('model-a');
+    // The persisted §13 record is the lane actually invoked, resolved from the
+    // same phase-start snapshot.
+    const record = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'agent-runtime.json'), 'utf8'));
+    expect(record).toMatchObject({ lane: 'structured_exec', model: 'model-a' });
+  });
+
+  test('the §2.1 contract appears exactly once in the codex exec prompt', async () => {
+    // The brief builder and the adapter both know how to append
+    // `reviewFindingsInstructions`; only the adapter may, or the reviewer reads
+    // "emit EXACTLY ONE envelope" twice.
+    const structured = fakeStructuredCodexRunner(
+      `${REVIEW_FINDINGS_MARKER}\n${JSON.stringify({ version: 1, status: 'success' })}\n${REVIEW_FINDINGS_END_MARKER}\n`,
+    );
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '0', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: 'All tests passed.', stderr: '', exitCode: 0 },
+      { stdout: 'diff --git a/src/a.ts b/src/a.ts\n+const a = 1;\n', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+    ]);
+    const context = CONTEXT({ session: SESSION({ reviewDispute: { enabled: true } }) });
+    await createReviewHandler(context, runner, undefined, undefined, undefined, undefined, {
+      structuredReviewRunner: structured,
+    })(makeTask());
+    const prompt = structured.calls[0].opts.stdin;
+    expect(prompt.split('## Structured Finding Output (required)')).toHaveLength(2);
   });
 
   // -------------------------------------------------------------------------
@@ -5437,6 +6497,55 @@ describe('review handler — structured finding envelope (issue #841)', () => {
       state: 'open', version: 1, severity: 'P1', humanGate: false, affectedBoundary: 'src/handlers/review.ts',
     });
     expect(result.context.reviewDispute.version).toBe(1);
+  });
+
+  test('the reviewer of record is persisted beside the block it opened (issue #955 review)', async () => {
+    // §8.3 measures a candidate arbiter's independence against the runs that
+    // produced the debate, and arbitration happens phases later. Without the
+    // reviewer of record on file it would be measured against whatever lane the
+    // session resolves by then.
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(claudeTask());
+    const parties = result.context.reviewDisputeParties;
+    // The agent id and nothing else: a persisted provider or model is
+    // indistinguishable from a forged one, and §8.3 re-derives the provider from
+    // the id rather than believing what the record claims (issue #955 review, P1).
+    expect(parties.review).toEqual({ agentId: 'claude' });
+    expect(Object.keys(parties.review)).toEqual(['agentId']);
+    // The implementer's half is written by the fix run that rebuts, not here.
+    expect(parties.implementation).toBeUndefined();
+  });
+
+  test('a re-review preserves the fix run half of the party provenance (issue #955 review)', async () => {
+    // Task context merges shallowly, so writing only the reviewer's half would
+    // evict the implementer's — the provenance loss the key exists to prevent.
+    const stored = { implementation: { agentId: 'codex', provider: 'openai', model: 'gpt-5' } };
+    const output = envelope({ version: 1, status: 'findings', findings: [FINDING] });
+    const result = await createReviewHandler(claudeContext(), claudeRunner(output, [LS_FILES]))(
+      claudeTask({ context: { ...makeTask().context, reviewDisputeParties: stored } }),
+    );
+    // Carried forward, and re-canonicalized on the way through: the stored
+    // provider and model are untrusted, so the id is all that survives.
+    expect(result.context.reviewDisputeParties.implementation).toEqual({ agentId: 'codex' });
+    expect(result.context.reviewDisputeParties.review).toEqual({ agentId: 'claude' });
+  });
+
+  test('the party provenance rides with the §10.1 block and never without it', async () => {
+    // Written exactly when a block is — an admitted clean review opens no
+    // lineage but still writes both, and a review that produced no block at all
+    // (protocol off, §13) writes neither. The key is protocol state, not run
+    // metadata: a legacy review must stay byte-identical to today.
+    const clean = await createReviewHandler(claudeContext(), claudeRunner(envelope({ version: 1, status: 'success' })))(
+      claudeTask(),
+    );
+    expect(clean.context.reviewDispute.lineages).toEqual({});
+    expect(clean.context.reviewDisputeParties.review).toMatchObject({ agentId: 'claude' });
+
+    const off = await createReviewHandler(claudeContext({ enabled: false }), claudeRunner('No blocking issues.'))(
+      claudeTask(),
+    );
+    expect(off.context?.reviewDispute).toBeUndefined();
+    expect(off.context?.reviewDisputeParties).toBeUndefined();
   });
 
   test('the classifier alone would have passed that review — the envelope is what blocks it', async () => {
@@ -5823,7 +6932,18 @@ describe('review handler — structured finding envelope (issue #841)', () => {
     // whose findings state could not be carried never passes as clean.
     expect(result.result).toBe('blocked');
     expect(result.context.reviewDispute).toBeUndefined();
-    expect(result.context.reviewFindings).toMatchObject({ mode: 'rejected' });
+    // Since issue #952 the refusal happens EARLIER — the §7.1 sub-turn gate parks
+    // a §12 block before any review work, because a block this layer cannot read
+    // may be hiding a `disputed` lineage — so the review agent is never invoked
+    // and no findings envelope is produced to reject. The guarantee is the same
+    // one, reached without spending a review run.
+    expect(result.context.reviewFindings).toBeUndefined();
+    expect(result.context.reviewDisputeSubTurn).toMatchObject({
+      turn: null,
+      taskTurn: null,
+      disposition: 'parked',
+      failure: 'invalid_context',
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -5997,5 +7117,150 @@ describe('review handler — structured finding envelope (issue #841)', () => {
     const result = await createReviewHandler(claudeContext(), runner)(claudeTask());
     expect(result.result).not.toBe('success');
     expect(result.context?.reviewFindings).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // The §7.1 reviewer sub-turn (issue #952)
+  // -------------------------------------------------------------------------
+
+  /** A lineage the fix run rebutted: §7.1 rule 2 selects the reviewer's turn. */
+  function disputedBlock(overrides = {}) {
+    return {
+      version: 1,
+      reviewStructure: 'structured',
+      lineages: {
+        'ln-aaaaaaaaaaaa': {
+          lineageId: 'ln-aaaaaaaaaaaa',
+          state: 'disputed',
+          version: 1,
+          counters: {
+            rebuttals: 1,
+            reconsiderations: 0,
+            arbitrationPasses: 0,
+            malformedArbiterAttempts: 0,
+            evidenceRoundsUsed: 0,
+          },
+          rebuttedVersions: [1],
+          humanGate: false,
+          severity: 'P1',
+          affectedBoundary: 'src/handlers/review.ts',
+          ...overrides,
+        },
+      },
+    };
+  }
+
+  const disputedTask = (block = disputedBlock()) =>
+    claudeTask({ context: { ...makeTask().context, reviewDispute: block } });
+
+  // The worktree setup consumes five runner steps before the sub-turn gate is
+  // reached; nothing after it may be consumed, because none of it runs.
+  const worktreeOnlyRunner = () =>
+    sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'ai/issue-77-run-impl-1', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },                     // git fetch origin +main
+      { stdout: 'ai/issue-77-run-impl-1', stderr: '', exitCode: 0 }, // git rev-parse
+      { stdout: '', stderr: '', exitCode: 0 },                     // git pull --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                    // git rev-list --count
+    ]);
+
+  test('a persisted `disputed` lineage never reaches the ordinary review prompt', async () => {
+    const result = await createReviewHandler(claudeContext(), worktreeOnlyRunner())(disputedTask());
+
+    // The §7.1 reviewer turn ran instead. Here it refuses for want of the fix
+    // run's §10.2 dispute record — this task carries no `disputeArtifactDir` —
+    // and a refusal is a §9 park with the debate state untouched.
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewDisputeSubTurn).toMatchObject({
+      turn: 'reviewer_reconsideration',
+      taskTurn: 'reviewer',
+      disposition: 'parked',
+      failure: 'invocation_failed',
+      failureDetail: 'disputeArtifactDir:absent',
+    });
+    // No ordinary review happened: no prompt was rendered, no verification ran,
+    // no findings envelope was requested, and no block was written over the one
+    // on file.
+    expect(existsSync(join(artifactRoot, 'runs', 'run-review-1', 'review-prompt.md'))).toBe(false);
+    expect(existsSync(join(artifactRoot, 'runs', 'run-review-1', 'review-findings.json'))).toBe(false);
+    expect(result.context.reviewFindings).toBeUndefined();
+    expect(result.context.reviewDispute).toBeUndefined();
+    // The phase's own bookkeeping still travels on the completion.
+    expect(result.context.prUrl).toBe('https://github.com/m2dw/test-repo/pull/99');
+  });
+
+  test('with the protocol off the same block takes the legacy review path', async () => {
+    // The gate is `session.reviewDispute.enabled`, not the presence of a block:
+    // a disabled session reviews exactly as it did before the protocol existed.
+    const result = await createReviewHandler(
+      claudeContext({ enabled: false }),
+      claudeRunner('No blocking issues.'),
+    )(disputedTask());
+    expect(result.result).toBe('success');
+    expect(promptText()).not.toContain(REVIEW_FINDINGS_MARKER);
+    expect(result.context.reviewDisputeSubTurn).toBeUndefined();
+  });
+
+  test('an `open` lineage is still an ordinary review', async () => {
+    // Rule 2's FIX turn: the lineage awaits the implementer, and a review run
+    // that finds itself here re-reviews exactly as before.
+    const open = disputedBlock({ state: 'open', rebuttedVersions: [], counters: { rebuttals: 0, reconsiderations: 0, arbitrationPasses: 0, malformedArbiterAttempts: 0, evidenceRoundsUsed: 0 } });
+    const result = await createReviewHandler(
+      claudeContext(),
+      claudeRunner(envelope({ version: 1, status: 'success' })),
+    )(disputedTask(open));
+    // The gate fell through: the ordinary review prompt was built and still
+    // carries the structured output contract, exactly as before.
+    expect(promptText()).toContain(REVIEW_FINDINGS_MARKER);
+    expect(result.context.reviewDisputeSubTurn).toBeUndefined();
+  });
+
+  // P1 (issue #952 review): the sub-turn gate returns AHEAD of every
+  // ordinary-review release point, so a PR-url-only review — which runs on a
+  // SYNTHETIC `ai/pr-<n>` worktree — must free that worktree itself before
+  // handing the sub-turn's completion back. Left checked out on `ai/pr-99`, the
+  // issue path wedges the next implementation fix (that phase resolves the
+  // worktree on the PR's REAL head and `resolveIssueWorktree` refuses a path
+  // held on another branch), whether the fix comes from §7.1 routing or from a
+  // human resuming the parked task.
+  test('frees the synthetic ai/pr-<n> worktree when the sub-turn parks a PR-url-only review', async () => {
+    const wt = worktreePath();
+    const runner = sequenceRunner([
+      { stdout: JSON.stringify({ number: 99, url: 'https://github.com/m2dw/test-repo/pull/99', headRefName: 'feature/custom', baseRefName: 'main', state: 'OPEN', isCrossRepository: false }), stderr: '', exitCode: 0 }, // gh pr view 99
+      { stdout: '', stderr: '', exitCode: 0 },                  // git fetch origin +main:refs/remotes/origin/main
+      { stdout: 'ai/pr-99', stderr: '', exitCode: 0 },          // git rev-parse refs/heads/ai/pr-99 (synthetic per-PR name exists)
+      { stdout: '', stderr: '', exitCode: 0 },                  // git pull origin pull/99/head --ff-only
+      { stdout: '0', stderr: '', exitCode: 0 },                 // git rev-list --count FETCH_HEAD..HEAD
+      { stdout: '', stderr: '', exitCode: 0 },                  // git status --porcelain (synthetic release dirty check) — clean
+      { stdout: '', stderr: '', exitCode: 0 },                  // git worktree remove --force --force <wt>
+    ]);
+    const resolver = fakeWorktreeResolver(wt, { branchReused: true });
+    const task = claudeTask({
+      context: {
+        title: 'Add login rate limiting',
+        url: 'https://github.com/m2dw/test-repo/issues/77',
+        prUrl: 'https://github.com/m2dw/test-repo/pull/99',
+        labels: ['agent:claude', 'status:needs-review'],
+        // no `branch` recorded — the PR head is non-conventional, so review runs
+        // on the SYNTHETIC `ai/pr-99` worktree.
+        reviewDispute: disputedBlock(),
+      },
+    });
+
+    const result = await createReviewHandler(claudeContext(), runner, resolver.resolve)(task);
+
+    // The §7.1 reviewer turn ran and parked (no `disputeArtifactDir` on file).
+    expect(result.result).toBe('blocked');
+    expect(result.context.reviewDisputeSubTurn).toMatchObject({
+      turn: 'reviewer_reconsideration',
+      disposition: 'parked',
+    });
+    // The synthetic path really was taken...
+    expect(resolver.calls[0].branch).toBe('ai/pr-99');
+    // ...and the worktree it materialized is gone, so the fix phase can
+    // re-materialize the same path on the PR's real head.
+    const removed = runner.calls.find((c) => c.cmd === 'git' && c.args[0] === 'worktree' && c.args[1] === 'remove');
+    expect(removed).toBeDefined();
+    expect(removed.args).toContain(wt);
   });
 });

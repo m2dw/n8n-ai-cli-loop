@@ -1,6 +1,8 @@
 # ChatOps result, acknowledgement, and dependency contract
 
-Status: **approved design, not yet implemented** (issue #785). This document
+Status: **approved design, implemented** (issue #785; runtime in
+`src/core/chatops-result.ts`, wired into the bounded pass by issue #1024).
+This document
 is the authoritative contract for how a dispatched (or never-dispatched)
 ChatOps comment ends up with a deterministic, bounded, sanitized outcome —
 both the durable record an operator can rely on and the provider-visible
@@ -9,8 +11,9 @@ specification and MUST NOT redefine its policy; a change of policy is a
 change to this document first.
 
 See [feature-status.md](feature-status.md) for ChatOps's overall
-availability, which stays `foundation-only` while this layer remains
-unimplemented.
+availability, which is `config-gated` on `session.chatOps.enabled` (default
+off) now that this layer is implemented (`src/core/chatops-result.ts`) and
+wired into the bounded pass `src/cli/chatops-scan.ts` runs (issue #1024).
 
 This is issue #785, split part 3 of superseded #779. It supersedes the
 result/dependency portion of #779 and of #696 / PR #776. It is the successor
@@ -1342,7 +1345,8 @@ once, and may assume without re-verifying:
 
 ## 13. Test seams and matrix
 
-Nothing in this document is implemented. When implementation begins, the
+Implemented by issue #1024 (`src/core/chatops-result.ts`, exercised by
+`test/chatops-result.test.js` and `test/chatops-runtime.test.js`). The
 required coverage is:
 
 | Area | Cases |

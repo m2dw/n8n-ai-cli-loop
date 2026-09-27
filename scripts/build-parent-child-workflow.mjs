@@ -30,12 +30,13 @@
  * Parent (5 nodes):
  *   Triggers → Config → Create Context → Call Phase Runner
  *
- * Child (5 nodes):
- *   When Called by Parent → GitHub Intake → Run One Phase → Dispatch Outbox → Return Context
+ * Child (6 nodes):
+ *   When Called by Parent → GitHub Intake → Run One Phase → ChatOps Scan →
+ *   Dispatch Outbox → Return Context
  *
  * The parent passes only contextId to the child trigger.  The child reads it
  * from the trigger payload via
- * $("When Called by Parent").first().json.contextId in all three Execute Command
+ * $("When Called by Parent").first().json.contextId in all four Execute Command
  * nodes so $json overwrite after each command is never a problem.  runId is
  * inlined as $execution.id (with millisecond fallback) in the run-one-phase
  * command expression.
@@ -330,12 +331,13 @@ const PX_STOP_ERROR = 960;
 // Y for the error-path nodes (below the main path at Y=240)
 const Y_ERROR = 400;
 
-// Child x-positions — 5-node chain
+// Child x-positions — 6-node chain
 const CX_TRIGGER = -560;
 const CX_INTAKE = -280;
 const CX_RUN = 0;
-const CX_DISPATCH = 280;
-const CX_RETURN = 560;
+const CX_CHATOPS = 280;
+const CX_DISPATCH = 560;
+const CX_RETURN = 840;
 
 // ---------------------------------------------------------------------------
 // Shell-escape helper
@@ -673,6 +675,27 @@ export function buildChildWorkflow(options = {}) {
       },
       typeVersion: 1,
     },
+    // One bounded ChatOps scan/dispatch/publish pass (issue #1024).  Placed
+    // before Dispatch Outbox so the claim/ack/result comments this pass enqueues
+    // are delivered by the same execution rather than waiting for the next one.
+    //
+    // No ChatOps policy is encoded here: whether the session is enabled at all,
+    // who may command it, which verbs exist, and what a result may say all live
+    // in the session config and the ChatOps contracts.  A session with
+    // `chatOps.enabled` unset exits 0 with outcome `disabled` without opening a
+    // store or a provider connection, so this node is inert for every session
+    // that has not opted in — which is why it is unconditional in the shared
+    // child workflow.
+    {
+      id: 'chatops-scan',
+      name: 'ChatOps Scan',
+      type: 'n8n-nodes-base.executeCommand',
+      position: [CX_CHATOPS, Y],
+      parameters: {
+        command: `={{ "node '${cliBaseEsc}/chatops-scan.js' --context-id " + $("When Called by Parent").first().json.contextId }}`,
+      },
+      typeVersion: 1,
+    },
     {
       id: 'dispatch-outbox',
       name: 'Dispatch Outbox',
@@ -718,6 +741,9 @@ export function buildChildWorkflow(options = {}) {
       main: [[{ node: 'Run One Phase', type: 'main', index: 0 }]],
     },
     'Run One Phase': {
+      main: [[{ node: 'ChatOps Scan', type: 'main', index: 0 }]],
+    },
+    'ChatOps Scan': {
       main: [[{ node: 'Dispatch Outbox', type: 'main', index: 0 }]],
     },
     'Dispatch Outbox': {
@@ -743,8 +769,8 @@ export function buildChildWorkflow(options = {}) {
 // Private-node shadow child workflow
 // ---------------------------------------------------------------------------
 
-// Shadow child workflow that replaces all three Execute Command operations
-// (GitHub Intake, Run One Phase, and Dispatch Outbox) with private
+// Shadow child workflow that replaces all four Execute Command operations
+// (GitHub Intake, Run One Phase, ChatOps Scan, and Dispatch Outbox) with private
 // n8n-nodes-ai-cli-loop operations.  No Execute Command nodes remain.
 //
 // The workflow is named "SHADOW TEST" and has a distinct ID so it can coexist
@@ -797,6 +823,20 @@ export function buildPrivateNodeChildWorkflow(options = {}) {
       },
       typeVersion: 1,
     },
+    // ChatOps Scan — private node operation, mirroring the Execute Command
+    // child's node in both position and placement (before Dispatch Outbox, so
+    // the comments the pass enqueues drain in the same execution).
+    {
+      id: 'chatops-scan',
+      name: 'ChatOps Scan',
+      type: PRIVATE_NODE_TYPE,
+      position: [CX_CHATOPS, Y],
+      parameters: {
+        operation: 'chatopsScan',
+        contextId: `={{ $("When Called by Parent").first().json.contextId }}`,
+      },
+      typeVersion: 1,
+    },
     // Dispatch Outbox — private node operation (Slice 1 replacement).
     // contextId is a typed parameter; no shell-quoting or CLI_BASE path needed
     // in the workflow JSON.  The node resolves its CLI path from the CLI_BASE
@@ -845,6 +885,9 @@ export function buildPrivateNodeChildWorkflow(options = {}) {
       main: [[{ node: 'Run One Phase', type: 'main', index: 0 }]],
     },
     'Run One Phase': {
+      main: [[{ node: 'ChatOps Scan', type: 'main', index: 0 }]],
+    },
+    'ChatOps Scan': {
       main: [[{ node: 'Dispatch Outbox', type: 'main', index: 0 }]],
     },
     'Dispatch Outbox': {

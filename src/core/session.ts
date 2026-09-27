@@ -1,4 +1,6 @@
 import type { AgentId } from "./task.js";
+import type { QualityLevel } from "./agent-profile-catalog.js";
+import type { StagedVerificationConfig } from "./staged-verification-config.js";
 
 export interface SessionDefaults {
   implementationAgent: AgentId;
@@ -18,6 +20,16 @@ export interface SessionLabels {
 export interface ReviewLoopConfig {
   /** Maximum number of needs_fix cycles before escalating to human. Default: 3. */
   maxCycles?: number;
+  /**
+   * Per-command execution budget for review-verification commands
+   * (`session.verification`, run during the review phase), in milliseconds.
+   * Defaults to `REVIEW_VERIFICATION_DEFAULT_TIMEOUT_MS` (600000 / 10
+   * minutes) when absent — a shipped review verification command ran
+   * unbounded before issue #1090, which let a hung command or an
+   * unterminated descendant hold the review worker (and the Issue lock and
+   * worktree it owns) indefinitely.
+   */
+  verificationTimeoutMs?: number;
 }
 
 /**
@@ -54,6 +66,33 @@ export interface ReviewDisputeArbiterConfig {
 }
 
 /**
+ * Reviewer §4.1 reconsideration execution policy (contract §17.6 D2, §17.16).
+ *
+ * The one setting here is the operator opt-in decision D2 describes, and it is
+ * deliberately a second switch rather than a widening of `enabled`: turning the
+ * protocol on must never turn this on with it.
+ */
+export interface ReviewDisputeReconsiderationConfig {
+  /**
+   * Admit the `read-bounded` execution posture for a reviewer whose CLI cannot
+   * have its tool surface removed (today: `codex`). **Default false.**
+   *
+   * What the operator accepts by setting it is stated in contract §17.6's table
+   * and is not softened here: writes and network are refused by the CLI sandbox,
+   * operator agent configuration is refused by argv, and **reads are available**
+   * — bounded only by a throwaway cwd and the host's own read permissions — so
+   * §8.2's "the bundle is the entire input" is NOT guaranteed for a lineage
+   * decided under it. Such a lineage records `toolPolicy: "read-bounded"` in its
+   * §10.2 record and in the run summary, permanently distinguishable from one
+   * decided under `no-tools`.
+   *
+   * A `claude` reviewer is unaffected either way: it has a real no-tools
+   * invocation, and this flag never relabels or relaxes it.
+   */
+  readBounded?: boolean;
+}
+
+/**
  * Review dispute, reconsideration, and arbitration protocol
  * (docs/review-dispute-contract.md). Off by default: with `enabled` absent or
  * false, review and fix behave byte-identically to today — free-form feedback,
@@ -66,6 +105,8 @@ export interface ReviewDisputeConfig {
   limits?: ReviewDisputeLimitsConfig;
   /** Arbiter selection policy (§8.3). */
   arbiter?: ReviewDisputeArbiterConfig;
+  /** Reviewer reconsideration execution policy (§17.6 D2). Default-off opt-in. */
+  reconsideration?: ReviewDisputeReconsiderationConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +359,44 @@ export interface ClaudeConfig {
    * preserving today's behavior.
    */
   complexityProfiles?: ClaudeComplexityProfilesConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Agent runtime quality selection (issue #905, slice B2 of
+// docs/agent-runtime-profiles-contract.md §14.1)
+//
+// `sessions.json` holds *selection* only, never the catalog itself (§9.1): an
+// `agentProfiles`/`providers` catalog under a session stays a validation error,
+// so there is exactly one place to look for a model name. This block is the
+// selection surface; the catalog lives in `agent-profiles.json`.
+// ---------------------------------------------------------------------------
+
+export interface AgentRuntimeConfig {
+  /**
+   * The quality level requested when no pin and no label name one (§8.2 layer
+   * 4). Optional and a no-op when absent: a session without it resolves the
+   * built-in default `normal`, preserving today's behavior. Never a model name
+   * and never a provider effort value — which profile a level buys is the
+   * provider catalog's answer, not this field's.
+   */
+  defaultQuality?: QualityLevel;
+  /**
+   * Absolute path of the `agent-profiles.json` overlay (§9.1), consulted after
+   * the `AGENT_PROFILES_FILE` environment override and before the default
+   * location beside `sessions.json`. Selection only: the catalog itself never
+   * lives in `sessions.json`. Opened by the write-capable lane cutover (issue
+   * #911), which is the first consumer of the configured path.
+   */
+  profilesPath?: string;
+  /**
+   * Per-agent runtime profile pins (§8.1 layer 3): agent id → profile name.
+   * A pin replaces the quality-binding lookup outright for that agent and is
+   * validated against the effective catalog at resolution time — a name the
+   * provider does not declare refuses (`unknown-profile`) rather than falling
+   * through to the binding. Opened by the write-capable lane cutover (issue
+   * #911) alongside the boundary that reads it.
+   */
+  pins?: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +836,66 @@ export interface SessionAuditConfig {
   acknowledge?: Record<string, string>;
 }
 
+// ---------------------------------------------------------------------------
+// ChatOps comment surface (issue #1024)
+//
+// The trust configuration for the one supported ChatOps path: a bounded scan of
+// a work item's comments, recognition and authorization of a `/verb` command,
+// dispatch through the callable operation port, and publication of the
+// contracted result. See docs/chatops-operations.md for the operator surface and
+// the chatops-*-contract.md family for the rules each layer implements.
+//
+// Disabled unless a session opts in. `enabled: false` is a total runtime no-op:
+// the scan entrypoint reports `disabled` and performs no provider read, no
+// database write, and no comment post.
+// ---------------------------------------------------------------------------
+
+export interface ChatOpsConfig {
+  /**
+   * Master switch (`docs/chatops-command-grammar-contract.md` §5 gate 1).
+   * Defaults to off; a session without this block never runs ChatOps.
+   */
+  enabled: boolean;
+  /**
+   * Provider logins allowed to issue commands, compared case-insensitively.
+   * Never derived from repository role or collaborator state — an allowlist is
+   * the whole trust boundary, and inferring it from a provider permission would
+   * let a repository setting silently widen who can dispatch.
+   *
+   * Required when `enabled` is true; an enabled surface with nobody allowed is a
+   * configuration mistake, not a deliberately inert one.
+   */
+  authorAllowlist?: string[];
+  /**
+   * Logins this session's automation has posted acknowledgement markers as,
+   * across every credential rotation. Disjoint in purpose from
+   * `authorAllowlist`, and required to be disjoint in *value*
+   * (`docs/chatops-execution-ledger-contract.md` §10.3): an overlapping login
+   * would let a human command author post markers that authenticate, forging
+   * the evidence every restore detector reads.
+   *
+   * Never pruned — a marker posted under a retired credential must still
+   * authenticate, or reconciliation would read a real acknowledgement as absent.
+   */
+  automationLogins?: string[];
+  /**
+   * Commands one bounded pass may dispatch before stopping. Defaults to 5.
+   *
+   * A cap rather than a queue drain: each dispatch posts a claim marker,
+   * invokes an operation, and posts an acknowledgement, so an unbounded pass
+   * would make one invocation's wall-clock cost depend on how many commands
+   * accumulated. Whatever is left is picked up by the next pass.
+   */
+  maxDispatchesPerPass?: number;
+  /**
+   * Advisory per-invocation wall-clock budget in ms, passed to the operation
+   * port as `OperationContext.deadlineMs`. Advisory because the port has no
+   * cancellation: exceeding it produces an indeterminate-effect failure, never a
+   * silent abort. Omitted means no budget.
+   */
+  operationTimeoutMs?: number;
+}
+
 export interface SessionConfig {
   sessionId: string;
   /**
@@ -782,6 +921,23 @@ export interface SessionConfig {
   baseBranch?: string;
   defaults: SessionDefaults;
   verification: VerificationCommands;
+  /**
+   * Staged verification (issues #1094–#1097,
+   * docs/staged-verification-contract.md §5.3;
+   * docs/changed-file-verification-contract.md §6 rule 5 for `testSuite`).
+   * Optional and disabled by default: a session without it (or with
+   * `enabled: false`) runs one full verification set per lane and grants
+   * `status:stack-ready` on a passing review alone — exactly today's behavior
+   * (§10 rule 1).
+   *
+   * Every staged decision lives here and only here: `session.verification` is
+   * untouched, and nothing the repository contains reaches it. Issue #1155
+   * removed the group-selection settings and the repository-owned
+   * `.ai-cli-loop/verification.json` that sat beside them; what an enabled
+   * session declares is the test suite binding, and a stage runs the entire
+   * required set.
+   */
+  stagedVerification?: StagedVerificationConfig;
   labels: SessionLabels;
   reviewLoop?: ReviewLoopConfig;
   /**
@@ -832,6 +988,13 @@ export interface SessionConfig {
    */
   claude?: ClaudeConfig;
   /**
+   * Provider-neutral agent runtime selection (issue #905). Optional and a no-op
+   * when absent: a session without it requests the built-in default quality
+   * level. Selection only — the runtime profile catalog itself never lives in
+   * `sessions.json` (docs/agent-runtime-profiles-contract.md §9.1).
+   */
+  agentRuntime?: AgentRuntimeConfig;
+  /**
    * Research-phase agent configuration. Optional and a no-op when absent: a
    * session without it uses the CLI default model for the research agent,
    * preserving today's behavior.
@@ -880,6 +1043,12 @@ export interface SessionConfig {
    * absent; read only by `admin session-audit`, never by a phase handler.
    */
   audit?: SessionAuditConfig;
+  /**
+   * ChatOps comment surface (issue #1024). Optional and disabled by default: a
+   * session without it (or with `enabled: false`) never scans comments,
+   * dispatches a command, or posts a marker. See {@link ChatOpsConfig}.
+   */
+  chatOps?: ChatOpsConfig;
 }
 
 export interface ResolvedSession extends SessionConfig {

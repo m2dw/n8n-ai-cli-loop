@@ -54,6 +54,7 @@
  */
 
 import type { AgentId } from "./task.js";
+import { CLAUDE_NO_TOOLS_ARGS } from "./claude-runtime-adapter.js";
 import type { AntigravityResearchConfig, CodexConfig } from "./session.js";
 import {
   ARBITER_CANDIDATE_AGENT_IDS,
@@ -193,43 +194,20 @@ export function knownModel(model: string | undefined | null): string | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Built-in agent tools that must be unreachable while the arbiter reads a bundle
- * assembled from agent-authored prose (§8.2: "the agent is invoked with no tool
- * permissions, and the bundle is the entire input").
+ * The CLI-level half of §8.2's read-only boundary for the Claude CLI: every
+ * built-in tool unreachable while the arbiter reads a bundle assembled from
+ * agent-authored prose (§8.2: "the agent is invoked with no tool permissions,
+ * and the bundle is the entire input"). Read tools are denied too, because a
+ * bundle is the entire input and an arbiter that reads a file the runner did
+ * not resolve is deciding on evidence nobody bounded.
  *
- * The same list #838 denies for the reviewer's reconsideration, and for the same
- * reason: read tools are denied too, because a bundle is the entire input and an
- * arbiter that reads a file the runner did not resolve is deciding on evidence
- * nobody bounded.
+ * The argv is the Claude runtime adapter's `no_tools` lane boundary
+ * (src/core/claude-runtime-adapter.ts, issue #907), aliased rather than
+ * restated — #838's reviewer reconsideration aliases the same constant, and one
+ * literal list per lane is how two lanes end up pinning different boundaries
+ * while both claim to implement §8.2.
  */
-const ARBITER_DISALLOWED_TOOLS = [
-  "Bash",
-  "BashOutput",
-  "KillBash",
-  "Edit",
-  "Write",
-  "NotebookEdit",
-  "Read",
-  "Glob",
-  "Grep",
-  "WebFetch",
-  "WebSearch",
-  "Task",
-  "TodoWrite",
-].join(",");
-
-/** The CLI-level half of §8.2's read-only boundary for the Claude CLI. */
-export const ARBITER_CLAUDE_NO_TOOLS_ARGS: readonly string[] = [
-  "--tools",
-  "",
-  "--allowedTools",
-  "",
-  "--disallowedTools",
-  ARBITER_DISALLOWED_TOOLS,
-  "--strict-mcp-config",
-  "--safe-mode",
-  "--no-session-persistence",
-];
+export const ARBITER_CLAUDE_NO_TOOLS_ARGS: readonly string[] = CLAUDE_NO_TOOLS_ARGS;
 
 /**
  * Which agents this runner has a DEFINED no-tools invocation for.
@@ -305,18 +283,31 @@ export interface ArbiterPartyIdentity {
 /** What a caller supplies for each party. */
 export interface ArbiterPartyInput {
   /**
-   * Implementation: `context.assignment.implementationAgent`. Review: the agent
-   * of the ACTUAL resolved review-run profile.
+   * The agent that actually RAN the party's side of the debate, as the run which
+   * ran it recorded (`task.context.reviewDisputeParties`, and for the reviewer
+   * the reconsideration summary that supersedes it). Never the current lane's
+   * assignment or session default: arbitration happens phases later, and a task
+   * reconfigured in between would otherwise be measured against a reviewer who
+   * never reviewed it (issue #955 review, P1). The persisted assignment's
+   * `implementationAgent` remains the fall-back for a debate that predates the
+   * recorded provenance.
    */
   agentId: AgentId;
   /**
-   * Provider from the party's resolved execution profile. When the run metadata
-   * is unavailable this falls back to the canonical agent → company mapping,
-   * which is the same value every resolved profile in this codebase records —
-   * an agent id, not a label or an executable name.
+   * Provider from a party profile resolved IN THE CALLER'S OWN RUN. Absent for
+   * a party recovered from task context, which carries an agent id and nothing
+   * else — a persisted provider cannot be authenticated, and believing a forged
+   * one would hide the very overlap this policy exists to detect (issue #955
+   * review, P1). It then falls back to the canonical agent → company mapping,
+   * which is the same value every resolved profile in this codebase records.
    */
   provider?: string;
-  /** Model from the party's resolved execution profile; absent = unknown. */
+  /**
+   * Model from a party profile resolved in the caller's own run; absent =
+   * unknown, which is what a party recovered from task context always is. An
+   * unknown model makes the same-provider fallback inadmissible for that party
+   * (`same-provider-model-unknown`) — strictly the safe direction.
+   */
   model?: string;
 }
 

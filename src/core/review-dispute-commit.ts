@@ -25,9 +25,10 @@
  *
  * Routing is part of that durable write, not a hint — and it is checked against
  * what this runner can actually dispatch. A §7.1 turn whose run has no
- * production dispatcher yet (the reconsideration, evidence, and arbitration
- * turns) parks the task for a human instead of being queued into a phase that
- * cannot discharge it; see {@link routingLacksDispatcher}.
+ * production dispatcher parks the task for a human instead of being queued into
+ * a phase that cannot discharge it; every current turn has one (the evidence
+ * turn gained its dispatcher in issue #964), so the check is the standing guard
+ * for a turn added before its dispatcher; see {@link routingLacksDispatcher}.
  *
  * A phase run reaches the same guarantees without a second transaction: the
  * runner folds `disputeContextPatch`, `disputeTransitionEvent`, and
@@ -129,6 +130,29 @@ export type DisputeCommitOutcome =
  *  - `implementer` — rule 2's fix run: today's `needs_fix` routing, the
  *    implementation phase handler, which reads the §10.1 block and carries the
  *    open/binding lineages into its prompt.
+ *  - `reviewer` — rule 2's reconsideration run (issue #952). It names the
+ *    `review` phase but is NOT an ordinary review, and the review handler
+ *    dispatches it as an internal sub-turn BEFORE it builds the generic review
+ *    prompt (`handlers/review-reconsideration-turn.ts`): a `disputed` lineage
+ *    reaches #838's invocation, never the review agent. The two cannot drift
+ *    apart silently — that handler's gate has no fall-through for a `disputed`
+ *    lineage, so a review run that somehow reached one parks instead of
+ *    discharging it.
+ *  - `runner` — rule 2's arbitration turn (issue #955). §7.1 dispatches no agent
+ *    run of the debate's own parties for it — "the runner advances arbitration
+ *    between runs" — but the runner that advances it is a phase run, and the
+ *    review handler takes it as an internal sub-turn before it builds the generic
+ *    review prompt (`handlers/review-arbitration-subturn.ts`): the ARBITER #839
+ *    selected runs, never the review agent, and the routed §7 row is applied
+ *    through #840 in the completion's own transaction.
+ *  - `evidence` — rule 2's dual-party evidence round (issue #964). It names the
+ *    `review` phase and the review handler takes it as an internal sub-turn on
+ *    the same terms: #963's per-party collection runner
+ *    (`handlers/review-evidence-turn.ts`) runs ONE missing party per phase run,
+ *    the partial round persists in the completion, and the phase requeues for
+ *    the remaining party until #951 synthesizes row 22 from the pair. A review
+ *    run that cannot assemble the party runtime parks through the gate's own
+ *    fail-closed path rather than falling through to an ordinary review.
  *  - `re_review` — rule 3: the accumulated diff back to the ordinary review
  *    phase handler, which is exactly what that handler does.
  *  - `none` — rules 4 and the §13 legacy path: no protocol turn at all, so the
@@ -137,38 +161,43 @@ export type DisputeCommitOutcome =
  * Every other turn names a run that has no production dispatcher in this
  * codebase; see {@link routingLacksDispatcher}.
  */
-export const DISPATCHABLE_DISPUTE_TURNS: readonly DisputeTaskRouting["turn"][] = ["implementer", "re_review", "none"];
+export const DISPATCHABLE_DISPUTE_TURNS: readonly DisputeTaskRouting["turn"][] = [
+  "implementer",
+  "reviewer",
+  "evidence",
+  "runner",
+  "re_review",
+  "none",
+];
 
 /**
- * §7.1 turns whose run nothing here dispatches yet — the fail-closed half of
+ * §7.1 turns whose run nothing here dispatches — the fail-closed half of
  * routing.
  *
- * Three of rule 2's turns name protocol-only runs:
+ * The set is empty today, and the predicate stays: it is what keeps a turn
+ * added to §7.1 before its dispatcher exists from being queued into a handler
+ * that cannot discharge it. Every turn that was ever here left the same way.
+ * The reviewer turn is a **reconsideration** run, not an ordinary review — its
+ * prompt carries the pending dispute records and it returns §4 reconsideration
+ * records — so routing it onto `review` was unsafe for exactly as long as the
+ * review handler had only its ordinary path; issue #952 gave that handler an
+ * internal sub-turn that runs #838's invocation before the generic review prompt
+ * is built. Issue #955 did the same for the runner turn: the arbiter #839
+ * selected is invoked through #846, its verdict is routed to one §7 row by #847,
+ * and the row is applied through #840 in the completion's own transaction. Issue
+ * #964 closed the set with the evidence turn: #963's per-party collection runner
+ * is registered by the same gate, one party per review-phase run, with the round
+ * record deciding which party is still owed.
  *
- *  - the reviewer turn is a **reconsideration** run. §7.1 calls it a
- *    review-phase run, but it is not an ordinary review: its prompt carries the
- *    pending dispute records and it returns §4 reconsideration records. The
- *    review handler (handlers/review.ts) dispatches an ordinary review — it
- *    admits new findings and never applies rows 9–12 — so queuing this turn
- *    onto `review` sends a `disputed` lineage to a run that cannot consume it,
- *    and that run can then finish the task with the dispute still open.
- *  - the evidence turn dispatches one bounded collection run per party, and the
- *    runner turn advances arbitration between runs (§8). Both have a real
- *    invocation module (`runReviewReconsideration`, `runReviewArbitration`, from
- *    #838/#846), but no phase handler or runner loop calls either yet: agent
- *    invocation is out of scope for this layer, and the dispatch that closes
- *    the gap is the downstream rollout Issue's.
- *
- * Until those dispatchers exist, the safe destination is a human, not a guess:
+ * While a turn IS undispatchable, the safe destination is a human, not a guess:
  * queueing an ordinary review run risks the WRONG handler discharging the
  * dispute, and holding the task `blocked` risks a valid dispute sitting
  * non-runnable forever with nothing scheduled to wake it. So the task parks as
  * `ready_for_human` — the §9 handoff this contract already uses whenever a
  * required route cannot proceed safely — with the §10.1 block committed
- * unchanged in the same transaction. The lineage keeps its real state
- * (`disputed`, `arbitration_pending`, `evidence_requested`), no counter is spent
- * on the park, and the debate resumes exactly where it stopped once a dispatcher
- * lands or an operator acts on it.
+ * unchanged in the same transaction. The lineage keeps its real state, no
+ * counter is spent on the park, and the debate resumes exactly where it stopped
+ * once a dispatcher lands or an operator acts on it.
  *
  * Rule 1 is excluded because it is already going to a human on its own terms;
  * this predicate answers only "is the turn's run dispatchable".
@@ -235,9 +264,8 @@ export function routingTaskPatch(routing: DisputeTaskRouting): TaskPatch {
  * the same shape `nextPhaseAfter` uses for its own `blocked`/`tool_request`
  * handoffs. An undispatchable turn ({@link routingLacksDispatcher}) parks it the
  * same way and for the same reason — critically NOT on `nextPhaseAfter`'s review
- * destination, nor on the reviewer turn's own `review` destination, either of
- * which would let an ordinary review run finish a task whose reconsideration or
- * arbitration never happened.
+ * destination, which would let an ordinary review run finish a task whose
+ * arbitration or evidence round never happened.
  */
 export function routedPhaseCompletion(
   routing: DisputeTaskRouting,

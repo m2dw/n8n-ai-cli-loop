@@ -39,11 +39,24 @@
       "typeVersion": 1
     },
     {
+      "id": "chatops-scan",
+      "name": "ChatOps Scan",
+      "type": "n8n-nodes-base.executeCommand",
+      "position": [
+        280,
+        240
+      ],
+      "parameters": {
+        "command": "={{ \"node '/opt/n8n-ai-cli-loop/dist/cli/chatops-scan.js' --context-id \" + $(\"When Called by Parent\").first().json.contextId }}"
+      },
+      "typeVersion": 1
+    },
+    {
       "id": "dispatch-outbox",
       "name": "Dispatch Outbox",
       "type": "n8n-nodes-base.executeCommand",
       "position": [
-        280,
+        560,
         240
       ],
       "parameters": {
@@ -56,7 +69,7 @@
       "name": "Return Context",
       "type": "n8n-nodes-base.set",
       "position": [
-        560,
+        840,
         240
       ],
       "parameters": {
@@ -102,6 +115,17 @@
       ]
     },
     "Run One Phase": {
+      "main": [
+        [
+          {
+            "node": "ChatOps Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ChatOps Scan": {
       "main": [
         [
           {

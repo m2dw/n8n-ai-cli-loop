@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "fs";
-import { homedir } from "os";
 import { isAbsolute, join, resolve } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 import type { AgentId } from "../core/task.js";
 import { DEFAULT_FLOW } from "../core/assignment.js";
 import { parseAntigravityPrintTimeout } from "../core/antigravity-print-timeout.js";
@@ -9,13 +9,24 @@ import {
   ISSUE_REFINEMENT_LIMIT_KEYS,
   resolveIssueRefinementSettings,
 } from "../core/issue-refinement.js";
+import { validateChatOpsLoginSeparation } from "../core/chatops-execution-ledger.js";
+import {
+  StagedVerificationConfigError,
+  cloneStagedVerificationConfig,
+  validateStagedVerificationConfig,
+} from "../core/staged-verification-config.js";
+import { findDuplicateJsonKeys } from "../core/json-duplicate-keys.js";
+import { QUALITY_LEVELS } from "../core/agent-profile-catalog.js";
+import { isQualityLevel } from "../core/agent-quality.js";
 import type {
+  AgentRuntimeConfig,
   AntigravityResearchConfig,
   AntigravityWorkspaceSettingsSessionConfig,
   AssignmentProfile,
   ClaudeComplexityProfileOverride,
   ClaudeComplexityProfilesConfig,
   ClaudeConfig,
+  ChatOpsConfig,
   CodexConfig,
   CodexContextModeConfig,
   DependencySyncConfig,
@@ -39,6 +50,7 @@ import type {
   ReviewDisputeArbiterConfig,
   ReviewDisputeConfig,
   ReviewDisputeLimitsConfig,
+  ReviewDisputeReconsiderationConfig,
   SessionAuditConfig,
   SessionConfig,
   SessionRegistry,
@@ -49,7 +61,7 @@ import type {
 } from "../core/session.js";
 
 export const DEFAULT_SESSIONS_PATH = join(
-  homedir(),
+  resolveHomeDir(),
   ".config",
   "n8n-ai-cli-loop",
   "sessions.json",
@@ -422,14 +434,51 @@ interface LoadedSessions {
   quarantinedRefIndex: Map<string, SessionRegistryDiagnostic>;
 }
 
-function parseRawSessionsFile(path: string): unknown[] {
+/**
+ * The suite binding (issue #1152, `docs/changed-file-verification-contract.md`
+ * §6 rule 5) must name exactly one key. Two literally identical keys collapse
+ * into one under `JSON.parse`, so that refusal is also made over the text.
+ *
+ * Both levels of the block hide the same collapse, so both are scanned: a
+ * second `"testSuite"` property inside `stagedVerification` discards a whole
+ * binding, and a second key inside the binding object discards one suite.
+ */
+const STAGED_VERIFICATION_PATH = /^sessions\[(\d+)\]\.stagedVerification$/;
+const TEST_SUITE_PATH = /^sessions\[(\d+)\]\.stagedVerification\.testSuite$/;
+
+/** A suite binding declared twice in the file's *text*, at either level. */
+interface DuplicateTestSuite {
+  /**
+   * `binding`: two keys inside the `testSuite` object.
+   * `property`: two `testSuite` properties inside `stagedVerification`.
+   */
+  readonly level: "binding" | "property";
+  /** The duplicated key: a `session.verification` name, or `"testSuite"`. */
+  readonly key: string;
+}
+
+interface RawSessions {
+  sessions: unknown[];
+  /**
+   * Session index → a suite binding declared twice in the file's *text*.
+   *
+   * `JSON.parse` keeps the last of two identical keys, so by the time
+   * `validateStagedVerificationConfig` sees the block the losing binding is
+   * already gone. The suite binding must name exactly one key, and the original
+   * bytes are the only place a duplicate is still visible.
+   */
+  duplicateTestSuiteKeys: Map<number, DuplicateTestSuite>;
+}
+
+function parseRawSessionsFile(path: string): RawSessions {
   if (!existsSync(path)) {
     throw new SessionRegistryFatalError(`Session registry file does not exist: ${path}`);
   }
 
+  const text = readFileSync(path, "utf8");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8"));
+    parsed = JSON.parse(text);
   } catch (err) {
     throw new SessionRegistryFatalError(
       `Failed to parse session registry file (${path}): ${err instanceof Error ? err.message : String(err)}`,
@@ -443,11 +492,30 @@ function parseRawSessionsFile(path: string): unknown[] {
   if (!Array.isArray(sessions)) {
     throw new SessionRegistryFatalError("Session registry must contain a sessions array");
   }
-  return sessions;
+
+  const duplicateTestSuiteKeys = new Map<number, DuplicateTestSuite>();
+  // The first duplicate found for a session is the one reported; the entry is
+  // refused either way, so later ones would add nothing.
+  const recordDuplicate = (index: number, duplicate: DuplicateTestSuite): void => {
+    if (!duplicateTestSuiteKeys.has(index)) duplicateTestSuiteKeys.set(index, duplicate);
+  };
+  for (const duplicate of findDuplicateJsonKeys(text)) {
+    const suiteMatch = TEST_SUITE_PATH.exec(duplicate.path);
+    if (suiteMatch) {
+      recordDuplicate(Number(suiteMatch[1]), { level: "binding", key: duplicate.key });
+      continue;
+    }
+    const blockMatch = STAGED_VERIFICATION_PATH.exec(duplicate.path);
+    if (blockMatch && duplicate.key === "testSuite") {
+      recordDuplicate(Number(blockMatch[1]), { level: "property", key: duplicate.key });
+    }
+  }
+
+  return { sessions, duplicateTestSuiteKeys };
 }
 
 function loadSessions(path: string): LoadedSessions {
-  const raw = parseRawSessionsFile(path);
+  const { sessions: raw, duplicateTestSuiteKeys } = parseRawSessionsFile(path);
 
   const identities = raw.map((entry) => shallowIdentity(entry));
   const { refRegs, repoKeyRegs } = collectIdentityRegistrations(identities);
@@ -485,6 +553,20 @@ function loadSessions(path: string): LoadedSessions {
   raw.forEach((entry, index) => {
     if (quarantined.has(index)) return;
     try {
+      const duplicateSuite = duplicateTestSuiteKeys.get(index);
+      if (duplicateSuite !== undefined) {
+        const blockPath = `sessions[${index}].stagedVerification`;
+        throw new StagedVerificationConfigError(
+          "duplicate_test_suite_key",
+          duplicateSuite.level === "binding"
+            ? `${blockPath}.testSuite.${duplicateSuite.key}`
+            : `${blockPath}.testSuite`,
+          duplicateSuite.level === "binding"
+            ? `${blockPath}.testSuite must name exactly one session.verification key; ` +
+              `it declares "${duplicateSuite.key}" twice`
+            : `${blockPath} must declare the suite binding once; it declares "testSuite" twice`,
+        );
+      }
       sessions.push(resolveSession(validateSession(entry, index)));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -577,6 +659,37 @@ function validateSession(value: unknown, index: number): SessionConfig {
       }
       config.reviewLoop.maxCycles = maxCycles;
     }
+    if (reviewLoop.verificationTimeoutMs !== undefined) {
+      const verificationTimeoutMs = reviewLoop.verificationTimeoutMs;
+      if (
+        typeof verificationTimeoutMs !== "number" ||
+        !Number.isInteger(verificationTimeoutMs) ||
+        verificationTimeoutMs < 1
+      ) {
+        throw new Error(
+          `sessions[${index}].reviewLoop.verificationTimeoutMs must be a positive integer`,
+        );
+      }
+      config.reviewLoop.verificationTimeoutMs = verificationTimeoutMs;
+    }
+  }
+
+  // Staged verification (issue #1097). The contract module owns the normative
+  // rules — `docs/staged-verification-contract.md` §5.3,
+  // `docs/project-verification-contract.md` §3.2 and
+  // `docs/verification-evidence-validity-contract.md` §7.3 rule 5 — so the
+  // table has exactly one home, as the review-dispute limits do. It is
+  // resolved against the live `session.verification` keys because the suite
+  // binding names an operator-authored command and nothing else.
+  if (session.stagedVerification !== undefined) {
+    config.stagedVerification = validateStagedVerificationConfig(
+      session.stagedVerification,
+      `sessions[${index}].stagedVerification`,
+      Object.keys(config.verification),
+      // Issue #1166: the values too, so a declared `requirementCommands` entry
+      // that another configured check already runs refuses at load.
+      config.verification,
+    );
   }
 
   if (session.reviewDispute !== undefined) {
@@ -641,6 +754,26 @@ function validateSession(value: unknown, index: number): SessionConfig {
     config.claude = validateClaudeConfig(session.claude, `sessions[${index}].claude`);
   }
 
+  if (session.agentRuntime !== undefined) {
+    config.agentRuntime = validateAgentRuntimeConfig(
+      session.agentRuntime,
+      `sessions[${index}].agentRuntime`,
+    );
+  }
+
+  // docs/agent-runtime-profiles-contract.md §9.1: sessions.json holds selection
+  // only. A catalog inlined here would give model names two homes, so the keys
+  // a catalog would arrive under are rejected outright rather than ignored —
+  // an operator who wrote one meant it to take effect.
+  for (const key of ["agentProfiles", "providers"] as const) {
+    if (session[key] !== undefined) {
+      throw new Error(
+        `sessions[${index}].${key} is not a session key: the agent runtime profile catalog lives in ` +
+          `agent-profiles.json (see docs/agent-runtime-profiles-contract.md §9.1), not in sessions.json`,
+      );
+    }
+  }
+
   if (session.research !== undefined) {
     config.research = validateResearchConfig(session.research, `sessions[${index}].research`);
   }
@@ -658,6 +791,10 @@ function validateSession(value: unknown, index: number): SessionConfig {
 
   if (session.audit !== undefined) {
     config.audit = validateAuditConfig(session.audit, `sessions[${index}].audit`);
+  }
+
+  if (session.chatOps !== undefined) {
+    config.chatOps = validateChatOpsConfig(session.chatOps, `sessions[${index}].chatOps`);
   }
 
   if (
@@ -693,7 +830,11 @@ function resolveSession(config: SessionConfig): ResolvedSession {
     ...(config.worktrees ? { worktrees: { ...config.worktrees } } : {}),
     ...(config.codex ? { codex: cloneCodexConfig(config.codex) } : {}),
     ...(config.claude ? { claude: cloneClaudeConfig(config.claude) } : {}),
+    ...(config.agentRuntime ? { agentRuntime: cloneAgentRuntimeConfig(config.agentRuntime) } : {}),
     ...(config.research ? { research: cloneResearchConfig(config.research) } : {}),
+    ...(config.stagedVerification
+      ? { stagedVerification: cloneStagedVerificationConfig(config.stagedVerification) }
+      : {}),
     ...(config.reviewDispute ? { reviewDispute: cloneReviewDisputeConfig(config.reviewDispute) } : {}),
     ...(config.issueRefinement ? { issueRefinement: cloneIssueRefinementConfig(config.issueRefinement) } : {}),
     artifactRoot: resolve(config.repoRoot, config.artifactDir),
@@ -705,6 +846,7 @@ function resolveSession(config: SessionConfig): ResolvedSession {
     ...(config.notifications ? { notifications: cloneNotificationsConfig(config.notifications) } : {}),
     ...(config.reportOnly ? { reportOnly: cloneReportOnly(config.reportOnly) } : {}),
     ...(config.audit ? { audit: cloneAuditConfig(config.audit) } : {}),
+    ...(config.chatOps ? { chatOps: cloneChatOpsConfig(config.chatOps) } : {}),
     workItemProvider: config.workItemProvider
       ? cloneProvider(config.workItemProvider)
       : { ...DEFAULT_WORK_ITEM_PROVIDER, auth: { ...DEFAULT_WORK_ITEM_PROVIDER.auth } },
@@ -718,10 +860,24 @@ function resolveSession(config: SessionConfig): ResolvedSession {
   };
 }
 
+/**
+ * Every NESTED block gets its own copy, not just the top level.
+ *
+ * The spread above copies the config's own keys, so a nested object left
+ * unlisted here is the SAME object in the cached session and in every session
+ * this registry hands out. A caller that then wrote to it would change what a
+ * later `getSessionById` returns without touching the session file — and
+ * `reconsideration.readBounded` is the one field where that matters most: it is
+ * the §17.6 D2 opt-in, and an opt-in that can be turned on by a stray local
+ * write is not the explicit, default-off, file-declared opt-in the approval was
+ * given for (issue #1085 review, P2). So it is cloned beside `limits` and
+ * `arbiter`, and a block added to this config later must be added here too.
+ */
 function cloneReviewDisputeConfig(config: ReviewDisputeConfig): ReviewDisputeConfig {
   return {
     ...config,
     ...(config.limits ? { limits: { ...config.limits } } : {}),
+    ...(config.reconsideration ? { reconsideration: { ...config.reconsideration } } : {}),
     ...(config.arbiter
       ? {
           arbiter: {
@@ -1015,6 +1171,67 @@ function validateClaudeComplexityProfileOverride(value: unknown, path: string): 
   return override;
 }
 
+/**
+ * Validate the provider-neutral agent-runtime selection block (issues #905,
+ * #911, docs/agent-runtime-profiles-contract.md §9.1).
+ *
+ * Selection only: `defaultQuality` names one of the four provider-neutral
+ * levels, `profilesPath` names where the catalog file lives, and `pins` name
+ * declared profiles per agent — and nothing else. A model name, an effort
+ * value, or a budget here is a rejected unknown key — those live in the
+ * profile catalog, addressed by a level, so a provider's model refresh never
+ * becomes a sessions.json diff. `profilesPath` and `pins` are accepted here
+ * because the write-capable lane cutover (issue #911) consumes them; each is
+ * shape-checked only — whether a pinned name is declared is the resolution
+ * boundary's catalog-aware answer (`unknown-profile`), not this loader's.
+ */
+function validateAgentRuntimeConfig(value: unknown, path: string): AgentRuntimeConfig {
+  const obj = record(value, path);
+  for (const key of Object.keys(obj)) {
+    if (key !== "defaultQuality" && key !== "profilesPath" && key !== "pins") {
+      throw new Error(`${path}.${key} is not a recognized agentRuntime setting`);
+    }
+  }
+  const config: AgentRuntimeConfig = {};
+  if (obj.defaultQuality !== undefined) {
+    const level = requiredString(obj.defaultQuality, `${path}.defaultQuality`);
+    if (!isQualityLevel(level)) {
+      throw new Error(`${path}.defaultQuality must be one of: ${QUALITY_LEVELS.join(", ")}`);
+    }
+    config.defaultQuality = level;
+  }
+  if (obj.profilesPath !== undefined) {
+    // Absoluteness is deliberately not checked here: the catalog loader
+    // refuses a relative path with its own `catalog-unreadable` reason, so the
+    // refusal names the contract that owns the rule (§9.1).
+    config.profilesPath = requiredString(obj.profilesPath, `${path}.profilesPath`);
+  }
+  if (obj.pins !== undefined) {
+    const pins = record(obj.pins, `${path}.pins`);
+    const entries = Object.entries(pins);
+    if (entries.length === 0) {
+      throw new Error(`${path}.pins pins nothing; add an agent id → profile name entry or remove it`);
+    }
+    const cloned: Record<string, string> = {};
+    for (const [agentId, profileName] of entries) {
+      if (agentId.trim().length === 0) {
+        throw new Error(`${path}.pins has an entry with an empty agent id`);
+      }
+      cloned[agentId] = requiredString(profileName, `${path}.pins.${agentId}`);
+    }
+    config.pins = cloned;
+  }
+  return config;
+}
+
+function cloneAgentRuntimeConfig(config: AgentRuntimeConfig): AgentRuntimeConfig {
+  return {
+    ...(config.defaultQuality !== undefined ? { defaultQuality: config.defaultQuality } : {}),
+    ...(config.profilesPath !== undefined ? { profilesPath: config.profilesPath } : {}),
+    ...(config.pins !== undefined ? { pins: { ...config.pins } } : {}),
+  };
+}
+
 function cloneClaudeConfig(config: ClaudeConfig): ClaudeConfig {
   if (!config.complexityProfiles) return {};
   const profiles = config.complexityProfiles;
@@ -1045,7 +1262,7 @@ function cloneClaudeConfig(config: ClaudeConfig): ClaudeConfig {
 function validateReviewDisputeConfig(value: unknown, path: string): ReviewDisputeConfig {
   const obj = record(value, path);
   const config: ReviewDisputeConfig = {};
-  const allowedTop = ["enabled", "limits", "arbiter"];
+  const allowedTop = ["enabled", "limits", "arbiter", "reconsideration"];
   for (const key of Object.keys(obj)) {
     if (!allowedTop.includes(key)) {
       throw new Error(
@@ -1108,6 +1325,25 @@ function validateReviewDisputeConfig(value: unknown, path: string): ReviewDisput
       arbiter.minConfidence = raw.minConfidence;
     }
     config.arbiter = arbiter;
+  }
+  if (obj.reconsideration !== undefined) {
+    const raw = record(obj.reconsideration, `${path}.reconsideration`);
+    const allowed = ["readBounded"];
+    for (const key of Object.keys(raw)) {
+      if (!allowed.includes(key)) {
+        throw new Error(
+          `${path}.reconsideration.${key} is not a known reconsideration setting; expected one of: ${allowed.join(", ")}`,
+        );
+      }
+    }
+    const reconsideration: ReviewDisputeReconsiderationConfig = {};
+    if (raw.readBounded !== undefined) {
+      if (typeof raw.readBounded !== "boolean") {
+        throw new Error(`${path}.reconsideration.readBounded must be a boolean`);
+      }
+      reconsideration.readBounded = raw.readBounded;
+    }
+    config.reconsideration = reconsideration;
   }
   // One authority for the value rules; the registry only reports what it says.
   const resolved = resolveReviewDisputeSettings(config, path);
@@ -1617,6 +1853,83 @@ function cloneAuditConfig(config: SessionAuditConfig): SessionAuditConfig {
   };
 }
 
+/**
+ * Validate the `chatOps` block (issue #1024, docs/chatops-operations.md).
+ *
+ * `enabled` is the master switch. The two login lists are required only when
+ * the block is enabled — a disabled block must load when written minimally as
+ * `{ "enabled": false }` — but any list that IS supplied is validated either
+ * way, so a typo surfaces before the surface is switched on.
+ *
+ * The disjointness check is the one rule here that is not merely structural:
+ * `docs/chatops-execution-ledger-contract.md` §10.3 requires command authors
+ * and automation identities to be disjoint, because an overlapping login would
+ * let a human command author post acknowledgement markers that authenticate —
+ * and those markers are the evidence every restore detector reads. Enforcing it
+ * at load, rather than at scan time, means a session that could forge its own
+ * evidence never resolves at all.
+ */
+function validateChatOpsConfig(value: unknown, path: string): ChatOpsConfig {
+  const obj = record(value, path);
+  if (typeof obj.enabled !== "boolean") {
+    throw new Error(`${path}.enabled must be a boolean`);
+  }
+  const config: ChatOpsConfig = { enabled: obj.enabled };
+
+  if (obj.authorAllowlist !== undefined) {
+    config.authorAllowlist = stringArray(obj.authorAllowlist, `${path}.authorAllowlist`, {
+      nonEmpty: obj.enabled,
+    });
+  } else if (obj.enabled) {
+    throw new Error(`${path}.authorAllowlist is required when chatOps is enabled`);
+  }
+
+  if (obj.automationLogins !== undefined) {
+    config.automationLogins = stringArray(obj.automationLogins, `${path}.automationLogins`, {
+      nonEmpty: obj.enabled,
+    });
+  } else if (obj.enabled) {
+    throw new Error(`${path}.automationLogins is required when chatOps is enabled`);
+  }
+
+  const overlap = validateChatOpsLoginSeparation(
+    config.authorAllowlist ?? [],
+    config.automationLogins ?? [],
+  );
+  if (overlap.length > 0) {
+    throw new Error(
+      `${path}.authorAllowlist and ${path}.automationLogins must be disjoint; ` +
+        `${overlap.map((login) => JSON.stringify(login)).join(", ")} appears in both`,
+    );
+  }
+
+  if (obj.maxDispatchesPerPass !== undefined) {
+    const parsed = obj.maxDispatchesPerPass;
+    if (!Number.isInteger(parsed) || (parsed as number) < 1) {
+      throw new Error(`${path}.maxDispatchesPerPass must be a positive integer`);
+    }
+    config.maxDispatchesPerPass = parsed as number;
+  }
+
+  if (obj.operationTimeoutMs !== undefined) {
+    const parsed = obj.operationTimeoutMs;
+    if (!Number.isInteger(parsed) || (parsed as number) < 1) {
+      throw new Error(`${path}.operationTimeoutMs must be a positive integer`);
+    }
+    config.operationTimeoutMs = parsed as number;
+  }
+
+  return config;
+}
+
+function cloneChatOpsConfig(config: ChatOpsConfig): ChatOpsConfig {
+  return {
+    ...config,
+    ...(config.authorAllowlist ? { authorAllowlist: [...config.authorAllowlist] } : {}),
+    ...(config.automationLogins ? { automationLogins: [...config.automationLogins] } : {}),
+  };
+}
+
 function cloneAssignmentProfiles(
   profiles: Record<string, AssignmentProfile>,
 ): Record<string, AssignmentProfile> {
@@ -1642,7 +1955,11 @@ function cloneSession(session: ResolvedSession | undefined): ResolvedSession | u
     ...(session.worktrees ? { worktrees: { ...session.worktrees } } : {}),
     ...(session.codex ? { codex: cloneCodexConfig(session.codex) } : {}),
     ...(session.claude ? { claude: cloneClaudeConfig(session.claude) } : {}),
+    ...(session.agentRuntime ? { agentRuntime: cloneAgentRuntimeConfig(session.agentRuntime) } : {}),
     ...(session.research ? { research: cloneResearchConfig(session.research) } : {}),
+    ...(session.stagedVerification
+      ? { stagedVerification: cloneStagedVerificationConfig(session.stagedVerification) }
+      : {}),
     ...(session.reviewDispute ? { reviewDispute: cloneReviewDisputeConfig(session.reviewDispute) } : {}),
     ...(session.issueRefinement ? { issueRefinement: cloneIssueRefinementConfig(session.issueRefinement) } : {}),
     ...(session.baseBranch !== undefined ? { baseBranch: session.baseBranch } : {}),
@@ -1652,6 +1969,7 @@ function cloneSession(session: ResolvedSession | undefined): ResolvedSession | u
     ...(session.notifications ? { notifications: cloneNotificationsConfig(session.notifications) } : {}),
     ...(session.reportOnly ? { reportOnly: cloneReportOnly(session.reportOnly) } : {}),
     ...(session.audit ? { audit: cloneAuditConfig(session.audit) } : {}),
+    ...(session.chatOps ? { chatOps: cloneChatOpsConfig(session.chatOps) } : {}),
     workItemProvider: cloneProvider(session.workItemProvider),
     repoHostProvider: cloneProvider(session.repoHostProvider),
     repoHostProviderConfigured: session.repoHostProviderConfigured,

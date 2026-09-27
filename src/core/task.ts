@@ -166,7 +166,14 @@ export type StoreResultCode =
   // `conflict`: nothing about the task itself is wrong and nothing was
   // mutated; the identical call succeeds once maintenance releases the lock,
   // so callers surface it as retryable contention rather than a failure.
-  | "maintenance_locked";
+  | "maintenance_locked"
+  // A `cancelPending` effect carrying `refuseWhileClaimed` named a row a
+  // dispatch attempt is holding RIGHT NOW, so the whole compound write was
+  // refused (issue #980 review). Like `maintenance_locked`: nothing about the
+  // task is wrong and nothing was mutated — the identical call succeeds once
+  // the in-flight attempt resolves and releases its claim, so callers surface
+  // it as retryable contention and simply re-run.
+  | "effect_in_flight";
 
 export type StoreResult<T> =
   | { ok: true; value: T; reactivated?: boolean }

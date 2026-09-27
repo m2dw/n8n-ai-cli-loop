@@ -20,8 +20,8 @@
  * `<root>`.
  */
 
-import { homedir } from "os";
 import { isAbsolute, join } from "path";
+import { resolveHomeDir } from "./home-dir.js";
 
 /** Environment variable that overrides the managed worktree state root. */
 export const WORKTREE_ROOT_ENV = "N8N_AI_WORKTREE_ROOT";
@@ -32,7 +32,7 @@ export const WORKTREE_ROOT_ENV = "N8N_AI_WORKTREE_ROOT";
  * lives under one predictable tree.
  */
 export const DEFAULT_WORKTREE_ROOT = join(
-  homedir(),
+  resolveHomeDir(),
   ".local",
   "state",
   "n8n-ai-cli-loop",

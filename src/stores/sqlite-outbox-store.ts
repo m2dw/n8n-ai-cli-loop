@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
-import { homedir } from "os";
 import { mkdirSync } from "fs";
 import { join } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 import {
   OUTBOX_MAX_ATTEMPTS,
   OUTBOX_CLAIM_STALE_MS,
@@ -30,7 +30,7 @@ import { isMaintenanceLockHeld, MaintenanceLockedError } from "./maintenance-loc
 import { sqliteBackendId } from "./sqlite-backend-id.js";
 
 export const DEFAULT_DB_PATH = join(
-  homedir(),
+  resolveHomeDir(),
   ".config",
   "n8n-ai-cli-loop",
   "dev_loop.db",
@@ -215,15 +215,17 @@ export class SqliteOutboxStore implements OutboxStore {
    * would leave the earlier rows durable while the caller's completion is
    * refused and re-run.
    */
-  async enqueueEffects(effects: OutboxEffect[]): Promise<void> {
+  async enqueueEffects(effects: readonly OutboxEffect[]): Promise<void> {
     if (effects.length === 0) return;
     const run = this.#db.transaction((): void => {
       if (isMaintenanceLockHeld(this.#db)) throw new MaintenanceLockedError("outbox effect enqueue");
       for (const effect of effects) {
         if (effect.kind === "enqueue") {
           this.#insertEnqueue(effect.input);
-        } else {
+        } else if (effect.kind === "replacePendingPrSummary") {
           this.#insertReplacePendingPrSummary(effect.input, effect.key);
+        } else {
+          this.#cancelPendingByKey(effect.idempotencyKey, effect.now);
         }
       }
     });
@@ -244,6 +246,32 @@ export class SqliteOutboxStore implements OutboxStore {
       )
       .run(input.idempotencyKey, input.topic, JSON.stringify(input.payload), now);
     return { enqueued: result.changes > 0 };
+  }
+
+  /**
+   * The `cancelPending` effect (issue #980 review), without the transaction or
+   * the maintenance guard — call only from inside a transaction that has
+   * already read the lock. Byte-identical to the write `SqliteTaskStore`'s own
+   * effect applier performs, since both address the same `outbox` table (this
+   * store simply reaches it on its own connection); see
+   * `OutboxEffectCancelPending` in core/task-store.ts for the semantics (unsent
+   * rows only, claim state ignored, already-cancelled rows untouched).
+   *
+   * `refuseWhileClaimed` is not enforceable here (issue #980 review): this
+   * connection is the outbox's, not the task transition's, so "refuse the whole
+   * write" is not something it can still decide — the transition it accompanies
+   * has already been committed elsewhere. Only producers whose effects travel
+   * through the task store's transaction get that guarantee, which is why §13's
+   * recovery commits through `completePhaseWithEffects`.
+   */
+  #cancelPendingByKey(idempotencyKey: string, now?: string): void {
+    const asOf = now ?? new Date().toISOString();
+    this.#db
+      .prepare(
+        `UPDATE outbox SET dead_letter_at = COALESCE(dead_letter_at, ?), cancelled_at = ?
+         WHERE idempotency_key = ? AND sent_at IS NULL AND cancelled_at IS NULL`,
+      )
+      .run(asOf, asOf, idempotencyKey);
   }
 
   /**

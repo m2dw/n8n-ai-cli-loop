@@ -19,7 +19,10 @@
  *
  * See docs/agent-isolation-policy.md.
  */
-import { existsSync, rmSync, statSync } from 'fs';
+import { spawnSync } from 'child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 import {
   buildIsolatedInvocation,
@@ -155,15 +158,42 @@ describe('agent-isolation — the boundaries the policy does not move', () => {
     });
   });
 
-  test('openai isolation is unchanged, including its CODEX_HOME passthrough', () => {
+  test('openai gets a throwaway home with CODEX_HOME synthesized as the Codex config dir, not the home itself (#978)', () => {
     withInvocation({ provider: 'openai', toolPolicy: 'no-tools' }, (inv) => {
       expect(inv.homePolicy).toBe('throwaway');
       expect(inv.env.HOME).not.toBe('/Users/real');
       expect(inv.env.GH_CONFIG_DIR).toBe(inv.env.HOME);
-      // A hidden home is what needs its config dir named back.
-      expect(inv.env.CODEX_HOME).toBe('/Users/real');
+      // CODEX_HOME identifies Codex's own config directory
+      // ($HOME/.codex by default), not the home directory that contains it —
+      // a hidden home needs its config dir named back at the right depth for
+      // the CLI to find an existing login there.
+      expect(inv.env.CODEX_HOME).toBe('/Users/real/.codex');
       expect(inv.env.OPENAI_API_KEY).toBe('openai-key');
       expect(inv.env.ANTHROPIC_API_KEY).toBeUndefined();
+    });
+  });
+
+  test('an explicit CODEX_HOME is honored exactly, never rewritten to a subdirectory', () => {
+    withInvocation(
+      {
+        provider: 'openai',
+        toolPolicy: 'no-tools',
+        source: callerEnv({ CODEX_HOME: '/Users/real/custom-codex' }),
+      },
+      (inv) => {
+        expect(inv.env.CODEX_HOME).toBe('/Users/real/custom-codex');
+      },
+    );
+  });
+
+  test('openai with no caller home to synthesize from gets no CODEX_HOME at all', () => {
+    const source = callerEnv();
+    delete source.HOME;
+    withInvocation({ provider: 'openai', toolPolicy: 'no-tools', source }, (inv) => {
+      expect(inv.env.CODEX_HOME).toBeUndefined();
+      // The throwaway home still stands in for HOME, exactly as it does for
+      // any other provider with no caller home to inherit.
+      expect(inv.env.HOME).toBe(inv.env.GH_CONFIG_DIR);
     });
   });
 
@@ -199,5 +229,40 @@ describe('agent-isolation — resolveHomePolicy', () => {
     expect(resolveHomePolicy('google', 'no-tools')).toBe('throwaway');
     expect(resolveHomePolicy('mystery', 'no-tools')).toBe('throwaway');
     expect(resolveHomePolicy('constructor', 'no-tools')).toBe('throwaway');
+  });
+});
+
+describe('agent-isolation — the Codex critic can locate an existing login through CODEX_HOME (#978)', () => {
+  test('a mocked Codex auth file under the caller real home is reachable through the synthesized CODEX_HOME', () => {
+    // A real, writable stand-in for the operator's home — unlike the fixed
+    // '/Users/real' used elsewhere in this file, a mocked CLI actually has to
+    // read from this one, so it has to exist on disk.
+    const realHome = mkdtempSync(join(tmpdir(), 'ai-isolation-test-realhome-'));
+    const codexDir = join(realHome, '.codex');
+    mkdirSync(codexDir, { recursive: true });
+    writeFileSync(join(codexDir, 'auth.json'), JSON.stringify({ token: 'codex-secret' }));
+    try {
+      withInvocation(
+        { provider: 'openai', toolPolicy: 'no-tools', source: callerEnv({ HOME: realHome }) },
+        (inv) => {
+          expect(inv.env.CODEX_HOME).toBe(codexDir);
+          // Stands in for the Codex CLI itself: it reads its login from
+          // $CODEX_HOME/auth.json, exactly as the real `codex` binary does.
+          const probe = spawnSync(
+            process.execPath,
+            [
+              '-e',
+              "const fs=require('fs'),path=require('path');" +
+                "const p=path.join(process.env.CODEX_HOME,'auth.json');" +
+                "process.stdout.write(fs.existsSync(p) ? JSON.parse(fs.readFileSync(p,'utf8')).token : 'missing');",
+            ],
+            { env: inv.env, encoding: 'utf8' },
+          );
+          expect(probe.stdout).toBe('codex-secret');
+        },
+      );
+    } finally {
+      rmSync(realHome, { recursive: true, force: true });
+    }
   });
 });

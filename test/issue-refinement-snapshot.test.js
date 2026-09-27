@@ -11,7 +11,12 @@ import {
   DEFAULT_REFINEMENT_MARKER_LABEL,
   IMPLEMENTATION_STATUS_LABEL,
   ISSUE_REFINEMENT_DEFAULT_LIMITS,
+  MANAGED_REGION_BEGIN_PREFIX,
+  MANAGED_REGION_END,
+  REFINEMENT_EVIDENCE_OMISSION_REASONS,
   REFINEMENT_MAX_COMMENT_IDENTITY_BYTES,
+  REFINEMENT_MAX_EVIDENCE_SELECTIONS,
+  REFINEMENT_MAX_EVIDENCE_SOURCE_BYTES,
   REFINEMENT_MAX_PR_IDENTITY_BYTES,
   REFINEMENT_MAX_TARGET_LABELS,
   REFINEMENT_MAX_TARGET_LABEL_BYTES,
@@ -22,6 +27,9 @@ import {
   buildRefinementSnapshot,
   classifyPredecessorUsability,
   computePredecessorFingerprint,
+  extractExportedDeclaration,
+  parseRefinementEvidenceDeclaration,
+  refinementEvidenceOmissions,
   refinementPredecessorRecords,
   refinementSnapshotByteBudget,
 } from '../dist/index.js';
@@ -166,6 +174,19 @@ function makeSource(world, opts = {}) {
       const i = nth('chainAgreement');
       if (opts.chainAgreementThrows) throw new Error(opts.chainAgreementThrows);
       return resolve(opts.chainAgreement, i);
+    };
+  }
+  // §5.1 (issue #983): the optional evidence resolver. `opts.evidence` is a
+  // function of (request, callIndex) so a test can echo the request, return a
+  // fixed file, or misbehave per call. Left absent — the seam's default — the
+  // port has no `readPredecessorEvidence`, which is the resolver-unavailable
+  // shape the core must degrade on.
+  if (opts.evidence || opts.evidenceThrows) {
+    port.readPredecessorEvidence = async (request) => {
+      calls.push(['readPredecessorEvidence', { ...request }]);
+      const i = nth('evidence');
+      if (opts.evidenceThrows) throw new Error(opts.evidenceThrows);
+      return opts.evidence(request, i);
     };
   }
   return { port, calls };
@@ -1435,5 +1456,686 @@ describe('issue-refinement snapshot — read-only by construction', () => {
     // One over the cap: the extra entry is the truncation probe, never captured.
     expect(calls).toContainEqual(['readChangedPaths', 901, 8]);
     expect(calls).toContainEqual(['readIssueComments', 1, 3]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.1 — declared predecessor contract evidence (issue #983)
+// ---------------------------------------------------------------------------
+
+/** A target body carrying one well-formed declaration block. */
+function bodyWithDeclaration(selections, prefix = 'Downstream body') {
+  return [prefix, '', '```refinement-evidence', JSON.stringify(selections, null, 2), '```'].join(
+    '\n',
+  );
+}
+
+/** A compliant resolver: echoes the pinned commit, serves fixed file content. */
+const serveFile = (content) => (request) => ({
+  kind: 'found',
+  content,
+  resolvedCommitSha: request.commitSha,
+});
+
+// The #950/#951 shape this section exists for: an exported selector result
+// type, multi-line union, surrounded by exports the selection must NOT expose.
+const SELECTOR_TYPE_TEXT = [
+  'export type DisputeTurnSelection =',
+  '  | { kind: "dispatch"; subTurn: string }',
+  '  | { kind: "hold"; reason: "cross_lineage_contradiction" }',
+  '  | { kind: "terminal" };',
+].join('\n');
+const SELECTOR_SOURCE = [
+  '/** Unrelated exports first, so extraction must select, never slice. */',
+  'export const UNRELATED_SECRET_ADJACENT = 1;',
+  '',
+  '/** The §7.1 next-sub-turn selector result (issue #950). */',
+  SELECTOR_TYPE_TEXT,
+  '',
+  'export function selectNextDisputeSubTurn(state) {',
+  '  return { kind: "terminal" };',
+  '}',
+].join('\n');
+
+describe('issue-refinement snapshot — §5.1 declared evidence capture', () => {
+  test('no declaration: empty evidence, and the fingerprint is the pre-#983 one', async () => {
+    const { result } = await build({ 1: predecessor(1) }, { blockedBy: edges(1) });
+    expect(result.kind).toBe('captured');
+    const snap = result.snapshot;
+    expect(snap.evidence).toEqual([]);
+    expect(snap.manifest.evidenceCount).toBe(0);
+    // The three-argument form is the pre-#983 serialization: an undeclared
+    // Issue's recorded fingerprint must not move because the capability exists.
+    expect(computePredecessorFingerprint(snap.target, snap.predecessors, LANE_LABELS)).toBe(
+      snap.predecessorFingerprint,
+    );
+  });
+
+  test('the #950 scenario: an exact exported selector type is captured from the head commit', async () => {
+    const { result, calls } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({
+        body: bodyWithDeclaration([
+          { issue: 1, path: 'src/core/review-dispute-turn.ts', export: 'DisputeTurnSelection' },
+        ]),
+      }),
+      evidence: serveFile(SELECTOR_SOURCE),
+    });
+    expect(result.kind).toBe('captured');
+    const [entry] = result.snapshot.evidence;
+    expect(entry.status).toBe('captured');
+    expect(entry.content).toBe(SELECTOR_TYPE_TEXT);
+    expect(entry.truncated).toBe(false);
+    expect(entry.omissionReason).toBeNull();
+    expect(entry.selector).toEqual({
+      issueNumber: 1,
+      path: 'src/core/review-dispute-turn.ts',
+      exportName: 'DisputeTurnSelection',
+      lines: null,
+      maxBytes: null,
+      // §5.2 (issue #1003): a declaration that says nothing about requiredness
+      // is required — declaring the selection IS the assertion that the
+      // contract depends on it.
+      required: true,
+    });
+    // Immutable provenance: the open shape reads at the stack-ready PR's head.
+    expect(entry.source).toEqual({
+      issueNumber: 1,
+      prNumber: 901,
+      shape: 'open_stack_ready',
+      headRefName: 'ai/issue-1',
+      commitSha: sha(1),
+    });
+    const read = calls.find((c) => c[0] === 'readPredecessorEvidence')[1];
+    expect(read.commitSha).toBe(sha(1));
+    expect(read.maxBytes).toBe(REFINEMENT_MAX_EVIDENCE_SOURCE_BYTES + 1);
+    // Unselected repository content stays out of the snapshot.
+    expect(JSON.stringify(result.snapshot)).not.toContain('UNRELATED_SECRET_ADJACENT');
+    expect(result.snapshot.manifest.evidenceCount).toBe(1);
+  });
+
+  test('a merged predecessor reads at its merge commit, not its stale head', async () => {
+    const world = { 1: predecessor(1, { pr: { state: 'merged', mergeCommitSha: sha(7) } }) };
+    const { result, calls } = await build(world, {
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([{ issue: 1, path: 'src/a.ts' }]) }),
+      evidence: serveFile('merged bytes\n'),
+    });
+    expect(result.kind).toBe('captured');
+    const [entry] = result.snapshot.evidence;
+    expect(entry.source.shape).toBe('merged');
+    expect(entry.source.commitSha).toBe(sha(7));
+    expect(calls.find((c) => c[0] === 'readPredecessorEvidence')[1].commitSha).toBe(sha(7));
+  });
+
+  test('mismatched predecessor identity: content from any other commit is refused', async () => {
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([{ issue: 1, path: 'src/a.ts' }]) }),
+      evidence: () => ({
+        kind: 'found',
+        content: 'bytes from somewhere else',
+        resolvedCommitSha: 'f'.repeat(40),
+      }),
+    });
+    expect(result.kind).toBe('captured');
+    const [entry] = result.snapshot.evidence;
+    expect(entry.status).toBe('omitted');
+    expect(entry.omissionReason).toBe('identity_mismatch');
+    expect(entry.content).toBeNull();
+    expect(entry.detail).toContain(`expected=${sha(1)}`);
+    expect(entry.detail).toContain(`resolved=${'f'.repeat(40)}`);
+    // Provenance still names the commit the capture REQUIRED.
+    expect(entry.source.commitSha).toBe(sha(1));
+  });
+
+  test('a selection naming a non-predecessor Issue is unknown_predecessor, never resolved', async () => {
+    const reads = [];
+    const { result, calls } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([{ issue: 99, path: 'src/a.ts' }]) }),
+      evidence: (request) => {
+        reads.push(request);
+        return serveFile('x')(request);
+      },
+    });
+    expect(result.kind).toBe('captured');
+    const [entry] = result.snapshot.evidence;
+    expect(entry.omissionReason).toBe('unknown_predecessor');
+    expect(entry.source).toBeNull();
+    expect(reads).toEqual([]);
+    expect(calls.filter((c) => c[0] === 'readPredecessorEvidence')).toEqual([]);
+  });
+
+  test('no resolver wired: declared selections degrade to resolver_unavailable omissions', async () => {
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([{ issue: 1, path: 'src/a.ts' }]) }),
+    });
+    expect(result.kind).toBe('captured');
+    const [entry] = result.snapshot.evidence;
+    expect(entry.omissionReason).toBe('resolver_unavailable');
+    // The provenance the read WOULD have used is still recorded for #1003.
+    expect(entry.source.commitSha).toBe(sha(1));
+  });
+
+  test('missing path and unavailable content are recorded omissions, not failures', async () => {
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({
+        body: bodyWithDeclaration([
+          { issue: 1, path: 'src/gone.ts' },
+          { issue: 1, path: 'src/sub' },
+        ]),
+      }),
+      evidence: (request) =>
+        request.path === 'src/gone.ts'
+          ? { kind: 'missing_path' }
+          : { kind: 'unavailable', detail: 'type=submodule' },
+    });
+    expect(result.kind).toBe('captured');
+    const [gone, sub] = result.snapshot.evidence;
+    expect(gone.omissionReason).toBe('missing_path');
+    expect(sub.omissionReason).toBe('source_unavailable');
+    expect(sub.detail).toBe('type=submodule');
+    expect(refinementEvidenceOmissions(result.snapshot)).toHaveLength(2);
+  });
+
+  test('a thrown evidence read fails the capture at its own stage', async () => {
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([{ issue: 1, path: 'src/a.ts' }]) }),
+      evidence: () => serveFile('x'),
+      evidenceThrows: 'HTTP 500',
+    });
+    expect(result.kind).toBe('failed');
+    expect(result.stage).toBe('evidence');
+  });
+
+  test('line ranges capture exact lines; an out-of-range end is an omission that says why', async () => {
+    const file = ['l1', 'l2', 'l3', 'l4'].join('\n');
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({
+        body: bodyWithDeclaration([
+          { issue: 1, path: 'src/a.ts', lines: [2, 3] },
+          { issue: 1, path: 'src/a.ts', lines: [2, 9] },
+        ]),
+      }),
+      evidence: serveFile(file),
+    });
+    expect(result.kind).toBe('captured');
+    const [inRange, outOfRange] = result.snapshot.evidence;
+    expect(inRange.status).toBe('captured');
+    expect(inRange.content).toBe('l2\nl3');
+    expect(outOfRange.omissionReason).toBe('line_range_out_of_bounds');
+    expect(outOfRange.detail).toBe('lines=4');
+  });
+
+  test('a range reaching the byte-capped scan tail is out of bounds, never captured as exact', async () => {
+    // Ten bytes per line: the 262,144-byte scan cap lands four bytes into a
+    // line, so the scan ends in a PARTIAL line that must not be selectable.
+    const lineWidth = 10;
+    const fullLines = Math.floor(REFINEMENT_MAX_EVIDENCE_SOURCE_BYTES / lineWidth);
+    const file = Array.from({ length: fullLines + 2 }, () => 'x'.repeat(lineWidth - 1)).join('\n');
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({
+        body: bodyWithDeclaration([
+          { issue: 1, path: 'src/a.ts', lines: [fullLines, fullLines + 1] },
+          { issue: 1, path: 'src/a.ts', lines: [fullLines - 1, fullLines] },
+        ]),
+      }),
+      evidence: serveFile(file),
+    });
+    expect(result.kind).toBe('captured');
+    const [tail, whole] = result.snapshot.evidence;
+    expect(tail.omissionReason).toBe('line_range_out_of_bounds');
+    expect(tail.detail).toBe('source_truncated');
+    // The last FULLY-read line is still selectable, exactly.
+    expect(whole.status).toBe('captured');
+    expect(whole.content).toBe(['x'.repeat(9), 'x'.repeat(9)].join('\n'));
+    expect(whole.truncated).toBe(false);
+  });
+
+  test('an export the file does not have is export_not_found, never a guess', async () => {
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({
+        body: bodyWithDeclaration([{ issue: 1, path: 'src/a.ts', export: 'NoSuchExport' }]),
+      }),
+      evidence: serveFile(SELECTOR_SOURCE),
+    });
+    const [entry] = result.snapshot.evidence;
+    expect(entry.omissionReason).toBe('export_not_found');
+    expect(entry.content).toBeNull();
+  });
+
+  test('bounds: maxBytes may only lower the §8 prose cap, and truncation is recorded', async () => {
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      limits: { maxSnapshotTextBytes: 50 },
+      target: target({
+        body: bodyWithDeclaration([
+          { issue: 1, path: 'src/a.ts', maxBytes: 10 },
+          { issue: 1, path: 'src/b.ts', maxBytes: 10_000 },
+        ]),
+      }),
+      evidence: serveFile('x'.repeat(100)),
+    });
+    expect(result.kind).toBe('captured');
+    const [lowered, floored] = result.snapshot.evidence;
+    expect(lowered.content).toBe('x'.repeat(10));
+    expect(lowered.maxBytesApplied).toBe(10);
+    expect(lowered.truncated).toBe(true);
+    expect(floored.content).toBe('x'.repeat(50));
+    expect(floored.maxBytesApplied).toBe(50);
+    const m = result.snapshot.manifest;
+    expect(m.truncatedFields).toContain('evidence.0.content');
+    expect(m.truncatedFields).toContain('evidence.1.content');
+    expect(m.totalTextBytes).toBeLessThanOrEqual(m.maxTotalTextBytes);
+  });
+
+  test('selections past the cap are one recorded selection_capped entry, never silent', async () => {
+    const declared = Array.from({ length: REFINEMENT_MAX_EVIDENCE_SELECTIONS + 1 }, (_, i) => ({
+      issue: 1,
+      path: `src/f${i}.ts`,
+    }));
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration(declared) }),
+      evidence: serveFile('x'),
+    });
+    expect(result.kind).toBe('captured');
+    const evidence = result.snapshot.evidence;
+    expect(evidence).toHaveLength(REFINEMENT_MAX_EVIDENCE_SELECTIONS + 1);
+    const capped = evidence[REFINEMENT_MAX_EVIDENCE_SELECTIONS];
+    expect(capped.omissionReason).toBe('selection_capped');
+    expect(capped.detail).toBe(`declared=${REFINEMENT_MAX_EVIDENCE_SELECTIONS + 1}`);
+    expect(capped.index).toBe(REFINEMENT_MAX_EVIDENCE_SELECTIONS);
+  });
+
+  test('invalid selections are itemized with parser literals; the deny floor refuses secret shapes', async () => {
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({
+        body: bodyWithDeclaration([
+          { issue: 1, path: 'src/a.ts', export: 'X', lines: [1, 2] },
+          { issue: 1, path: '/abs/x.ts' },
+          { issue: 0, path: 'src/a.ts' },
+          { issue: 1, path: 'src/a.ts', nope: true },
+          { issue: 1, path: 'src/a.ts', maxBytes: 0 },
+          { issue: 1, path: 'config/.env' },
+        ]),
+      }),
+      evidence: serveFile('x'),
+    });
+    expect(result.kind).toBe('captured');
+    const details = result.snapshot.evidence.map((e) => [e.omissionReason, e.detail]);
+    expect(details).toEqual([
+      ['invalid_selection', 'conflicting_selectors'],
+      ['invalid_selection', 'bad_path'],
+      ['invalid_selection', 'bad_issue'],
+      ['invalid_selection', 'unknown_key'],
+      ['invalid_selection', 'bad_max_bytes'],
+      ['denied_path', 'deny_floor'],
+    ]);
+    // Every recorded reason is contract vocabulary.
+    for (const e of result.snapshot.evidence) {
+      expect(REFINEMENT_EVIDENCE_OMISSION_REASONS).toContain(e.omissionReason);
+    }
+  });
+
+  test('a malformed declaration is one all-or-nothing omission', async () => {
+    const twoBlocks = [
+      'Body',
+      '```refinement-evidence',
+      '[]',
+      '```',
+      '```refinement-evidence',
+      '[]',
+      '```',
+    ].join('\n');
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({ body: twoBlocks }),
+      evidence: serveFile('x'),
+    });
+    expect(result.kind).toBe('captured');
+    expect(result.snapshot.evidence).toHaveLength(1);
+    expect(result.snapshot.evidence[0].omissionReason).toBe('malformed_declaration');
+    expect(result.snapshot.evidence[0].detail).toBe('multiple_blocks');
+    expect(result.snapshot.evidence[0].selector).toBeNull();
+  });
+
+  test('a declaration inside the managed region is the lane talking to itself, and is ignored', async () => {
+    const body = [
+      'Operator text',
+      '',
+      `${MANAGED_REGION_BEGIN_PREFIX}${'a'.repeat(12)} -->`,
+      '```refinement-evidence',
+      JSON.stringify([{ issue: 1, path: 'src/a.ts' }]),
+      '```',
+      MANAGED_REGION_END,
+    ].join('\n');
+    const { result, calls } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({ body }),
+      evidence: serveFile('x'),
+    });
+    expect(result.kind).toBe('captured');
+    expect(result.snapshot.evidence).toEqual([]);
+    expect(calls.filter((c) => c[0] === 'readPredecessorEvidence')).toEqual([]);
+  });
+
+  test('captured evidence is sanitized like every other snapshot text, SHAs preserved', async () => {
+    const secrety = [
+      `const token = "ghp_${'a'.repeat(24)}";`,
+      'const auth = "Bearer abcdefgh1234567890";',
+      `const pin = "${'b'.repeat(40)}";`,
+    ].join('\n');
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([{ issue: 1, path: 'src/a.ts' }]) }),
+      evidence: serveFile(secrety),
+    });
+    const [entry] = result.snapshot.evidence;
+    expect(entry.content).not.toContain('ghp_');
+    expect(entry.content).toContain('[redacted]');
+    expect(entry.content).toContain('b'.repeat(40));
+  });
+
+  test('every evidence text field is charged to the manifest, and the bound holds', async () => {
+    const { result } = await build({ 1: predecessor(1) }, {
+      blockedBy: edges(1),
+      target: target({
+        body: bodyWithDeclaration([
+          { issue: 1, path: 'src/core/review-dispute-turn.ts', export: 'DisputeTurnSelection' },
+          { issue: 1, path: 'src/gone.ts' },
+          { issue: 99, path: 'src/other.ts' },
+        ]),
+      }),
+      evidence: (request) =>
+        request.path === 'src/gone.ts' ? { kind: 'missing_path' } : serveFile(SELECTOR_SOURCE)(request),
+    });
+    expect(result.kind).toBe('captured');
+    const { manifest, ...content } = result.snapshot;
+    let counted = 0;
+    const walk = (value) => {
+      if (typeof value === 'string') counted += Buffer.byteLength(value, 'utf8');
+      else if (Array.isArray(value)) value.forEach(walk);
+      else if (value && typeof value === 'object') Object.values(value).forEach(walk);
+    };
+    walk(content);
+    expect(manifest.totalTextBytes).toBe(counted);
+    expect(manifest.totalTextBytes).toBeLessThanOrEqual(manifest.maxTotalTextBytes);
+    expect(manifest.evidenceCount).toBe(3);
+  });
+
+  test('evidence is deterministic and fingerprinted: same inputs agree, different bytes diverge', async () => {
+    const opts = (content) => ({
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([{ issue: 1, path: 'src/a.ts' }]) }),
+      evidence: serveFile(content),
+    });
+    const a1 = (await build({ 1: predecessor(1) }, opts('AAA'))).result.snapshot;
+    const a2 = (await build({ 1: predecessor(1) }, opts('AAA'))).result.snapshot;
+    const b = (await build({ 1: predecessor(1) }, opts('BBB'))).result.snapshot;
+    expect(JSON.stringify(a1.evidence)).toBe(JSON.stringify(a2.evidence));
+    expect(a1.predecessorFingerprint).toBe(a2.predecessorFingerprint);
+    expect(b.predecessorFingerprint).not.toBe(a1.predecessorFingerprint);
+    // The stored fingerprint is reproducible from the stored snapshot — and
+    // only the four-argument form reproduces it, because evidence is hashed.
+    expect(
+      computePredecessorFingerprint(a1.target, a1.predecessors, LANE_LABELS, a1.evidence),
+    ).toBe(a1.predecessorFingerprint);
+    expect(computePredecessorFingerprint(a1.target, a1.predecessors, LANE_LABELS)).not.toBe(
+      a1.predecessorFingerprint,
+    );
+  });
+
+  // §5.2 (issue #1003): requiredness changes what the lane does with identical
+  // bytes, so §6's one-to-one rule has to cover it like every other selector
+  // field. Only DECLARING Issues move; an undeclared body still hashes the
+  // pre-evidence serialization (covered above).
+  test('requiredness is hashed: the same bytes under a different requirement diverge', async () => {
+    const opts = (selection) => ({
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([selection]) }),
+      evidence: serveFile('AAA'),
+    });
+    const required = (
+      await build({ 1: predecessor(1) }, opts({ issue: 1, path: 'src/a.ts' }))
+    ).result.snapshot;
+    const optional = (
+      await build({ 1: predecessor(1) }, opts({ issue: 1, path: 'src/a.ts', required: false }))
+    ).result.snapshot;
+    expect(required.evidence[0].content).toBe(optional.evidence[0].content);
+    expect(required.evidence[0].selector.required).toBe(true);
+    expect(optional.evidence[0].selector.required).toBe(false);
+    expect(optional.predecessorFingerprint).not.toBe(required.predecessorFingerprint);
+  });
+
+  test('an omission is hashed input too: captured versus omitted diverge on the same declaration', async () => {
+    const base = {
+      blockedBy: edges(1),
+      target: target({ body: bodyWithDeclaration([{ issue: 1, path: 'src/a.ts' }]) }),
+    };
+    const captured = (
+      await build({ 1: predecessor(1) }, { ...base, evidence: serveFile('AAA') })
+    ).result.snapshot;
+    const omitted = (
+      await build({ 1: predecessor(1) }, { ...base, evidence: () => ({ kind: 'missing_path' }) })
+    ).result.snapshot;
+    expect(captured.predecessorFingerprint).not.toBe(omitted.predecessorFingerprint);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.1 — the declaration parser and the export extractor, directly
+// ---------------------------------------------------------------------------
+
+describe('issue-refinement snapshot — §5.1 parser and extractor', () => {
+  test('a body with no block declares nothing; an unterminated or non-array block is malformed', () => {
+    expect(parseRefinementEvidenceDeclaration('plain body')).toEqual({ kind: 'none' });
+    expect(
+      parseRefinementEvidenceDeclaration('```refinement-evidence\n[]'),
+    ).toEqual({ kind: 'malformed', detail: 'unterminated_block' });
+    expect(
+      parseRefinementEvidenceDeclaration('```refinement-evidence\nnot json\n```'),
+    ).toEqual({ kind: 'malformed', detail: 'invalid_json' });
+    expect(
+      parseRefinementEvidenceDeclaration('```refinement-evidence\n{"issue":1}\n```'),
+    ).toEqual({ kind: 'malformed', detail: 'not_an_array' });
+  });
+
+  test('a declaration quoted inside an enclosing fence is literal, not live', () => {
+    // Inside a four-backtick block the inner triple-backtick lines are text,
+    // not fences, so the example must not become a live declaration.
+    const quoted = [
+      'Example of the format:',
+      '',
+      '````markdown',
+      '```refinement-evidence',
+      '[{ "issue": 950, "path": "src/core/x.ts" }]',
+      '```',
+      '````',
+    ].join('\n');
+    expect(parseRefinementEvidenceDeclaration(quoted)).toEqual({ kind: 'none' });
+    // A tilde fence encloses just the same.
+    expect(
+      parseRefinementEvidenceDeclaration(
+        ['~~~', '```refinement-evidence', '[]', '```', '~~~'].join('\n'),
+      ),
+    ).toEqual({ kind: 'none' });
+    // The quoted example neither shadows a real declaration after it nor
+    // counts toward the one-block rule.
+    const parsed = parseRefinementEvidenceDeclaration(
+      [quoted, '', bodyWithDeclaration([{ issue: 1, path: 'src/a.ts' }])].join('\n'),
+    );
+    expect(parsed.kind).toBe('declared');
+    expect(parsed.entries).toHaveLength(1);
+    expect(parsed.entries[0].kind).toBe('valid');
+  });
+
+  test('a longer-fenced declaration closes only on a fence at least as long', () => {
+    expect(parseRefinementEvidenceDeclaration('````refinement-evidence\n[]\n```')).toEqual({
+      kind: 'malformed',
+      detail: 'unterminated_block',
+    });
+    expect(parseRefinementEvidenceDeclaration('````refinement-evidence\n[]\n````')).toEqual({
+      kind: 'declared',
+      entries: [],
+    });
+  });
+
+  test('a valid entry normalizes its path and keeps the selector verbatim', () => {
+    const parsed = parseRefinementEvidenceDeclaration(
+      bodyWithDeclaration([{ issue: 950, path: './src/core/x.ts', export: 'Selector$1' }]),
+    );
+    expect(parsed.kind).toBe('declared');
+    expect(parsed.entries).toEqual([
+      {
+        kind: 'valid',
+        index: 0,
+        selector: {
+          issueNumber: 950,
+          path: 'src/core/x.ts',
+          exportName: 'Selector$1',
+          lines: null,
+          maxBytes: null,
+          required: true,
+        },
+      },
+    ]);
+  });
+
+  // §5.2 (issue #1003): the requirement is part of the closed schema, so only
+  // the JSON literal `false` opts a selection out — a truthy-looking string
+  // would be an interpreted requirement, which is not an explicit one.
+  test('`required` is parsed as a boolean, and anything else is an invalid selection', () => {
+    const optional = parseRefinementEvidenceDeclaration(
+      bodyWithDeclaration([{ issue: 950, path: 'src/a.ts', required: false }]),
+    );
+    expect(optional.entries[0].selector.required).toBe(false);
+    const explicit = parseRefinementEvidenceDeclaration(
+      bodyWithDeclaration([{ issue: 950, path: 'src/a.ts', required: true }]),
+    );
+    expect(explicit.entries[0].selector.required).toBe(true);
+    for (const value of ['false', 0, null]) {
+      const parsed = parseRefinementEvidenceDeclaration(
+        bodyWithDeclaration([{ issue: 950, path: 'src/a.ts', required: value }]),
+      );
+      expect(parsed.entries[0]).toEqual({
+        kind: 'invalid',
+        index: 0,
+        reason: 'invalid_selection',
+        detail: 'bad_required',
+      });
+    }
+  });
+
+  test('extracts a multi-line exported union type exactly, and a function body to its close', () => {
+    expect(extractExportedDeclaration(SELECTOR_SOURCE, 'DisputeTurnSelection')).toBe(
+      SELECTOR_TYPE_TEXT,
+    );
+    expect(extractExportedDeclaration(SELECTOR_SOURCE, 'selectNextDisputeSubTurn')).toBe(
+      ['export function selectNextDisputeSubTurn(state) {', '  return { kind: "terminal" };', '}'].join(
+        '\n',
+      ),
+    );
+    expect(extractExportedDeclaration(SELECTOR_SOURCE, 'UNRELATED_SECRET_ADJACENT')).toBe(
+      'export const UNRELATED_SECRET_ADJACENT = 1;',
+    );
+    expect(extractExportedDeclaration(SELECTOR_SOURCE, 'NoSuch')).toBeNull();
+  });
+
+  test('a second statement sharing the terminator line never rides into the capture', () => {
+    const shared = 'export const Selected = 1; export const InternalOnly = "secret";';
+    expect(extractExportedDeclaration(shared, 'Selected')).toBe('export const Selected = 1;');
+    // Mid-line, the second declaration is not findable either — never sliced at.
+    expect(extractExportedDeclaration(shared, 'InternalOnly')).toBeNull();
+    // A `}`-terminated declaration ends at its own close brace...
+    const fn = 'export function f() { return 1; } export const InternalOnly = 2;';
+    expect(extractExportedDeclaration(fn, 'f')).toBe('export function f() { return 1; }');
+    // ...while a same-line union member still continues past a balanced `}`,
+    // and the `;` after the last member ends the capture exactly.
+    const union = 'export type S = { a: 1 } | { b: 2 }; export const InternalOnly = 3;';
+    expect(extractExportedDeclaration(union, 'S')).toBe('export type S = { a: 1 } | { b: 2 };');
+  });
+
+  test('braces inside strings and comments do not derail the extractor', () => {
+    const tricky = [
+      'export const WEIRD = {',
+      '  // a comment with a stray { brace',
+      '  a: "a string with } inside",',
+      '  /* } another { */',
+      '  b: 2,',
+      '};',
+      'export const AFTER = 1;',
+    ].join('\n');
+    expect(extractExportedDeclaration(tricky, 'WEIRD')).toBe(
+      tricky.split('\n').slice(0, 6).join('\n'),
+    );
+  });
+
+  test('an unterminated declaration yields null, never a partial capture', () => {
+    expect(
+      extractExportedDeclaration('export interface Cut {\n  a: string;', 'Cut'),
+    ).toBeNull();
+  });
+
+  test('an export quoted in a comment or template literal is not a declaration', () => {
+    const commented = [
+      '/**',
+      ' * Docs quoting a shape that is NOT exported here:',
+      'export type NotActuallyExported = { a: string };',
+      ' */',
+      'export type Real = { b: number };',
+    ].join('\n');
+    expect(extractExportedDeclaration(commented, 'NotActuallyExported')).toBeNull();
+    expect(extractExportedDeclaration(commented, 'Real')).toBe(
+      'export type Real = { b: number };',
+    );
+
+    const templated = [
+      'const doc = `',
+      'export const InsideTemplate = 1;',
+      '`;',
+      'export const AfterTemplate = 2;',
+    ].join('\n');
+    expect(extractExportedDeclaration(templated, 'InsideTemplate')).toBeNull();
+    expect(extractExportedDeclaration(templated, 'AfterTemplate')).toBe(
+      'export const AfterTemplate = 2;',
+    );
+  });
+
+  test('a nested template inside `${…}` does not end the outer template', () => {
+    // The inner backtick pair must not be read as closing the outer template:
+    // the fake export on the middle line is template text, and the real
+    // declaration after the template is the one extracted.
+    const nested = [
+      'const x = `${`',
+      'export type Selected = { fake: true };',
+      '`}`;',
+      'export type Selected = { real: true };',
+    ].join('\n');
+    expect(extractExportedDeclaration(nested, 'Selected')).toBe(
+      'export type Selected = { real: true };',
+    );
+
+    // Braces nested inside a `${…}` expression (including a deeper template)
+    // must not detach the `}` that actually closes the expression, and a
+    // declaration whose initializer uses `${…}` still terminates exactly.
+    const braced = [
+      'const y = `${fmt({ a: `inner ${deep({ b: 1 })}` })}',
+      'export const InsideExpr = 1;',
+      '`;',
+      'export const GREETING = `hi ${wrap({ name })}`;',
+    ].join('\n');
+    expect(extractExportedDeclaration(braced, 'InsideExpr')).toBeNull();
+    expect(extractExportedDeclaration(braced, 'GREETING')).toBe(
+      'export const GREETING = `hi ${wrap({ name })}`;',
+    );
   });
 });

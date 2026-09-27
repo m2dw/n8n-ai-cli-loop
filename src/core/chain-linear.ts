@@ -43,7 +43,11 @@
  * task has started against it.
  */
 
-import { validateChainGraph } from "./chain-graph.js";
+import {
+  chainDiagnosticOwners,
+  describeChainOwnership,
+  validateChainGraph,
+} from "./chain-graph.js";
 import type {
   CanonicalChainGraph,
   ChainGraphDiagnostic,
@@ -259,7 +263,11 @@ export function ownedElsewhereChainLinearRefusal(
   const sorted = [...owners].sort(
     (a, b) => a.issueNumber - b.issueNumber || (a.chainId < b.chainId ? -1 : a.chainId > b.chainId ? 1 : 0),
   );
-  const rendered = sorted.map((o) => `#${o.issueNumber} (${o.chainId})`).join(", ");
+  // The owning chain is named with whatever identity the caller collected: an
+  // Issue number is unique only inside its repository (issue #1045), so a bare
+  // `#697 (chain_777)` does not say which #697 this is.
+  const rendered = sorted.map((o) => describeChainOwnership(o)).join(", ");
+  const identified = chainDiagnosticOwners(sorted);
   return refusal(
     "structural",
     false,
@@ -273,6 +281,7 @@ export function ownedElsewhereChainLinearRefusal(
           observedEdges: [],
           expectedEdges: [],
           chains: [...new Set(sorted.map((o) => o.chainId))].sort(),
+          ...(identified.length > 0 ? { owners: identified } : {}),
           message: `issues ${sorted.map((o) => o.issueNumber).join(", ")} already belong to another chain`,
         },
       ],

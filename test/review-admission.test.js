@@ -207,4 +207,29 @@ describe('resolveDependencyReviewBase', () => {
       missing: false,
     });
   });
+
+  // Issue #1165 (decision D5): the dependency flow's attestation that it
+  // incorporated one exact head, which is the only thing that may advance a
+  // changed-file Issue base. A malformed one is simply absent — it never
+  // changes review admission, and it never advances anything either.
+  test('admits a well-formed acceptance and ignores every malformed one', () => {
+    expect(
+      resolveDependencyReviewBase({
+        dependencyBase: { baseHeadSha: 'abc123', baseHeadAccepted: { sha: ' abc123 ', evidence: 'stack-ready' } },
+      }).base,
+    ).toEqual({ sha: 'abc123', refName: undefined, accepted: { sha: 'abc123', evidence: 'stack-ready' } });
+
+    for (const baseHeadAccepted of [
+      undefined,
+      null,
+      'stack-ready',
+      ['abc123'],
+      { sha: 'abc123' },
+      { sha: '', evidence: 'stack-ready' },
+      { sha: 'abc123', evidence: 'merged' },
+    ]) {
+      const parsed = resolveDependencyReviewBase({ dependencyBase: { baseHeadSha: 'abc123', baseHeadAccepted } });
+      expect([baseHeadAccepted, parsed.base.accepted]).toEqual([baseHeadAccepted, undefined]);
+    }
+  });
 });

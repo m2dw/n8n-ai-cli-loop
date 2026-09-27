@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createConflictResolutionHandler as _createConflictResolutionHandler } from '../dist/handlers/conflict-resolution.js';
@@ -786,6 +786,43 @@ describe('conflict resolution — merge abort / cleanup', () => {
     expect(result.retryAfterMs).toBeLessThan(60 * 60 * 1000);
     expect(result.message).toMatch(/rate limit/i);
     expect(result.message).not.toMatch(/usage quota/i);
+  });
+
+  // Issue #911 review: an `agent-profiles.json` overlay (found beside the
+  // sessions file this run loaded, threaded via context.sessionsPath) can
+  // select an operator-supplied claude executable. That binary's stderr has no
+  // provider provenance (docs/phase-contracts.md "Stderr: a bounded,
+  // provider-owned diagnostic channel"), so quota-shaped text from it must
+  // fail as an ordinary failure rather than convert into an automatic delayed
+  // retry.
+  test('quota-shaped stderr from an overlay-selected binary fails instead of delaying (issue #911 review)', async () => {
+    const configDir = join(tmpDir, 'custom-config');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'agent-profiles.json'), JSON.stringify({
+      schemaVersion: 1,
+      providers: { anthropic: { profiles: { 'claude-normal': { binary: '/opt/claude-wrapper' } } } },
+    }), 'utf8');
+    const runner = sequenceRunner(setupSteps([
+      { stdout: '', stderr: 'CONFLICT', exitCode: 1 },             // merge (conflicts)
+      { stdout: TEXT_CONFLICT_LS_FILES, stderr: '', exitCode: 0 }, // ls-files -u
+      { stdout: '12\t3\tsrc/foo.ts\n', stderr: '', exitCode: 0 },  // diff --numstat (foo text)
+      { stdout: '4\t5\tsrc/bar.ts\n', stderr: '', exitCode: 0 },   // diff --numstat (bar text)
+      { stdout: 'src/foo.ts\nsrc/bar.ts\n', stderr: '', exitCode: 0 }, // diff --cached --name-only (baseline)
+      { stdout: '', stderr: '', exitCode: 0 },                     // git diff prBranch...baseBranch (main-side changes)
+      { stdout: '', stderr: 'Error: HTTP 429 too many requests', exitCode: 1 }, // wrapper — quota-shaped, untrusted
+      { stdout: '', stderr: '', exitCode: 0 },                     // status --porcelain (no residue from the failed agent)
+      { stdout: '', stderr: '', exitCode: 0 },                     // merge --abort
+    ]));
+    const result = await createConflictResolutionHandler(
+      CONTEXT({ sessionsPath: join(configDir, 'sessions.json') }), runner,
+    )(makeTask());
+
+    expect(result.result).toBe('failed');
+    expect(result.error).toMatch(/agent exited 1/);
+    // The overridden binary actually ran (the overlay took effect) and the
+    // merge was still aborted on the ordinary-failure path.
+    expect(runner.calls.some((c) => c.cmd === '/opt/claude-wrapper')).toBe(true);
+    expect(findCall(runner.calls, 'git', (a) => a[0] === 'merge' && a[1] === '--abort')).toBeTruthy();
   });
 
   test('cleans agent residue when the agent exits non-zero after creating untracked/unstaged files', async () => {

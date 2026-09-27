@@ -1421,12 +1421,31 @@ describe('ownership collection', () => {
     });
 
     expect(await collectChainOwnership(store, [5, 7])).toEqual([
-      { issueNumber: 5, chainId: first },
-      { issueNumber: 7, chainId: second },
+      { issueNumber: 5, chainId: first, sessionId: 's1' },
+      { issueNumber: 7, chainId: second, sessionId: 's1' },
     ]);
     expect(await collectChainOwnership(store, [5, 7], { excludeChainId: second })).toEqual([
-      { issueNumber: 5, chainId: first },
+      { issueNumber: 5, chainId: first, sessionId: 's1' },
     ]);
+  });
+
+  test('it names the repository a conflicting chain belongs to when the caller knows it', async () => {
+    // An Issue number is unique only within its repository (issue #1045), so a
+    // caller that knows the mapping can have it carried into the diagnostic.
+    const owner = await createChain({ headIssueNumber: 5 });
+
+    expect(
+      await collectChainOwnership(store, [5], {
+        repositoryBySessionId: new Map([['s1', 'm2dw/yoda_form_js']]),
+      }),
+    ).toEqual([
+      { issueNumber: 5, chainId: owner, sessionId: 's1', repository: 'm2dw/yoda_form_js' },
+    ]);
+
+    // A session the map says nothing about simply leaves the repository unnamed.
+    expect(
+      await collectChainOwnership(store, [5], { repositoryBySessionId: new Map() }),
+    ).toEqual([{ issueNumber: 5, chainId: owner, sessionId: 's1' }]);
   });
 
   test('repeated and malformed issue numbers are not queried twice or at all', async () => {
@@ -1440,6 +1459,6 @@ describe('ownership collection', () => {
     };
     const entries = await collectChainOwnership(probe, [5, 5, 0, -1, 'x']);
     expect(asked).toEqual([5]);
-    expect(entries).toEqual([{ issueNumber: 5, chainId }]);
+    expect(entries).toEqual([{ issueNumber: 5, chainId, sessionId: 's1' }]);
   });
 });

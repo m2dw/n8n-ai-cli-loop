@@ -536,6 +536,10 @@ describe('docs/review-dispute-contract.md — persistence and publication', () =
       // Issue #838 review, P2: bytes the RUNNER wrote about a subprocess that
       // never ran have their own file, so neither transcript above carries them.
       'reconsideration-runner-error-<lineageId>.txt',
+      // Issue #1085: the `read-bounded` lane's CLI separates progress from the
+      // answer, so its stdout is neither the transcript nor the verdict and
+      // gets a file whose name says which it is.
+      'reconsideration-events-<lineageId>.jsonl',
       // Issue #846: the arbitration run's §8.2 bundle manifest — written before
       // the arbiter answers, so a malformed verdict still records what it saw —
       // and the three transcripts that mirror the reconsideration ones.
@@ -543,9 +547,30 @@ describe('docs/review-dispute-contract.md — persistence and publication', () =
       'arbitration-raw-<lineageId>.txt',
       'arbitration-stderr-<lineageId>.txt',
       'arbitration-runner-error-<lineageId>.txt',
+      // Issue #956: §7.1 dispatches one evidence-collection run PER PARTY for one
+      // lineage, so the record and the three transcripts are party-scoped —
+      // neither run may overwrite the other's.
+      'evidence-<party>-<lineageId>.json',
+      'evidence-raw-<party>-<lineageId>.txt',
+      'evidence-stderr-<party>-<lineageId>.txt',
+      'evidence-runner-error-<party>-<lineageId>.txt',
     ]) {
       expect(doc).toContain(artifact);
     }
+  });
+
+  // Issue #956: the persisted evidence-collection record. It is bounded task
+  // state like `disputeRuns` and `appliedTransitions`, so the contract has to
+  // say what it holds, what an older block's absence of a field means, and what
+  // may never reach it — otherwise a later runner could persist an excerpt, a
+  // path, or a party state nothing defines.
+  test('bounds the evidence round with a per-party collection record', () => {
+    expect(doc).toMatch(/`task\.context\.reviewDisputeEvidenceRound` records/);
+    expect(doc).toMatch(/`running`, `recoverable`, or `completed`; a party with no record has not\s+started/);
+    expect(doc).toMatch(/Zero\s+admitted attachments is a completed party, never a missing one/);
+    expect(doc).toMatch(/a quoted span of the Issue body is persisted as a digest and a length/);
+    expect(doc).toMatch(/Artifacts are named by base name, digest,\s+and byte length, never by path/);
+    expect(doc).toMatch(/the absent fields mean `completed`, round 1, and "no\s+reference detail was recorded"/);
   });
 
   // Issue #838 review, P2: the raw transcript is the agent's bytes, not the
@@ -743,10 +768,16 @@ describe('docs/review-dispute-contract.md — open specification gaps', () => {
     expect(doc).toMatch(/records a request against a \*\*resolved\*\* lineage without overturning it/);
   });
 
-  test('records the undispatched-turn park as a dispatcher gap, not an operator one', () => {
+  // Issue #964 gave the last §7.1 turn its dispatcher and issue #965 qualified
+  // the whole set, so G2 no longer describes "a turn nobody runs". It must still
+  // describe the fail-closed stop that remains, and it must NOT be closed by
+  // inventing an operator transition that moves a lineage nobody adjudicated.
+  test('records the undispatched-turn park as a fail-closed stop with no operator transition', () => {
     expect(doc).toMatch(/G2 — no operator continuation for the undispatched-turn park/);
+    expect(doc).toMatch(/Every turn now has a dispatcher/);
+    expect(doc).toMatch(/fail-closed stop for a run that could not ANSWER its turn/);
     expect(doc).toMatch(
-      /The gap closes by implementing the missing dispatchers, not by adding an operator transition/,
+      /not adding an operator command that moves a lineage nobody adjudicated/,
     );
   });
 

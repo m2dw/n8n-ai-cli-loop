@@ -24,16 +24,16 @@ import {
   statSync,
   writeFileSync,
 } from "fs";
-import { homedir } from "os";
 import { basename, join } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 import {
-  ARTIFACT_DIR_CONTEXT_FIELDS,
   ARTIFACT_DIR_PENDING_CONTEXT_FIELD,
+  collectArtifactDirReferences,
   isSafeArtifactDirAfterRun,
 } from "../handlers/artifact-dir.js";
 import { seedMaintenanceLock } from "./sqlite-maintenance-lock.js";
 
-export const DEFAULT_BACKUP_DIR = join(homedir(), ".config", "n8n-ai-cli-loop", "backups");
+export const DEFAULT_BACKUP_DIR = join(resolveHomeDir(), ".config", "n8n-ai-cli-loop", "backups");
 
 /** §8: at least the 3 most recent verified backups per dbPath are retained. */
 export const BACKUP_RETENTION_FLOOR = 3;
@@ -457,6 +457,12 @@ export interface RestoreResult {
  * deleted or redirected — so restore must fail before the replacement file
  * is ever renamed into place, not after.
  *
+ * "Every field" is `collectArtifactDirReferences`, which includes the
+ * per-lineage dispute/reconsideration records' own directories and not just
+ * the top-level scalars: on a task with two disputed lineages the scalars name
+ * only the last run, so an earlier still-live lineage's directory is reachable
+ * only through its nested entry (issue #955 review, P1).
+ *
  * This is a scoped, interim check: the contract's full point-5 design keys
  * validation off a durable `session_id -> artifactRoot` mapping (that part
  * does not exist yet — separate, larger follow-up surface). It does,
@@ -507,10 +513,8 @@ function validateRestoredArtifactReferences(
     }
     if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) continue;
     const ctxObj = ctx as Record<string, unknown>;
-    for (const field of ARTIFACT_DIR_CONTEXT_FIELDS) {
-      const dir = ctxObj[field];
-      if (typeof dir !== "string" || dir.length === 0) continue;
-      if (field === "artifactDir" && ctxObj[ARTIFACT_DIR_PENDING_CONTEXT_FIELD] === true) continue;
+    for (const { field, dir, isPendingEligible } of collectArtifactDirReferences(ctxObj)) {
+      if (isPendingEligible && ctxObj[ARTIFACT_DIR_PENDING_CONTEXT_FIELD] === true) continue;
       if (!isSafeArtifactDirAfterRun(artifactRoot, dir)) {
         return {
           ok: false,

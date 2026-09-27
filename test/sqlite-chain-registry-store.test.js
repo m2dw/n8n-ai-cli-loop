@@ -397,8 +397,11 @@ describe('DAG persistence', () => {
 
     expect(refused.ok).toBe(false);
     expect(refused.code).toBe('conflict');
-    expect(refused.owners).toEqual([{ issueNumber: 42, chainId: 'chain_10' }]);
-    expect(refused.detail).toContain('issue 42 already belongs to chain chain_10');
+    // The owning session rides along: an Issue number identifies an Issue only
+    // within one repository, so a caller cannot attribute the conflict without
+    // it (issue #1045).
+    expect(refused.owners).toEqual([{ issueNumber: 42, chainId: 'chain_10', sessionId: 's1' }]);
+    expect(refused.detail).toContain('issue 42 already belongs to chain chain_10 (session s1)');
     // The claim is decided before anything moves, so the loser is untouched.
     expect(rowCounts()).toEqual(before);
     expect((await store.getChainRecord('chain_20')).graphRevision).toBe(1);
@@ -449,7 +452,7 @@ describe('DAG persistence', () => {
     // wave exactly that acceptance through.
     expect(again.ok).toBe(false);
     expect(again.code).toBe('conflict');
-    expect(again.owners).toEqual([{ issueNumber: 42, chainId: 'chain_20' }]);
+    expect(again.owners).toEqual([{ issueNumber: 42, chainId: 'chain_20', sessionId: 's1' }]);
     expect(rowCounts()).toEqual(rowsBefore);
     expect(await store.getChainRecord('chain_10')).toEqual(before);
   });
@@ -476,8 +479,94 @@ describe('DAG persistence', () => {
     // Every offender, ascending, across batch boundaries — the order the port
     // promises is over the whole result, not within a batch.
     expect(claimed.owners).toEqual(
-      many.map((m) => ({ issueNumber: m.issueNumber, chainId: 'chain_10' })),
+      many.map((m) => ({ issueNumber: m.issueNumber, chainId: 'chain_10', sessionId: 's1' })),
     );
+  });
+
+  test('a multi-session claim scope binds every session it names, and only those', async () => {
+    // The repository-scoped shape (issue #1045): sessions `s1` and `s2` are two
+    // views of one repository, `s3` is a different repository that happens to
+    // number an Issue the same.
+    await createChain({
+      headIssueNumber: 10,
+      sessionId: 's2',
+      members: [{ issueNumber: 10, role: 'head' }, { issueNumber: 697 }],
+    });
+    await createChain({
+      headIssueNumber: 20,
+      sessionId: 's3',
+      members: [{ issueNumber: 20, role: 'head' }, { issueNumber: 698 }],
+    });
+    await createChain({ headIssueNumber: 30, sessionId: 's1' });
+
+    // 698 is claimed by a chain outside the scope, so it does not refuse.
+    const written = await store.putChainGraph({
+      chainId: 'chain_30',
+      members: [{ issueNumber: 30, role: 'head' }, { issueNumber: 698 }],
+      edges: [],
+      exclusiveMemberScope: { sessionIds: ['s1', 's2'] },
+      now: LATER,
+    });
+    expect(written.ok).toBe(true);
+
+    // 697 is claimed by the sibling session inside the scope, so it does.
+    const refused = await store.putChainGraph({
+      chainId: 'chain_30',
+      members: [{ issueNumber: 30, role: 'head' }, { issueNumber: 697 }],
+      edges: [],
+      exclusiveMemberScope: { sessionIds: ['s1', 's2'] },
+      now: LATER,
+    });
+    expect(refused.ok).toBe(false);
+    expect(refused.code).toBe('conflict');
+    expect(refused.owners).toEqual([{ issueNumber: 697, chainId: 'chain_10', sessionId: 's2' }]);
+  });
+
+  test('an empty claim scope is refused rather than read as an unscoped claim', async () => {
+    await createChain({ headIssueNumber: 10, members: [{ issueNumber: 10 }, { issueNumber: 42 }] });
+    await createChain({ headIssueNumber: 20 });
+    const before = rowCounts();
+
+    // Naming no session describes a claim against no chain at all, which would
+    // let the write through exactly as if no claim had been asked for.
+    const refused = await store.putChainGraph({
+      chainId: 'chain_20',
+      members: [{ issueNumber: 20, role: 'head' }, { issueNumber: 42 }],
+      edges: [],
+      exclusiveMemberScope: { sessionIds: [] },
+      now: LATER,
+    });
+
+    expect(refused.ok).toBe(false);
+    expect(refused.code).toBe('invalid_input');
+    expect(rowCounts()).toEqual(before);
+  });
+
+  test('a session-list filter scopes the chain listings too', async () => {
+    for (const [head, sessionId] of [[10, 's1'], [20, 's2'], [30, 's3']]) {
+      await createChain({
+        headIssueNumber: head,
+        sessionId,
+        members: [{ issueNumber: head, role: 'head' }, { issueNumber: 697 }],
+      });
+    }
+
+    expect((await store.listChains({ sessionIds: ['s1', 's2'] })).map((c) => c.chainId)).toEqual([
+      'chain_10',
+      'chain_20',
+    ]);
+    expect(
+      (await store.listChainsForIssue(697, { sessionIds: ['s1', 's2'] })).map((c) => c.chainId),
+    ).toEqual(['chain_10', 'chain_20']);
+    // An empty list names no session, so it matches no chain — never every chain.
+    expect(await store.listChainsForIssue(697, { sessionIds: [] })).toEqual([]);
+    expect(await store.listChains({ sessionIds: [] })).toEqual([]);
+    // Both fields apply: the single session must also be in the list.
+    expect(
+      (await store.listChainsForIssue(697, { sessionId: 's3', sessionIds: ['s1', 's3'] })).map(
+        (c) => c.chainId,
+      ),
+    ).toEqual(['chain_30']);
   });
 
   test('an exclusive member claim over an unowned graph of that size is written', async () => {

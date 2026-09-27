@@ -163,6 +163,12 @@ export interface AcceptChainGraphInput {
    */
   ownershipScope?: ChainListFilter;
   /**
+   * `owner/repo` per session id, used only to name the repository a
+   * duplicate-ownership diagnostic implicates (issue #1045). It changes no
+   * verdict: what is checked is decided by `ownershipScope` alone.
+   */
+  repositoryBySessionId?: ReadonlyMap<string, string>;
+  /**
    * Chains whose ownership of the candidate's members does not refuse this
    * acceptance, passed through to the store's exclusive claim as
    * {@link import("./chain-registry.js").PutChainGraphInput.tolerateOwnerChainIds}.
@@ -380,11 +386,26 @@ export type ChainGraphAcceptance =
  *
  * Malformed Issue numbers are skipped rather than queried: validation reports
  * them, and asking the store about them would only invent a failure mode.
+ *
+ * `filter` is what scopes the question. An Issue number identifies an Issue only
+ * within one repository (issue #1045), so a lookup left unscoped compares bare
+ * numbers across every session on the machine and reports two unrelated `#697`s
+ * as one Issue. `resolveChainOwnershipScope` (`chain-ownership-scope.ts`) is
+ * what every chain command derives that filter from.
  */
 export async function collectChainOwnership(
   store: Pick<ChainRegistryStore, "listChainsForIssue">,
   issueNumbers: readonly number[],
-  options?: { filter?: ChainListFilter; excludeChainId?: string },
+  options?: {
+    filter?: ChainListFilter;
+    excludeChainId?: string;
+    /**
+     * `owner/repo` per session, for the identity a duplicate-ownership
+     * diagnostic renders. Absent entries simply leave the repository unnamed —
+     * the finding itself does not depend on it.
+     */
+    repositoryBySessionId?: ReadonlyMap<string, string>;
+  },
 ): Promise<ChainOwnershipEntry[]> {
   const seen = new Set<number>();
   const entries: ChainOwnershipEntry[] = [];
@@ -397,7 +418,13 @@ export async function collectChainOwnership(
       if (options?.excludeChainId !== undefined && chain.chainId === options.excludeChainId) {
         continue;
       }
-      entries.push({ issueNumber, chainId: chain.chainId });
+      const repository = options?.repositoryBySessionId?.get(chain.sessionId);
+      entries.push({
+        issueNumber,
+        chainId: chain.chainId,
+        sessionId: chain.sessionId,
+        ...(repository === undefined ? {} : { repository }),
+      });
     }
   }
 
@@ -599,9 +626,29 @@ export async function acceptChainGraph(
     await collectChainOwnership(
       store,
       input.members.map((member) => member.issueNumber),
-      { filter: ownershipScope, excludeChainId: chainId },
+      {
+        filter: ownershipScope,
+        excludeChainId: chainId,
+        ...(input.repositoryBySessionId === undefined
+          ? {}
+          : { repositoryBySessionId: input.repositoryBySessionId }),
+      },
     )
   ).filter((entry) => !tolerated.has(entry.chainId));
+
+  /** An owner the store reported from inside its claim, given the same identity. */
+  const describeRacedOwner = (owner: ChainMemberOwner): ChainOwnershipEntry => {
+    const repository =
+      owner.sessionId === undefined
+        ? undefined
+        : input.repositoryBySessionId?.get(owner.sessionId);
+    return {
+      issueNumber: owner.issueNumber,
+      chainId: owner.chainId,
+      ...(owner.sessionId === undefined ? {} : { sessionId: owner.sessionId }),
+      ...(repository === undefined ? {} : { repository }),
+    };
+  };
 
   const candidate = { chainId, headIssueNumber, members: input.members, edges: input.edges };
 
@@ -624,7 +671,9 @@ export async function acceptChainGraph(
     acceptedRevision: number | undefined,
   ): ChainGraphAcceptance => {
     if (put.owners !== undefined && put.owners.length > 0) {
-      const raced = validateChainGraph(candidate, { ownership: [...ownership, ...put.owners] });
+      const raced = validateChainGraph(candidate, {
+        ownership: [...ownership, ...put.owners.map(describeRacedOwner)],
+      });
       if (!raced.ok) {
         return {
           status: "rejected",

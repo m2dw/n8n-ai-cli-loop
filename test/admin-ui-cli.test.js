@@ -2,7 +2,16 @@ import { execFileSync } from 'child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { SqliteTaskStore } from '../dist/index.js';
+import {
+  SqliteTaskStore,
+  MAX_VERIFICATION_AMENDMENT_COMMAND_CHARS,
+  MAX_VERIFICATION_AMENDMENT_OPERATIONS,
+  MAX_VERIFICATION_AMENDMENT_REASON_CHARS,
+  MAX_VERIFICATION_AMENDMENT_REVISIONS,
+  MAX_VERIFICATION_PLAN_REQUIREMENTS,
+  MAX_VERIFICATION_SESSION_BASELINE_ENTRIES,
+  VERIFICATION_REQUEST_KEY_PATTERN,
+} from '../dist/index.js';
 import {
   ACTIVE_STATUSES,
   isActiveStatus,
@@ -15,6 +24,10 @@ import {
   isCapRecoverable,
   isToolRequestHandoff,
   isHumanReviewHandoff,
+  isRefinementRecoverable,
+  isMergedPrReconcilable,
+  buildRefinementRecoverArgv,
+  buildTaskReconcileMergedArgv,
   collectActiveTasks,
   partitionByGitHubState,
   buildGhIssueStateReader,
@@ -49,6 +62,24 @@ import {
   formatFilterStatus,
   formatSessionScope,
   sessionIdsForScope,
+  buildTaskVerificationShowArgv,
+  buildTaskVerificationAmendArgv,
+  buildTaskVerificationRefreshArgv,
+  buildTaskVerificationResetArgv,
+  parseRefreshIssueBodyDigest,
+  parsePreviewBasePlanDigest,
+  parsePreviewUnchangedPlanDigest,
+  parsePreviewRequestKey,
+  newVerificationRequestKey,
+  parseAppliedRevisionOrdinal,
+  isRedactedCommandText,
+  parseVerificationPlanView,
+  formatVerificationPlanDetail,
+  previousAmendmentReason,
+  verificationContinuationChoices,
+  hasVerificationAmendments,
+  isVerificationAmendable,
+  ADMIN_COMMAND_MAX_BUFFER_BYTES,
 } from '../dist/cli/admin-ui.js';
 
 const CLI = new URL('../dist/cli/admin.js', import.meta.url).pathname;
@@ -305,8 +336,88 @@ describe('admin ui — command building', () => {
     expect(
       isHumanReviewHandoff(mkTask({ status: 'ready_for_human', context: { toolRequest: { command: 'x' } } })),
     ).toBe(false);
+    // Issue #980: a stopped Issue refinement is `ready_for_human` too, but it
+    // has its own §13 recovery command — `human-review-return` and generic
+    // `recover` would both leave the failed attempt's block in place.
+    const stoppedRefinement = mkTask({
+      status: 'ready_for_human',
+      phase: 'refinement',
+      context: { refinement: { state: 'escalated_human', handoffReason: 'critique_blocked' } },
+    });
+    expect(isHumanReviewHandoff(stoppedRefinement)).toBe(false);
+    expect(isRefinementRecoverable(stoppedRefinement)).toBe(true);
+    expect(buildTaskMenuActions(stoppedRefinement, '2026-06-20T12:00:00.000Z').map((a) => a.action))
+      .toContain('refinement-recover');
+    expect(buildRefinementRecoverArgv(stoppedRefinement, '/tmp/db', '/tmp/sessions.json')).toEqual([
+      'refinement', 'recover',
+      '--session-id', 'session-a',
+      '--issue-number', '1',
+      '--db-path', '/tmp/db',
+      '--sessions-path', '/tmp/sessions.json',
+    ]);
+    expect(buildRefinementRecoverArgv(stoppedRefinement, undefined, undefined, { yes: true }))
+      .toEqual(['refinement', 'recover', '--session-id', 'session-a', '--issue-number', '1', '--yes']);
+
+    // A refinement task that has NOT stopped is an ordinary handoff again: the
+    // recovery command refuses any state but `escalated_human`.
+    const midLane = mkTask({
+      status: 'ready_for_human',
+      phase: 'refinement',
+      context: { refinement: { state: 'drafting' } },
+    });
+    expect(isRefinementRecoverable(midLane)).toBe(false);
+    expect(isHumanReviewHandoff(midLane)).toBe(true);
+
     // Not a human handoff at all.
     expect(isHumanReviewHandoff(mkTask({ status: 'failed' }))).toBe(false);
+  });
+
+  // Issue #1048: the merged-PR reconciliation entry. Additive (it never
+  // replaces a recovery action), gated on task state alone so the menu cannot
+  // offer a command the contract would refuse outright, and surfaced as
+  // preview+apply commands rather than run for the operator.
+  test('buildTaskMenuActions offers reconcile-merged only for a task the contract could write', () => {
+    const now = '2026-06-20T12:00:00.000Z';
+    const withPr = (overrides) =>
+      mkTask({ context: { prUrl: 'https://github.com/o/r/pull/7' }, ...overrides });
+
+    for (const status of ['queued', 'blocked', 'ready_for_human', 'failed', 'cancelled']) {
+      expect(isMergedPrReconcilable(withPr({ status }))).toBe(true);
+      expect(buildTaskMenuActions(withPr({ status }), now).map((a) => a.action))
+        .toContain('reconcile-merged');
+    }
+
+    // No recorded PR identity — the contract never derives one from the Issue
+    // number, so the command would refuse `missing-pr-identity`.
+    expect(isMergedPrReconcilable(mkTask({ status: 'queued' }))).toBe(false);
+    expect(buildTaskMenuActions(mkTask({ status: 'queued' }), now).map((a) => a.action))
+      .not.toContain('reconcile-merged');
+
+    // `claimed`/`running` are never reconciled, and `done` is a no-op.
+    for (const status of ['claimed', 'running', 'done']) {
+      expect(isMergedPrReconcilable(withPr({ status }))).toBe(false);
+      expect(buildTaskMenuActions(withPr({ status }), now).map((a) => a.action))
+        .not.toContain('reconcile-merged');
+    }
+
+    // Additive: a failed task still gets generic recover beside it.
+    const failedActions = buildTaskMenuActions(withPr({ status: 'failed' }), now).map((a) => a.action);
+    expect(failedActions).toContain('recover');
+    expect(failedActions).toContain('reconcile-merged');
+  });
+
+  test('buildTaskReconcileMergedArgv previews by default and applies only on request', () => {
+    const task = mkTask({ sessionId: 'sx', issueNumber: 42, context: { prUrl: 'https://x/pull/7' } });
+    expect(buildTaskReconcileMergedArgv(task, '/tmp/db', '/tmp/sessions.json')).toEqual([
+      'task', 'reconcile-merged',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--db-path', '/tmp/db',
+      '--sessions-path', '/tmp/sessions.json',
+    ]);
+    expect(buildTaskReconcileMergedArgv(task, undefined, undefined, { yes: true })).toEqual([
+      'task', 'reconcile-merged', '--session-id', 'sx', '--issue-number', '42', '--yes',
+    ]);
   });
 
   test('buildHumanReviewReturnArgv targets the dedicated review-return flow', () => {
@@ -603,6 +714,33 @@ describe('admin ui — collectActiveTasks', () => {
     const tasks = await collectActiveTasks(store, ['session-a']);
     store.close();
     expect(tasks).toHaveLength(0);
+  });
+
+  // Issue #1048: `cancelled` is not an active status, but it is one of the
+  // statuses the merged-PR reconciliation command can write. The task menu is
+  // only ever built for a task this function returned, so excluding it would
+  // make the reconciliation action unreachable for that case.
+  test('includes a cancelled task only while it is still merged-PR reconcilable', async () => {
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({ sessionId: 'session-a', issueNumber: 1, phase: 'implementation' });
+    await store.enqueueTask({ sessionId: 'session-a', issueNumber: 2, phase: 'implementation' });
+    await store.transitionTask(
+      { sessionId: 'session-a', issueNumber: 1 },
+      { status: 'queued' },
+      { status: 'cancelled', context: { prUrl: 'https://github.com/o/r/pull/7' } },
+    );
+    // No recorded PR identity: the command would refuse it, so it stays out.
+    await store.transitionTask(
+      { sessionId: 'session-a', issueNumber: 2 },
+      { status: 'queued' },
+      { status: 'cancelled' },
+    );
+
+    const tasks = await collectActiveTasks(store, ['session-a']);
+    store.close();
+    expect(tasks.map((t) => t.issueNumber)).toEqual([1]);
+    expect(buildTaskMenuActions(tasks[0], '2026-06-20T12:00:00.000Z').map((a) => a.action))
+      .toContain('reconcile-merged');
   });
 });
 
@@ -1379,5 +1517,443 @@ describe('admin ui — worktree lock awareness', () => {
     const help = nonTtyHelp();
     expect(help).toContain('admin status');
     expect(help).toContain('worktree release-lock');
+    expect(help).toContain('task-verification show');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Verification plan view (issue #1044)
+// ---------------------------------------------------------------------------
+
+describe('admin ui — verification plan', () => {
+  const now = '2026-06-20T12:00:00.000Z';
+  const task = mkTask({ sessionId: 'sx', issueNumber: 42, status: 'ready_for_human', phase: 'review' });
+
+  test('the entry is offered for an amendable task and labels an amended one', () => {
+    expect(buildTaskMenuActions(task, now).map((a) => a.action)).toContain('verification');
+
+    const amended = mkTask({
+      status: 'running',
+      context: { verificationAmendments: { revisions: [], checkpoint: {} } },
+    });
+    expect(hasVerificationAmendments(amended)).toBe(true);
+    // A running task cannot be amended, but its recorded plan must still be
+    // inspectable — the view reports the refusal instead of hiding the entry.
+    expect(isVerificationAmendable(amended)).toBe(false);
+    const entry = buildTaskMenuActions(amended, now).find((a) => a.action === 'verification');
+    expect(entry.label).toContain('AMENDED');
+
+    // A running task with no amendment record has nothing to inspect.
+    expect(
+      buildTaskMenuActions(mkTask({ status: 'running' }), now).map((a) => a.action),
+    ).not.toContain('verification');
+  });
+
+  // A plan that stays entirely inside the documented bounds still prints more
+  // than Node's default 1 MiB capture, and a truncated payload is not a payload
+  // the view could parse (issue #1044 review, P2).
+  test('the admin spawn can capture a show payload as large as the contract permits', () => {
+    const worstCaseSlots =
+      MAX_VERIFICATION_SESSION_BASELINE_ENTRIES +
+      MAX_VERIFICATION_PLAN_REQUIREMENTS +
+      MAX_VERIFICATION_AMENDMENT_REVISIONS * MAX_VERIFICATION_AMENDMENT_OPERATIONS;
+    // Commands and reasons alone — every key, digest and ordinal the payload
+    // also carries is on top of this, so the real bound must exceed it.
+    const worstCaseBytes =
+      worstCaseSlots * MAX_VERIFICATION_AMENDMENT_COMMAND_CHARS +
+      MAX_VERIFICATION_AMENDMENT_REVISIONS * MAX_VERIFICATION_AMENDMENT_REASON_CHARS;
+    expect(worstCaseBytes).toBeGreaterThan(1024 * 1024);
+    expect(ADMIN_COMMAND_MAX_BUFFER_BYTES).toBeGreaterThan(worstCaseBytes);
+
+    // And the ceiling is what makes the difference: output that a default-buffer
+    // spawn kills with ENOBUFS — leaving truncated JSON behind — comes back
+    // whole under the bound the UI spawns with.
+    const size = 2 * 1024 * 1024;
+    const argv = ['-e', `process.stdout.write('x'.repeat(${size}))`];
+    expect(() => execFileSync(process.execPath, argv, { encoding: 'utf8' })).toThrow(/ENOBUFS/);
+    const captured = execFileSync(process.execPath, argv, {
+      encoding: 'utf8',
+      maxBuffer: ADMIN_COMMAND_MAX_BUFFER_BYTES,
+    });
+    expect(captured.length).toBe(size);
+  }, 30_000);
+
+  test('the amend argv binds each --command to the operation flag it follows', () => {
+    const argv = buildTaskVerificationAmendArgv(
+      task,
+      {
+        operations: [
+          { flag: '--replace', value: 'req:abc', command: 'npm run e2e', opReason: 'typo' },
+          { flag: '--add-execution', value: 'lint', command: 'npm run lint' },
+          { flag: '--retire', value: 'exec:test' },
+        ],
+        reason: 'correcting the plan',
+        continueMode: 'review',
+        expectPlanDigest: 'deadbeef',
+        yes: true,
+      },
+      '/tmp/db',
+      '/tmp/sessions.json',
+    );
+    expect(argv).toEqual([
+      'task-verification', 'amend',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--db-path', '/tmp/db',
+      '--sessions-path', '/tmp/sessions.json',
+      '--replace', 'req:abc', '--command', 'npm run e2e', '--op-reason', 'typo',
+      '--add-execution', 'lint', '--command', 'npm run lint',
+      '--retire', 'exec:test',
+      '--reason', 'correcting the plan',
+      '--continue', 'review',
+      '--expect-plan-digest', 'deadbeef',
+      '--yes',
+    ]);
+    // The preview form is the same command minus --yes: nothing is written and
+    // what the operator confirms is what runs.
+    expect(
+      buildTaskVerificationAmendArgv(task, { operations: [{ flag: '--retire', value: 'exec:test' }], reason: 'r' }),
+    ).toEqual([
+      'task-verification', 'amend',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--retire', 'exec:test',
+      '--reason', 'r',
+    ]);
+  });
+
+  test('show, refresh and reset argv carry the flags their contracts require', () => {
+    expect(buildTaskVerificationShowArgv(task, '/tmp/db', undefined, { json: true })).toEqual([
+      'task-verification', 'show',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--db-path', '/tmp/db',
+      '--json',
+    ]);
+    expect(buildTaskVerificationRefreshArgv(task, { reason: 'r', allowRetire: true, yes: true })).toEqual([
+      'task-verification', 'refresh-from-issue',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--reason', 'r',
+      '--allow-retire',
+      '--yes',
+    ]);
+    expect(buildTaskVerificationResetArgv(task, { reason: 'r', requestKey: 'k-1' })).toEqual([
+      'task-verification', 'reset',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--reason', 'r',
+      '--request-key', 'k-1',
+    ]);
+  });
+
+  // A refresh derives its operations from the LIVE Issue, so an apply that does
+  // not pin the digest the preview reported re-reads the Issue and can apply a
+  // different diff — with `--allow-retire`, retiring a requirement the operator
+  // never saw. The UI recovers the digest from the preview it just showed.
+  test('the refresh apply is bound to the Issue digest the preview reported', () => {
+    const digest = 'd'.repeat(64);
+    const preview = [
+      'task-verification refresh-from-issue — issue #42 (session sx)',
+      `  live Issue body digest: ${digest}`,
+      '  unchanged: 1',
+      '    - npm test',
+      `  Preview only. Re-run with --yes --expect-issue-digest ${digest} to apply exactly this.`,
+    ].join('\n');
+    expect(parseRefreshIssueBodyDigest(preview)).toBe(digest);
+    // No digest line at all (a refusal before the Issue was read) must not be
+    // read as "any digest will do".
+    expect(parseRefreshIssueBodyDigest('task-verification refresh-from-issue — issue #42\n  REFUSED')).toBeNull();
+    expect(
+      buildTaskVerificationRefreshArgv(task, {
+        reason: 'r',
+        allowRetire: true,
+        expectIssueDigest: digest,
+        yes: true,
+      }),
+    ).toEqual([
+      'task-verification', 'refresh-from-issue',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--reason', 'r',
+      '--allow-retire',
+      '--expect-issue-digest', digest,
+      '--yes',
+    ]);
+  });
+
+  // The Issue is only half a refresh's input: it is diffed against the TASK's
+  // effective plan, so a concurrent `amend` changes the additions and
+  // retirements applied while the Issue body — and its digest — stays put.
+  test('the refresh apply is bound to the base plan digest the preview reported too', () => {
+    const base = 'b'.repeat(64);
+    const next = 'c'.repeat(64);
+    const preview = [
+      'task-verification refresh-from-issue — issue #42 (session sx)',
+      `  live Issue body digest: ${'d'.repeat(64)}`,
+      '  add: 1',
+      '    - req:new npm run e2e',
+      `  plan digest: ${base} -> ${next}`,
+      '  revision: vamd-00112233445566aa (request key vreq-778899aabbccddee)',
+    ].join('\n');
+    expect(parsePreviewBasePlanDigest(preview)).toBe(base);
+    // A preview that proposed no revision prints no such line, and "no line"
+    // must never be read as "any plan will do".
+    expect(parsePreviewBasePlanDigest('  plan digest: abc (unchanged)')).toBeNull();
+    expect(parsePreviewBasePlanDigest('task-verification refresh-from-issue\n  REFUSED')).toBeNull();
+    expect(
+      buildTaskVerificationRefreshArgv(task, {
+        reason: 'r',
+        expectIssueDigest: 'd'.repeat(64),
+        expectPlanDigest: base,
+        requestKey: 'vreq-ui-0011',
+        yes: true,
+      }),
+    ).toEqual([
+      'task-verification', 'refresh-from-issue',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--reason', 'r',
+      '--expect-issue-digest', 'd'.repeat(64),
+      '--expect-plan-digest', base,
+      '--request-key', 'vreq-ui-0011',
+      '--yes',
+    ]);
+  });
+
+  // A `no_change` preview proposes no revision, so it prints no `base -> new`
+  // pair — but it did resolve a plan, and that plan is the only one an apply
+  // may be guarded on. Falling back to a digest read from an earlier screen
+  // would bind the apply to a plan this invocation never diffed against.
+  test('a no-change preview reports the plan digest it actually resolved', () => {
+    const digest = 'e'.repeat(64);
+    const noChange = [
+      'task-verification refresh-from-issue — issue #42 (session sx)',
+      `  live Issue body digest: ${'d'.repeat(64)}`,
+      '  add: 0',
+      `  plan digest: ${digest} (unchanged)`,
+      '  No difference to apply. No revision was recorded.',
+    ].join('\n');
+    expect(parsePreviewUnchangedPlanDigest(noChange)).toBe(digest);
+    // The two lines are read by two parsers, and neither answers for the other:
+    // a proposed revision has a base digest, a no-change has an unchanged one.
+    expect(parsePreviewBasePlanDigest(noChange)).toBeNull();
+    expect(
+      parsePreviewUnchangedPlanDigest(`  plan digest: ${'b'.repeat(64)} -> ${'c'.repeat(64)}`),
+    ).toBeNull();
+    // A refusal reports no plan at all, and must not read as "any plan will do".
+    expect(
+      parsePreviewUnchangedPlanDigest('task-verification refresh-from-issue\n  REFUSED'),
+    ).toBeNull();
+  });
+
+  // §5.3 rule 2: omitting the key makes the core derive one from the
+  // invocation's own content, so an operator repeating a correction they had
+  // reversed — retire, restore, retire again — would type content identical to
+  // the first retirement's and have the apply answered as ITS replay, leaving
+  // the slot active after a confirmation that said otherwise. One fresh key per
+  // UI flow says "deliberate repeat"; carrying that same key into the apply
+  // keeps a lost-response rerun a replay.
+  test('each UI amendment flow gets its own well-formed request key', () => {
+    // The core's own rule, not a copy of it: a key this UI mints must be one
+    // the CLI accepts, and the two must never drift apart.
+    const keys = new Set();
+    for (let i = 0; i < 50; i += 1) {
+      const key = newVerificationRequestKey();
+      expect(VERIFICATION_REQUEST_KEY_PATTERN.test(key)).toBe(true);
+      keys.add(key);
+    }
+    expect(keys.size).toBe(50);
+    // The key reaches the amend argv the same way the CLI's own would.
+    expect(
+      buildTaskVerificationAmendArgv(task, {
+        operations: [{ flag: '--retire', value: 'req:abc' }],
+        reason: 'r',
+        requestKey: 'vreq-ui-0011',
+      }),
+    ).toEqual([
+      'task-verification', 'amend',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--retire', 'req:abc',
+      '--reason', 'r',
+      '--request-key', 'vreq-ui-0011',
+    ]);
+  });
+
+  // §5.2 lists six operations and the UI offers all six: an operator who needs
+  // to record why a slot stands as it does — without touching its bytes or its
+  // state — must not be pushed back to the non-interactive CLI for it (issue
+  // #1044 review, P2). `--annotate` takes a commandId and refuses a --command,
+  // so the clause the UI builds carries the id alone.
+  test('the annotate operation reaches the amend argv', () => {
+    expect(
+      buildTaskVerificationAmendArgv(task, {
+        operations: [{ flag: '--annotate', value: 'req:abc' }],
+        reason: 'kept retired until the flake is fixed',
+        requestKey: 'vreq-ui-0012',
+      }),
+    ).toEqual([
+      'task-verification', 'amend',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--annotate', 'req:abc',
+      '--reason', 'kept retired until the flake is fixed',
+      '--request-key', 'vreq-ui-0012',
+    ]);
+  });
+
+  // §9.2 rule 3: the override chooses WHICH re-queueable lane an amendment
+  // returns the task to, and is never a way to acquire a re-queue the table
+  // withholds. The UI therefore offers the choice exactly where one exists.
+  test('the continuation choice is offered only on a row the table re-queues', () => {
+    const choices = verificationContinuationChoices({ defaultContinuation: 'review' });
+    expect(choices.map((c) => c.value)).toEqual(['review', 'implementation', 'none']);
+    // The row's own default is named, so an operator who wants what would have
+    // happened anyway can see which entry that is.
+    expect(choices[0].label).toContain("the default for this task's row");
+    expect(choices[1].label).not.toContain('default');
+    // A `none`-default row — a `queued` task, or one parked outside the review
+    // lane — offers nothing: `review` and `implementation` there refuse and
+    // mutate nothing, and `none` is already what the row does. Offering three
+    // options of which two only produce a refusal would be worse than offering
+    // none, so the empty list tells the flow to send no --continue at all.
+    expect(verificationContinuationChoices({ defaultContinuation: 'none' })).toEqual([]);
+    // An unrecognized value from a future payload is not a lane either.
+    expect(verificationContinuationChoices({ defaultContinuation: '' })).toEqual([]);
+  });
+
+  // A reset erases the operations its own request key would be derived from, so
+  // an apply that loses its response reruns into "nothing left to undo" unless
+  // it names the key the preview reported (§11 rule 3).
+  test('the reset apply carries the request key its preview named', () => {
+    const preview = [
+      'task-verification reset — issue #42 (session sx)',
+      '  operations: 1',
+      '    - restore req:abc',
+      `  plan digest: ${'b'.repeat(64)} -> ${'c'.repeat(64)}`,
+      '  revision: vamd-00112233445566aa (request key vreq-778899aabbccddee)',
+      `  Preview only. Re-run with --yes --expect-plan-digest ${'b'.repeat(64)} --request-key vreq-778899aabbccddee to apply exactly this.`,
+    ].join('\n');
+    expect(parsePreviewRequestKey(preview)).toBe('vreq-778899aabbccddee');
+    expect(parsePreviewRequestKey('task-verification reset — issue #42\n  REFUSED (task_active)')).toBeNull();
+    // A preview is not an apply: nothing was recorded, so it must not read as
+    // an applied ordinal either (issue #1044 review, P2).
+    expect(parseAppliedRevisionOrdinal(preview)).toBeNull();
+    expect(
+      buildTaskVerificationResetArgv(task, {
+        reason: 'r',
+        expectPlanDigest: 'b'.repeat(64),
+        requestKey: 'vreq-778899aabbccddee',
+        yes: true,
+      }),
+    ).toEqual([
+      'task-verification', 'reset',
+      '--session-id', 'sx',
+      '--issue-number', '42',
+      '--reason', 'r',
+      '--expect-plan-digest', 'b'.repeat(64),
+      '--request-key', 'vreq-778899aabbccddee',
+      '--yes',
+    ]);
+  });
+
+  // Exit 0 does not mean a revision exists: a `no_change` and a recognized
+  // replay both succeed having written nothing, and the UI must not tell the
+  // operator an event and a comment were produced (issue #1044 review, P2).
+  test('an applied ordinal is read only from an outcome that consumed one', () => {
+    const applied = [
+      'task-verification amend — issue #42 (session sx)',
+      `  plan digest: ${'b'.repeat(64)} -> ${'c'.repeat(64)}`,
+      '  revision: vamd-00112233445566aa (request key vreq-778899aabbccddee)',
+      '  continuation: none (recorded only)',
+      '  Applied as revision ordinal 3.',
+    ].join('\n');
+    expect(parseAppliedRevisionOrdinal(applied)).toBe(3);
+
+    const replay = [
+      'task-verification reset — issue #42 (session sx)',
+      '  Replay: the request key already names revision vamd-00112233445566aa (ordinal 2). Nothing was written.',
+    ].join('\n');
+    expect(parseAppliedRevisionOrdinal(replay)).toBeNull();
+
+    const noChange = [
+      'task-verification refresh-from-issue — issue #42 (session sx)',
+      `  live Issue body digest: ${'d'.repeat(64)}`,
+      '  add: 0',
+      '  No difference to apply. No revision was recorded.',
+    ].join('\n');
+    expect(parseAppliedRevisionOrdinal(noChange)).toBeNull();
+  });
+
+  // `task-verification show` redacts every command it prints, so the bytes the
+  // plan screen displays are not always the bytes the loop runs. Offering them
+  // as a replacement's starting point would store `<path>` as an executable
+  // command — a "correction" that breaks the check it was meant to fix.
+  test('a redacted command is recognized so it is never offered as a replacement default', () => {
+    expect(isRedactedCommandText('bash <path>/scripts/e2e.sh')).toBe(true);
+    expect(isRedactedCommandText('curl -H "token [redacted]" http://localhost')).toBe(true);
+    expect(isRedactedCommandText('npm test')).toBe(false);
+    expect(isRedactedCommandText('npm run e2e -- --grep "path"')).toBe(false);
+  });
+
+  test('the plan view reports origin, evidence status, revisions and continuation', () => {
+    const view = parseVerificationPlanView(
+      JSON.stringify({
+        ok: true,
+        outcome: 'ok',
+        planDigest: 'digest-1',
+        reconciliation: 'consistent',
+        amendable: true,
+        defaultContinuation: 'review',
+        execution: [
+          { commandId: 'exec:test', state: 'active', command: 'npm test', origin: 'session-default', amended: false, revisionOrdinals: [] },
+        ],
+        requirement: [
+          { commandId: 'req:abc', state: 'retired', command: 'npm run e2e', origin: 'issue-requirement', amended: true, revisionOrdinals: [1], status: 'retired' },
+        ],
+        revisions: [
+          { revisionOrdinal: 1, revisionId: 'vamd-1', source: 'admin-cli', reason: 'the suite cannot run here', operations: ['retire'], continuation: 'review', createdAt: '2026-06-20T00:00:00.000Z' },
+        ],
+        notes: ['masked session entry exec:test (a task-local add claims it)'],
+      }),
+    );
+    const detail = formatVerificationPlanDetail(view).join('\n');
+    expect(detail).toContain('plan digest: digest-1 (consistent)');
+    expect(detail).toContain('amendable:   yes');
+    expect(detail).toContain('exec:test [active] npm test (session-default)');
+    expect(detail).toContain('req:abc [retired] npm run e2e (issue-requirement, amended rev 1) — retired');
+    expect(detail).toContain('continuation an applied revision would take: review');
+    expect(detail).toContain('note: masked session entry');
+    // The previous reason is what the next correction's prompt starts from.
+    expect(previousAmendmentReason(view)).toBe('the suite cannot run here');
+  });
+
+  test('a refusal payload renders as a refusal, and unparseable output yields no view', () => {
+    const refused = parseVerificationPlanView(
+      JSON.stringify({ ok: false, outcome: 'refused', error: 'the chain reconciles against nothing' }),
+    );
+    expect(formatVerificationPlanDetail(refused).join('\n')).toContain('REFUSED (refused)');
+    expect(parseVerificationPlanView('not json at all')).toBeNull();
+    expect(parseVerificationPlanView('{"unexpected": true}')).toBeNull();
+  });
+
+  test('a not-amendable task reports why, and offers no correction', () => {
+    const view = parseVerificationPlanView(
+      JSON.stringify({
+        ok: true,
+        outcome: 'ok',
+        planDigest: 'digest-1',
+        reconciliation: 'unamended',
+        amendable: false,
+        amendmentRefusal: { reason: 'task_active', detail: 'task is running (ownerRunId run-7)' },
+        defaultContinuation: 'none',
+        execution: [],
+        requirement: [],
+        revisions: [],
+        notes: [],
+      }),
+    );
+    expect(formatVerificationPlanDetail(view).join('\n')).toContain('NO — task is running');
   });
 });

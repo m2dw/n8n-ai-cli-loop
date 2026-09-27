@@ -768,6 +768,16 @@ export type StructuredFindingsSupport =
  * a `--base`, and Codex composes the report itself. There is no place to put an
  * output contract that Codex is obliged to honor, so requiring one would produce
  * a permanently malformed envelope rather than a structured review.
+ *
+ * This is a statement about a COMMAND, not about an agent, and issue #1069 is
+ * why the distinction now matters: an enabled session's Codex review does not run
+ * `codex review` at all — it runs `codex exec` under a runner-authored prompt
+ * (contract §17.11), where the envelope instruction has a place to go. That lane
+ * selects itself in `handlers/review.ts` and never consults this table, so this
+ * entry stays exactly what it has always been: the answer for the native review
+ * command, which is still what a session with the protocol disabled runs.
+ * Removing `codex` from this list would not route anything; it would only start
+ * asking `codex review` for an envelope it cannot emit.
  */
 export const STRUCTURED_FINDINGS_UNSUPPORTED_AGENTS: readonly string[] = ["codex"];
 
@@ -891,6 +901,52 @@ export function processReviewFindings(input: ProcessReviewFindingsInput): Review
   );
   if (!parsed.ok) return { kind: "rejected", failure: parsed.failure };
 
+  return admitParsedReviewFindings({
+    envelope: parsed.value,
+    residual: extracted.residual,
+    reviewerMeta: input.reviewerMeta,
+    humanGate: input.humanGate,
+    resolveEvidenceRef: input.resolveEvidenceRef,
+    ...(input.repoRoot !== undefined ? { repoRoot: input.repoRoot } : {}),
+    ...(input.limits !== undefined ? { limits: input.limits } : {}),
+    ...(input.priorContext !== undefined ? { priorContext: input.priorContext } : {}),
+  });
+}
+
+export interface AdmitParsedReviewFindingsInput {
+  /** One envelope that has ALREADY passed §2.1 parsing. */
+  envelope: ParsedReviewEnvelope;
+  /** The reviewer's own prose outside the envelope, for §13's structure classifier. */
+  residual: string;
+  reviewerMeta: ReviewerMeta;
+  humanGate: boolean;
+  resolveEvidenceRef: EvidenceRefResolver;
+  repoRoot?: string;
+  limits?: ReviewDisputeLimits;
+  /** See {@link ProcessReviewFindingsInput.priorContext}. */
+  priorContext?: unknown;
+}
+
+/**
+ * Admit an already-parsed envelope: everything {@link processReviewFindings}
+ * does after extraction and parsing, and nothing it does before.
+ *
+ * Exported because a review lane can obtain its envelope by a route other than
+ * scraping one agent's stdout. The structured `codex exec` lane (issue #1069)
+ * reads a runner-owned final-message FILE and admits it through
+ * `admitCodexReviewEnvelope`, which accepts the bare (or singly fenced) JSON
+ * object a schema-honoring build returns as well as the marker form — a shape
+ * {@link extractReviewFindingsEnvelope} reports as `absent`. Re-running the text
+ * path over that response would reject, as a legacy prose review, an envelope
+ * the lane had already validated.
+ *
+ * Every rule below the parse is therefore the SAME rule for both lanes: the
+ * prior block is re-validated and carried forward, lineage ids are derived from
+ * the §2.2 identity tuple, evidence is resolved through the caller's resolver,
+ * and the §10.2 artifact is serialized before anything is returned. Never
+ * returns `legacy` — an envelope exists by construction.
+ */
+export function admitParsedReviewFindings(input: AdmitParsedReviewFindingsInput): ReviewFindingsOutcome {
   // A task re-enters review after every implementation fix, and the block this
   // run writes replaces the stored one wholesale. What an earlier review
   // persisted is therefore re-validated FIRST — before admission, because a
@@ -908,7 +964,7 @@ export function processReviewFindings(input: ProcessReviewFindingsInput): Review
   const priorLineages = priorBlock?.lineages;
 
   const admitted = admitReviewFindings({
-    candidates: parsed.value.candidates,
+    candidates: input.envelope.candidates,
     reviewerMeta: input.reviewerMeta,
     humanGate: input.humanGate,
     resolveEvidenceRef: input.resolveEvidenceRef,
@@ -942,7 +998,7 @@ export function processReviewFindings(input: ProcessReviewFindingsInput): Review
   // zero-change validity §3.4 grants exactly that shape.
   const structure = classifyReviewStructure({
     structuredFindingCount: 1,
-    residualFeedback: extracted.residual,
+    residualFeedback: input.residual,
   });
 
   // The whole prior block is carried — lineages and both run-level flags —
@@ -958,15 +1014,15 @@ export function processReviewFindings(input: ProcessReviewFindingsInput): Review
   return {
     kind: "admitted",
     retainedLineages: priorLineages === undefined ? 0 : Object.keys(priorLineages).length,
-    status: parsed.value.status,
-    ...(parsed.value.blockedReason !== undefined ? { blockedReason: parsed.value.blockedReason } : {}),
+    status: input.envelope.status,
+    ...(input.envelope.blockedReason !== undefined ? { blockedReason: input.envelope.blockedReason } : {}),
     findings: admitted.value.findings,
     attachments: admitted.value.attachments,
     context: built.value.context,
     findingsArtifact: artifact.value,
     structure,
-    residual: extracted.residual,
-    ignoredRunnerOwnedFields: parsed.value.ignoredRunnerOwnedFields,
+    residual: input.residual,
+    ignoredRunnerOwnedFields: input.envelope.ignoredRunnerOwnedFields,
   };
 }
 

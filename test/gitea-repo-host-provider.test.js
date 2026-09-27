@@ -133,6 +133,68 @@ describe('GiteaRepoHostProvider — findPullRequestForWorkItem', () => {
 });
 
 // ---------------------------------------------------------------------------
+// GiteaRepoHostProvider — findOpenPullRequestsByHead (issue #998)
+// ---------------------------------------------------------------------------
+
+describe('GiteaRepoHostProvider — findOpenPullRequestsByHead', () => {
+  test('matches the exact head client-side and maps every match', () => {
+    const prs = [
+      { number: 3, html_url: 'https://gitea.example.com/acme/code/pulls/3', state: 'open', head: { ref: 'other' }, base: { ref: 'main' }, mergeable: true },
+      { number: 5, html_url: 'https://gitea.example.com/acme/code/pulls/5', state: 'open', head: { ref: 'ai/issue-42' }, base: { ref: 'main' }, mergeable: true },
+    ];
+    const client = fakeGitea([{ status: 200, body: JSON.stringify(prs) }]);
+    const host = new GiteaRepoHostProvider(client, OWNER, REPO);
+
+    expect(host.findOpenPullRequestsByHead('ai/issue-42')).toEqual({
+      ok: true,
+      value: [{
+        number: 5,
+        url: 'https://gitea.example.com/acme/code/pulls/5',
+        headRefName: 'ai/issue-42',
+        state: 'open',
+        baseRefName: 'main',
+        mergeable: 'MERGEABLE',
+      }],
+    });
+  });
+
+  test('does not stop at the first match — a duplicate on a later page stays visible', () => {
+    const firstPage = Array.from({ length: 50 }, (_, k) =>
+      k === 0
+        ? { number: 1, html_url: 'https://gitea.example.com/acme/code/pulls/1', state: 'open', head: { ref: 'ai/issue-42' }, base: { ref: 'main' }, mergeable: true }
+        : { number: 1000 + k, html_url: `https://gitea.example.com/acme/code/pulls/${1000 + k}`, state: 'open', head: { ref: `ai/issue-${1000 + k}` }, base: { ref: 'main' }, mergeable: true },
+    );
+    const secondPage = [
+      { number: 2, html_url: 'https://gitea.example.com/acme/code/pulls/2', state: 'open', head: { ref: 'ai/issue-42' }, base: { ref: 'main' }, mergeable: true },
+    ];
+    const client = fakeGitea([
+      { status: 200, body: JSON.stringify(firstPage) },
+      { status: 200, body: JSON.stringify(secondPage) },
+    ]);
+    const host = new GiteaRepoHostProvider(client, OWNER, REPO);
+
+    const result = host.findOpenPullRequestsByHead('ai/issue-42');
+    expect(result.ok).toBe(true);
+    expect(result.value.map((pr) => pr.number)).toEqual([1, 2]);
+    expect(client.calls).toHaveLength(2);
+  });
+
+  test('an unreadable page fails instead of reporting a partial match set', () => {
+    const client = fakeGitea([{ status: 500, body: 'boom' }]);
+    const host = new GiteaRepoHostProvider(client, OWNER, REPO);
+    const result = host.findOpenPullRequestsByHead('ai/issue-42');
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/gitea pulls list failed/);
+  });
+
+  test('no match on an exhausted listing is ok:true with an empty list', () => {
+    const client = fakeGitea([{ status: 200, body: '[]' }]);
+    const host = new GiteaRepoHostProvider(client, OWNER, REPO);
+    expect(host.findOpenPullRequestsByHead('ai/issue-42')).toEqual({ ok: true, value: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GiteaRepoHostProvider — createPullRequest
 // ---------------------------------------------------------------------------
 

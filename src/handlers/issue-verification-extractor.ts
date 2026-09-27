@@ -4,6 +4,49 @@
  * Scans for Markdown section headers whose titles match "Verification",
  * "Test Plan", "Acceptance Criteria", or "Verify". Within those sections,
  * extracts shell commands from fenced code blocks and inline backtick spans.
+ *
+ * Non-required caveat: a command mentioned in inline backticks is excluded
+ * from the required list when the SAME clause also contains the phrase "not
+ * required" or "out of scope" (case-insensitive), e.g.:
+ *
+ *   `npm run validate:release` may remain blocked by unresolved production
+ *   data and is not required by this Issue.
+ *
+ * A line is split into clauses on `;` or `.` boundaries before the marker is
+ * tested, so the marker only excludes the backtick spans in its own clause —
+ * required commands sharing a line with a caveat (e.g. "Run `npm test`;
+ * `npm run e2e` is not required") are not swept up by the caveat next to
+ * them. The split never lands inside an inline backtick span, so a required
+ * command that itself contains a `;` or `.` (e.g. `` `npm run lint; npm
+ * test` ``) is kept intact as a single clause rather than being torn apart
+ * into unmatched fragments.
+ *
+ * This is a narrow, deterministic textual marker — not natural-language
+ * interpretation — so issue authors can mention a command for context while
+ * explicitly excluding it from mandatory verification (issue #993).
+ *
+ * Fenced-block section boundary: a Markdown heading that appears inside ANY
+ * fenced code block (```...```) — including one nested inside an unrelated
+ * section, such as a quoted example under "## Regression fixture" — is never
+ * treated as opening, closing, or replacing a task-level Verification/Test
+ * Plan/Acceptance Criteria section. Fence state is tracked globally across
+ * the whole body for this purpose. This keeps an Issue free to quote a
+ * sample Verification section (e.g. to document the extractor's own
+ * behavior) without that sample being parsed as the Issue's real contract.
+ * Commands inside a fenced block that genuinely lives INSIDE a real
+ * Verification section are still extracted as before.
+ *
+ * Fence delimiters are length-tracked (CommonMark-style): opening a fence
+ * with four or more backticks — the standard way to quote a sample that
+ * itself contains a triple-backtick fence — records that opening length, and
+ * only a line with a backtick run of at least that length closes it. A
+ * shorter backtick run nested inside (e.g. an inner ```md sample) is treated
+ * as literal fence content, not a fence boundary, so headings and commands
+ * inside that inner sample are not mistaken for real verification content.
+ * A closing delimiter must also have nothing but whitespace after its
+ * backtick run (CommonMark rule) — a nested line like "```md" inside an
+ * already-open fence has a long-enough backtick run but is followed by an
+ * info string, so it is literal content, not a close.
  */
 
 const VERIFICATION_SECTION_RE = /^(#{1,6})\s+(.+)$/;
@@ -85,7 +128,7 @@ function extractFromFencedBlocks(text: string): string[] {
           }
         }
         if (cmd) {
-          if (!isCompoundRunnableCommand(cmd) && (ENV_ONLY_RE.test(cmd) || SETUP_LINE_RE.test(cmd))) {
+          if (!isCompoundRunnableCommand(cmd) && (isEnvAssignmentOnly(cmd) || SETUP_LINE_RE.test(cmd))) {
             pendingSetup.push(cmd);
           } else {
             const full = pendingSetup.length > 0 ? [...pendingSetup, cmd].join(" && ") : cmd;
@@ -99,7 +142,7 @@ function extractFromFencedBlocks(text: string): string[] {
         // they are not part of the runnable command.
         const promptMatch = PROMPT_RE.exec(trimmed);
         const bare = promptMatch ? trimmed.slice(promptMatch[0].length).trim() : trimmed;
-        if (!isCompoundRunnableCommand(bare) && (ENV_ONLY_RE.test(bare) || SETUP_LINE_RE.test(bare))) {
+        if (!isCompoundRunnableCommand(bare) && (isEnvAssignmentOnly(bare) || SETUP_LINE_RE.test(bare))) {
           // Setup/context line — defer it so it can be prepended to the next
           // real command. This preserves required execution context such as
           // `cd frontend` before `npm test`, preventing a root-level `npm test`
@@ -136,15 +179,32 @@ const SHELL_COMMAND_PREFIXES = [
 // After stripping these, the remainder is the actual command.
 const ENV_PREFIX_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+/;
 
-// Matches a line that is ONLY env-var assignments (no trailing command).
-// Unlike ENV_PREFIX_RE, the final assignment need not be followed by whitespace.
-const ENV_ONLY_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s*)+$/;
+// Matches a single whitespace-free token that is a shell env-var assignment.
+const ENV_ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Returns true when `s` is ONLY env-var assignments (no trailing command),
+ * e.g. `CI=1` or `A=1 B=2`. Unlike ENV_PREFIX_RE, the final assignment need
+ * not be followed by whitespace.
+ *
+ * This is a linear-time token scan rather than a single regex: the former
+ * `/^(?:NAME=[^\s]*\s*)+$/` let each repetition end inside a whitespace-free
+ * run, so a line like `A=A=A=…A=A x` backtracked exponentially (issue #1190).
+ * Splitting on whitespace is equivalent because any whitespace-free run that
+ * starts with `NAME=` is itself one assignment whose value is the rest of the
+ * run; the line matches iff it has no leading whitespace and every run does.
+ */
+function isEnvAssignmentOnly(s: string): boolean {
+  if (s === "" || /^\s/.test(s)) return false;
+  const tokens = s.split(/\s+/).filter((t) => t !== "");
+  return tokens.length > 0 && tokens.every((t) => ENV_ASSIGNMENT_TOKEN_RE.test(t));
+}
 
 // Shell setup/stateful lines that do not represent standalone verification checks:
 // directory changes, variable exports (export VAR=val), file sourcing, and shell
 // option flags (set -e, set -x). These lines configure the environment for the
 // real command that follows and should not be recorded as required verifications.
-// Note: bare env-var assignments (VAR=val) are already filtered by ENV_ONLY_RE.
+// Note: bare env-var assignments (VAR=val) are already filtered by isEnvAssignmentOnly.
 const SETUP_LINE_RE =
   /^(?:cd(?:\s|$)|export\s+[A-Za-z_][A-Za-z0-9_]*=|source\s|\.(?:\s|$)|set\s+-[a-z]|unset\s+|local\s+|readonly\s+)/;
 
@@ -176,19 +236,92 @@ function looksLikeShellCommand(s: string): boolean {
   });
 }
 
-function extractFromInlineCode(text: string): string[] {
-  const commands: string[] = [];
+// Explicit, deterministic marker for a command an issue author mentions but
+// does not require: the phrase "not required" or "out of scope" appearing in
+// the same clause as the backticked command (see issue #993). This is a fixed
+// textual marker, not natural-language interpretation of arbitrary negation.
+const NOT_REQUIRED_MARKER_RE = /\bnot\s+required\b|\bout\s+of\s+scope\b/i;
+
+// Splits a line into clauses on `;` or `.` boundaries so the not-required
+// marker is scoped to only the clause it appears in, not the whole line.
+// This keeps a required command from being dropped when it shares a line
+// with an unrelated caveat, e.g. "Run `npm test`; `npm run e2e` is not
+// required" — only `npm run e2e` is excluded.
+//
+// The split must never land inside an inline backtick code span: a required
+// command that itself contains a `;` (e.g. `` `npm run lint; npm test` ``)
+// would otherwise have its opening and closing backticks pulled into
+// different clauses, so neither fragment matches the inline-code regex and
+// the whole command silently disappears from extraction (issue #993 review
+// follow-up). Backtick state is tracked while scanning so `;`/`.` characters
+// inside an (even unterminated) code span are never treated as boundaries.
+function splitClauses(line: string): string[] {
+  const clauses: string[] = [];
+  let current = "";
+  let inCode = false;
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === "`") {
+      inCode = !inCode;
+      current += ch;
+      i++;
+      continue;
+    }
+    if (!inCode && (ch === ";" || ch === ".") && /\s/.test(line[i + 1] ?? "")) {
+      current += ch;
+      clauses.push(current);
+      current = "";
+      i++;
+      while (i < line.length && /\s/.test(line[i])) i++;
+      continue;
+    }
+    current += ch;
+    i++;
+  }
+  if (current) clauses.push(current);
+  return clauses;
+}
+
+function extractFromInlineCode(text: string): { required: string[]; excluded: string[] } {
+  const required: string[] = [];
+  const excluded: string[] = [];
   // Remove fenced blocks first to avoid double-counting
   const stripped = text.replace(/```[\s\S]*?```/g, "");
-  const inlineRe = /`([^`\n]+)`/g;
-  let m: RegExpExecArray | null;
-  while ((m = inlineRe.exec(stripped)) !== null) {
-    const code = m[1].trim();
-    if (looksLikeShellCommand(code)) {
-      commands.push(code);
+  for (const line of stripped.split("\n")) {
+    for (const clause of splitClauses(line)) {
+      const isExcludedClause = NOT_REQUIRED_MARKER_RE.test(clause);
+      const inlineRe = /`([^`\n]+)`/g;
+      let m: RegExpExecArray | null;
+      while ((m = inlineRe.exec(clause)) !== null) {
+        const code = m[1].trim();
+        if (!looksLikeShellCommand(code)) continue;
+        if (isExcludedClause) {
+          excluded.push(code);
+        } else {
+          required.push(code);
+        }
+      }
     }
   }
-  return commands;
+  return { required, excluded };
+}
+
+/**
+ * The extraction, plus whether a supported section was present at all.
+ *
+ * `sectionFound` distinguishes "the Issue has a Verification section that asks
+ * for nothing" from "the Issue has no supported section" — two readings of an
+ * empty command list that a caller diffing a LIVE body against a task's plan
+ * must not confuse. The refresh path (issue #1041,
+ * `docs/verification-amendment-contract.md` §10 rule 5) refuses on the second:
+ * a body whose section was renamed, or which was fetched from the wrong place,
+ * would otherwise read as "the Issue now requires nothing" and propose retiring
+ * every requirement the task has.
+ */
+export interface IssueVerificationExtraction {
+  commands: string[];
+  sectionFound: boolean;
 }
 
 /**
@@ -201,20 +334,35 @@ function extractFromInlineCode(text: string): string[] {
  * the order they appear.
  */
 export function extractIssueVerificationCommands(body: string): string[] {
+  return extractIssueVerificationSections(body).commands;
+}
+
+/**
+ * The same scan as {@link extractIssueVerificationCommands}, reporting whether
+ * a supported section was found. The command list is byte-identical to what
+ * that function returns for the same body — one scan, one behavior, so the
+ * pinned intake extraction and a live refresh can never disagree.
+ */
+export function extractIssueVerificationSections(body: string): IssueVerificationExtraction {
   const lines = body.split("\n");
   const seen = new Set<string>();
   const commands: string[] = [];
+  const excluded = new Set<string>();
 
   let inVerification = false;
+  let sectionFound = false;
   let verificationLevel = 0;
   let sectionBuf = "";
   let inFence = false;
+  let fenceDelimiterLength = 0;
 
   const flush = (): void => {
     if (!sectionBuf) return;
+    const { required, excluded: excludedHere } = extractFromInlineCode(sectionBuf);
+    for (const cmd of excludedHere) excluded.add(cmd);
     const extracted = [
       ...extractFromFencedBlocks(sectionBuf),
-      ...extractFromInlineCode(sectionBuf),
+      ...required,
     ];
     for (const cmd of extracted) {
       if (!seen.has(cmd)) {
@@ -226,15 +374,44 @@ export function extractIssueVerificationCommands(body: string): string[] {
   };
 
   for (const line of lines) {
-    // Track fenced code blocks so comment lines (# ...) inside them are not
-    // mistaken for Markdown headers, which would prematurely close the section.
-    if (inVerification && line.trimStart().startsWith("```")) {
-      inFence = !inFence;
-      sectionBuf += line + "\n";
-      continue;
+    // Track fenced code blocks globally (not just while inside a verification
+    // section) so a heading embedded in a fenced sample — e.g. a Markdown
+    // example quoted for illustration, as in the #569 self-hosting fixture —
+    // can never open, close, or replace a task-level Verification/Test
+    // Plan/Acceptance Criteria section. Comment lines (# ...) inside a real
+    // fenced command block are likewise protected from being mistaken for
+    // Markdown headers, which would otherwise prematurely close the section.
+    //
+    // Delimiter length is tracked so a fence opened with four or more
+    // backticks — used to quote a sample that itself contains a nested
+    // ``` fence — is only closed by a backtick run at least as long as the
+    // one that opened it. A shorter nested run is literal fence content.
+    const trimmedLine = line.trimStart();
+    const fenceDelimiterMatch = /^`{3,}/.exec(trimmedLine);
+    if (fenceDelimiterMatch) {
+      const delimiterLength = fenceDelimiterMatch[0].length;
+      if (!inFence) {
+        inFence = true;
+        fenceDelimiterLength = delimiterLength;
+        if (inVerification) sectionBuf += line + "\n";
+        continue;
+      }
+      const remainder = trimmedLine.slice(delimiterLength);
+      if (delimiterLength >= fenceDelimiterLength && remainder.trim() === "") {
+        inFence = false;
+        fenceDelimiterLength = 0;
+        if (inVerification) sectionBuf += line + "\n";
+        continue;
+      }
+      // Either a shorter backtick run than the fence that is currently open,
+      // or a long-enough run followed by trailing content (e.g. an info
+      // string like "```md") — CommonMark only allows whitespace after a
+      // closing fence's backticks, so this is literal content nested inside
+      // the fence, not a closing delimiter. Fall through to the inFence
+      // branch below.
     }
     if (inFence) {
-      sectionBuf += line + "\n";
+      if (inVerification) sectionBuf += line + "\n";
       continue;
     }
 
@@ -251,6 +428,7 @@ export function extractIssueVerificationCommands(body: string): string[] {
 
       if (!inVerification && isVerificationSection(title)) {
         inVerification = true;
+        sectionFound = true;
         verificationLevel = level;
         sectionBuf = "";
       } else if (inVerification) {
@@ -264,5 +442,5 @@ export function extractIssueVerificationCommands(body: string): string[] {
 
   if (inVerification) flush();
 
-  return commands;
+  return { commands: commands.filter((cmd) => !excluded.has(cmd)), sectionFound };
 }

@@ -468,6 +468,12 @@ export interface ChainMemberOwner {
   issueNumber: number;
   /** The other chain that already contains it. */
   chainId: string;
+  /**
+   * Session that chain belongs to. Reported because an Issue number alone does
+   * not identify an Issue (issue #1045), so a diagnostic naming only the chain
+   * leaves an operator without the repository the conflict is in.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -566,6 +572,11 @@ export interface PutChainGraphInput {
    * offenders as {@link ChainRegistryResult.owners}. An empty filter claims
    * them against the whole registry; omitting the field claims nothing and
    * leaves membership unconstrained, which is the pre-existing behaviour.
+   *
+   * A filter carrying an empty {@link ChainListFilter.sessionIds} is refused
+   * with `invalid_input` rather than honoured: it describes a claim against no
+   * chain at all, which is indistinguishable in its effect from omitting the
+   * claim — and a caller that meant to claim nothing would not have asked.
    *
    * The point of pushing this into the write rather than leaving it to a
    * caller's pre-check is that a pre-check is not a claim: two callers can
@@ -685,6 +696,19 @@ export interface ChainRetirement {
 
 export interface ChainListFilter {
   sessionId?: string;
+  /**
+   * Match any of these sessions. Supplied alongside `sessionId`, both apply, so
+   * a chain must satisfy each — the two are independent clauses, not
+   * alternatives.
+   *
+   * It exists because an Issue number is only unique inside the repository that
+   * issued it (issue #1045): the set of sessions bound to one repository is the
+   * scope a duplicate-ownership question is actually asked over, and that set is
+   * a list rather than a single session. An implementation must treat an empty
+   * list as matching no chain — never as an absent filter, which would silently
+   * widen an ownership claim to the whole registry.
+   */
+  sessionIds?: readonly string[];
   syncStatus?: ChainSyncStatus;
 }
 

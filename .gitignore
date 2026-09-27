@@ -2,3 +2,14 @@ node_modules/
 .n8n-artifacts/
 dist/
 coverage/
+.test-cost/
+# Issue #1156: reports scripts/changed-file-stage-timing.mjs writes on request,
+# and the console transcript an operator redirects alongside them. They must stay
+# ignored: an untracked report in the worktree would move the working-tree
+# identity a stage run attests.
+.changed-file-timing*
+# Issue #1111: everything the opt-in StrykerJS pilot writes — its sandbox, the
+# generated run spec, and the raw HTML/JSON mutation reports. The raw reports
+# embed whole source files and absolute sandbox paths, so only the bounded,
+# sanitized summary.md is ever quoted in a checked-in report.
+.mutation/

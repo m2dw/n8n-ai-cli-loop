@@ -26,11 +26,82 @@ export interface OutboxEffectReplacePendingPrSummary {
 }
 
 /**
+ * Retire every UNSENT row carrying `idempotencyKey`, so an effect a transition
+ * is about to contradict can never be delivered after it (issue #980 review).
+ *
+ * The one producer today is §13's refinement recovery: the handoff it undoes
+ * enqueued a ready-for-human label ADD, and a row that failed once is sitting
+ * delayed behind its backoff. Enqueueing only the compensating REMOVE is not
+ * enough — the remove can dispatch first and the add's retry then re-applies a
+ * "needs a human" label to a task that is queued again — so the add has to be
+ * retired in the same transaction that requeues the task, not compensated for
+ * afterwards.
+ *
+ * Deliberately "cancel", not "delete": the row keeps its failure history for
+ * `admin outbox list`, is excluded from dispatch selection exactly as an
+ * operator's `admin outbox cancel` would exclude it, and stays revivable by
+ * `admin outbox retry` if the cancellation later turns out to be wrong. A row
+ * already sent, already cancelled, or simply absent is left alone — this is a
+ * "make sure it will not be delivered" instruction, not an assertion that a row
+ * exists.
+ *
+ * Unlike {@link OutboxStore.cancelEntry}, a row a dispatch attempt currently
+ * holds a claim on IS cancelled. That command must refuse it, because it reports
+ * to an operator whether the side effect was stopped; here what must not survive
+ * is the RETRY, and a concurrent `markFailed` only writes `next_attempt_at`, so
+ * it cannot revive a row this cancelled.
+ *
+ * Cancelling a CLAIMED row does not, by itself, order the attempt already on the
+ * wire against the compensating row's own future dispatch: an add whose HTTP
+ * call lands after the remove dispatched leaves the label on, `markSent` accepts
+ * the claimed row afterwards, and nothing schedules a second removal. That is
+ * what {@link OutboxEffectCancelPending.refuseWhileClaimed} exists for.
+ */
+export interface OutboxEffectCancelPending {
+  kind: "cancelPending";
+  idempotencyKey: string;
+  /** Cancellation timestamp; defaults to the store's own clock. */
+  now?: string;
+  /**
+   * Refuse the WHOLE compound write — nothing cancelled, no transition, no
+   * event — when a row carrying this key is being dispatched right now, i.e.
+   * holds a claim that is not yet stale (issue #980 review).
+   *
+   * Without it, cancelling a claimed row stops the retry but cannot abort the
+   * request in flight. If the compensating effect committed beside it dispatches
+   * before that request completes, the contradicted side effect lands last and
+   * stays: the add re-applies `ready-for-human` after the remove already took it
+   * off, `markSent` accepts the claimed row, and no later removal is scheduled.
+   * Refusing while the claim is live is what makes the pair ordered — the
+   * dispatcher's next claim of that row is impossible once the cancellation
+   * commits (`claimForDispatch` requires `cancelled_at IS NULL`), so the two
+   * writes can only serialize one way.
+   *
+   * Opt-in per effect, because refusing is only the right answer for a caller
+   * that can simply be re-run: §13's `admin refinement recover` is an operator
+   * command whose refusal is "try again in a moment", while a phase completion
+   * carrying the mirror-image cancellation must commit — re-running the phase to
+   * dodge a claim it merely raced would cost far more than the divergence.
+   *
+   * Enforced by stores that apply this effect INSIDE the transition's own
+   * transaction (`SqliteTaskStore`). The portable fallbacks — a store with
+   * no shared transaction domain, `cancelPendingOutboxEntriesByKey` — cannot
+   * refuse a write they have already begun; they leave a claimed row to its
+   * attempt instead, so producers that need this guarantee must commit through
+   * the task store.
+   */
+  refuseWhileClaimed?: boolean;
+}
+
+/**
  * A single outbox write produced by a phase completion, queued for
  * {@link TaskStore.completePhaseWithEffects} to commit alongside the task
  * transition (issue #701).
  */
-export type OutboxEffect = OutboxEffectEnqueue | OutboxEffectReplacePendingPrSummary;
+export type OutboxEffect =
+  | OutboxEffectEnqueue
+  | OutboxEffectReplacePendingPrSummary
+  | OutboxEffectCancelPending;
 
 /** The task-store half of a phase completion: the CAS transition plus its event. */
 export interface PhaseCompletionTransition {

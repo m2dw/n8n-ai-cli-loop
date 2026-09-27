@@ -47,8 +47,9 @@ import { GiteaWorkItemProvider } from "../providers/gitea/gitea-work-item-provid
 import {
   resolveGiteaToken,
   redactGiteaSecrets,
-  defaultGiteaHttp,
+  createGiteaHttp,
 } from "../providers/gitea/gitea-client.js";
+import { OUTBOX_GH_CALL_DEADLINE_MS } from "../core/outbox-transport-deadline.js";
 import type { GiteaHttpRequest } from "../providers/gitea/gitea-client.js";
 import type { ProviderAuthConfig } from "../core/session.js";
 import type { OutboxEntry } from "../core/outbox.js";
@@ -137,11 +138,24 @@ function failingWorkItemProvider(message: string): WorkItemProvider {
 // Main — exported for testing with injectable runner
 // ---------------------------------------------------------------------------
 
+/**
+ * Gitea's outbox transport, bounded like every other one this CLI drives (issue
+ * #1064). `defaultGiteaHttp` is deliberately unbounded for the retrying runtime
+ * paths, but here it would be the one delivery route a dispatch deadline could
+ * not stop: a Gitea instance that accepts the connection and goes quiet would
+ * hold the row's claim and every later row behind it. Built with the same
+ * per-call bound the `gh` path uses, since both are one request per provider
+ * call.
+ */
+const boundedGiteaHttp: GiteaHttpRequest = createGiteaHttp({
+  timeoutMs: OUTBOX_GH_CALL_DEADLINE_MS,
+});
+
 export async function main(
   argv: string[],
   runner: GhRunner = defaultGhRunner,
   authDeps: GhRunnerAuthDeps = {},
-  giteaHttp: GiteaHttpRequest = defaultGiteaHttp,
+  giteaHttp: GiteaHttpRequest = boundedGiteaHttp,
 ): Promise<void> {
   const parsed = parseArgs(argv);
   if ("error" in parsed) die(parsed.error);
@@ -531,6 +545,12 @@ export async function main(
       // re-opened span. Emitted only when it happened, so a normal drain's JSON
       // shape is unchanged.
       ...(result.cursorFenceStale ? { cursorFenceStale: true } : {}),
+      // Rows whose attempt was cut short by a transport deadline (issue #1064).
+      // Already counted in `failed` — they are ordinary retryable failures — but
+      // reported separately so an operator can tell a provider that REFUSED the
+      // write from one that never answered. Emitted only when it happened, so a
+      // normal drain's JSON shape is unchanged.
+      ...(result.transportTimeouts ? { transportTimeouts: result.transportTimeouts } : {}),
       dispatched: result.dispatched,
       failed: result.failed,
       // A repair failure is reported beside the dispatch failures rather than

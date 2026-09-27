@@ -425,8 +425,28 @@ sanitized summaries are posted.
 - Unknown flags on the cleanup commands fail fast (a typoed `--force`/`--yes`
   never silently falls through to a destructive default). Worktree paths are
   local-only and never published to public comments.
+- **Merged PRs are not a cleanup concern** (issue #1046). `cleanup` performs no
+  merged-PR scan, makes no provider call, and prints no merged-PR advisory, and
+  there is no `--include-merged` flag: a task whose PR an operator already
+  merged is still `active` here while its status is
+  `queued`/`claimed`/`running`/`blocked`/`ready_for_human`, and its durable
+  worktree is preserved. Reconciling that merge back into the task lifecycle is
+  a separate, filesystem-free contract —
+  [merged-pr-reconciliation-contract.md](merged-pr-reconciliation-contract.md).
+  It changes only lifecycle metadata; the two compose only incidentally,
+  because a reconciled task is `done` and `done` is already a prune candidate
+  above.
 - Disk-usage policy: operators prune terminal/stale worktrees individually with
-  `prune` or in bulk with `cleanup`.
+  `prune` or in bulk with `cleanup`. When `cleanup` alone does not free enough
+  space because tasks are still `active` behind PRs an operator merged by hand,
+  the supported sequence (issue #1048) runs in three steps, each a separate
+  operator decision with its own preview: run `cleanup`; if more space must
+  still be reclaimed, preview and apply `admin task reconcile-merged`; then run
+  the same, unchanged `cleanup` again, which now sees the reconciled tasks as
+  ordinary `done` prune candidates. `task reconcile-merged` never deletes a
+  worktree, a branch, or a file — it writes task lifecycle metadata only — and
+  `cleanup` never learns that a merge is why a task went terminal. See §14 of
+  [merged-pr-reconciliation-contract.md](merged-pr-reconciliation-contract.md).
 
 ## Compatibility
 

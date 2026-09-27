@@ -68,6 +68,10 @@ The refiner and critic never mutate GitHub; the runner never authors prose.
 
 **Critic verdicts** (closed set, exactly three): `pass`, `revise`, `block`.
 
+**Critic block reasons** (closed set, exactly five; §7.2): `missing_decision`,
+`authority_conflict`, `evidence_unavailable`, `premise_invalidated`,
+`scope_change`.
+
 **Change classes** (closed set, exactly two): `applicable` — changes the
 runner may apply automatically; `advisory` — changes the runner records and
 publishes but never applies. Every field of a refiner result belongs to
@@ -89,7 +93,7 @@ evaluation that creates no task or holds the Issue, never a handoff:
 `malformed_managed_region`, `managed_region_modified`,
 `no_independent_critic`, `effect_undeliverable`,
 `agent_unavailable`, `marker_precondition_failed`,
-`execution_marker_conflict`.
+`execution_marker_conflict`, `evidence_required`.
 
 `agent_unavailable` and `marker_precondition_failed` exist because the two most
 ordinary runtime failures — an agent
@@ -100,7 +104,10 @@ a task exists, while both of these happen to a task that is already mid-lane.
 `execution_marker_conflict` (§3) exists for the same reason and covers the one
 conflicting-marker shape that is not an admission decision: a task that already
 exists at an executable phase when `status:needs-refinement` appears on its
-Issue.
+Issue. `evidence_required` (§5.2) is raised **before** either agent is invoked,
+on an Issue whose eligibility and roles both resolved: it declared predecessor
+contract evidence the snapshot could not carry, and running the agents on an
+under-specified contract would spend the round cap reaching this same human.
 
 **Executable `status:*` labels** (closed set, exactly six) — the statuses the
 existing intake router (`labelsToPhase` in `core/github-intake.ts`) maps to a
@@ -477,6 +484,149 @@ Bounds and treatment:
   predecessor's implementation in the downstream Issue body is out of scope
   and would leak repository content into a public Issue.
 
+### 5.1 Declared predecessor contract evidence
+
+An Issue may **explicitly select** bounded predecessor file or API evidence,
+and the capture then places that evidence — or a recorded account of why it
+could not be captured — in the same frozen snapshot both agents receive. This
+is not a relaxation of the diff exclusion above: no diff, no patch hunk, and
+no unselected file ever enters the snapshot, and the refiner remains forbidden
+to reproduce source content into the Issue body. What it fixes is the failure
+mode of issue #951: when an Issue makes a predecessor's exported code contract
+authoritative, a snapshot that cannot carry that exact contract leaves the
+refiner inferring it and the critic correctly blocking the inference, and
+re-running the same refinement cannot converge on evidence neither agent has.
+
+- **The declaration is operator-visible and deterministic.** It is exactly one
+  fenced code block with info string `refinement-evidence` in the Issue body's
+  operator-owned text (the managed region of §10 is elided before parsing, so
+  the lane cannot declare evidence to itself), containing a JSON array of
+  selections. Each selection names a predecessor Issue number, a repo-relative
+  `path`, at most one of `export` (a named exported declaration) or `lines`
+  (`[start, end]`, 1-based inclusive), and optionally `maxBytes`, which may
+  only lower the §8 per-field cap, and `required`, which §5.2 reads and
+  which defaults to `true`. The schema is closed; an entry with an
+  unknown key, an invalid path, or both selectors at once is recorded as an
+  `invalid_selection` omission rather than half-honoured. A body with no
+  block declares nothing; an unterminated block, a second block, or a payload
+  that is not a JSON array is one `malformed_declaration` omission for the
+  whole declaration, because no rule could deterministically say which
+  selections were meant.
+- **Evidence resolves ONLY from the authoritative predecessor branch.** A
+  selection must name a direct, usable predecessor of the target (§1, §4); any
+  other Issue number is an `unknown_predecessor` omission, however plausible.
+  Content is read at exactly the commit the stacked-branch contract makes
+  authoritative — the head commit SHA of the stack-ready PR for the
+  `open_stack_ready` shape, the merge commit SHA for `merged` — never at a
+  branch name, and the read happens inside the capture window, before the §4
+  identity re-verification, so a predecessor that moves mid-read holds the
+  attempt. A resolver that reports content from any other commit is refused as
+  an `identity_mismatch` omission: bytes from a commit §4 never certified do
+  not enter a snapshot whose provenance would claim otherwise.
+- **Only the selection is exposed.** A whole-file selection is bounded like
+  any other snapshot text; an `export` or `lines` selection carries only the
+  extracted declaration or range. The capture scans at most a fixed source
+  bound per file; an export or line range the scan cannot fully reach is an
+  omission that says so (`export_not_found`, `line_range_out_of_bounds`),
+  never a partial slice presented as exact. Paths matching the
+  repository-evidence deny floor (credential and secret shapes) are refused as
+  `denied_path` — a snapshot must not expose what an evidence turn could not.
+- **Provenance is immutable and recorded per entry**: source Issue, PR number,
+  §4 shape, head ref name, the exact commit SHA read, the selector itself, the
+  byte cap applied, and whether the content was truncated. Captured content is
+  sanitized, credential-redacted, and bounded exactly like every other §5
+  field, its truncation is recorded in the manifest, and every entry counts
+  against the snapshot's published byte bound.
+- **Both agents receive byte-identical evidence.** The evidence entries are
+  part of the one frozen snapshot serialization both prompts embed inside the
+  untrusted-input fence; there is no refiner-only or critic-only view, and
+  evidence text is data under the same prompt-injection posture as all other
+  snapshot text. The agents still hold no repository or network access; the
+  runner performed the read.
+- **A selection that cannot be captured is recorded, not guessed.** Every
+  omission carries a closed-vocabulary reason
+  (`malformed_declaration`, `invalid_selection`, `denied_path`,
+  `selection_capped`, `unknown_predecessor`, `resolver_unavailable`,
+  `source_unavailable`, `missing_path`, `identity_mismatch`,
+  `export_not_found`, `line_range_out_of_bounds`), decided at capture without
+  invoking any agent. Whether required-but-omitted evidence stops the
+  refinement before the agents run is the `evidence_required` preflight of
+  issue #1003 (§5.2), which dispositions on exactly these recorded reasons;
+  this section only guarantees the record exists.
+
+### 5.2 Required-evidence preflight
+
+**Required evidence that could not be captured stops the refinement before
+either agent is invoked.** §5.1 records what happened to every declared
+selection; this section decides what that record means. The decision is a
+**preflight**: it runs on the frozen capture alone, in state `eligible`,
+after the snapshot exists and before the first refiner turn (§12, row 48).
+
+The reason it is a stop rather than a warning is the failure mode §5.1 names.
+An Issue that declares a predecessor's exported contract is asserting that its
+own contract cannot be written without it. Run the round-set anyway and the
+refiner has only inference to draft from, the critic correctly objects that the
+inference has no snapshot basis, and the pair spends the §8 round cap
+converging on evidence neither of them holds — ending at a human handoff having
+consumed the agent budget, and re-running produces the identical rejection
+because nothing about the evidence changed. Stopping first reaches the same
+human with the same Issue, minus two agents and the round cap.
+
+- **Requiredness is declared, and defaults to required.** A selection is
+  required unless its declaration entry says `"required": false`; only the
+  JSON literal `false` opts out, since an interpreted requirement is not an
+  explicit one. The default is `true` because declaring a selection at all is
+  the assertion that the contract depends on it — a default of "optional" would
+  admit exactly the #951 failure under a declaration that looks like it
+  prevented it.
+- **A gap is a required selection the snapshot does not carry.** Every §5.1
+  omission of a required entry is a gap, whatever its reason — a missing file
+  or export, a predecessor branch the resolver could not reach or has no
+  resolver for, an ambiguous or capped or schema-rejected selection, a path the
+  deny floor refuses, a line range past the scanned bound, or content read at a
+  commit §4 never certified. One gap is not an omission: a required entry
+  captured with `truncated: true` is in the snapshot and still is not the
+  contract, because the agents are instructed to treat conclusions that depend
+  on the missing remainder as unsupported. The closed gap vocabulary is
+  therefore the §5.1 omission vocabulary plus `truncated`.
+- **Unknown requiredness fails closed.** A malformed declaration, an entry the
+  closed schema rejected, and a selection past the §5.1 cap carry no `required`
+  flag to read — the declaration never named a usable selection at all. Each is
+  a gap, recorded as `undetermined` rather than as `required` so the audit
+  record still says whether the operator asked for the stop or the lane
+  defaulted to it.
+- **Optional absence is not a gap.** A selection marked `"required": false`
+  that could not be captured, or that was captured truncated, is counted and
+  recorded and never stops the lane. That is the whole difference the flag
+  buys, and it is the operator's supported way to keep a nice-to-have selection
+  in the declaration.
+- **Nothing declared is nothing to require.** A body with no §5.1 block has an
+  empty evidence list, no gaps, and reaches the preflight unchanged — the
+  refinement lane behaves exactly as it did before this section existed.
+- **The stop is the ordinary handoff.** A gap raises the `evidence_required`
+  handoff of §13 through the same durable ready-for-human path every other
+  reason uses: task status `ready_for_human` at phase `refinement`, the
+  persisted reason, the `refinement.escalated.human` audit event, the
+  ready-for-human label, and one public comment carrying the reason literal and
+  the §16 fields. No round is spent, no malformed-attempt or agent-failure
+  counter moves, and neither agent process is started.
+- **What is persisted is literals.** The block records the declared, captured,
+  and optional-gap counts, each gap's declaration index, its gap reason, its
+  `required`/`undetermined` requirement, the predecessor Issue it named when it
+  named one, and the NAME of the local artifact carrying the full account. The
+  declared paths are not persisted to the block and never appear in a comment:
+  §5 excludes predecessor diffs from public Issues for the same reason, and a
+  path recorded on the block is one refactor away from being published. The
+  local artifact — `evidence-preflight.json` beside the run's `snapshot.json`
+  (§15) — is where an operator reads the selections themselves.
+- **The decision is deterministic, so a retry is idempotent.** It is a pure
+  function of the frozen snapshot, so an attempt re-run against unchanged
+  inputs reaches the same handoff by the same route and still invokes no agent.
+  The lane leaves `escalated_human` only through the §13 recovery of §12 row
+  36, which clears the gate record with the reason it belongs to; the recovered
+  attempt captures a **fresh** snapshot, so evidence that became reachable, or
+  a declaration the operator corrected, is read as it now stands.
+
 ## 6. Fingerprints and staleness
 
 The runner computes one **`predecessorFingerprint`**: a SHA-256 over a
@@ -512,6 +662,18 @@ exclusions are enumerated below rather than left implicit.
   lineage state literals and counts when the dispute protocol is enabled;
 - the digest of the captured comment window — per comment, its identifier, its
   last-edited timestamp, and its body digest, in capture order.
+
+**Hashed — the §5.1 declared evidence**, when any entry exists: every entry in
+declaration order — its selector including its §5.2 requiredness, its status and omission literals, its
+provenance (source Issue, PR, shape, head ref name, commit SHA), the digest of
+its captured content or the literal `absent`, the byte cap applied, and its
+truncation flag. A snapshot whose body declares no evidence hashes exactly the
+pre-evidence serialization, so recorded fingerprints of undeclared Issues —
+including every fingerprint already embedded in a live managed-region marker —
+are unchanged by the evidence capability existing. Requiredness is hashed for
+the reason every other selector field is: flipping a selection between required
+and optional changes what the lane does with identical bytes, and §6 admits no
+unhashed input. Only Issues that already declare evidence are affected.
 
 Every text digest is taken over the **truncated** text actually placed in the
 snapshot, so a digest is exactly the bytes the agents saw and a lowered
@@ -659,6 +821,20 @@ The fingerprint is the identity of the whole refinement attempt:
 
 ## 7. Roles, isolation, and structured result schemas
 
+Both prompts carry an explicit statement of the repository's stacked-branch
+semantics alongside the §5 snapshot: a predecessor's `shape` is `merged` (its
+PR landed on the base branch) or `open_stack_ready` (its PR is still open,
+but it passed review and carries the `status:stack-ready` marker, so its PR
+branch is already the reviewed contract this Issue builds on, per §4's open
+shape). Usability is decided by the PR state and the `status:stack-ready`
+label, not by `issue.state`: the predecessor Issue may be open or closed
+independently — closing the Issue while its stack-ready PR remains open is
+normal once the stack is queued for a later merge. An `open_stack_ready`
+predecessor's PR being unmerged, and its Issue being open or closed, is that
+shape's normal, intentional state — not evidence the predecessor's work is
+missing or undelivered — and neither role may treat unmerged-ness or the
+Issue's open/closed state by itself as a contradiction (issue #999).
+
 ### 7.1 Refiner (AI A)
 
 The refiner receives the §5 snapshot and returns exactly one fenced JSON
@@ -678,7 +854,12 @@ object. It edits no files, runs no commands, and touches no network.
     {
       "kind": "split | dependency_add | dependency_remove | dependency_rewire | supersede",
       "rationale": "...",
-      "disposition": "advisory | blocking"
+      "disposition": "advisory | blocking",
+      "relationship": {                // required for the dependency_* kinds (§9.1)
+        "blockedIssue": 951,           // the Issue that carries the `blocked by` edge
+        "blockerIssue": 950,           // the predecessor it points at
+        "previousBlockerIssue": 949    // dependency_rewire only — the edge replaced
+      }
     }
   ],
   "unresolvedQuestions": ["..."],      // advisory
@@ -691,6 +872,20 @@ Rules:
 - Every applicable claim must be traceable to the snapshot, and every entry
   in `predecessorReferences` must name a predecessor that is actually in the
   snapshot. A reference to any other Issue or PR is malformed (§17).
+- Every entry in `risks` must be grounded in the snapshot: the target Issue, a
+  predecessor named in the snapshot, or another Issue, PR, or defect that the
+  target's or a named predecessor's own content in the snapshot actually
+  references. Citing an Issue, PR, or defect with no such grounding is not
+  traceable to the snapshot and the critic objects to it as `unsupported`
+  (§7.2).
+- Every `dependency_add`, `dependency_remove`, and `dependency_rewire`
+  proposal must carry `relationship`, naming the edge by Issue number so §9.1
+  can compare it against the authoritative relationship graph. A proposal that
+  omits it is not malformed — it is **unverifiable**, which fails closed
+  exactly like a blocking one. A `relationship` that is present but does not
+  parse (a non-integer, a non-positive Issue number, an unknown key) is
+  malformed (§17). `split` and `supersede` name no edge; a `relationship`
+  beside either is ignored.
 - The refiner must not restate predecessor source code, quote file contents,
   or emit any local filesystem path.
 - The refiner must not emit the managed-region markers of §10 anywhere in its
@@ -723,7 +918,9 @@ It returns exactly one fenced JSON object.
   "topologyDispositions": [
     { "index": 0, "disposition": "advisory | blocking" }
   ],
-  "confidence": "low | medium | high"
+  "confidence": "low | medium | high",
+  // verdict `block` ONLY — omitted entirely on `pass` and `revise`
+  "blockReason": "missing_decision | authority_conflict | evidence_unavailable | premise_invalidated | scope_change"
 }
 ```
 
@@ -734,12 +931,50 @@ Verdict semantics:
   scope. `objections` must be empty.
 - **`revise`** — the contract is fixable within the round cap. `objections`
   must be non-empty; they are the only critic output handed back to the
-  refiner.
+  refiner. **A draft that drops, weakens, or reinterprets a requirement the
+  original Issue already states is a repairable omission, not a missing human
+  decision**: the critic answers it with `revise` and a `lost_requirement`
+  objection naming the requirement, and the refiner restores it from the
+  snapshot (issue #1176). Unsupported claims, ambiguity, and scope creep the
+  draft introduced are `revise` for the same reason.
 - **`block`** — the contract must not be applied and the round cap must not
-  be spent trying. Used when the refiner contradicts predecessor evidence,
-  drops a requirement the original Issue stated, or refines an Issue whose
-  premise the predecessor outcome invalidated. `block` goes straight to human
-  handoff.
+  be spent trying, because no revision of the draft could fix it from the
+  snapshot. The critic names why in `blockReason`, a closed set of exactly
+  five: `missing_decision` (the Issue leaves open a decision only the operator
+  can make), `authority_conflict` (authoritative inputs — the Issue and
+  predecessor evidence, or two stated requirements — conflict with each
+  other), `evidence_unavailable` (evidence needed to judge the draft is omitted
+  or truncated), `premise_invalidated` (the predecessor outcome invalidated
+  the Issue's premise, including a draft that contradicts predecessor
+  evidence the Issue depends on), and `scope_change` (refining needs a scope
+  or topology change requiring operator choice). `block` goes straight to
+  human handoff. A predecessor's Issue or PR being `open` is not, by itself,
+  predecessor evidence contradicting the draft when that predecessor's
+  snapshot `shape` is `open_stack_ready` (§7 intro, issue #999); genuinely
+  unusable or incomplete predecessors remain blocking.
+
+`blockReason` is optional in the schema: absent or `null` means the critic
+named no reason, and it is malformed on a `pass` or `revise` verdict (§17).
+The critic prompt therefore shows it apart from the every-verdict schema, as
+a field added for `block` only, so a critic that copies the displayed schema
+for a `pass` or `revise` does not produce a malformed result.
+
+**Repairable-block routing (issue #1176).** The runner acts on a routed
+verdict, not only on the literal. A `block` is routed as `revise` — §12 row 17
+below `MAX_REFINEMENT_ROUNDS_PER_ISSUE`, row 18 (`no_convergence`) at it —
+only when **all** of these hold: it names no `blockReason`; it carries at least
+one objection and every objection is `lost_requirement`; and the snapshot's
+declared evidence (§5.1) is complete, with no selection `omitted` or
+`truncated`. That is the shape of a critic that blocked on an omission of an
+already-written requirement (incident #1111). Every other `block` stays a
+`block` (row 19): a named `blockReason` is honoured verbatim, any other
+objection kind beside `lost_requirement` may be the real blocker, and
+incomplete evidence may be why the critic could not judge the draft. The
+routing spends no extra round, adds no retry, and changes no cap; the routed
+round is the same bounded revision any `revise` gets, and the revised draft is
+critiqued again before it can be accepted. The `refinement.critique.revise`
+event, and a `no_convergence` handoff at the cap, record
+`criticVerdict: "block"` when the round was routed this way.
 
 The critic evaluates; it never authors replacement prose. A critic result
 containing a rewritten body, criteria list, or notes is malformed (§17).
@@ -865,7 +1100,64 @@ change. Beyond that:
   the Issue is not activated, `status:needs-refinement` stays, and the task
   escalates with reason `topology_change_required`. A downstream Issue that
   genuinely needs to be split or rewired is a decision for a human, and
-  implementing it as written would be the wrong work.
+  implementing it as written would be the wrong work. "Any proposal" means any
+  proposal §9.1 classifies as an actual change: a no-op is subtracted first.
+
+### 9.1 Normalization against the authoritative graph
+
+The rules above ask whether a proposal is `blocking`. They never asked whether
+it would **change anything**. An agent can propose adding an edge the
+relationship graph already carries, or removing one it never had; the answer to
+"should a human decide this?" is no, because there is nothing to decide. Before
+#982 such a no-op escalated like any other blocking proposal, which spent a
+human handoff on nothing and — in a serial chain — parked every downstream
+Issue behind an operator decision that did not exist.
+
+Every proposal is therefore normalized before its disposition is read:
+
+- **The comparison set is the direct GitHub Issue Relationships captured for
+  this refinement's §5 snapshot**, reused rather than re-read. That set is
+  authoritative and complete for the target Issue: §4 refuses to capture unless
+  every direct `blocked by` neighbour read back usable, so the snapshot's
+  predecessor list **is** the target's current `blocked by` set, frozen at the
+  same instant as every other input the agents saw. Nothing else is consulted —
+  not the Issue body, not labels, not the proposal's own rationale.
+- Each proposal is classified into exactly one of three literals:
+  - **`already_satisfied`** — the requested state already holds.
+    `dependency_add(A, B)` when A is already blocked by B;
+    `dependency_remove(A, B)` when that edge is already absent;
+    `dependency_rewire(A, B, previous P)` when A is blocked by B and not by P.
+  - **`effective_change`** — applying it would alter the graph. Every `split`
+    and `supersede` is here by construction: neither names an edge, so neither
+    can be satisfied by the graph.
+  - **`invalid_or_unverifiable`** — it cannot be safely compared. A missing
+    `relationship`, a `blockedIssue` that is not the target (the snapshot
+    captures the target's edges and no others, so another Issue's graph is
+    unread rather than empty), a self-edge, a rewire with no
+    `previousBlockerIssue`, or no authoritative graph at all.
+- **`already_satisfied` proposals are excluded from
+  `topology_change_required`,** whatever either party said about them. A critic
+  disposition cannot turn a no-op into a blocking topology change; there is no
+  change to block on.
+- **Everything else keeps §9 verbatim.** `effective_change` and
+  `invalid_or_unverifiable` proposals follow the disposition rules and the
+  handoff rules above unchanged. Normalization only ever subtracts no-ops; it
+  never promotes a proposal to `advisory` and never applies one.
+- **Duplicate equivalent proposals in the same draft collapse to one
+  normalized proposal** — same kind, same edge, one decision — and the
+  collapsed group fails closed: it blocks when **any** of its members does, so
+  repeating a proposal cannot dilute a `blocking` judgement.
+- **A relationship read failure is never "already satisfied."** A failed read
+  is a `failed` capture under §4 — there is no snapshot and no draft to
+  normalize — and if a graph is unavailable for any other reason, every
+  proposal is `invalid_or_unverifiable` and the §9 rules decide it. Absence of
+  evidence is never evidence of an existing edge.
+- The classification of every proposal, its closed detail literal, the
+  collapsed-duplicate index, and whether the proposal still requires a human
+  are recorded as **private** audit metadata (§15): the accepted record, the
+  `refinement.topology.recorded` event, and the `topology_change_required`
+  handoff event all carry them. None of it is published (§16), and no raw agent
+  output rides along with it.
 
 ## 10. The managed body region
 
@@ -1171,7 +1463,11 @@ the one shape in which a handoff cannot deliver the public comment §13 and §16
 otherwise require of it. Row 47 was appended for the same reason once more: it
 is the second admission refusal of §4 condition 1, and it sits beside row 2
 rather than replacing it because the two failures are repaired by opposite
-label edits.
+label edits. Row 48 was appended last: it is the §5.2 required-evidence
+preflight, and it sits beside row 10 rather than inside it because the two are
+opposite outcomes of the same `snapshot.captured` event — row 10 begins the
+round-set, row 48 refuses to begin one. Their guards are mutually exclusive:
+row 10 requires that §5.2 raises no gap.
 
 Row 4 is the one row whose effect is stated in terms of the **task row** as well
 as the state: its hold is persisted as a non-runnable `blocked` refinement task
@@ -1201,16 +1497,16 @@ and changes no state.
 | 7 | `pending` | `predecessors.resolved` | no direct predecessor | `escalated_human` | handoff (`not_chain_scoped`) |
 | 8 | `eligible` | `roles.resolved` | refiner and critic resolve to two agents satisfying the independence rule of §7.3 | `eligible` | record both resolved roles on the task; `refinement.roles.resolved` |
 | 9 | `eligible` | `roles.resolved` | no independent critic can be selected | `escalated_human` | handoff (`no_independent_critic`); no snapshot captured, no round spent |
-| 10 | `eligible` | `snapshot.captured` | roles resolved, within snapshot caps | `drafting` | record `predecessorFingerprint`; `refinement.snapshot.captured` |
+| 10 | `eligible` | `snapshot.captured` | roles resolved, within snapshot caps, and §5.2 raises no evidence gap | `drafting` | record `predecessorFingerprint`; `refinement.snapshot.captured` |
 | 11 | `drafting` | `draft.returned` | well-formed refiner result | `critiquing` | `refinement.draft.recorded` |
 | 12 | `drafting` | `draft.returned` | malformed, attempts below `MAX_MALFORMED_ATTEMPTS_PER_ROLE` | `drafting` | re-run the refiner; `refinement.draft.malformed` |
 | 13 | `drafting` | `draft.returned` | malformed, attempts at cap | `escalated_human` | handoff (`malformed_refiner_output`) |
 | 14 | `critiquing` | `critique.returned` | `pass`, no topology proposal | `accepted` | `refinement.critique.passed` |
-| 15 | `critiquing` | `critique.returned` | `pass`, every proposal `advisory` by both parties | `accepted` | `refinement.critique.passed`; `refinement.topology.recorded` |
-| 16 | `critiquing` | `critique.returned` | `pass`, any proposal `blocking` | `escalated_human` | handoff (`topology_change_required`); nothing applied |
-| 17 | `critiquing` | `critique.returned` | `revise`, rounds used below `MAX_REFINEMENT_ROUNDS_PER_ISSUE` | `drafting` | `refinement.critique.revise`; objections handed back to the refiner |
-| 18 | `critiquing` | `critique.returned` | `revise`, rounds used at cap | `escalated_human` | handoff (`no_convergence`) |
-| 19 | `critiquing` | `critique.returned` | `block` | `escalated_human` | handoff (`critique_blocked`) |
+| 15 | `critiquing` | `critique.returned` | `pass`, every proposal `advisory` by both parties or `already_satisfied` (§9.1) | `accepted` | `refinement.critique.passed`; `refinement.topology.recorded` |
+| 16 | `critiquing` | `critique.returned` | `pass`, any proposal `blocking` that §9.1 did not classify `already_satisfied` | `escalated_human` | handoff (`topology_change_required`); nothing applied |
+| 17 | `critiquing` | `critique.returned` | `revise`, or a `block` §7.2 routes as `revise`; rounds used below `MAX_REFINEMENT_ROUNDS_PER_ISSUE` | `drafting` | `refinement.critique.revise`; objections and the previous draft handed back to the refiner |
+| 18 | `critiquing` | `critique.returned` | `revise`, or a `block` §7.2 routes as `revise`; rounds used at cap | `escalated_human` | handoff (`no_convergence`) |
+| 19 | `critiquing` | `critique.returned` | `block` that §7.2 does not route as `revise` | `escalated_human` | handoff (`critique_blocked`), recording the critic's `blockReason` and objection literals |
 | 20 | `critiquing` | `critique.returned` | malformed, attempts below `MAX_MALFORMED_ATTEMPTS_PER_ROLE` | `critiquing` | re-run the critic; `refinement.critique.malformed` |
 | 21 | `critiquing` | `critique.returned` | malformed, attempts at cap | `escalated_human` | handoff (`malformed_critic_output`) |
 | 22 | `accepted` | `apply.requested` | live fingerprint equals `predecessorFingerprint` | `applying` | persist the accepted refinement (commit point), including the `appliedRegionDigest` of the region step 3 will write; stamp the fingerprint precondition on the attempt's effects; `refinement.accepted.persisted` |
@@ -1239,6 +1535,7 @@ and changes no state.
 | 45 | `applying` | `activation.reconciled` | the attempt's final label effect is durably recorded `sent` (§11 step 6) | `activated` | in one TaskStore transaction, compare-and-set on the row still being this lane's: park the shared task row at `blocked`/phase `implementation` with `context.assignment` untouched, and move the refinement state to `activated`; a repeated pass is a no-op; `refinement.activated` |
 | 46 | `escalated_human` | `handoff.comment.dead_lettered` | the handoff's own public comment exhausted its retry budget or was cancelled | `escalated_human` | the handoff stands on its local record — status `ready_for_human`, the persisted reason, and `refinement.escalated.human` — with no comment; record `refinement.handoff.comment.undeliverable`; no replacement comment is attempted (§13) |
 | 47 | `pending` | `intake.scanned` | marker present, no executable `status:*`, and no implementation-lane `agent:*` label | `pending` | refuse admission; no task; `refinement.eligibility.refused` (`no_implementation_agent`); re-evaluated next poll |
+| 48 | `eligible` | `snapshot.captured` | the captured snapshot has at least one §5.2 gap — a required or undetermined-requiredness declared selection that is omitted or truncated | `escalated_human` | record `predecessorFingerprint` and the §5.2 gate record; handoff (`evidence_required`); no round spent, and neither agent is invoked |
 
 ## 13. Human handoff
 
@@ -1259,6 +1556,36 @@ entered the §12 state machine:
    budget and no fingerprint, marker, or region precondition, so that whatever
    stopped the lane cannot also stop the notification that it stopped
    (§11; row 32 in particular forbids only later *application* stages).
+
+**A handoff also reaches the session's configured notifier.** Those four items
+are the lane's obligations on the work item itself. A handoff is *also* an
+ordinary `ready_for_human` transition, and every other lane's ready-for-human
+transition already sends the provider-neutral notification the session
+configures; a handoff — the one outcome that is waiting for a human by
+definition — must not be the exception that reaches a correct Issue and a silent
+notifier. It is enqueued as a further effect in the same durable transaction as
+the transition and items 3–4, and it is not a work-item write: which messenger
+receives it is session configuration this contract does not name, a session that
+configures none sends none, and the handoff completes identically either way.
+What it may carry is bounded by §16 almost exactly as the comment is — the
+repository, the Issue number and its public URL, the phase (`refinement`), the
+transition, the handoff reason literal, and the session id every notification
+already carries; never an artifact or repository path, agent output, provider
+error text, a snapshot excerpt, or a run identifier. Delivery is the outbox's
+problem: a notification that cannot be delivered retries and dead-letters on its
+own budget and can no more undo the handoff than an undeliverable comment can,
+and no handoff waits on one. Its idempotency is the handoff's own identity —
+session, Issue, reason, and the recovery ordinal below — so a completion
+re-derived after a lost CAS notifies once, while a lane recovered and escalated
+again is a new handoff and notifies again.
+
+The public URL among those fields is the *work item's* own. It is built from the
+coordinates of whichever tracker actually holds the Issue, not from the session's
+GitHub repository — a session whose work items live on another supported tracker
+would otherwise be handed a link to a different Issue, or to none — and it is
+absent altogether rather than guessed whenever the configured coordinates cannot
+build one. Its absence is not a failure: the rest of the notification is
+provider-independent and still goes out.
 
 The preconditions item 4 is free of are the lane's own — the §6 fingerprint, the
 §10 managed region, the §11 label markers. Its **delivery** carries exactly one:
@@ -1343,9 +1670,9 @@ implementation enqueue as a duplicate, the same mechanism the manual skip below
 relies on. Everything else about the handoff is unchanged: no executable status
 is added by the lane, the ready-for-human label is added, and one comment
 carries the reason literal. The operator then has exactly the two exits below —
-cancel the row and let the hand-applied status stand (the skip path, whose
-label step is already done for them), or restore the label shape and run the
-recovery command.
+move the row into implementation and let the hand-applied status stand (the
+skip path, whose label step is already done for them), or restore the label
+shape and run the recovery command.
 
 No automatic transition leaves `escalated_human`. Clearing it is an operator
 action: fix the Issue, fix the relationship graph, or accept the topology
@@ -1364,14 +1691,28 @@ therefore two ordinary operator steps, in this order:
    `status:needs-implementation`** — the same removal-before-addition ordering
    §11 step 5 gives the automatic path, so the Issue never carries both
    markers at once.
-2. **Dispose of the stranded refinement task row** with `admin task cancel`.
-   That row still exists at status `ready_for_human`, phase `refinement`;
-   left in place, the next intake scan finds it and refuses the implementation
-   enqueue as a duplicate, exactly as it does for the re-labelling case below.
+2. **Move the stranded refinement task row into implementation** with
+   `admin recover --session-id <session-id> --issue-number <n> --from
+   ready_for_human --phase implementation`. That row still exists at status
+   `ready_for_human`, phase `refinement`; this command requeues it in place to
+   `queued` at phase `implementation`, so the next intake scan finds an
+   already-active row rather than admitting a duplicate.
 
-This lane adds no command for either step, and the refinement state of the
-cancelled row stays `escalated_human`. That is correct: the Issue left the
-refinement lane rather than completing it, and nothing in §12 claims otherwise.
+   **Never `admin task cancel` for this step** (issue #984). Cancellation is
+   terminal, and ordinary implementation intake
+   (`SqliteTaskStore.enqueueTask`) only reactivates a row `blocked` at
+   implementation or conflict-resolution — a `cancelled` row returns
+   `already_exists` forever, so the labels can be relabelled correctly and
+   the Issue can still never reach implementation. `admin task cancel` remains
+   correct for genuinely abandoned work; it is simply not this transition.
+
+Step 1 is an ordinary label edit with no command of its own. Step 2 reuses the
+same `admin recover --from ready_for_human --phase <phase>` surface every
+other `ready_for_human` handoff is recovered through — it is not specific to
+this lane — and the refinement state of the requeued row stays
+`escalated_human`. That is correct: the Issue left the refinement lane rather
+than completing it, and nothing in §12 claims otherwise; the row is simply
+pointed at a different phase now.
 
 **Recovery is an explicit command, because re-labelling cannot work.** The
 marker was deliberately left in place, so it is already present and re-applying
@@ -1408,6 +1749,47 @@ Normative behavior, modelled on the existing handoff-recovery commands:
   outbox. `status:needs-refinement` is untouched: on every handoff reason but
   `marker_precondition_failed` it never left, and on that one the label check
   above has already established that the operator put it back.
+- **The handoff's own label addition is retired in that same transaction**, not
+  merely compensated for. §13 item 3 enqueued the ready-for-human label as an
+  outbox row, and a row whose dispatch failed is still pending behind its
+  backoff: the removal above can dispatch first and that retry then re-applies
+  "a human is needed here" to a row recovery has already returned to `queued`.
+  So the pending addition is cancelled — addressed by its own idempotency key,
+  in the transaction that performs the reset, so "the label will not be added"
+  and "the task is queued again" are one fact. An addition already delivered is
+  left alone; the removal is what retracts it. The handoff **comment** is not
+  retired: it is a dated record of an attempt that really did stop for that
+  reason, not a claim about the row's current state, and the retried attempt
+  raises its own handoff under its own key if it stops again.
+- **A recovery that would race the addition's own dispatch is refused, not
+  applied.** Retiring a pending row stops its retry; it cannot abort a request
+  already on the wire. If the addition is being dispatched at the instant
+  recovery commits, that request can land after the removal has dispatched, the
+  delivery is still recorded, and nothing schedules a second removal — the Issue
+  keeps a ready-for-human label on a task that is `queued` again. So a recovery
+  whose retirement names a row a dispatcher currently holds commits nothing at
+  all: no reset, no event, no removal. The command reports the contention and is
+  re-run once that attempt resolves, at which point the row is retirable and the
+  recovery proceeds unchanged. This applies to the operator command only; the
+  mirror-image retirement performed by a handoff raised after a recovery is
+  never refused, because rolling back a completed attempt's transition to dodge
+  a dispatch it merely raced would cost more than the missed removal, which the
+  next handoff or recovery re-derives.
+- **The removal names the label the handoff actually added**, which the handoff
+  records on its own block in the transaction that raised it. The session's
+  ready-for-human label is configuration an operator may rename, and this
+  removal compensates for one specific addition: naming the currently configured
+  label after a rename would take off a label the Issue never carried and leave
+  the one it is really wearing in place. A block written before that record
+  existed has no label to name and falls back to the configured one, which is
+  the value its own handoff read.
+- **A handoff raised after a recovery retires that recovery's removal**, the
+  mirror image of the retirement above. If the removal's own dispatch failed it
+  is waiting behind a backoff while the recovered attempt runs; should that
+  attempt escalate again, the new addition and the old removal are live at once,
+  and the removal's retry would strip the marker off a task that is
+  `ready_for_human` again. The handoff cancels it in the transaction that
+  publishes the new addition.
 - **`context.assignment` is preserved, not re-resolved** (§14). Recovery is a
   retry of the same work item, not a re-admission of it.
 - **The record of the fingerprint actually applied is preserved too** (§6). A
@@ -1488,17 +1870,51 @@ rendered (§6), the predecessor list (Issue numbers, PR numbers,
 head SHAs), the round counters, per-role malformed-attempt counters, per-role
 agent process-failure counters, the
 stale-restart counter, the accepted refined contract, the recorded advisory
-proposals, the refiner's and critic's `confidence` literals, the handoff
-reason when escalated, and — while a retryable agent process failure awaits
-its delayed re-run (§12, rows 38 and 40; §17) — the resumable mid-round
+proposals **with their §9.1 normalization literals** (the classification, its
+closed detail literal, the collapsed-duplicate index, and whether the proposal
+still requires a human), the refiner's and critic's `confidence` literals, the handoff
+reason when escalated together with the **ready-for-human label that handoff
+added**, the §5.2 evidence gate record when the required-evidence preflight
+raised the handoff — the declared/captured/optional-gap counts, each gap's
+declaration index, gap reason, requirement literal, and named predecessor
+Issue, and the local artifact's file name, never a declared path — the
+**critic block record** when the critic raised the `critique_blocked` handoff
+(§12 row 19; issue #1176) — the round, the critic's `blockReason` (or `null`
+when it named none), and each objection's field and kind literals, never the
+objection prose — and,
+while a retryable agent process failure awaits
+its delayed re-run (§12, rows 38 and 40; §17), the resumable mid-round
 retry record: the role, round, and attempt to resume, plus the validated
 draft (critic re-run) or the previous round's contract and objections
 (refiner re-run) the deferred turn re-runs against.
 
+One field survives the §13 reset that clears all of the above: the **recovery
+count**, the number of times row 36 has returned this row to `pending`. It is
+deliberately not one of the §8 counters — those are cleared by the very
+transition that increments it — and it exists because the retried attempt has
+to be distinguishable from the attempt before it. A second attempt that stops
+for the SAME reason raises a handoff whose public half is keyed on the session,
+the Issue, and the reason (§13 item 4, "exactly one comment per handoff"); with
+no attempt discriminator that key would be the first attempt's, and the second
+handoff would dedupe against a comment describing an attempt that has since been
+reset. A row that has never been recovered records nothing here and keys exactly
+as it always did.
+
+The recorded **handoff label** is written for the same kind of reason: the §13
+removal that retracts it is a compensation for one specific addition, and
+`labels.readyForHuman` is session configuration that can be renamed in between.
+Recording the label the addition used is what keeps the retraction pointed at
+the label the Issue actually carries. It is cleared by the reset alongside the
+reason it belongs to, and a block written without it falls back to the
+configured label.
+
 **Artifacts** (local-only, never published): under
 `<artifactRoot>/issue-refinement/issue-<n>/<runId>/` — the snapshot bundle
 and its manifest (including which fields were truncated), the raw refiner and
-critic transcripts written before parsing, the rendered managed region, and a
+critic transcripts written before parsing, the rendered managed region, the
+§5.2 `evidence-preflight.json` record when the required-evidence preflight
+stopped the attempt (the gaps together with the declared selections themselves,
+which the block deliberately does not carry), and a
 run manifest carrying agent/model/effort per role. Artifact paths never
 appear in any GitHub comment or Issue body.
 
@@ -1557,14 +1973,20 @@ nothing, which means a hold that committed without its event would stay
 unauditable for the life of the task. Either both are on record or neither is,
 and a refused compare-and-set leaves no trace of a hold that did not happen.
 
-Two events belong to tasks and effects outside the §12 state machine, and exist
-so that neither is silent. `refinement.execution.suspended` records the
-pre-execution marker guard of §3.1 stopping an already-existing executable task
-— that task carries no refinement state, so no §12 row could record it.
+Three events belong to tasks and effects outside the §12 state machine, and
+exist so that none of them is silent. `refinement.execution.suspended` records
+the pre-execution marker guard of §3.1 stopping an already-existing executable
+task — that task carries no refinement state, so no §12 row could record it.
 `refinement.handoff.comment.undeliverable` records a handoff whose public
 comment could not be delivered (§12, row 46): the handoff is otherwise
 invisible on GitHub, so this event and the persisted handoff reason are the only
 record an operator has.
+`refinement.progress.comment.unpublishable` records a committed progress
+milestone whose public comment could not be projected at all (§16) — an unknown
+schema version, an unrecognised milestone kind, or a `retry_scheduled` carrying
+no committed deadline. That is not a delivery failure: no outbox row was ever
+created, so no pending or dead-lettered row exists to find it in, and the event
+is written in the same transaction as the milestone it belongs to.
 
 Event fields: task id, issue number, refinement state, predecessor Issue
 numbers, the `predecessorFingerprint`, actor role
@@ -1573,13 +1995,119 @@ outcome or handoff-reason literal, the round and attempt counters, and
 timestamps. Events carry literals and counters only — never refined prose,
 snapshot content, agent reasoning, or local paths.
 
+**Progress milestones** are a stable, versioned PROJECTION over those audit
+events — not a second state machine, and not a replacement for any of them.
+The audit vocabulary above is a diagnostic log: open-ended, fine-grained, and
+shaped by what each transition needed. A surface that wants to answer "where is
+this Issue now" needs a bounded contract instead, and every surface deriving
+its own answer from the diagnostic log would get a slightly different one.
+
+Milestones are persisted as `refinement.progress.milestone` task events, one
+per milestone, carrying a `schemaVersion`, a deterministic `milestoneId`, and
+one of exactly eight `kind` literals: `started` (refinement became eligible and
+actually began), `refiner_completed`, `critic_completed` (with the `revise` or
+`pass` verdict as its result), `retry_scheduled`, `accepted`, `activated`,
+`human_handoff`, and `failed`. Beside those: the Issue identity and the
+refinement source fingerprint or revision; the round, role, attempt, and
+refinement state where they apply; agent/provider/model/effort and their
+sources; `durationMs` when known; bounded result, reason, and failure-class
+literals; a machine-readable `nextAction`; the authoritative retry deadline for
+`retry_scheduled`; and whether human action is required. Nothing else — no raw
+prompt, no agent output, no artifact reference, no absolute path, no
+unbounded prose.
+
+**Milestones are emitted at boundaries, never at ticks.** Worker polling and
+claim attempts, idle runs, predecessor-not-ready and other eligibility holds,
+unchanged retry checks, duplicate intake, and every internal event that crosses
+none of the eight boundaries produce no milestone at all.
+
+**`milestoneId` is derived, not minted.** It hashes stable task/refinement
+identity together with the semantic transition — source fingerprint, round,
+role, attempt where a round can cross the same boundary twice, kind, and the
+transition literal — and depends on no wall-clock time and no randomness.
+Replaying the same semantic transition after a retry, a process restart, or a
+claim-loss recovery therefore reproduces the same id and persists no duplicate.
+Suppression survives restarts because the ids already emitted are kept on the
+block itself (`task.context.refinement.progressMilestones`), bounded by the §8
+caps that already bound the lane — an in-memory set would forget exactly the
+restart it exists to survive, and an unbounded milestone history in
+`task.context` is not an acceptable substitute.
+
+**Milestones commit with the transition they describe.** They are written
+through the same task/event transaction as the task-state move and the dedupe
+ledger, with no GitHub-backed source of truth: no milestone may be committed
+for a transition that loses the task claim or fails its authoritative
+task-state commit. The `retry_scheduled` deadline is the task `notBefore` the
+committing layer ACTUALLY wrote, never a handler-side estimate of it — which is
+why the projection is performed by the layer that computes the delay.
+
+**The operator view is one normalized model, not three renderings.** `admin
+task-status` — human output and `--json` alike — and the admin UI derive
+refinement progress from exactly two authoritative inputs: the task row (its
+status, phase, and `notBefore`) and the persisted
+`refinement.progress.milestone` events. They share a single projection, so they
+cannot disagree about a round, a deadline, or whether a human has to act. The
+view reports the phase and refinement sub-state, the round and attempt, the
+current role, the refiner and critic agent identities, the last milestone kind
+and the instant it occurred, the machine-readable `nextAction`, the
+authoritative retry deadline, the bounded failure class or handoff reason,
+whether human action is required, and one execution disposition drawn from a
+closed six: `running`, `queued`, `delayed`, `activated`, `failed`, and
+`awaiting_human`. The disposition is decided by the task ROW in its own order,
+and the last milestone is consulted only where the row genuinely cannot answer:
+a row still sitting in the §11 step 6 activation park is indistinguishable from
+an ordinary dependency hold from the row alone, and §18 requires a terminal
+refinement process failure to be recorded as `ready_for_human`, under which a
+hard failure and a §13 handoff also read identically. Both exceptions are read
+from the park the row is STILL in, never from a terminal state a row that has
+moved on happens to keep carrying: §12 row 33 reactivates the parked row to
+`queued` at phase `implementation` while the block keeps `state: "activated"`
+for good, and that reactivated row is reported as the ordinary queued
+implementation task it now is. Everywhere else the row wins too — a task an
+operator recovered after a hard failure is running again while its milestone log
+still ends at `failed`, and reporting it dead would be the one mistake this view
+must never make.
+
+**Operator output never scrapes the projection back.** Neither surface reads a
+GitHub comment, infers state from outbox delivery, or reconstructs the
+fine-grained `refinement.*` audit events into a second progress state machine.
+Status and UI commands perform no GitHub mutation at all, and the progress
+comments of §16 remain a one-way human-facing projection of these milestones —
+never an input to them.
+
+**The retry deadline is machine-exact.** `--json` carries stable field names and
+absolute ISO-8601 UTC timestamps, including the exact persisted
+`retryNotBefore` — the committed task `notBefore`, byte for byte, never a
+re-derived or reformatted copy. Human-readable output may additionally render an
+instant in local time, but it states the same value. Deciding whether that
+deadline has passed — the `delayed`/`queued` split — compares parsed INSTANTS
+through the same predicate the claim path uses, never the timestamp strings:
+two valid ISO-8601 UTC representations of one instant may differ in text (a
+second-precision `notBefore` sorts after its millisecond-precision twin), and a
+text comparison would report a delay on a task the scheduler is already willing
+to hand out.
+
+**The operator view fails closed too.** A persisted milestone whose
+`schemaVersion` this build does not implement, or whose `kind` falls outside the
+closed eight, is refused and COUNTED — never coerced into a plausible-looking
+boundary. Where a refused record is newer than the newest readable one, that
+readable one stops informing the disposition, which falls back to the
+authoritative task row: an operator is told what is certain plus how much this
+build could not read, rather than a confident answer derived from a superseded
+milestone. Committed milestones whose public comment could not be projected
+(`refinement.progress.comment.unpublishable`) are surfaced as a count for the
+same reason — a comment that was never enqueued leaves no outbox row to find it
+in.
+
 ## 16. Public GitHub comment policy
 
 Every applied refinement leaves exactly one auditable comment, posted at step
 4 of §11. Every handoff leaves exactly one comment (§13) — with the single
 exception §13 defines: when the handoff's own comment effect dead-letters the
 handoff stands with no comment at all (§12, row 46), and no replacement is
-attempted. One or none, never two. No other comment is posted by this lane.
+attempted. One or none, never two. Beside those two, the lane posts the §15
+progress comments specified at the end of this section — one per committed
+progress milestone, append-only. No other comment is posted by this lane.
 
 An applied-refinement comment contains at most:
 
@@ -1617,15 +2145,79 @@ one. The run id in particular is a run identifier and is never published, so the
 configuration, not a correlation id. An operator who needs the run id has
 `admin task-status`.
 
+It binds the handoff **notification** of §13 too, with one recorded difference: a
+notification is delivered to the operator's own configured messenger rather than
+posted on the Issue, so it carries the session id every notification already
+carries and no comment ever may. Everything else on the never-published list —
+local and artifact paths, run and task identifiers, raw agent output, agent
+reasoning, provider error text, snapshot excerpts, repository file contents — is
+as forbidden there as it is here, and what remains is the repository, the Issue
+number and its public URL, the phase, the transition, the handoff reason
+literal, and the NAME of the environment variable holding the delivery
+credential — never the credential itself, which is resolved at dispatch and
+never persisted.
+
 The comment is metadata about a change the reader can already see in the
 Issue body; it does not restate that change.
+
+**Progress comments** publish the §15 progress milestones, and they are the one
+exception to "one or none" above: each committed milestone leaves at most one
+comment, so a refinement that runs to completion leaves an ordered trail from
+`started` through `activated`. They are strictly append-only — the lane never
+edits one mutable status comment, and never revises a comment it has posted.
+Milestones are emitted at boundaries and never at ticks (§15), so worker polls,
+claim attempts, idle runs, predecessor and eligibility holds, unchanged retry
+checks, and duplicate intake produce no comment at all.
+
+A progress comment contains at most:
+
+- the milestone kind literal, and the refinement state at that boundary;
+- the round, the role, and the attempt, where the milestone carries them;
+- the milestone's bounded result, reason, and failure-class literals;
+- the agent id, provider, model, and effort resolved for the sub-turn;
+- the sub-turn duration;
+- the machine-readable `nextAction` and its short fixed phrase;
+- the authoritative retry deadline, for a `retry_scheduled` milestone;
+- whether human action is required.
+
+An optional field the milestone does not carry is omitted, never rendered as
+`undefined`, `null`, or filled in with guessed prose. The milestone's
+`sourceFingerprint` and `predecessorFingerprint` are deliberately NOT published
+even though the milestone carries both: the never-published list above binds a
+progress comment exactly as it binds the other two.
+
+Its delivery carries the same two properties the handoff comment's does. The
+outbox row is keyed on the milestone's deterministic `milestoneId` together with
+the comment projection's fixed name and version — never on a run id, a
+timestamp, or the wording — so a replayed phase transition, a process restart, a
+claim-loss recovery, and an operator `outbox retry` all re-derive the same key
+and publish no duplicate; and the body opens with an idempotency marker derived
+from that key, so a dispatcher that posted the comment and then lost its claim
+recognises its own delivery instead of appending a second copy to a history that
+can never be edited back. The comment effect is committed in the SAME
+transaction as the milestone it publishes: a committed milestone is never left
+without its intended effect, and a transition that loses the task claim
+publishes neither. In particular a `retry_scheduled` comment is posted once, by
+the transition that commits the delay, and not by each scheduler pass that
+observes it.
+
+A milestone this build cannot render — an unknown `schemaVersion`, an
+unrecognised `kind`, or a `retry_scheduled` with no committed deadline —
+publishes nothing and records `refinement.progress.comment.unpublishable` (§15)
+carrying the refusal literal. Nothing outside the known boundaries is guessed
+into a public comment.
+
+Progress comments are never read back as workflow state: SQLite task state and
+the `refinement.progress.milestone` events remain authoritative, and nothing in
+this lane parses a comment it posted.
 
 ## 17. Fail-closed behavior for malformed agent output
 
 **Malformed** is any of: output that is not exactly one fenced JSON object;
 an unparseable object; an unknown or missing enum literal; a missing required
 field; a `pass` verdict carrying objections; a `revise` verdict carrying no
-objection; a critic result containing replacement prose; a
+objection; a `blockReason` on a verdict other than `block`; a critic result
+containing replacement prose; a
 `predecessorReferences` entry naming an Issue or PR absent from the snapshot;
 any output containing the managed-region markers; any output containing an
 absolute or repository-external filesystem path; or a rendered region above
@@ -1855,6 +2447,15 @@ refuses admission without it (row 47), and leaves it in place at activation
 (§11 step 5). A design that dropped the label and instead reactivated from the
 persisted assignment was rejected in §20.2.
 
+**Admin status and the admin UI.** Extended, never replaced. `admin task-status`
+keeps its existing defaults, its `--json` field shape, and its closed/completed
+task filtering unchanged; the refinement block simply gains the normalized §15
+progress view, and a task carrying no refinement block renders exactly what it
+rendered before. The admin UI renders that same model through the same shared
+projection rather than interpreting milestones itself, and adds one read-only
+action for a refinement task. Neither surface gains a GitHub mutation, and
+neither reads a GitHub comment back as workflow state.
+
 **Task phases.** `refinement` is a new `TaskPhase`. The follow-up
 implementation must teach the surfaces that enumerate phases — the phase
 runner's supported-phase set, the worktree phase set, and the admin status
@@ -2011,6 +2612,16 @@ lane changes behavior only for Issues carrying the marker.
   re-enqueueing forever (§13, §12 row 46).
 - **No routine human approval on the successful path.** The final human gate
   is the PR merge, as it already is for every other lane.
+- **A dropped requirement is repaired, not escalated (issue #1176).** A
+  requirement the original Issue already states is not a decision the operator
+  still has to make, so spending a handoff on its omission only moves agent
+  work to a human. The critic is told to answer it with `revise`, and the one
+  legacy `block` shape that means the same thing is routed through the same
+  bounded revision (§7.2). The routing is narrow on purpose — a named
+  `blockReason`, any other objection kind, or incomplete evidence keeps the
+  `block` — so a genuine human blocker is never converted into another draft,
+  and nothing about the round cap, the evidence gate, or independent
+  acceptance changes.
 
 ### 20.2 Rejected
 
@@ -2093,7 +2704,14 @@ handoff reasons), the two-lane separation, the eligibility rules including
 stack-ready-not-merged, the merged-predecessor shape, the required
 implementation `agent:*` label with its admission refusal and its retention
 through activation, and fail-closed holds, the
-snapshot input list and its exclusions, the fingerprint's one-to-one coverage of
+snapshot input list and its exclusions, the §5.1 declared-evidence rules — the
+single declaration block, authoritative-commit resolution, the closed omission
+vocabulary, and the byte-identical delivery to both agents — together with
+their §6 hashing and the undeclared-fingerprint stability guarantee, the §5.2
+required-evidence preflight — requiredness defaulting to required, unknown
+requiredness failing closed, optional absence never blocking, and the stop
+landing on the ordinary `evidence_required` handoff before either agent runs —
+the fingerprint's one-to-one coverage of
 that input list together with its two named exclusions and the preconditions
 that compensate for them — the marker preconditions for the labels and the
 `appliedRegionDigest` for the managed region — the staleness behavior, both
@@ -2109,7 +2727,8 @@ wait, and no-human-action property, every transition-table row's
 state/event/next-state triple, the handoff behavior including the operator
 recovery command and its label-shape precondition, the marker-precondition
 handoff and the bounded-retry-then-handoff disposition for agent process
-failures, the undeliverable-handoff-comment exception,
+failures, the undeliverable-handoff-comment exception, the configured-notifier
+handoff notification with its bounded payload and its transition identity,
 the assignment-retention rules, the audit-event vocabulary,
 the public comment policy, the fail-closed malformed-output rules,
 the compatibility statements including the three required outbox extensions,

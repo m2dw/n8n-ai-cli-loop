@@ -1182,3 +1182,123 @@ describe('github-intake — assignment persistence', () => {
     expect(task?.context?.assignment?.reviewAgent).toBe('claude');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Quality request persistence (issue #905, slice B2 of
+// docs/agent-runtime-profiles-contract.md §9.3)
+// ---------------------------------------------------------------------------
+
+describe('github-intake — quality request persistence', () => {
+  function capture(args, gh = fakeGh) {
+    const chunks = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { chunks.push(chunk); return true; };
+    return runIntake(args, gh, noBlockerChecker)
+      .finally(() => { process.stdout.write = origWrite; })
+      .then(() => JSON.parse(chunks.join('').trim()));
+  }
+
+  const args = () => ({
+    sessionId: 'addon-dev', sessionsPath, dbPath, limit: 100, dryRun: false,
+    supportedPhases: ['implementation', 'review'],
+  });
+
+  function issue(number, labels) {
+    return {
+      number,
+      title: `Issue ${number}`,
+      url: `https://github.com/m2dw/thunderbird-auth-results-filter/issues/${number}`,
+      labels: labels.map((name) => ({ name })),
+    };
+  }
+
+  async function taskFor(issueNumber) {
+    const store = new SqliteTaskStore(dbPath);
+    const task = await store.getTask({ sessionId: 'addon-dev', issueNumber });
+    store.close();
+    return task;
+  }
+
+  test('persists a quality request resolved from the same labels as the assignment', async () => {
+    await capture(args());
+    const task = await taskFor(101);
+    // 101 carries no complexity label: the built-in default request.
+    expect(task?.context?.requestedQuality).toMatchObject({
+      implementation: { quality: 'normal', source: 'default' },
+      review: { quality: 'normal', source: 'default' },
+    });
+    expect(typeof task?.context?.requestedQuality?.resolvedAt).toBe('string');
+  });
+
+  test('the compatibility labels select the level, per phase class', async () => {
+    const gh = {
+      listIssues: () => [
+        issue(401, ['agent:claude', 'status:needs-implementation', 'complexity:xhigh', 'review:low']),
+      ],
+    };
+    await capture(args(), gh);
+    const task = await taskFor(401);
+    expect(task?.context?.requestedQuality).toMatchObject({
+      implementation: { quality: 'maximum', source: 'compat-label', label: 'complexity:xhigh' },
+      review: { quality: 'light', source: 'compat-label', label: 'review:low' },
+    });
+  });
+
+  test('a malformed quality label refuses that Issue only, and enqueues the rest', async () => {
+    const gh = {
+      listIssues: () => [
+        issue(402, ['agent:claude', 'status:needs-implementation', 'quality:xhigh']),
+        issue(403, ['agent:claude', 'status:needs-implementation', 'quality:strong']),
+      ],
+    };
+    const out = await capture(args(), gh);
+    expect(out.results.find((r) => r.issueNumber === 402)).toMatchObject({
+      action: 'quality_request_refused',
+      reason: 'invalid-quality-request',
+    });
+    expect(await taskFor(402)).toBeUndefined();
+
+    // One Issue's typo never stops another Issue's automation.
+    expect(out.results.find((r) => r.issueNumber === 403)).toMatchObject({ action: 'enqueued' });
+    expect((await taskFor(403))?.context?.requestedQuality?.implementation).toMatchObject({
+      quality: 'strong',
+      source: 'label',
+      label: 'quality:strong',
+    });
+  });
+
+  test('--dry-run previews the refusal instead of a task it would never enqueue', async () => {
+    const gh = { listIssues: () => [issue(405, ['agent:claude', 'status:needs-implementation', 'quality:light', 'quality:strong'])] };
+    const out = await capture({ ...args(), dryRun: true }, gh);
+    expect(out.results.find((r) => r.issueNumber === 405)).toMatchObject({
+      action: 'quality_request_refused',
+      reason: 'invalid-quality-request',
+    });
+  });
+
+  test('reactivating a blocked task preserves the originally pinned quality request', async () => {
+    const labelled = (labels) => ({ listIssues: () => [issue(404, labels)] });
+    await capture(args(), labelled(['agent:claude', 'status:needs-implementation', 'complexity:high']));
+    expect((await taskFor(404))?.context?.requestedQuality?.implementation?.quality).toBe('strong');
+
+    const store = new SqliteTaskStore(dbPath);
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 404 },
+      { status: 'queued' },
+      { status: 'blocked', phase: 'implementation' },
+    );
+    store.close();
+
+    // The Issue is relabelled down while the task waits; §9.3 says a task in
+    // flight keeps the request it was admitted with.
+    const out = await capture(args(), labelled(['agent:claude', 'status:needs-implementation', 'complexity:low']));
+    expect(out.results.find((r) => r.issueNumber === 404)).toMatchObject({ action: 'reactivated' });
+    const task = await taskFor(404);
+    expect(task?.context?.requestedQuality?.implementation).toMatchObject({
+      quality: 'strong',
+      label: 'complexity:high',
+    });
+    // The refreshed intake context still lands — only the request is pinned.
+    expect(task?.context?.labels).toContain('complexity:low');
+  });
+});

@@ -35,6 +35,16 @@ npm run build:parent-child-workflow
 
 This project's `npm run package` intentionally regenerates the workflow JSONs. It exists so the same n8n automation contract can verify this repository too.
 
+Staged verification does not change the `npm test` requirement. When an operator opts a session into `stagedVerification`, every loop and final stage runs the entire required set of non-test checks (`npm run typecheck`, `npm run package`), and with a `testSuite` binding the test entry leaves both for the changed-file stages. Issue #1155 retired the group-selection policy, so there is no selection adapter, no `.ai-cli-loop/verification.json` project file and no setting that can omit a required check.
+
+**During the implemented loop, Stage 1 is selected-file verification: the test files this Issue added or modified, union the files an earlier Stage 2 left failing — nothing else. Final completion requires full verification: the whole suite runs at the approved head, after Stage 1 has passed and code review has approved the same revision, and only the completion that records that complete, passing full run publishes `status:stack-ready`.** A green Stage 1 is never a green suite, and nothing may report it as one.
+
+`npm run test:files` is the same Jest invocation as `npm test` without the `pretest` rebuild; it exists so a bound stage builds once through `setupCommand` instead of once per suite launch. It is not a substitute for the `npm test` requirement above.
+
+A session that binds a suite command spelled differently from the `npm test` an Issue requires must say so in the binding (`"requirementCommands": ["npm test"]`, issue #1166). The requirement then reads *pending Stage 2* instead of missing, and only a complete, passing Stage 2 at the approved revision discharges it — the declaration grants nothing by itself. **No session in this repository binds the suite today**, so none of this is switched on here: the loop still runs `npm test` as an ordinary verification command on every cycle, and adding the binding is an operator step the runner cannot take.
+
+CI and any full project verification run outside the loop remain an **independent final safeguard**. Stage 1 narrows what the loop runs before approval; it never narrows what CI runs, and no staged setting can make it do so. See `docs/staged-verification-operations.md` §6, `docs/changed-file-verification-validation.md` and `docs/changed-file-verification-contract.md`.
+
 ## Operational Boundaries
 
 - Do not merge PRs from automation.

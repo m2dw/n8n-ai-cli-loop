@@ -10,8 +10,9 @@ dispatch — those are separate, later contracts (§16).
 
 This "implemented" status is component-level, not end-to-end: see
 [feature-status.md](feature-status.md) for ChatOps's overall availability,
-which stays `foundation-only` until comment ingestion, dispatch, and result
-publication are connected.
+which is `config-gated` on `session.chatOps.enabled` (default off) now that
+comment ingestion, dispatch, and result publication are connected end to end
+by `src/cli/chatops-scan.ts` (issue #1024).
 
 Issue #696 / PR #776 attempted to specify the entire ChatOps surface in one
 document and could not converge after ten review cycles. #777 extracted the
@@ -280,6 +281,29 @@ not verified against a live endpoint by this issue. Both are stated here so a
 later change in provider behavior is a documented contract violation rather
 than a silent skip. An adapter that cannot honor the ascending-order
 requirement must not be wired to this core; there is no descending-order mode.
+
+### 6.2 Gitea derives the end-of-list signal from an *empty* page
+
+`src/providers/gitea/gitea-chatops-comment-port.ts` (issue #1032) satisfies the
+same table, with one difference the row on the end-of-list signal explicitly
+allows an adapter to choose: it reports `hasMore` for every **non-empty** page
+and stops only at an empty one.
+
+A short page is not a legitimate end-of-list signal on Gitea. A self-hosted
+instance clamps the `limit` query to its own configured maximum page size, so a
+*full* page routinely comes back shorter than requested; converting that into
+`hasMore: false` would satisfy §5 condition 3 with a window that stops in the
+middle of the list, and the cursor would advance over every comment behind it —
+the permanent skip I1 forbids. Zero is the only length the server cannot have
+clamped, so it is the only one that proves exhaustion. The cost is one extra
+request per scan; an instance that ignores `page` entirely never yields an empty
+page and exhausts §5.2's page guard instead, which fails the window closed.
+
+**Pinned assumption (Gitea).** That Gitea's per-issue comment listing returns
+comments in ascending creation order, applies `page`/`limit` to that endpoint,
+and filters `since` on the update instant are read from the provider's
+documentation and source, not verified against a live instance here. They are
+stated for the same reason the GitHub assumptions above are.
 
 ## 7. Overlap, duplicates, and unstable ordering
 

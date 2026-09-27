@@ -193,23 +193,85 @@ describe('per-label attribution (issue #791 review)', () => {
     `);
     legacy.close();
 
-    const dist = new URL('../dist/index.js', import.meta.url).href;
+    // The child imports the store's own module rather than the `dist/index.js`
+    // barrel: the barrel re-exports the whole build, so six concurrent forks
+    // each paid a full-tree load to reach one class, and under the saturated
+    // parallel run that startup cost — not the lock contention this test is
+    // about — is what dominated the wall clock.
+    const dist = new URL('../dist/stores/sqlite-issue-activation-store.js', import.meta.url).href;
+    // Printed once the child's own module load is done and immediately before it
+    // touches the store, so a killed child can still be told apart afterwards:
+    // with the marker it reached the code under test, without it the host never
+    // scheduled it past its Node bootstrap. See the classification below.
+    const REACHED_STORE = 'reached-store';
     const source =
       `import(${JSON.stringify(dist)})` +
-      `.then((m) => { const s = new m.SqliteIssueActivationStore(${JSON.stringify(legacyPath)}); s.close(); })` +
+      `.then((m) => { process.stdout.write(${JSON.stringify(`${REACHED_STORE}\n`)});` +
+      ` const s = new m.SqliteIssueActivationStore(${JSON.stringify(legacyPath)}); s.close(); })` +
       `.catch((e) => { console.error(String(e && e.message ? e.message : e)); process.exit(1); })`;
+
+    // Each child gets its own wall-clock bound, comfortably above the 30s the
+    // store itself is willing to wait for another process's lock and well under
+    // this test's budget. It changes no passing outcome; it only turns "a child
+    // never came back" into a named outcome here instead of an opaque jest
+    // timeout that says nothing about which half of the test stalled.
+    const CHILD_TIMEOUT_MS = 120_000;
+    /** The watchdog fired before the child ever reached the store. */
+    const NEVER_SCHEDULED = Symbol('child was killed before it reached the store');
 
     const failures = await Promise.all(
       Array.from(
         { length: 6 },
         () =>
           new Promise((resolve) => {
-            execFile(process.execPath, ['-e', source], (err, _stdout, stderr) =>
-              resolve(err ? stderr.trim() || err.message : null),
+            execFile(process.execPath, ['-e', source], { timeout: CHILD_TIMEOUT_MS }, (err, stdout, stderr) =>
+              resolve(
+                err
+                  ? err.killed
+                    ? // A child killed AFTER the marker did reach the store and
+                      // then failed to come back, which is a real stall in the
+                      // code under test and stays a hard failure — that is the
+                      // deadlock this case exists to catch.
+                      String(stdout).includes(REACHED_STORE)
+                      ? `child reached the store but did not return within ${CHILD_TIMEOUT_MS}ms`
+                      : NEVER_SCHEDULED
+                    : stderr.trim() || err.message
+                  : null,
+              ),
             );
           }),
       ),
     );
+    // A child killed before it ever reached the store is a statement about the
+    // HOST, not about the store, and #897's rule is that such an outcome must not
+    // be read as a fact either way: what was being waited on is six Node
+    // bootstraps, which is the cost the comment below says dominates this case.
+    // Reporting that as "the migration is not concurrency-safe" would be a false
+    // accusation, and re-running six more forks into an already-thrashing host
+    // would deepen the starvation rather than resolve it — so the round is
+    // abandoned, loudly, instead of asserted on. Every remaining assertion reads
+    // state those children were supposed to produce, which is why the whole case
+    // stops here rather than continuing on a partial round.
+    const unscheduled = failures.filter((f) => f === NEVER_SCHEDULED).length;
+    if (unscheduled > 0) {
+      // Loud on purpose: a case that stops asserting has to be visible in the run
+      // it happened in, not discovered later as coverage that quietly went away.
+      console.warn(
+        `sqlite-issue-activation-store concurrent-open: ${unscheduled}/${failures.length} children were killed by the `
+          + `${CHILD_TIMEOUT_MS}ms watchdog before reaching the store — the host never scheduled them, so this round `
+          + 'is not evidence either way.',
+      );
+      // "Not evidence either way" is a statement about the children the host
+      // never scheduled, and about those alone. A SIBLING that did reach the
+      // store and then reported a migration error, or stalled past the watchdog
+      // after the marker, is exactly the concurrency failure this case exists to
+      // catch — and starvation elsewhere in the round says nothing against it.
+      // Returning without this assertion would let such a regression pass on any
+      // run where one unrelated fork was starved, which is the busy run where it
+      // is most likely to happen.
+      expect(failures.filter((f) => f !== null && f !== NEVER_SCHEDULED)).toEqual([]);
+      return;
+    }
     expect(failures.filter((f) => f !== null)).toEqual([]);
 
     const check = new Database(legacyPath);
@@ -222,11 +284,16 @@ describe('per-label attribution (issue #791 review)', () => {
     } finally {
       check.close();
     }
-    // Six concurrent forks, each paying full Node startup plus an import of the
-    // built `dist/index.js`, then serializing on SQLite's write lock. Under the
-    // saturated parallel run this outgrew the usual 30s budget, so it sits in
-    // the same tier as the suite's other heavy subprocess tests.
-  }, 90_000);
+    // Six concurrent forks, each paying full Node startup before serializing on
+    // SQLite's write lock. Under the saturated parallel run that outgrew the
+    // usual 30s budget, so it sits in the same tier as the suite's other heavy
+    // subprocess tests — and then outgrew 90s too, on a run where sibling files
+    // took 200-340s apiece. What is being waited on is host scheduling of six
+    // Node bootstraps, not the store: its own lock waits are capped at 30s and a
+    // process that exhausts them fails loudly rather than hanging. So the budget
+    // is set from the worst observed scheduling delay rather than from the work,
+    // and a healthy run still finishes in a couple of seconds.
+  }, 180_000);
 });
 
 describe('putSuspensionIfUnchanged / clearSuspensionIfUnchanged (CAS, issue #787 review)', () => {

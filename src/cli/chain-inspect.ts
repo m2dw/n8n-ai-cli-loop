@@ -58,6 +58,10 @@ import type {
 import { checkFrozenPrefixes } from "../core/chain-frozen-prefix.js";
 import type { FrozenPrefixGuardVerdict, FrozenPrefixSnapshot } from "../core/chain-frozen-prefix.js";
 import { collectChainOwnership } from "../core/chain-acceptance.js";
+import {
+  formatChainRepository,
+  resolveChainOwnershipScopeFor,
+} from "../core/chain-ownership-scope.js";
 import type { WorkItemProvider } from "../providers/types.js";
 
 /* -------------------------------------------------------------------------
@@ -369,6 +373,13 @@ interface ChainValidatePayload {
   chainRef: string;
   chainId: string;
   sessionId: string;
+  /**
+   * The Issue-number space duplicate ownership was judged over (issue #1045):
+   * every session bound to this chain's repository, and that repository when
+   * the session file named one. Reported because a `duplicate_ownership`
+   * finding — or its absence — is only readable alongside what was compared.
+   */
+  ownershipScope: { sessionIds: string[]; repository: string | null };
   revision: {
     graphRevision: number;
     graphFingerprint: string;
@@ -394,6 +405,14 @@ function renderChainValidate(payload: ChainValidatePayload, _mode: OutputMode): 
     `Validate chain ${payload.chainId} (session ${payload.sessionId}): ${payload.ok ? "OK" : "PROBLEMS FOUND"}`,
     `  revision: ${payload.revision.graphRevision} (accepted: ${payload.revision.acceptedRevision ?? "none"}, status: ${payload.revision.status})`,
   ];
+  if (payload.ownershipScope.repository !== null || payload.ownershipScope.sessionIds.length > 1) {
+    // Named on its own line because "no duplicate ownership" only means
+    // something once an operator can see which Issue-number space was searched.
+    lines.push(
+      `  ownership scope: ${payload.ownershipScope.repository ?? "session only"} ` +
+        `(sessions: ${payload.ownershipScope.sessionIds.join(", ")})`,
+    );
+  }
   if (payload.structural.ok) {
     lines.push(`  structural: ok (observed fingerprint ${payload.structural.fingerprint})`);
   } else {
@@ -447,11 +466,31 @@ export async function runChainValidate(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  // Which chains an Issue number may be compared against is a session-file
+  // question (issue #1045): the number alone identifies an Issue only within
+  // one repository, and every other chain command already scopes its ownership
+  // lookup this way. The session file is opened here rather than in Phase 2
+  // because the scope is needed before the lookup below — but a failure to read
+  // it is still Phase 2's to report, with the store already shut, so it is only
+  // recorded here.
+  let registry: JsonSessionRegistry | undefined;
+  let registryError: unknown;
+  try {
+    registry = new JsonSessionRegistry(sessionsPath);
+  } catch (err) {
+    registryError = err;
+  }
+  const scope = await resolveChainOwnershipScopeFor(graph.chain.sessionId, registry);
+
   const frozenSnapshots = await store.listFrozenPrefixes({ chainId });
   const ownership = await collectChainOwnership(
     store,
     graph.members.map((m) => m.issueNumber),
-    { excludeChainId: chainId },
+    {
+      filter: scope.filter,
+      excludeChainId: chainId,
+      repositoryBySessionId: scope.repositoryBySessionId,
+    },
   );
   store.close();
 
@@ -459,11 +498,10 @@ export async function runChainValidate(argv: string[]): Promise<void> {
   // legitimately `die()` on a setup problem (unknown session, unsupported or
   // misconfigured work-item provider) — the same posture `admin issue
   // activate|suspend` uses.
-  let registry: JsonSessionRegistry;
-  try {
-    registry = new JsonSessionRegistry(sessionsPath);
-  } catch (err) {
-    die(`Failed to load sessions file (${sessionsPath}): ${err instanceof Error ? err.message : String(err)}`);
+  if (registry === undefined) {
+    die(
+      `Failed to load sessions file (${sessionsPath}): ${registryError instanceof Error ? registryError.message : String(registryError)}`,
+    );
   }
   const session = await registry.getSessionById(graph.chain.sessionId);
   if (!session) die(describeUnresolvedSessionId(registry, graph.chain.sessionId, sessionsPath));
@@ -534,6 +572,10 @@ export async function runChainValidate(argv: string[]): Promise<void> {
     chainRef,
     chainId,
     sessionId: graph.chain.sessionId,
+    ownershipScope: {
+      sessionIds: scope.sessionIds,
+      repository: scope.repository ? formatChainRepository(scope.repository) : null,
+    },
     revision: {
       graphRevision: graph.chain.graphRevision,
       graphFingerprint: graph.chain.graphFingerprint,

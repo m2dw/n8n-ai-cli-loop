@@ -61,12 +61,16 @@ every refiner invocation having exited non-zero with
 - `resolveHomePolicy("anthropic", "tool-capable")` → `throwaway`
 - every other provider, either boundary → `throwaway`
 
-`openai`/Codex isolation is therefore unchanged, including its `CODEX_HOME`
-passthrough — #935 neither altered nor re-verified that passthrough, so whether a
-Codex subscription login survives the throwaway home is an open question for
-whoever next runs a Codex no-tool turn, not something this document asserts.
-`src/cli/issue-discuss.ts` builds its own environment for a **tool-capable**
-agent step and keeps the throwaway home; nothing in #935 relaxes it.
+`openai`/Codex isolation is therefore unchanged in SHAPE — a throwaway home with
+its config dir named back — but issue #978 corrected what the config-dir var
+had to be named. `CODEX_HOME` identifies Codex's own config directory
+(`$HOME/.codex` by default), not the home directory that contains it: the
+passthrough previously synthesized it as the bare real `HOME`, which pointed
+Codex's CLI at the wrong directory and hid its existing login exactly as an
+unset `HOME` would have. It is now synthesized as `$HOME/.codex`, matching
+Codex's own default resolution. `src/cli/issue-discuss.ts` builds its own
+environment for a **tool-capable** agent step and keeps the throwaway home;
+nothing here relaxes it.
 
 **Fail-closed properties.**
 

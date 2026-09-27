@@ -4,8 +4,9 @@ Status: **approved design, implemented** (`src/core/chatops-operation-mapping.ts
 
 This "implemented" status is component-level, not end-to-end: see
 [feature-status.md](feature-status.md) for ChatOps's overall availability,
-which stays `foundation-only` until comment ingestion, dispatch, and result
-publication are connected.
+which is `config-gated` on `session.chatOps.enabled` (default off) now that
+comment ingestion, dispatch, and result publication are connected end to end
+by `src/cli/chatops-scan.ts` (issue #1024).
 
 This is issue #784, split part 2 of superseded #779. It is the layer
 `docs/operation-dispatch-port-contract.md` (#783) leaves unspecified between
@@ -51,14 +52,14 @@ document is where that permission is actually decided, verb by verb, and
 `createChatOpsOperationMappingTable` enforces the decision structurally
 (§4) rather than leaving each mapping to remember it.
 
-The two structures are independent by design: no operation for `tool-request
-run` is registered anywhere in this codebase yet
-(`docs/operation-dispatch-port-contract.md`, "No operation is registered
-yet"), and this contract does not register one. A mapping's `operationId`,
+The two structures are independent by design: this contract registers no
+operation, and it did not depend on one existing — it was written and enforced
+before either mapped operation was callable. A mapping's `operationId`,
 `scope`, and `mutating` fields are this contract's own declaration of what it
-believes about the eventual operation; once one is registered, the two must
-agree, which is a check for the issue that does the registering, not this one
-(§12).
+believes about the operation; once one is registered, the two must agree, which
+is a check for the issue that does the registering, not this one (§12). Issue
+#1031 registered both mapped operations in `src/core/chatops-operations.ts` and
+performed that reconciliation.
 
 ## 3. Trusted fields are never a mapping parameter
 
@@ -288,7 +289,11 @@ type ChatOpsOperationMappingOutcome =
 - **Operation registration.** No operation is registered by this document —
   `operationId`/`scope`/`mutating` are this contract's own declaration, to be
   checked against a real `OperationDescriptor` by whichever issue registers
-  `tool-request.run` and `tool-request.resolve`.
+  `tool-request.run` and `tool-request.resolve`. **Done (#1031)**:
+  `src/core/chatops-operations.ts` registers both, and
+  `test/chatops-tool-request-operations.test.js` asserts that every mapping's
+  `scope`, `mutating`, `summary`, and parameter allowlist agree with the
+  registered descriptor.
 - **Result and acknowledgement publication**, and how `detail`/`summary` text
   becomes a comment — the successor issue named in this issue's own
   dependency list ("result, acknowledgement, and dependency contract").

@@ -40,7 +40,9 @@ import {
   DEFAULT_RECONSIDERATION_TIMEOUT_MS,
   MAX_RECONSIDERATION_RAW_BYTES,
   RECONSIDERATION_NO_TOOLS_ARGS,
+  RECONSIDERATION_SUPPORTED_AGENTS,
   createReconsiderationAgentRunner,
+  reconsiderationAgentSupport,
   resolveReconsiderationProfile,
   runReviewReconsideration,
 } from '../dist/handlers/review-reconsideration.js';
@@ -736,7 +738,15 @@ describe('the read-only boundary', () => {
     () => {
       const { profile } = resolveReconsiderationProfile('claude', {});
       // An absolute cmd, so the isolated env's PATH never decides what runs.
-      const noisy = { ...profile, cmd: '/bin/sh', argv: ['-c', 'printf out; printf diag >&2'] };
+      // The fixture must drain stdin (`cat >/dev/null`) before exiting: the
+      // prompt is delivered via spawnSync's `input`, and a child that exits
+      // without reading it can race Node's pipe write, producing a spurious
+      // EPIPE on an otherwise-successful run (issue #1027).
+      const noisy = {
+        ...profile,
+        cmd: '/bin/sh',
+        argv: ['-c', 'cat >/dev/null; printf out; printf diag >&2'],
+      };
       // No runner argument: this is the default the real invocation path uses.
       const result = createReconsiderationAgentRunner(noisy)({
         prompt: 'the bundle',
@@ -845,6 +855,273 @@ describe('the read-only boundary', () => {
       'warning: retrying once\n',
     );
   });
+});
+
+/**
+ * Issue #1070: the reconsideration turn stops for contract decision D2.
+ *
+ * #1070 asked for a Codex reviewer's reconsideration and carried its own stop
+ * condition — enforce the boundary with real CLI configuration, never a prompt
+ * instruction or a deleted guard, and stop if the predecessor left the boundary
+ * decision unresolved. Contract §17.12 records the stop; these tests are what
+ * keeps it from being undone by accident, and they assert the refusal as
+ * OPERATIONAL FACTS rather than as a message:
+ *
+ *   nothing is spawned, nothing is read, nothing is written, nothing moves.
+ *
+ * The half a test cannot verify is stated here rather than faked: whether a CLI
+ * actually has no tool surface is contract §17.8's on-host canary against a real
+ * binary, deliberately an operator procedure and never a CI test. That is
+ * exactly why C7 is `unknown` and why this describe block exists.
+ */
+describe('a Codex reconsideration is refused before anything runs (issue #1070)', () => {
+  test('no process is spawned, no checkout is read, and no artifact is written', () => {
+    const repoCalls = [];
+    const agentCalls = [];
+    const agentSeamCalls = [];
+    const result = invoke({
+      agentId: 'codex',
+      runner: trackedFilesRunner(repoCalls),
+      agentRunner: {
+        run(cmd, args, opts) {
+          agentCalls.push({ cmd, args, opts });
+          return { stdout: '', stderr: '', exitCode: 0 };
+        },
+      },
+      agent: (invocation) => {
+        agentSeamCalls.push(invocation);
+        return { stdout: fenced(reconsideration()), stderr: '', exitCode: 0 };
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.failure).toEqual({ kind: 'unsupported-agent', detail: 'codex' });
+    // The three sentinels. The `agent` seam is injected by this very call and is
+    // still never reached, which is the point: the refusal is ahead of the seam a
+    // caller could otherwise use to route around it.
+    expect(agentSeamCalls).toEqual([]);
+    expect(agentCalls).toEqual([]);
+    // The checkout is not even enumerated — no `git ls-files`, so no evidence was
+    // resolved and no file of the repository was opened on this agent's behalf.
+    expect(repoCalls).toEqual([]);
+    // Nothing local was produced: no raw transcript, no stderr file, no runner
+    // diagnostic, no §10.2 record.
+    expect(readdirSync(artifactDir)).toEqual([]);
+    expect(result.artifacts).toEqual([]);
+  });
+
+  test('the summary reports a refusal, not a run — no profile, no bundle, no deadline', () => {
+    const result = invoke({ agentId: 'codex' });
+    expect(result.summary).toEqual(
+      expect.objectContaining({
+        lineageId: LINEAGE,
+        version: 1,
+        // Never resolved, so nothing claims a posture, a model or an effort.
+        profile: null,
+        // The bundle was never composed: no digest, no prompt bytes, no excerpts.
+        bundleDigest: '',
+        promptBytes: 0,
+        excerpts: 0,
+        unresolvedExcerpts: 0,
+        // Nothing ran, so there is no exit status and no deadline to report. A
+        // turn that was refused is not a turn that timed out (issue #953).
+        exitCode: null,
+        timedOut: false,
+        rawArtifact: null,
+        stderrArtifact: null,
+        runnerErrorArtifact: null,
+        recordArtifact: null,
+        record: null,
+        failure: { kind: 'unsupported-agent', detail: 'codex' },
+      }),
+    );
+  });
+
+  test('no protocol state moves, and the checkout is byte-identical', () => {
+    const before = readdirSync(join(repoCwd, 'src', 'auth')).map((name) => [
+      name,
+      readFileSync(join(repoCwd, 'src', 'auth', name), 'utf8'),
+    ]);
+    const ctx = context();
+    const route = routing();
+    const ctxBefore = JSON.stringify(ctx);
+    const routeBefore = JSON.stringify(route);
+
+    const result = invoke({ agentId: 'codex', context: ctx, routing: route });
+
+    expect(result.ok).toBe(false);
+    // §17.7's cancellation row, and §12's rule for a turn that produced nothing:
+    // the lineage, its §6.1 counters and the routing state are exactly as they
+    // were. This layer never wrote them — the point is that it did not ask the
+    // coordinator to either.
+    expect(JSON.stringify(ctx)).toBe(ctxBefore);
+    expect(JSON.stringify(route)).toBe(routeBefore);
+    expect(ctx.lineages[LINEAGE].counters.reconsiderations).toBe(0);
+    expect(ctx.lineages[LINEAGE].state).toBe('disputed');
+    expect(
+      readdirSync(join(repoCwd, 'src', 'auth')).map((name) => [
+        name,
+        readFileSync(join(repoCwd, 'src', 'auth', name), 'utf8'),
+      ]),
+    ).toEqual(before);
+  });
+
+  test('the capability answer names the blocker and the decision, not a preference', () => {
+    const codex = reconsiderationAgentSupport('codex');
+    expect(codex.supported).toBe(false);
+    expect(codex.blocker).toBe('B2');
+    expect(codex.pendingDecision).toBe('D2');
+    // The one sentence an operator will actually read has to close the door the
+    // §17.5 refusals close — read-only sandboxing is not this boundary — and,
+    // since issue #1085, has to name the ONE setting that admits the weaker
+    // posture instead, so "unsupported" is not misread as "impossible".
+    expect(codex.reason).toMatch(/no tool surface/);
+    expect(codex.reason).toMatch(/only `claude` has a no-tools invocation defined/);
+    expect(codex.reason).toMatch(/D2 \(§17\.6\)/);
+    expect(codex.optIn).toBe('reviewDispute.reconsideration.readBounded');
+    expect(codex.reason).toMatch(/reviewDispute\.reconsideration\.readBounded: true/);
+    // And what accepting it costs is in the same sentence, never deferred.
+    expect(codex.reason).toMatch(/reads\s+are NOT bounded/);
+    expect(resolveReconsiderationProfile('codex', {}).error).toBe(codex.reason);
+    expect(resolveReconsiderationProfile('codex', {}).profile).toBeUndefined();
+  });
+
+  test('an agent with no invocation at all keeps the unconditional refusal', () => {
+    // The §17.5 wording, for an agent no decision has admitted: there is nothing
+    // to configure, and the reason must not suggest otherwise.
+    const gemini = reconsiderationAgentSupport('gemini');
+    expect(gemini.optIn).toBeUndefined();
+    expect(gemini.reason).toMatch(/bounds writes and network, not reads/);
+    expect(gemini.reason).toMatch(/§17\.8/);
+    expect(gemini.reason).toMatch(/neither is a code change on its own/);
+  });
+
+  test('the supported set is one agent, and everything else is refused identically', () => {
+    expect([...RECONSIDERATION_SUPPORTED_AGENTS]).toEqual(['claude']);
+    for (const agentId of ['codex', 'gemini', 'cursor-agent', 'claude-code', 'CLAUDE', '']) {
+      const support = reconsiderationAgentSupport(agentId);
+      expect(support.supported).toBe(false);
+      expect(support.pendingDecision).toBe('D2');
+      const result = invoke({ agentId });
+      expect(result.failure).toEqual({ kind: 'unsupported-agent', detail: agentId });
+    }
+    // The comparison case, unchanged: the one agent with a verified invocation
+    // still gets its turn, and still records the §8.2 posture — which the answer
+    // now names, so a supported agent's posture is never inferred.
+    expect(reconsiderationAgentSupport('claude')).toEqual({
+      supported: true,
+      toolPolicy: 'no-tools',
+      reason: expect.stringContaining('no-tools invocation'),
+    });
+    expect(resolveReconsiderationProfile('claude', {}).profile.toolPolicy).toBe('no-tools');
+  });
+
+  test('the omitted agent id still defaults to claude and runs', () => {
+    // The refusal is about which agent is configured, not about configuration
+    // being present: a caller that names none is the ordinary Claude turn.
+    const result = invoke({ agentId: undefined });
+    expect(result.ok).toBe(true);
+    expect(result.summary.profile.agentId).toBe('claude');
+    expect(result.summary.profile.toolPolicy).toBe('no-tools');
+  });
+});
+
+/**
+ * The half of the boundary the runner DOES own, asserted against the child
+ * process's own view of the world rather than against the argv it was given.
+ *
+ * An argv assertion says what the runner asked for; these say what a process
+ * launched through the real default runner actually observed. The fixture is
+ * `/bin/sh` — resolving the configured agent off PATH would spawn a real CLI and
+ * could bill a turn — and it reports its cwd, that directory's contents, the
+ * GitHub config dir it was pointed at, and the credentials it can see.
+ *
+ * What this cannot show is the tool surface itself, which is a property of the
+ * CLI and not of the environment around it. Contract §17.8 is where that is
+ * settled, on a real binary, by an operator.
+ */
+describe('the isolated invocation, observed from inside the subprocess (issue #1070)', () => {
+  test(
+    'the agent sees an empty cwd outside the checkout and no reachable GitHub credentials',
+    () => {
+      // An operator-shaped home: a real `gh` login sits at ~/.config/gh/hosts.yml,
+      // and the anthropic no-tools home policy (issue #935) hands the agent this
+      // very directory so its own subscription login stays reachable. So the home
+      // is NOT what makes GitHub unreachable — GH_CONFIG_DIR is, and this fixture
+      // is what tells the two apart.
+      // A prefix of its own, so it can never be mistaken for — or be a prefix of —
+      // the `ai-reconsider-*` directories the isolation layer mints below.
+      const fakeHome = mkdtempSync(join(tmpdir(), 'reconsider-operator-home-'));
+      mkdirSync(join(fakeHome, '.config', 'gh'), { recursive: true });
+      writeFileSync(join(fakeHome, '.config', 'gh', 'hosts.yml'), 'github.com:\n  oauth_token: sentinel\n', 'utf8');
+      try {
+        const { profile } = resolveReconsiderationProfile('claude', {});
+        const probe = {
+          ...profile,
+          // Absolute, so the isolated env's PATH never decides what runs; and it
+          // drains stdin first (issue #1027) before reporting anything.
+          cmd: '/bin/sh',
+          argv: [
+            '-c',
+            [
+              'cat >/dev/null',
+              'echo "cwd=$PWD"',
+              'echo "cwd_entries=$(ls -A . | wc -l)"',
+              'echo "repo_visible=$(test -e ./src && echo yes || echo no)"',
+              'echo "gh_dir=$GH_CONFIG_DIR"',
+              'echo "gh_entries=$(ls -A "$GH_CONFIG_DIR" | wc -l)"',
+              'echo "gh_hosts=$(cat "$GH_CONFIG_DIR/hosts.yml" 2>/dev/null || echo unreadable)"',
+              'echo "gh_token=${GH_TOKEN-unset}"',
+              'echo "github_token=${GITHUB_TOKEN-unset}"',
+              'echo "xdg=${XDG_CONFIG_HOME-unset}"',
+              'echo "home=$HOME"',
+            ].join('\n'),
+          ],
+        };
+        const result = createReconsiderationAgentRunner(probe, undefined, {
+          PATH: process.env.PATH,
+          HOME: fakeHome,
+          XDG_CONFIG_HOME: join(fakeHome, '.config'),
+          GH_TOKEN: 'sentinel-gh-token',
+          GITHUB_TOKEN: 'sentinel-github-token',
+          PWD: repoCwd,
+        })({ prompt: 'the bundle', timeoutMs: DEFAULT_RECONSIDERATION_TIMEOUT_MS });
+
+        expect(result.exitCode).toBe(0);
+        const observed = Object.fromEntries(
+          result.stdout
+            .split('\n')
+            .filter((l) => l.includes('='))
+            .map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1).trim()]),
+        );
+
+        // No checkout to write to: the cwd is a fresh empty directory, and it is
+        // not anywhere below the repository the evidence was excerpted from.
+        expect(observed.cwd.startsWith(repoCwd)).toBe(false);
+        expect(observed.cwd_entries).toBe('0');
+        expect(observed.repo_visible).toBe('no');
+        // No credentials to mutate GitHub with: the tokens are gone, and the
+        // config dir `gh` would read is a different, empty directory — even
+        // though the operator's real one exists under the home the agent kept.
+        expect(observed.gh_token).toBe('unset');
+        expect(observed.github_token).toBe('unset');
+        expect(observed.xdg).toBe('unset');
+        expect(observed.gh_entries).toBe('0');
+        expect(observed.gh_hosts).toBe('unreadable');
+        expect(observed.home).toBe(fakeHome);
+        expect(observed.gh_dir.startsWith(fakeHome)).toBe(false);
+        expect(existsSync(join(fakeHome, '.config', 'gh', 'hosts.yml'))).toBe(true);
+        // Both throwaway directories are gone once the invocation returns; the
+        // home, which was never one of them, is untouched.
+        expect(existsSync(observed.cwd)).toBe(false);
+        expect(existsSync(observed.gh_dir)).toBe(false);
+        expect(existsSync(fakeHome)).toBe(true);
+      } finally {
+        rmSync(fakeHome, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 });
 
 describe('artifacts and bounded output', () => {

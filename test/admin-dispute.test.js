@@ -33,6 +33,7 @@ import {
   REVIEW_DISPUTE_TRANSITION_EVENT,
 } from '../dist/core/review-dispute-commit.js';
 import { disputeReopenArgv, summarizeDisputeStatus } from '../dist/core/review-dispute-status.js';
+import { REVIEW_DISPUTE_EVIDENCE_ROUND_CONTEXT_KEY } from '../dist/core/review-dispute-evidence-state.js';
 import { buildDisputeStatusArgv, buildTaskMenuActions, formatTaskDetail } from '../dist/cli/admin-ui.js';
 
 // Every case below spawns the real CLI (several times, for the preview/apply
@@ -385,7 +386,12 @@ describe('supported next action', () => {
     expect(payload.dispute.nextAction.authorized).toBe(false);
     expect(payload.dispute.nextAction.reason).toBe('undispatched_turn');
     expect(payload.dispute.nextAction.description).toContain('reviewer');
-    expect(payload.dispute.nextAction.description).toContain('Do not requeue it into review');
+    // Issue #965: every §7.1 turn dispatches, so the stop reason must read as a
+    // fail-closed "this run could not answer the turn" — not as a feature that
+    // has not landed, which would tell an operator to wait for nothing.
+    expect(payload.dispute.nextAction.description).toContain('fail-closed stop');
+    expect(payload.dispute.nextAction.description).not.toMatch(/does not dispatch yet/);
+    expect(payload.dispute.nextAction.description).toContain('requeuing it into an ordinary review');
   });
 
   test('a review-loop cap handoff routes to the existing cap-reset command', async () => {
@@ -719,6 +725,95 @@ describe('task-status — dispute extension', () => {
     expect(t.phase).toBe('review');
     expect(t.reviewDispute.lineages[0].state).toBe('escalated_human');
     expect(t.reviewDispute.nextAction.reason).toBe('lineage_escalated_human');
+  });
+
+  // Issue #956: the §7.1 evidence round is the one stall that is invisible in
+  // §10.1 — a lineage waiting for its second party and a lineage nothing has
+  // dispatched for look identical in the block — so the operator surfaces
+  // project the record, and project counts and party states ONLY.
+  test('an in-flight evidence round reaches both operator surfaces', async () => {
+    const ctx = context({ [LINEAGE_A]: lineage(LINEAGE_A) });
+    const task = await seed(applied(ctx, [record(LINEAGE_A, 'review_disputed')]), {
+      extraContext: {
+        [REVIEW_DISPUTE_EVIDENCE_ROUND_CONTEXT_KEY]: {
+          lineages: {
+            [LINEAGE_A]: {
+              version: 1,
+              parties: {
+                implementer: {
+                  runId: 'run-review-1~evidence.implementer.0',
+                  attempt: 0,
+                  attachments: 1,
+                  references: [{ kind: 'file', path: BOUNDARY, startLine: 30, endLine: 36 }],
+                  artifacts: [
+                    { name: `evidence-implementer-${LINEAGE_A}.json`, digest: 'a1b2c3d4e5f6', bytes: 128 },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const human = run('task-status', '--session-id', SESSION, '--issue-number', String(ISSUE), '--db-path', dbPath);
+    // Issue #965: the party line also carries the attempt, so an operator can
+    // tell a first try from a retry, and a `recoverable` party's bounded reason
+    // token — the two things a stalled round is actually asked about.
+    expect(human.stdout).toContain('evidence round 1: implementer=completed(1)@0 reviewer=not_started(0)');
+    expect(human.stdout).toContain('recorded=1');
+    // Never the reference itself, and never the artifact it came from.
+    expect(human.stdout).not.toContain(`evidence-implementer-${LINEAGE_A}.json`);
+
+    const payload = parse(
+      run('task-status', '--session-id', SESSION, '--issue-number', String(ISSUE), '--db-path', dbPath, '--json'),
+    );
+    const [round] = payload.tasks[0].reviewDispute.evidenceCollection;
+    expect(round).toMatchObject({ lineageId: LINEAGE_A, round: 1, complete: false, attachmentsRecorded: 1 });
+    expect(round.parties.map((p) => [p.party, p.state])).toEqual([
+      ['implementer', 'completed'],
+      ['reviewer', 'not_started'],
+    ]);
+    // Counts, not content: the projection reports HOW MANY references and
+    // artifacts the record retained and nothing about either.
+    expect(round.parties[0]).toMatchObject({ references: 1, artifacts: 1 });
+    expect(JSON.stringify(payload)).not.toContain(`evidence-implementer-${LINEAGE_A}.json`);
+
+    // The UI renders the same line from the same projection.
+    expect(formatTaskDetail(task, NOW, undefined, await readEvents())).toContain(
+      '      evidence round 1: implementer=completed(1)@0 reviewer=not_started(0)  recorded=1',
+    );
+  });
+
+  // Issue #965: a party whose run stopped `recoverable` is the case an operator
+  // most needs to act on, and before this the human line said only
+  // `implementer=recoverable(0)` — indistinguishable from a party that answered
+  // with nothing. The bounded reason token is what names the stop.
+  test('a recoverable party reports its bounded stop reason on the human line', async () => {
+    const ctx = context({ [LINEAGE_A]: lineage(LINEAGE_A) });
+    await seed(applied(ctx, [record(LINEAGE_A, 'review_disputed')]), {
+      extraContext: {
+        [REVIEW_DISPUTE_EVIDENCE_ROUND_CONTEXT_KEY]: {
+          lineages: {
+            [LINEAGE_A]: {
+              version: 1,
+              parties: {
+                implementer: {
+                  runId: 'run-review-1~evidence.implementer.1',
+                  attempt: 1,
+                  attachments: 0,
+                  status: 'recoverable',
+                  reason: 'invocation_failed',
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const human = run('task-status', '--session-id', SESSION, '--issue-number', String(ISSUE), '--db-path', dbPath);
+    expect(human.stdout).toContain('implementer=recoverable(0)@1 [invocation_failed]');
   });
 
   test('a legacy task keeps its existing output and reports a null block', async () => {

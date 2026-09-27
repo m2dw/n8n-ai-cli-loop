@@ -465,6 +465,40 @@ test('captured stderr is replayed and oversized output is truncated', () => {
   expect(section).not.toContain(big);
 });
 
+test('captured output trailing whitespace is stripped before replay (issue #1191)', () => {
+  const section = toolRequestResolutionPromptSection(
+    resolvedRequest({
+      action: 'guided-run',
+      resolvedAt: '2026-06-08T07:00:00.000Z',
+      disposition: 'no-op',
+      capturedResult: { exitCode: 0, stdout: '  done\n\n \t\r\n  ', stderr: ' \n\t ' },
+    }),
+  ).join('\n');
+  // Leading whitespace survives; the trailing run (including Unicode `\s`) is gone.
+  expect(section).toContain('stdout:\n```\n  done\n```');
+  // Whitespace-only stderr trims to empty and is omitted.
+  expect(section).not.toContain('stderr:');
+});
+
+test('a long whitespace run before a non-whitespace character is handled in linear time (issue #1191)', () => {
+  // A `/\s+$/` regex retries from every whitespace start here, which is
+  // quadratic and would stall far beyond the test timeout.
+  const crafted = `${' \t\n'.repeat(100_000)}x`;
+  const section = toolRequestResolutionPromptSection(
+    resolvedRequest({
+      action: 'guided-run',
+      resolvedAt: '2026-06-08T07:00:00.000Z',
+      disposition: 'no-op',
+      capturedResult: { exitCode: 1, stdout: crafted, stderr: `${crafted}\n\n  ` },
+    }),
+  ).join('\n');
+  expect(section).toContain('Captured command output (exit code 1):');
+  // Nothing trailing to strip before `x`, so both streams keep the 4000-char bound.
+  const bounded = `${crafted.slice(0, 4000)}\n…(output truncated)`;
+  expect(section).toContain(`stdout:\n\`\`\`\n${bounded}\n\`\`\``);
+  expect(section).toContain(`stderr:\n\`\`\`\n${bounded}\n\`\`\``);
+});
+
 test('failed guided run replays the captured failure output and tells the agent to diagnose it (issue #678)', () => {
   const section = toolRequestResolutionPromptSection(
     resolvedRequest({

@@ -3,11 +3,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteTaskStore, SqliteOutboxStore, RepoLockStore } from '../dist/index.js';
+import { runAdmin } from './helpers/admin-cli.js';
 
 // Issue #301 — `admin tool-request grant`: scoped, one-shot, handler-owned
 // execution of an exact approved command for a Tool Request handoff.
-
-const CLI = new URL('../dist/cli/admin.js', import.meta.url).pathname;
+//
+// Since issue #1018 these cases drive the dispatcher in-process. The grant
+// handler still spawns the granted command and every git invocation as real
+// child processes, so what these assert — the preflight, the lock, the branch
+// discipline, the artifact — is unchanged.
 
 let tmpDir;
 let dbPath;
@@ -15,18 +19,13 @@ let sessionsPath;
 let repoRoot;
 let lockDir;
 
-function run(...args) {
+async function run(...args) {
   // Keep the repo lock hermetic to the test's tmp dir (the grant takes the lock
   // around its preflight + execution; the default lock dir is global state).
   if (args[0] === 'tool-request' && args[1] === 'grant' && !args.includes('--lock-dir')) {
     args = [...args, '--lock-dir', lockDir];
   }
-  try {
-    const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
-    return { code: 0, stdout };
-  } catch (err) {
-    return { code: err.status ?? 1, stdout: err.stdout ?? '' };
-  }
+  return runAdmin(args);
 }
 
 function parse(result) {
@@ -148,14 +147,14 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('admin CLI — tool-request grant: discoverability', () => {
-  test('appears in "help" listing', () => {
-    const r = run('help');
+  test('appears in "help" listing', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('tool-request grant');
   });
 
-  test('"help tool-request grant" shows its options', () => {
-    const r = run('help', 'tool-request grant');
+  test('"help tool-request grant" shows its options', async () => {
+    const r = await run('help', 'tool-request grant');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('--command');
     expect(r.stdout).toContain('--ttl-seconds');
@@ -168,15 +167,15 @@ describe('admin CLI — tool-request grant: discoverability', () => {
 // ---------------------------------------------------------------------------
 
 describe('admin CLI — tool-request grant: validation', () => {
-  test('missing --session-id exits non-zero', () => {
-    const r = run('tool-request', 'grant', '--issue-number', '1');
+  test('missing --session-id exits non-zero', async () => {
+    const r = await run('tool-request', 'grant', '--issue-number', '1');
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('missing --issue-number exits non-zero', () => {
+  test('missing --issue-number exits non-zero', async () => {
     writeSession();
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('issue-number') });
   });
@@ -186,7 +185,7 @@ describe('admin CLI — tool-request grant: validation', () => {
     const store = new SqliteTaskStore(dbPath);
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 7, phase: 'implementation' });
     store.close();
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '7', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '7', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('no Tool Request') });
   });
@@ -194,7 +193,7 @@ describe('admin CLI — tool-request grant: validation', () => {
   test('refuses an already-resolved request', async () => {
     writeSession();
     await seedToolRequestTask(123, { resolved: true, resolution: { action: 'reject', resolvedAt: '2026-06-07T01:00:00.000Z' } });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
   });
@@ -203,7 +202,7 @@ describe('admin CLI — tool-request grant: validation', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--command', 'true --force', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--command', 'true --force', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('exact-command only') });
     // Untouched: no execution, no resolution.
@@ -222,7 +221,7 @@ describe('admin CLI — tool-request grant: clean worktree', () => {
     writeSession();
     initRepo({ dirty: true });
     await seedToolRequestTask(123, { command: 'true' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('dirty') });
     const task = await getTask(123);
@@ -242,7 +241,7 @@ describe('admin CLI — tool-request grant: dry-run', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--dry-run', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--dry-run', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({ ok: true, dryRun: true, action: 'grant', wouldExecute: true });
@@ -266,7 +265,7 @@ describe('admin CLI — tool-request grant: execution success', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -309,7 +308,7 @@ describe('admin CLI — tool-request grant: execution success', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'echo to-out; echo diag-on-stderr >&2' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, exitCode: 0, success: true });
 
@@ -331,7 +330,7 @@ describe('admin CLI — tool-request grant: execution success', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'touch generated.txt' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -376,7 +375,7 @@ describe('admin CLI — tool-request grant: execution success', () => {
     writeSession();
     initRepo({ withRemote: true });
     await seedToolRequestTask(123, { command: 'git commit --allow-empty -q -m work-on-branch' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -426,7 +425,7 @@ describe('admin CLI — tool-request grant: execution success', () => {
     await seedToolRequestTask(123, {
       command: 'git checkout -q main && git commit --allow-empty -q -m base-contamination',
     });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -472,7 +471,7 @@ describe('admin CLI — tool-request grant: execution success', () => {
     await seedToolRequestTask(123, {
       command: 'git checkout -q main && touch base-contamination.txt',
     });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -507,9 +506,9 @@ describe('admin CLI — tool-request grant: execution success', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
-    expect(run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath).code).toBe(0);
+    expect((await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath)).code).toBe(0);
 
-    const second = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const second = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(second.code).not.toBe(0);
     expect(parse(second)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
   });
@@ -520,7 +519,7 @@ describe('admin CLI — tool-request grant: execution success', () => {
 // ---------------------------------------------------------------------------
 
 describe('admin CLI — tool-request grant: guided change handling (issue #419)', () => {
-  const grant = (...extra) =>
+  const grant = async (...extra) =>
     run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath, ...extra);
 
   const headBranch = () => execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
@@ -539,7 +538,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
-    const r = grant('--on-changes', 'push');
+    const r = await grant('--on-changes','push');
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('--on-changes') });
   });
@@ -548,7 +547,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
-    const r = grant('--on-changes', 'commit', '--confirm-discard');
+    const r = await grant('--on-changes','commit', '--confirm-discard');
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('--confirm-discard') });
   });
@@ -557,7 +556,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
-    const r = grant('--on-changes', 'keep', '--allow-unexpected');
+    const r = await grant('--on-changes','keep', '--allow-unexpected');
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('--allow-unexpected') });
   });
@@ -566,7 +565,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo({ withRemote: true });
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
-    const r = grant('--on-changes', 'commit');
+    const r = await grant('--on-changes','commit');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -610,7 +609,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
       command:
         'mkdir -p .n8n-artifacts && echo run > .n8n-artifacts/run.json && git add -f .n8n-artifacts/run.json && echo updated >> package.json',
     });
-    const r = grant('--on-changes', 'commit');
+    const r = await grant('--on-changes','commit');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, changeOutcome: 'committed', pushed: true });
 
@@ -629,7 +628,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo({ withRemote: true });
     await seedToolRequestTask(123, { command: 'echo updated >> package.json && echo extra > unexpected.ts' });
-    const r = grant('--on-changes', 'commit');
+    const r = await grant('--on-changes','commit');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -651,7 +650,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo({ withRemote: true });
     await seedToolRequestTask(123, { command: 'echo updated >> package.json && echo extra > unexpected.ts' });
-    const r = grant('--on-changes', 'commit', '--allow-unexpected');
+    const r = await grant('--on-changes','commit', '--allow-unexpected');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, changeOutcome: 'committed', pushed: true });
     expect(porcelain()).toBe('');
@@ -666,7 +665,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
-    const r = grant('--on-changes', 'commit');
+    const r = await grant('--on-changes','commit');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -692,7 +691,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
-    const r = grant('--on-changes', 'keep');
+    const r = await grant('--on-changes','keep');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -714,7 +713,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
-    const r = grant('--on-changes', 'discard');
+    const r = await grant('--on-changes','discard');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -729,7 +728,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
-    const r = grant('--on-changes', 'discard', '--confirm-discard');
+    const r = await grant('--on-changes','discard', '--confirm-discard');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -749,7 +748,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'echo generated > generated.txt' });
-    const r = grant('--on-changes', 'discard', '--confirm-discard');
+    const r = await grant('--on-changes','discard', '--confirm-discard');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, changeOutcome: 'discarded' });
     expect(existsSync(join(repoRoot, 'generated.txt'))).toBe(false);
@@ -768,7 +767,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
       command:
         'mkdir -p .n8n-artifacts && echo run > .n8n-artifacts/run.json && git add -f .n8n-artifacts/run.json && echo updated >> package.json',
     });
-    const r = grant('--on-changes', 'discard', '--confirm-discard');
+    const r = await grant('--on-changes','discard', '--confirm-discard');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, changeOutcome: 'discarded' });
 
@@ -789,12 +788,12 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     initRepo();
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
 
-    const refused = grant('--on-changes', 'discard');
+    const refused = await grant('--on-changes','discard');
     expect(refused.code).toBe(0);
     expect(parse(refused)).toMatchObject({ changeOutcome: 'refused', refusalCode: 'needs-confirmation' });
     expect(porcelain()).not.toBe('');
 
-    const retried = grant('--on-changes', 'discard', '--confirm-discard');
+    const retried = await grant('--on-changes','discard', '--confirm-discard');
     expect(retried.code).toBe(0);
     expect(parse(retried)).toMatchObject({ ok: true, changeAction: 'discard', changeOutcome: 'discarded' });
 
@@ -813,12 +812,12 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     initRepo({ withRemote: true });
     await seedToolRequestTask(123, { command: 'echo updated >> package.json && echo extra > unexpected.ts' });
 
-    const refused = grant('--on-changes', 'commit');
+    const refused = await grant('--on-changes','commit');
     expect(refused.code).toBe(0);
     expect(parse(refused)).toMatchObject({ changeOutcome: 'refused', refusalCode: 'unexpected-files' });
     expect(branchCommits('ai/issue-123')).toBe('0');
 
-    const retried = grant('--on-changes', 'commit', '--allow-unexpected');
+    const retried = await grant('--on-changes','commit', '--allow-unexpected');
     expect(retried.code).toBe(0);
     expect(parse(retried)).toMatchObject({ ok: true, changeOutcome: 'committed', pushed: true });
 
@@ -838,9 +837,9 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
     // keep is a terminal disposition (records 'kept', never 'refused'), so a
     // second grant is rejected as an already-issued one-shot grant.
-    const first = grant('--on-changes', 'keep');
+    const first = await grant('--on-changes','keep');
     expect(parse(first)).toMatchObject({ changeOutcome: 'kept' });
-    const second = grant('--on-changes', 'discard', '--confirm-discard');
+    const second = await grant('--on-changes','discard', '--confirm-discard');
     expect(second.code).not.toBe(0);
     expect(parse(second)).toMatchObject({ ok: false, error: expect.stringContaining('one-shot') });
   });
@@ -849,7 +848,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
-    const r = grant('--on-changes', 'reject');
+    const r = await grant('--on-changes','reject');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -869,7 +868,7 @@ describe('admin CLI — tool-request grant: guided change handling (issue #419)'
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
-    const r = grant('--on-changes', 'abort');
+    const r = await grant('--on-changes','abort');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -898,7 +897,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     expect(execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim()).toBe('main');
     await seedToolRequestTask(123, { command: 'touch from-grant.txt' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, dirtyAfter: true, branch: 'ai/issue-123' });
 
@@ -932,7 +931,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
       command: 'touch from-grant.txt',
       dependencyBase: { baseIssueNumber: 50, basePrNumber: 55, baseHeadRefName: 'ai/issue-50', basePrUrl: 'https://github.com/m2dw/some-repo/pull/55' },
     });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, dirtyAfter: true, branch: 'ai/issue-123' });
 
@@ -956,7 +955,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
       command: 'touch from-grant.txt',
       dependencyBase: { baseIssueNumber: 50, basePrNumber: 55, baseHeadRefName: 'ai/issue-50', basePrUrl: 'https://github.com/m2dw/some-repo/pull/55' },
     });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     // The command never ran and no base-derived branch was created.
     expect(existsSync(join(repoRoot, 'from-grant.txt'))).toBe(false);
@@ -972,7 +971,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     execFileSync('git', ['checkout', '-q', 'main'], { cwd: repoRoot, encoding: 'utf8' });
     await seedToolRequestTask(123, { command: 'touch on-pr-branch.txt', branch: 'pr-head-123' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, dirtyAfter: true, branch: 'pr-head-123' });
 
@@ -1007,7 +1006,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     expect(existsSync(join(repoRoot, 'from-origin.txt'))).toBe(false);
 
     await seedToolRequestTask(123, { command: 'touch from-grant.txt', branch: 'pr-head-123' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, branch: 'pr-head-123' });
 
@@ -1037,7 +1036,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     expect(existsSync(join(repoRoot, 'from-origin.txt'))).toBe(false);
 
     await seedToolRequestTask(123, { command: 'touch from-grant.txt', branch: 'pr-head-123' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, branch: 'pr-head-123' });
 
@@ -1069,7 +1068,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     expect(existsSync(join(repoRoot, 'pr-only.txt'))).toBe(false);
 
     await seedToolRequestTask(123, { command: 'touch from-grant.txt', branch: 'pr-head-123' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, branch: 'pr-head-123' });
 
@@ -1094,7 +1093,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     expect(execFileSync('git', ['branch', '--list', 'pr-head-123'], { cwd: repoRoot, encoding: 'utf8' }).trim()).toBe('');
 
     await seedToolRequestTask(123, { command: 'touch from-grant.txt', branch: 'pr-head-123' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({
       ok: false,
@@ -1123,7 +1122,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     expect(execFileSync('git', ['ls-remote', '--heads', 'origin', 'pr-head-123'], { cwd: repoRoot, encoding: 'utf8' }).trim()).toBe('');
 
     await seedToolRequestTask(123, { command: 'touch from-grant.txt', branch: 'pr-head-123' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({
       ok: false,
@@ -1148,7 +1147,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     git('remote', 'add', 'origin', join(tmpDir, 'does-not-exist.git'));
 
     await seedToolRequestTask(123, { command: 'touch from-grant.txt', branch: 'pr-head-123' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining("could not determine whether origin has 'pr-head-123'") });
     // The command never ran: no produced file.
@@ -1163,7 +1162,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, requeued: true, branch: 'ai/issue-123' });
 
@@ -1189,7 +1188,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     execFileSync('git', ['branch', 'ai/issue-123'], { cwd: repoRoot, encoding: 'utf8' });
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, requeued: true, branch: 'ai/issue-123' });
 
@@ -1215,7 +1214,7 @@ describe('admin CLI — tool-request grant: branch discipline (issue #316)', () 
     git('checkout', '-q', 'main');
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, requeued: true, branch: 'ai/issue-123' });
 
@@ -1240,7 +1239,7 @@ describe('admin CLI — tool-request grant: execution failure', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'false' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({
@@ -1285,7 +1284,7 @@ describe('admin CLI — tool-request grant: execution failure', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'sh -c "echo dirty > leftover.txt; exit 1"' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({
@@ -1330,7 +1329,7 @@ describe('admin CLI — tool-request grant: execution failure', () => {
         'sh -c "git checkout -q main && git commit --allow-empty -q -m base-contamination && ' +
         'git push -q origin main && git checkout -q ai/issue-123; exit 1"',
     });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({
@@ -1379,7 +1378,7 @@ describe('admin CLI — tool-request grant: execution failure', () => {
         'NEW=$(git commit-tree -p main main^{tree} -m base-contamination) && ' +
         'git push -q origin "$NEW":refs/heads/main; exit 1',
     });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({
@@ -1414,9 +1413,9 @@ describe('admin CLI — tool-request grant: execution failure', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'sh -c "echo dirty > leftover.txt; exit 1"' });
-    expect(run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath).code).toBe(0);
+    expect((await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath)).code).toBe(0);
 
-    const second = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const second = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(second.code).not.toBe(0);
     expect(parse(second)).toMatchObject({ ok: false, error: expect.stringContaining('one-shot') });
   });
@@ -1428,9 +1427,9 @@ describe('admin CLI — tool-request grant: execution failure', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'false' });
-    expect(run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath).code).toBe(0);
+    expect((await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath)).code).toBe(0);
 
-    const second = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const second = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(second.code).not.toBe(0);
     expect(parse(second)).toMatchObject({ ok: false, error: expect.stringContaining('already resolved') });
   });
@@ -1448,7 +1447,7 @@ describe('admin CLI — tool-request grant: shell semantics', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'FOO=bar true' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, exitCode: 0, success: true, requeued: true });
   });
@@ -1459,7 +1458,7 @@ describe('admin CLI — tool-request grant: shell semantics', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'touch a.txt && touch b.txt' });
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, exitCode: 0, success: true, dirtyAfter: true });
     expect(existsSync(join(repoRoot, 'a.txt'))).toBe(true);
@@ -1477,7 +1476,7 @@ describe('admin CLI — tool-request grant: quoted-whitespace exactness', () => 
     initRepo();
     await seedToolRequestTask(123, { command: 'printf "a b"' });
     // Same tokens, but the quoted argument has different (significant) spacing.
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--command', 'printf "a  b"', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--command', 'printf "a  b"', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('exact-command only') });
     const task = await getTask(123);
@@ -1500,7 +1499,7 @@ describe('admin CLI — tool-request grant: repo lock', () => {
     const lockStore = new RepoLockStore(lockDir);
     expect(lockStore.acquire('worker-run-1', 'addon-dev').locked).toBe(true);
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('repo lock') });
 
@@ -1519,7 +1518,7 @@ describe('admin CLI — tool-request grant: repo lock', () => {
     writeSession();
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
-    expect(run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath).code).toBe(0);
+    expect((await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath)).code).toBe(0);
 
     // The grant must have released the lock; a fresh context can acquire it.
     const lockStore = new RepoLockStore(lockDir);
@@ -1583,7 +1582,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     await seedToolRequestTask(123, { command: 'touch generated.txt' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -1625,7 +1624,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     // The worktree branch is committed locally but not yet on origin.
     expect(originHasBranch('ai/issue-123')).toBe(false);
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     // A clean no-op in the worktree re-queues for implementation; the canonical
     // dirt never entered the dirty preflight.
@@ -1655,7 +1654,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, exitCode: 0, success: true, requeued: true });
 
@@ -1676,7 +1675,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     writeFileSync(join(wtPath, 'wip.txt'), 'uncommitted edit\n', 'utf8');
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('dirty') });
 
@@ -1704,7 +1703,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     expect(execFileSync('git', ['rev-list', '--count', 'origin/main..main'], { cwd: repoRoot, encoding: 'utf8' }).trim()).toBe('1');
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     // The base-ahead guard is skipped in worktree mode, so the clean no-op re-queues.
     expect(parse(r)).toMatchObject({ ok: true, executed: true, exitCode: 0, success: true, requeued: true });
@@ -1728,7 +1727,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     const wtPath = addIssueWorktree(123, { commitFile: 'wip.txt' });
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, exitCode: 0, success: true, requeued: true });
 
@@ -1758,7 +1757,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
   // working-tree git ops in `grantRepoCwd`, which resolves to the worktree),
   // so these lock the behavior the acceptance criteria require.
   // -------------------------------------------------------------------------
-  const grant = (...extra) =>
+  const grant = async (...extra) =>
     run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath, ...extra);
 
   test('commit: commits to the issue branch in the worktree and pushes, canonical untouched', async () => {
@@ -1767,7 +1766,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     const wtPath = addIssueWorktree(123);
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
 
-    const r = grant('--on-changes', 'commit');
+    const r = await grant('--on-changes','commit');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -1806,7 +1805,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     const wtPath = addIssueWorktree(123);
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
 
-    const r = grant('--on-changes', 'keep');
+    const r = await grant('--on-changes','keep');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -1835,7 +1834,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     const wtPath = addIssueWorktree(123);
     await seedToolRequestTask(123, { command: 'echo updated >> package.json && echo gen > generated.txt' });
 
-    const r = grant('--on-changes', 'discard', '--confirm-discard');
+    const r = await grant('--on-changes','discard', '--confirm-discard');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -1865,7 +1864,7 @@ describe('admin CLI — tool-request grant: per-issue worktree sessions', () => 
     const wtPath = addIssueWorktree(123);
     await seedToolRequestTask(123, { command: 'echo updated >> package.json' });
 
-    const r = grant('--on-changes', 'commit');
+    const r = await grant('--on-changes','commit');
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({
       ok: true,
@@ -1918,7 +1917,7 @@ describe('admin CLI — tool-request grant: canonical artifact cleanup (issue #4
     initRepo({ gitignoreArtifacts: false });
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     // The artifact does NOT make the no-op look like produced changes: it is excluded
     // from the dirtiness probe, so the run is still recognised as a no-op and requeued.
@@ -1942,7 +1941,7 @@ describe('admin CLI — tool-request grant: canonical artifact cleanup (issue #4
     initRepo();
     await seedToolRequestTask(123, { command: 'true' });
 
-    const r = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const r = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, executed: true, success: true, requeued: true, branch: 'ai/issue-123' });
 
@@ -1968,7 +1967,7 @@ describe('admin CLI — tool-request grant: fresh repeated Tool Request (issue #
     await seedToolRequestTask(123, { command: 'true' });
 
     // First guided-run: succeeds, requeues.
-    const first = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const first = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(first.code).toBe(0);
     expect(parse(first)).toMatchObject({ ok: true, requeued: true });
 
@@ -2007,7 +2006,7 @@ describe('admin CLI — tool-request grant: fresh repeated Tool Request (issue #
 
     // Second guided-run for the fresh Tool Request: must succeed, not be blocked
     // by the one-shot guard that applies to the consumed first grant.
-    const second = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const second = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(second.code).toBe(0);
     expect(parse(second)).toMatchObject({ ok: true, executed: true, exitCode: 0, requeued: true });
 
@@ -2028,13 +2027,13 @@ describe('admin CLI — tool-request grant: fresh repeated Tool Request (issue #
     await seedToolRequestTask(123, { command: 'sh -c "echo dirty > leftover.txt; exit 1"' });
 
     // First grant: runs but fails — grant consumed (uses=1), task not requeued.
-    const first = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const first = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(first.code).toBe(0);
     expect(parse(first)).toMatchObject({ ok: true, executed: true, exitCode: expect.any(Number), requeued: false });
 
     // Retrying the same request (requestedAt unchanged, still before grantedAt):
     // must be refused — not a fresh Tool Request instance.
-    const second = run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const second = await run('tool-request', 'grant', '--session-id', 'addon-dev', '--issue-number', '123', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(second.code).not.toBe(0);
     expect(parse(second)).toMatchObject({ ok: false, error: expect.stringContaining('one-shot') });
   });

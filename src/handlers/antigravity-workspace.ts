@@ -40,8 +40,8 @@ import {
   writeSync,
 } from "fs";
 import type { Stats } from "fs";
-import { homedir } from "os";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 import {
   ANTIGRAVITY_SETTINGS_SCHEMA_PIN,
   AntigravityWorkspaceSettingsError,
@@ -152,17 +152,14 @@ export function nodeWorkspaceGitProbe(): WorkspaceGitProbe {
  * it from the home directory itself and offers no documented way of being
  * pointed at another one.
  *
- * `$HOME` is read before `homedir()` rather than after: that is the precedence
- * Node itself applies on POSIX, so a real run resolves the identical path, but
- * `homedir()` reads the *process* environment through libuv while a spawned
- * child — and a test — only ever sees `process.env`. Deriving from the variable
- * keeps the home this code answers with the same one anything downstream would
- * observe, instead of one that cannot be redirected.
+ * `$HOME` is read before `homedir()` rather than after (see
+ * {@link resolveHomeDir}, which issue #1063 made shared with every other managed
+ * default): that is the precedence Node itself applies, so a real run
+ * resolves the identical path, but the environment variable is the only one a
+ * spawned child — or a test — can observe and redirect.
  */
 export function canonicalGlobalSettingsPath(): string {
-  const home = process.env["HOME"];
-  const base = home && home.trim().length > 0 ? home : homedir();
-  return join(base, ".gemini", "antigravity-cli", "settings.json");
+  return join(resolveHomeDir(), ".gemini", "antigravity-cli", "settings.json");
 }
 
 /**
@@ -288,6 +285,37 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/**
+ * The clock and the blocking primitive the store's two wait loops use — the
+ * lock acquisition loop and the overlay exclusivity loop.
+ *
+ * Both loops are budgets measured against a clock, not against any particular
+ * source of time, and both are correct for exactly the same reason whether that
+ * clock is the wall or not: the deadline is compared against the same `now()`
+ * the sleeps advance. Naming the pair makes the budget the thing under test
+ * instead of the wall-clock delay that normally implements it — a caller may
+ * supply a clock that advances only by what it was asked to sleep, and the loop
+ * then spends its full ten seconds of budget without spending ten seconds
+ * (issue #1017).
+ *
+ * It is deliberately NOT a general time seam: staleness decisions read file
+ * mtimes and journal timestamps written by other processes, which are wall-clock
+ * facts about the machine and stay on `Date.now()`. Only the loops' own budgets
+ * are expressed here.
+ */
+export interface SettingsWaitStrategy {
+  /** Monotonically non-decreasing milliseconds; only differences are used. */
+  now(): number;
+  /** Give up the thread for `ms`, advancing `now()` by at least that much. */
+  sleep(ms: number): void;
+}
+
+/** What every production path uses: the wall clock and a real blocking sleep. */
+const REAL_WAIT_STRATEGY: SettingsWaitStrategy = {
+  now: () => Date.now(),
+  sleep: sleepSync,
+};
+
 function processAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -311,10 +339,14 @@ function processAlive(pid: number): boolean {
  * critical section only ever ends in an atomic rename, so a takeover can never
  * observe a half-written store.
  */
-function withGlobalSettingsLock<T>(globalSettingsPath: string, fn: () => T): T {
+function withGlobalSettingsLock<T>(
+  globalSettingsPath: string,
+  fn: () => T,
+  wait: SettingsWaitStrategy = REAL_WAIT_STRATEGY,
+): T {
   const lockPath = `${globalSettingsPath}${LOCK_SUFFIX}`;
   const token = randomBytes(8).toString("hex");
-  const fd = acquireGlobalSettingsLock(lockPath);
+  const fd = acquireGlobalSettingsLock(lockPath, wait);
   let owned = false;
   try {
     try {
@@ -366,8 +398,8 @@ function readLockHolder(lockPath: string): { pid: number | null; token: string |
 
 /** Create the lock file exclusively, taking over a demonstrably abandoned one
  * and giving up with `global-settings-locked` after the acquisition timeout. */
-function acquireGlobalSettingsLock(lockPath: string): number {
-  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+function acquireGlobalSettingsLock(lockPath: string, wait: SettingsWaitStrategy): number {
+  const deadline = wait.now() + LOCK_ACQUIRE_TIMEOUT_MS;
   for (;;) {
     try {
       mkdirSync(dirname(lockPath), { recursive: true });
@@ -381,13 +413,13 @@ function acquireGlobalSettingsLock(lockPath: string): number {
         );
       }
       if (takeOverStaleLock(lockPath)) continue;
-      if (Date.now() >= deadline) {
+      if (wait.now() >= deadline) {
         throw new AntigravityWorkspaceSettingsError(
           "global-settings-locked",
           "another process held the Antigravity settings lock for longer than the acquisition timeout",
         );
       }
-      sleepSync(LOCK_POLL_MS);
+      wait.sleep(LOCK_POLL_MS);
     }
   }
 }
@@ -1284,8 +1316,13 @@ function settleCommittedJournals(journals: readonly StoredOverlayJournal[]): voi
 export interface PrepareWorkspaceSettingsInput {
   /** The exact research workspace root (the run's cwd for the agent). */
   workspaceRoot: string;
-  /** Provenance of the research binary; only the vetted default is prepared for. */
-  cmdSource: "env" | "cli-default";
+  /**
+   * Provenance of the research binary; only the vetted default is prepared
+   * for. Accepts the full §13.2-derived vocabulary the runtime boundary
+   * reports (`runtimeCmdSource`), but anything other than `cli-default` — an
+   * env override or a catalog-named binary — is refused as unvetted.
+   */
+  cmdSource: "env" | "cli-default" | "catalog-builtin" | "catalog-overlay";
   denyGlobs?: readonly string[] | undefined;
   generatedGlobs?: readonly string[] | undefined;
   /**
@@ -1307,6 +1344,20 @@ export interface PrepareWorkspaceSettingsInput {
    * canonical-store requirement accordingly (issue #830 review).
    */
   probeCliVersion?: CliVersionProbe | undefined;
+  /**
+   * Clock and blocking primitive for the store's lock-acquisition and overlay-
+   * exclusivity budgets. Defaults to the wall clock and a real blocking sleep;
+   * nothing in production supplies it.
+   *
+   * It exists so the contended paths can be driven deterministically instead of
+   * in real time (issue #1017). Substituting a clock that advances only by what
+   * the loop asked to sleep leaves every ordering and every budget exactly as
+   * they are — the deadline is compared against the same clock — while taking
+   * the wall-clock wait out of the test. It is equally a synchronisation point:
+   * a caller may do work inside `sleep` and hand the lock over from there,
+   * which pins an interleaving that would otherwise have to be raced for.
+   */
+  waitStrategy?: SettingsWaitStrategy | undefined;
 }
 
 export interface PreparedWorkspaceSettings {
@@ -1644,13 +1695,16 @@ function assertGlobalSettingsOutsideWorkspace(globalSettingsPath: string, worksp
 export function prepareAntigravityWorkspaceSettings(
   input: PrepareWorkspaceSettingsInput,
 ): PreparedWorkspaceSettings {
-  // The permission profile is pinned to the vetted CLI's schema (§6.1). An
-  // operator-overridden binary may speak a different settings dialect, so the
-  // runner refuses rather than writing a profile it cannot vouch for — the same
-  // provenance seam the quota (#671) and denial (#804) classifiers use.
+  // The permission profile is pinned to the vetted CLI's schema (§6.1). A
+  // binary the operator overrode or a catalog profile named may speak a
+  // different settings dialect, so the runner refuses rather than writing a
+  // profile it cannot vouch for — the same provenance seam the quota (#671)
+  // and denial (#804) classifiers use.
   if (input.cmdSource !== "cli-default") {
     throw new AntigravityWorkspaceSettingsError("unvetted-cli-binary");
   }
+
+  const waitStrategy = input.waitStrategy ?? REAL_WAIT_STRATEGY;
 
   // Which store this run works on is settled first, and by ONE resolved
   // pathname: every lock, journal directory, read and write below is derived
@@ -1778,7 +1832,7 @@ export function prepareAntigravityWorkspaceSettings(
       const updated = withExactWorkspaceTrust(snapshot.document, workspaceRoot);
       writeGlobalStoreAtomically(globalSettingsPath, renderGlobalDocument(updated, snapshot.raw));
       return { trust: current, registered: true };
-    });
+    }, waitStrategy);
     trust = outcome.trust;
     registered = outcome.registered;
   }
@@ -1818,7 +1872,7 @@ export function prepareAntigravityWorkspaceSettings(
   //     mutation, so every refusal above still leaves the operator's global
   //     configuration untouched, and it is journalled so the entries can be
   //     removed deterministically on release or reclaimed after a crash.
-  const overlay = installGlobalOverlay(globalSettingsPath, workspaceRoot, settings);
+  const overlay = installGlobalOverlay(globalSettingsPath, workspaceRoot, settings, waitStrategy);
 
   return {
     policyVersion: WORKSPACE_SETTINGS_POLICY_VERSION,
@@ -1880,18 +1934,21 @@ function installGlobalOverlay(
   globalSettingsPath: string,
   workspaceRoot: string,
   settings: AntigravityWorkspaceSettings,
+  wait: SettingsWaitStrategy,
 ): InstalledOverlay {
   const overlay = buildGlobalPermissionOverlay(settings, workspaceRoot);
-  const deadline = Date.now() + OVERLAY_EXCLUSIVE_WAIT_MS;
+  const deadline = wait.now() + OVERLAY_EXCLUSIVE_WAIT_MS;
   for (;;) {
-    const attempt = withGlobalSettingsLock(globalSettingsPath, () =>
-      tryInstallGlobalOverlay(globalSettingsPath, workspaceRoot, overlay),
+    const attempt = withGlobalSettingsLock(
+      globalSettingsPath,
+      () => tryInstallGlobalOverlay(globalSettingsPath, workspaceRoot, overlay),
+      wait,
     );
     if (attempt.installed !== null) return attempt.installed;
-    if (Date.now() >= deadline) {
+    if (wait.now() >= deadline) {
       throw new AntigravityWorkspaceSettingsError("global-overlay-contended", contentionDetail(attempt.contention));
     }
-    sleepSync(OVERLAY_CONTENTION_POLL_MS);
+    wait.sleep(OVERLAY_CONTENTION_POLL_MS);
   }
 }
 

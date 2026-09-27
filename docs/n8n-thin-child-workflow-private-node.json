@@ -44,11 +44,25 @@
       "typeVersion": 1
     },
     {
+      "id": "chatops-scan",
+      "name": "ChatOps Scan",
+      "type": "CUSTOM.aiCliLoop",
+      "position": [
+        280,
+        240
+      ],
+      "parameters": {
+        "operation": "chatopsScan",
+        "contextId": "={{ $(\"When Called by Parent\").first().json.contextId }}"
+      },
+      "typeVersion": 1
+    },
+    {
       "id": "dispatch-outbox",
       "name": "Dispatch Outbox",
       "type": "CUSTOM.aiCliLoop",
       "position": [
-        280,
+        560,
         240
       ],
       "parameters": {
@@ -62,7 +76,7 @@
       "name": "Return Context",
       "type": "n8n-nodes-base.set",
       "position": [
-        560,
+        840,
         240
       ],
       "parameters": {
@@ -108,6 +122,17 @@
       ]
     },
     "Run One Phase": {
+      "main": [
+        [
+          {
+            "node": "ChatOps Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ChatOps Scan": {
       "main": [
         [
           {

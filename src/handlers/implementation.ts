@@ -1,20 +1,40 @@
 import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, relative, resolve } from "path";
 import { randomBytes } from "crypto";
-import type { AiTask, ImplementationMode } from "../core/task.js";
+import type { AiTask, ImplementationMode, TaskKey } from "../core/task.js";
+import type { TaskStore } from "../core/task-store.js";
 import type { PhaseHandler, PhaseHandlerContext, PhaseHandlerResult } from "../core/phase-runner.js";
 import { defaultCommandRunner } from "./command-runner.js";
-import type { CommandRunner } from "./command-runner.js";
+import type { CommandRunner, CommandRunResult } from "./command-runner.js";
 import type { DependencyChecker, DependencyDecision } from "../core/github-intake.js";
-import { labelsToComplexity, resolveComplexityTier } from "../core/github-intake.js";
+import {
+  legacyRuntimeSettingSource,
+  planAgentPhaseInvocation,
+  resolveAgentPhaseRuntime,
+  runtimeCmdSource,
+  withAgentRuntimeAudit,
+} from "./agent-runtime.js";
+import type { AgentPhaseRuntime, LegacyRuntimeSource } from "./agent-runtime.js";
+import { AGENT_RUNTIME_AUDIT_ARTIFACT_FILENAME, serializeAgentRuntimeAuditRecord } from "../core/agent-runtime-audit.js";
+import { REVIEW_LOOP_ESCALATION_QUALITY } from "../core/agent-quality.js";
 import {
   runArtifactDir,
   writeAssignmentFailureArtifact,
   isSafeArtifactDirAfterRun,
   ARTIFACT_DIR_PENDING_CONTEXT_FIELD,
+  DISPUTE_ARTIFACT_DIR_CONTEXT_FIELD,
 } from "./artifact-dir.js";
 import { agentForPhase, readResolvedAssignment } from "../core/assignment.js";
-import { branchName, findOpenPr, resolveFixPr, extractPrNumber } from "./pr-helpers.js";
+import {
+  REVIEW_DISPUTE_PARTIES_CONTEXT_FIELD,
+  mergeDisputeParties,
+  summarizeDisputeParty,
+} from "../core/review-dispute-parties.js";
+import {
+  REVIEW_DISPUTE_REBUTTALS_CONTEXT_FIELD,
+  mergeRebuttalLineageRecord,
+} from "../core/review-dispute-rebuttals.js";
+import { branchName, findOpenPr, resolveFixPr, extractPrNumber, adoptExistingPrForHead } from "./pr-helpers.js";
 import type { PrInfo } from "./pr-helpers.js";
 import { resolveIssueWorktree, removeWorktree, canonicalizePath, isPathInside } from "./worktree.js";
 import { resolveWorktreeRoot, issueWorktreePath } from "../core/worktree-paths.js";
@@ -22,14 +42,42 @@ import { ghRunnerFromCommandRunner } from "../providers/github/gh-runner.js";
 import type { GhRunner } from "../providers/github/gh-runner.js";
 import { resolveGhRunner } from "../providers/github/github-app-auth.js";
 import { resolveSessionRepoHost } from "../providers/repo-host-factory.js";
+import { JsonSessionRegistry } from "../registries/json-session-registry.js";
 import type { SessionRepoHost } from "../providers/repo-host-factory.js";
 import { resolveDependencyExecutionPlan } from "./dependency-plan.js";
 import type { DependencyExecutionPlan } from "./dependency-plan.js";
-import { runVerification } from "./verification.js";
-import type { VerificationFailure } from "./verification.js";
+import type { VerificationFailure, VerificationOutcome } from "./verification.js";
+import { runLoopStageVerification } from "./stage-verification.js";
+import type { LoopStageRun, RunLoopStageInput } from "./stage-verification.js";
+import {
+  NO_DEPENDENCY_BASE,
+  resolveTestStageContext,
+  runStage1TestVerification,
+  stage1VerificationFailure,
+  testStageReplacedCheck,
+  withStage1ContextPatch,
+  type Stage1TestRun,
+} from "./test-stage-verification.js";
+import { openStageRunGuard, stage1RecoveryOutcome } from "../core/test-stage-routing.js";
+import {
+  STAGED_VERIFICATION_CONTEXT_KEY,
+  grantingFinalBundle,
+  readStagedVerificationState,
+  validateStagedVerificationState,
+} from "../core/staged-verification-state.js";
+import type { StagedVerificationStateRead } from "../core/staged-verification-state.js";
+import { passedStageCheckNames, summarizeStageRun, type StageRunSummary } from "../core/stage-run.js";
+import {
+  LOOP_STAGE_RECOVERY_CONTEXT_KEY,
+  admitVerificationOnlyResume,
+  decideLoopStageRecovery,
+  readLoopStageRecovery,
+  type LoopStageRecoveryDecision,
+} from "../core/stage-recovery.js";
+import { resolveStagedVerificationSettings } from "../core/staged-verification-config.js";
 import { runDependencySync } from "./dependency-sync.js";
 import type { DependencySyncOutcome } from "./dependency-sync.js";
-import { ensureEnvironmentPrepared } from "./environment-prepare.js";
+import { ensureEnvironmentPrepared, environmentPrepareFailureMessage } from "./environment-prepare.js";
 import { runDependencyUpdate } from "./dependency-update.js";
 import type { DependencyUpdateApplied, DependencyUpdateFailed } from "./dependency-update.js";
 import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory, resolveTransientRetryDelayMs } from "../core/quota-classifier.js";
@@ -44,14 +92,16 @@ import {
   describeVerificationEnvironmentSignal,
 } from "../core/implementation-verification.js";
 import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
-import { parseToolRequest, toolRequestPromptSection, toolRequestResolutionPromptSection, normalizeToolRequestCommand } from "../core/tool-request.js";
+import { parseToolRequest, toolRequestPromptSection, toolRequestResolutionPromptSection, normalizeToolRequestCommand, hasUnresolvedToolRequest } from "../core/tool-request.js";
 import type { StoredToolRequest, ToolRequest } from "../core/tool-request.js";
-import type { ClaudeConfig, CodexConfig } from "../core/session.js";
-import { resolveCodexContextMode, resolveCodexModel, providerForAgent } from "./codex-context-mode.js";
+import type { ResolvedSession } from "../core/session.js";
+import { resolveCodexContextMode } from "./codex-context-mode.js";
+import type { CodexContextModeEnabled, CodexContextModeUnset } from "./codex-context-mode.js";
+import type { CodexLaneInputs } from "../core/codex-runtime-adapter.js";
 import { resolveReviewCompatContext } from "../core/review-legacy-compat.js";
 import type { ReviewCompatResolution } from "../core/review-legacy-compat.js";
 import { resolveReviewDisputeSettings, REVIEW_DISPUTE_DEFAULT_LIMITS } from "../core/review-dispute.js";
-import type { ReviewDisputeLimits, ReviewFinding } from "../core/review-dispute.js";
+import type { EvidenceRef, ReviewDisputeLimits, ReviewFinding } from "../core/review-dispute.js";
 import { REVIEW_FINDINGS_ARTIFACT, FIX_DISPOSITIONS_ARTIFACT } from "../core/review-dispute-lineage.js";
 import {
   parseFindingsArtifact,
@@ -65,8 +115,73 @@ import { persistFixDisputes } from "../core/review-dispute-persistence.js";
 import type { FixDisputePersistence } from "../core/review-dispute-persistence.js";
 import { applyDisputeTransition } from "../core/review-dispute-transition.js";
 import type { DisputeTransitionApplication } from "../core/review-dispute-transition.js";
-import { createReviewEvidenceResolver } from "../core/review-finding-envelope.js";
+import { createReviewEvidenceResolver, reviewResolvableEvidenceKinds } from "../core/review-finding-envelope.js";
 import { captureTrackedFiles, createTrackedFileReader } from "./evidence-checkout.js";
+import {
+  NO_CHANGE_CONTEXT_FIELD,
+  NO_CHANGE_TURNS_CONTEXT_FIELD,
+  admitNoChangeRun,
+  buildNoChangeContinuation,
+  buildNoChangePromptSection,
+  noChangeTurnsSpent,
+  parseNoChangeDeclaration,
+} from "../core/implementation-no-change.js";
+import type {
+  BranchCommitProbe,
+  NoChangeAdmission,
+  NoChangeContinuation,
+  NoChangeParseResult,
+  PublishedRevisionProbe,
+} from "../core/implementation-no-change.js";
+import {
+  resolveDependencyReviewBase,
+  type DependencyBaseAcceptanceEvidence,
+} from "../core/review-admission.js";
+
+// ---------------------------------------------------------------------------
+// Predecessor acceptance (issue #1165, decision D5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `baseHeadAccepted` attestation for one resolved predecessor head — or
+ * nothing, when no acceptance the loop recorded names that exact commit.
+ *
+ * `resolveDependencyExecutionPlan`'s `ready` verdict proves a LABEL: the blocker
+ * issue carries the success-specific stack-ready (review-passed) marker. A label
+ * is not bound to a commit. A blocker PR force-pushed after its review passed
+ * keeps the marker, so the SHA this run fetched from the blocker ref is not, by
+ * itself, a SHA anything reviewed — stamping it would turn a moved ref into
+ * exact-commit acceptance and could advance this Issue's verification base onto
+ * an unreviewed predecessor (`docs/changed-file-verification-contract.md` §4.1
+ * rule 1: "a moved ref, a force-push and a bare fetch change nothing").
+ *
+ * The attestation therefore comes from the predecessor's OWN recorded grant:
+ * the final-stage bundle whose recording transaction published that stack-ready
+ * marker (#1094 §8 step 5) names the head it ran against, and only a fetched SHA
+ * equal to that head is accepted. A predecessor with no readable stage state, no
+ * recorded grant, a grant whose bundle recorded no head, or a grant head that
+ * differs from the fetched one attests nothing: the Issue base then simply does
+ * not advance, which is the fail-closed direction the contract prescribes.
+ */
+async function acceptedPredecessorHead(
+  sha: string,
+  predecessor: TaskKey,
+  store: Pick<TaskStore, "getTask"> | undefined,
+): Promise<{ baseHeadAccepted?: { sha: string; evidence: DependencyBaseAcceptanceEvidence } }> {
+  if (store === undefined) return {};
+  let read: StagedVerificationStateRead;
+  try {
+    read = await readStagedVerificationState(store, predecessor);
+  } catch {
+    // A store read failure proves nothing about the predecessor's acceptance.
+    return {};
+  }
+  if (read.status !== "ok") return {};
+  const grantedHead = grantingFinalBundle(read.state)?.headSha;
+  if (grantedHead === undefined) return {};
+  if (grantedHead.trim().toLowerCase() !== sha.trim().toLowerCase()) return {};
+  return { baseHeadAccepted: { sha, evidence: "stack-ready" } };
+}
 
 // ---------------------------------------------------------------------------
 // Mode detection
@@ -689,6 +804,75 @@ function resolveFixDispositionSection(
   return { findings, lines: fixDispositionPromptLines(section) };
 }
 
+// ---------------------------------------------------------------------------
+// Explained no-change fix turns (issue #1125)
+// ---------------------------------------------------------------------------
+
+/** Run artifact recording what the no-change path decided, and why. */
+const NO_CHANGE_ARTIFACT = "implementation-no-change.json";
+
+/**
+ * Turn a no-change refusal into the clause appended to the run's failure.
+ *
+ * Every one of these is actionable on its own terms — what was missing, or what
+ * has to change before a no-change turn could be admitted — because the failure
+ * message is the only thing an operator reading the Issue comment sees. The
+ * leading `produced no file changes` stays verbatim so existing operator
+ * tooling, docs, and searches still match it.
+ */
+function describeNoChangeRefusal(admission: NoChangeAdmission): string {
+  if (admission.admitted) return "";
+  switch (admission.reason) {
+    case "not-a-fix-turn":
+      return "a fresh implementation must produce changes.";
+    case "structured-dispositions-pending":
+      return (
+        "this fix run has review findings awaiting a structured disposition, so a zero-change run is admitted "
+        + "only through the Review Dispute protocol (docs/review-dispute-contract.md §3.4), not through a "
+        + "free-standing no-change explanation."
+      );
+    case "unresolved-tool-request":
+      return (
+        "an unresolved Tool Request is still open for this issue; resolve it "
+        + "('admin tool-request resolve' / 'admin tool-request grant') before a no-change fix turn can be accepted."
+      );
+    case "turn-cap-reached":
+      return (
+        `this task has already taken ${admission.detail ?? "its"} consecutive no-change fix turns; the reviewer and `
+        + "the implementer are not converging, so this needs a human rather than another round."
+      );
+    case "declaration-refused":
+      return (
+        "no admissible explanation of why no change is needed was supplied "
+        + `(${admission.failure?.reason ?? "absent"}${admission.detail ? `: ${admission.detail}` : ""}). `
+        + "A fix turn that edits nothing must declare, with resolvable evidence, why the feedback it answers "
+        + "needs no further edit."
+      );
+    case "no-issue-commits":
+      return (
+        "the PR head carries no commits of this issue's own beyond its start point, so there is no implementation "
+        + "for a no-change explanation to stand on."
+      );
+    case "branch-probe-failed":
+      return (
+        "the Git probe for this issue's commits on the PR head could not be answered, so the branch state could "
+        + "not be confirmed; inspect the worktree and the recorded dependency start point before retrying."
+      );
+    case "revision-unpublished":
+      return (
+        `the local HEAD is not the PR head on origin (${admission.detail ?? "revisions differ"}), so the branch `
+        + "carries commits the PR does not contain — most often an earlier fix that committed but failed to push. "
+        + "A no-change turn pushes nothing, so returning this revision would send the reviewer code that is not in "
+        + "the PR; push or reconcile the branch with origin before retrying."
+      );
+    case "published-revision-probe-failed":
+      return (
+        `the PR head on origin could not be resolved (${admission.detail ?? "probe failed"}), so the revision a `
+        + "reviewer would read could not be confirmed; check the remote and the PR head branch before retrying."
+      );
+  }
+}
+
 function buildPrompt(
   task: AiTask,
   repoRoot: string,
@@ -697,6 +881,7 @@ function buildPrompt(
   verification?: Record<string, string>,
   dirtyContinuation?: Record<string, unknown>,
   fixDispositionSection?: string[],
+  noChangeSection?: string[],
 ): string {
   const ctx = task.context as Record<string, unknown>;
   const title = typeof ctx.title === "string" ? ctx.title : `Issue #${task.issueNumber}`;
@@ -734,6 +919,23 @@ function buildPrompt(
       ? (ctx["verificationFeedback"] as string)
       : "";
     const agentExitFailure = ctx["agentExitFailure"] as { message: string; exitCode: number } | undefined;
+    // Issue #1102: the prior cycle may have verified a SUBSET of the required
+    // set. Read defensively — this is persisted context, so the flag is trusted
+    // only when it is literally `false` — and say only that scope fact; the
+    // §10 rule 5 projection carries no output, paths or command bytes.
+    const priorStage = ctx["verificationStage"];
+    const priorStageNarrowed =
+      typeof priorStage === "object"
+      && priorStage !== null
+      && (priorStage as { full?: unknown }).full === false;
+    const priorStageScopeLines = priorStageNarrowed
+      ? [
+          "",
+          "The prior cycle ran a SUBSET of the required verification set, so the checks it did not "
+            + "run are not known to pass. Do not treat them as passing, and do not weaken or skip a "
+            + "check to make the next cycle green.",
+        ]
+      : [];
     continuationLines.push(
       "",
       "## Continuation Context",
@@ -758,6 +960,7 @@ function buildPrompt(
       if (verFeedback.trim()) {
         continuationLines.push("```", verFeedback.slice(0, 4000), "```");
       }
+      continuationLines.push(...priorStageScopeLines);
       continuationLines.push(
         "",
         `### Prior Repair Agent Exit (code ${agentExitFailure.exitCode})`,
@@ -776,6 +979,7 @@ function buildPrompt(
       if (verFeedback.trim()) {
         continuationLines.push("```", verFeedback.slice(0, 4000), "```");
       }
+      continuationLines.push(...priorStageScopeLines);
     } else if (agentExitFailure) {
       continuationLines.push(
         "The prior attempt's agent process exited abnormally before verification ran, so no verification " +
@@ -826,6 +1030,11 @@ function buildPrompt(
       "Do not modify unrelated files.",
       ...dependencySection,
       ...verificationSection,
+      // Issue #1125: how to end this turn with no edit at all. Rendered only for
+      // a fix turn whose findings are not already governed by the §3.1
+      // disposition contract above — that contract answers the same question
+      // (§3.4) and two instructions for one answer would contradict each other.
+      ...(noChangeSection ?? []),
       "",
       ...toolRequestPromptSection(),
     ].join("\n");
@@ -868,7 +1077,41 @@ function buildPrompt(
 // so this never becomes an infinite inner loop.
 // ---------------------------------------------------------------------------
 
-function buildRepairPrompt(task: AiTask, repoRoot: string, failure: VerificationFailure): string {
+/**
+ * The §10 rule 5 scope section for an agent-facing prompt (issue #1102).
+ *
+ * A loop stage may run a subset of the required set, so a prompt that says
+ * nothing about scope invites the agent to read "verification failed on `test`"
+ * as "everything else passed". The section states which checks ran, with what
+ * verdict, and whether the selection was the whole required set — and nothing
+ * else: no command bytes, no paths, no output. Empty on the legacy path, where
+ * the full configured set always ran.
+ */
+function stageVerificationScopeSection(stage?: StageRunSummary): string[] {
+  if (stage === undefined) return [];
+  const verdicts = stage.checks
+    .map((check) => `- \`${check.label}\`: ${check.verdict}`)
+    .join("\n");
+  return [
+    `## Verification Scope (${stage.stage} stage)`,
+    "",
+    stage.full
+      ? "This cycle ran the full required set."
+      : "This cycle ran a SUBSET of the required set. Checks that did not run are "
+        + "not known to pass — do not treat them as passing, and do not weaken or skip "
+        + "any check to make this cycle green.",
+    "",
+    verdicts,
+    "",
+  ];
+}
+
+function buildRepairPrompt(
+  task: AiTask,
+  repoRoot: string,
+  failure: VerificationFailure,
+  stage?: StageRunSummary,
+): string {
   return [
     `# Verification Repair Task — Issue #${task.issueNumber}`,
     "",
@@ -883,6 +1126,11 @@ function buildRepairPrompt(task: AiTask, repoRoot: string, failure: Verification
     failure.output,
     "```",
     "",
+    // Issue #1102: what this cycle actually ran, so a narrowed loop stage is
+    // never read as a full pass. Names, verdicts, counts and the
+    // `selection.full` flag only — docs/staged-verification-contract.md §10
+    // rule 5's bounded projection, never output bytes or command bytes.
+    ...stageVerificationScopeSection(stage),
     "## Instructions",
     "",
     "Edit the relevant source files so the failing verification command passes.",
@@ -914,6 +1162,25 @@ function buildPrBody(
   runId: string,
   mode: ImplementationMode,
   verification: Record<string, string>,
+  /**
+   * The loop stage this PR's head was verified by, when one ran (issue #1102).
+   * Present, the body reports the checks that actually recorded a `passed`
+   * verdict and flags a narrowed run; absent, it keeps the shipped line over
+   * the configured map, which is exactly what ran on the legacy path.
+   */
+  stage?: StageRunSummary,
+  passedStageChecks?: readonly string[],
+  /**
+   * Issue #1154: the Stage 1 test result this PR's head was verified by. Stage 1
+   * is never reported as a suite pass: the body names the non-test checks that
+   * passed and says the full suite runs after review approval.
+   */
+  testStage1?: {
+    readonly suiteKey: string;
+    readonly result: string;
+    readonly selectedFiles: number;
+    readonly nonTestChecks: readonly string[];
+  },
 ): string {
   const ctx = task.context as Record<string, unknown>;
   const issueTitle =
@@ -949,10 +1216,36 @@ function buildPrBody(
     lines.push("", bodyExcerpt);
   }
 
-  const verificationNames = Object.keys(verification).filter((k) => verification[k]);
   lines.push("", "---", "");
-  if (verificationNames.length > 0) {
-    lines.push(`**Verification**: ${verificationNames.join(", ")} ✓`);
+  if (testStage1 !== undefined) {
+    if (testStage1.nonTestChecks.length > 0) {
+      lines.push(`**Verification**: ${testStage1.nonTestChecks.join(", ")} ✓`);
+    }
+    lines.push(
+      `**Tests** (${testStage1.suiteKey}): Stage 1 \`${testStage1.result}\` over ${testStage1.selectedFiles} changed or retained `
+        + "test file(s); the full suite runs only after review approval (Stage 2)",
+    );
+  } else if (stage !== undefined) {
+    // §6.2 rule 1 and §10 rule 5: a bundle records its own scope, and the
+    // `selection.full` flag is deliberately public — "an operator reading
+    // 'verification passed' must be able to see whether that was the whole
+    // set". Listing the configured map here instead would report the checks
+    // this run omitted as passed.
+    const proven = passedStageChecks ?? [];
+    if (proven.length > 0) {
+      lines.push(`**Verification**: ${proven.join(", ")} ✓`);
+    }
+    if (!stage.full) {
+      lines.push(
+        `**Verification scope**: ${stage.counts.selected} of the required set `
+          + `(${stage.stage} stage; the rest did not run in this cycle)`,
+      );
+    }
+  } else {
+    const verificationNames = Object.keys(verification).filter((k) => verification[k]);
+    if (verificationNames.length > 0) {
+      lines.push(`**Verification**: ${verificationNames.join(", ")} ✓`);
+    }
   }
   lines.push(`**Mode**: ${mode}`, "", `Generated by run-one-phase (runId: ${runId})`);
 
@@ -970,24 +1263,18 @@ function buildPrBody(
 const MAX_VERIFICATION_REPAIR_ATTEMPTS = 1;
 
 // ---------------------------------------------------------------------------
-// Claude flags — mirrors the established n8n implementation lane contract
+// Resolved runtime metadata — projected from the runtime boundary (issue #911)
+//
+// The per-lane model/effort/budget chains this handler used to keep here were
+// the implementation rows of docs/agent-runtime-profiles-contract.md §1.2.
+// This lane now resolves through the provider runtime adapters (issues
+// #906–#909): the effective catalog decides the concrete settings, the
+// adapter's lane table builds the sanitized argv, and the block below only
+// projects that resolution into the run-metadata shape existing consumers
+// already read (implementation-context.json, status comments, session-control
+// attribution). The full §13 provenance is persisted separately as the audit
+// record; per §7 rule 2 the deleted chains are not layered under the adapter.
 // ---------------------------------------------------------------------------
-
-const CLAUDE_ALLOWED_TOOLS = [
-  "Read",
-  "Edit",
-  "MultiEdit",
-  "Write",
-  "Bash(rg *)",
-  "Bash(sed *)",
-  "Bash(cat *)",
-  "Bash(npm test)",
-  "Bash(npm run package)",
-  "Bash(git status *)",
-  "Bash(git diff *)",
-  "Bash(git log *)",
-  "Bash(git show *)",
-].join(",");
 
 export interface ResolvedImplementationProfile {
   phase: "implementation";
@@ -996,13 +1283,18 @@ export interface ResolvedImplementationProfile {
   /** Sanitized argv — no prompt content (prompt is passed via stdin). */
   argv: string[];
   model: string;
-  modelSource: "env" | "session-config" | "label" | "default";
+  modelSource: LegacyRuntimeSource;
   effort: string;
-  effortSource: "env" | "escalation" | "session-config" | "label" | "default";
+  effortSource: LegacyRuntimeSource;
   maxBudgetUsd: string;
-  budgetSource: "env" | "session-config" | "label" | "default";
-  /** Binary path source — set for Gemini/Antigravity; absent for Claude. */
-  cmdSource?: "env" | "cli-default";
+  budgetSource: LegacyRuntimeSource;
+  /**
+   * Binary path source, recorded for every agent (issue #911 review): the
+   * catalog overlay can point ANY provider at an operator-supplied
+   * executable, and the diagnostics boundary reads this field to withhold
+   * stderr trust from such an invocation.
+   */
+  cmdSource?: "env" | "cli-default" | "catalog-builtin" | "catalog-overlay";
   /** Company/provider backing the agent (e.g. "anthropic", "openai", "google"). */
   provider: string;
   /**
@@ -1014,244 +1306,121 @@ export interface ResolvedImplementationProfile {
   contextModeSource: "session" | "env" | "default";
   /** Resolved Codex context-mode invocation overrides, recorded when enabled. */
   contextModeConfig?: string[];
+  /** The catalog profile behind the concrete values above (§13.2). */
+  profileName?: string;
+  /** The task's persisted quality request (§8.2). */
+  requestedQuality?: string;
+  /** What this run resolved after any escalation floor (§10.3). */
+  effectiveQuality?: string;
 }
 
-// Relative ordering of Claude effort tiers, used to ensure review-loop
-// escalation only ever raises effort and never downgrades an already-stronger
-// label/session-derived profile (issue #243). `complexity:xhigh` resolves to
-// "xhigh" on Fable 5 (issue #857); `max` is not produced by the built-in
-// complexity mapping but remains valid via `CLAUDE_EFFORT` or a session
-// `claude.complexityProfiles` override, so the guard still applies.
-const EFFORT_RANK: Record<string, number> = {
-  low: 1,
-  medium: 2,
-  high: 3,
-  xhigh: 4,
-  max: 5,
-};
+/** The context-mode outcomes that reach metadata (an `error` fails the run first). */
+type ResolvedCodexContextMode = CodexContextModeEnabled | CodexContextModeUnset;
 
-function effortRank(effort: string): number {
-  return EFFORT_RANK[effort] ?? 0;
-}
-
-function resolveClaudeProfile(
-  labels: string[],
-  escalatedEffort?: string,
-  claudeConfig?: ClaudeConfig,
+function implementationProfileFromRuntime(
+  runtime: AgentPhaseRuntime,
+  agentId: string,
+  ctxMode: ResolvedCodexContextMode | undefined,
 ): ResolvedImplementationProfile {
-  const labelProfile = labelsToComplexity(labels, claudeConfig?.complexityProfiles);
-  const hasComplexityLabel =
-    labels.includes("complexity:xhigh") ||
-    labels.includes("complexity:high") ||
-    labels.includes("complexity:low");
-  // The session-config override for the resolved tier, if any — used below to
-  // report an accurate source per field so GitHub run metadata shows that a
-  // configured session profile (not just the built-in label/default table)
-  // determined what ran (issue #748 review).
-  const tierOverride = claudeConfig?.complexityProfiles?.[resolveComplexityTier(labels)];
-
-  const model = process.env["CLAUDE_MODEL"] ?? labelProfile.model;
-  const modelSource: ResolvedImplementationProfile["modelSource"] =
-    process.env["CLAUDE_MODEL"]
-      ? "env"
-      : tierOverride?.model !== undefined
-      ? "session-config"
-      : hasComplexityLabel
-      ? "label"
-      : "default";
-
-  const budget = process.env["CLAUDE_MAX_BUDGET_USD"] ?? labelProfile.budget;
-  const budgetSource: ResolvedImplementationProfile["budgetSource"] =
-    process.env["CLAUDE_MAX_BUDGET_USD"]
-      ? "env"
-      : tierOverride?.budget !== undefined
-      ? "session-config"
-      : hasComplexityLabel
-      ? "label"
-      : "default";
-
-  let effort: string;
-  let effortSource: ResolvedImplementationProfile["effortSource"];
-  if (process.env["CLAUDE_EFFORT"]) {
-    effort = process.env["CLAUDE_EFFORT"];
-    effortSource = "env";
-  } else if (escalatedEffort && effortRank(escalatedEffort) > effortRank(labelProfile.effort)) {
-    // Only escalate when it actually raises effort. This keeps the existing
-    // no-op for default/high profiles and, critically, never downgrades a
-    // stronger label profile such as complexity:xhigh down to "high".
-    effort = escalatedEffort;
-    effortSource = "escalation";
-  } else {
-    effort = labelProfile.effort;
-    effortSource =
-      tierOverride?.effort !== undefined ? "session-config" : hasComplexityLabel ? "label" : "default";
-  }
-
-  const argv = [
-    "-p",
-    "--model", model,
-    "--effort", effort,
-    "--permission-mode", "acceptEdits",
-    "--max-budget-usd", budget,
-    "--allowedTools", CLAUDE_ALLOWED_TOOLS,
-  ];
-
-  return {
-    phase: "implementation", agentId: "claude", cmd: "claude", argv, model, modelSource, effort, effortSource, maxBudgetUsd: budget, budgetSource,
-    provider: providerForAgent("claude"),
-    // Context-mode is a Codex-only capability; never applies to Claude (issue #376).
-    contextMode: "n/a", contextModeSource: "default",
-  };
-}
-
-function claudeArgs(profile: ResolvedImplementationProfile, prompt: string): string[] {
-  // Gemini/Antigravity requires the prompt as a positional arg after --print,
-  // matching the research lane contract: agy --print "<prompt>"
-  if (profile.agentId === "gemini") {
-    return [...profile.argv, prompt];
-  }
-  return profile.argv;
-}
-
-function resolveGeminiProfile(): ResolvedImplementationProfile {
-  const envBin = process.env["ANTIGRAVITY_BIN"];
-  const bin = envBin ?? "agy";
-  const cmdSource: "env" | "cli-default" = envBin ? "env" : "cli-default";
-  // --print forces non-interactive/TUI output, matching the research lane contract:
-  //   agy --print "<prompt>"
-  // The prompt is appended as a positional arg at call time (see claudeArgs).
+  const resolved = runtime.resolved;
   return {
     phase: "implementation",
-    agentId: "gemini",
-    cmd: bin,
-    argv: ["--print"],
-    cmdSource,
-    model: "cli-default",
-    modelSource: "default",
-    effort: "n/a",
-    effortSource: "default",
-    maxBudgetUsd: "n/a",
-    budgetSource: "default",
-    provider: providerForAgent("gemini"),
-    // Context-mode is a Codex-only capability; never applies to Gemini (issue #376).
-    contextMode: "n/a",
-    contextModeSource: "default",
+    agentId,
+    cmd: runtime.command,
+    argv: [...runtime.argv],
+    // An unset model stays spelled `cli-default` in this legacy shape — one of
+    // the established `UNRESOLVED_MODEL_TOKENS` absences, never a model name.
+    model: resolved.model.value ?? "cli-default",
+    modelSource: legacyRuntimeSettingSource(resolved.model, resolved, runtime.quality),
+    effort: resolved.effort.value ?? "n/a",
+    effortSource: legacyRuntimeSettingSource(resolved.effort, resolved, runtime.quality),
+    maxBudgetUsd: resolved.budget.value ?? "n/a",
+    budgetSource: legacyRuntimeSettingSource(resolved.budget, resolved, runtime.quality),
+    provider: resolved.provider,
+    cmdSource: runtimeCmdSource(resolved),
+    // Context-mode is a Codex-only capability (issue #376).
+    contextMode: ctxMode === undefined ? "n/a" : ctxMode.status,
+    contextModeSource: ctxMode === undefined ? "default" : ctxMode.source,
+    ...(ctxMode?.status === "enabled"
+      ? {
+          contextModeConfig: [
+            ...(ctxMode.profile ? [`profile=${ctxMode.profile}`] : []),
+            ...ctxMode.config,
+          ],
+        }
+      : {}),
+    profileName: resolved.profileName,
+    requestedQuality: runtime.quality.requested.quality,
+    effectiveQuality: runtime.quality.quality,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Codex flags — implementation lane
+// Agent runtime selection (issue #911)
 //
-// Codex does not expose a per-run budget cap via CLI flags. Model selection is
-// optional: `resolveCodexModel()` (src/handlers/codex-context-mode.ts) resolves
-// an explicit `--model <model>` (a global Codex option, spliced before `exec`)
-// from `CODEX_MODEL` / `session.codex.model`; when neither is set the Codex CLI's
-// own config/default selects the model (compatibility mode, recorded as
-// `model: "cli-default"`). Effort is passed via -c model_reasoning_effort=<value>;
-// the effort tier is resolved from task labels / escalation / env just like
-// Claude, then mapped to the three levels Codex accepts (low / medium / high).
-// xhigh and max (Claude-specific tiers) are mapped to "high" since Codex has no
-// finer tier above it. Prompt is passed via stdin (same contract as Claude).
+// The persisted assignment names the agent; the runtime boundary resolves
+// everything else. Codex context-mode remains a lane input this handler
+// resolves from session config (issue #376 — the invocation form is always
+// operator-supplied) and hands to the adapter, which places it under the one
+// argument-ordering rule the lane table owns.
 // ---------------------------------------------------------------------------
 
-function resolveCodexProfile(
-  labels: string[],
-  escalatedEffort?: string,
-  codex?: CodexConfig,
-): { profile: ResolvedImplementationProfile } | { error: string } {
-  const labelProfile = labelsToComplexity(labels);
-  const hasComplexityLabel =
-    labels.includes("complexity:xhigh") ||
-    labels.includes("complexity:high") ||
-    labels.includes("complexity:low");
-
-  let effort: string;
-  let effortSource: ResolvedImplementationProfile["effortSource"];
-  if (process.env["CODEX_EFFORT"]) {
-    effort = process.env["CODEX_EFFORT"];
-    effortSource = "env";
-  } else if (escalatedEffort && effortRank(escalatedEffort) > effortRank(labelProfile.effort)) {
-    effort = escalatedEffort;
-    effortSource = "escalation";
-  } else {
-    effort = labelProfile.effort;
-    effortSource = hasComplexityLabel ? "label" : "default";
+function implementationRuntime(
+  task: AiTask,
+  session: ResolvedSession,
+  agentId: string | undefined,
+  escalatedEffort: string | undefined,
+  sessionsPath: string | undefined,
+): { runtime: AgentPhaseRuntime; profile: ResolvedImplementationProfile } | { error: string } {
+  const agent = agentId ?? "claude";
+  if (agent !== "claude" && agent !== "codex" && agent !== "gemini") {
+    return { error: `Unsupported implementation agent: ${agent}. Supported: claude, codex, gemini` };
   }
 
-  // Map effort tier to the three levels Codex accepts via model_reasoning_effort.
-  // "xhigh" and "max" are Claude-specific tiers with no Codex equivalent; map to "high".
-  const codexEffortLevel =
-    effort === "low" ? "low" :
-    effort === "medium" ? "medium" :
-    "high";
-
-  // Resolve context-mode BEFORE building argv so an invalid/unavailable
+  // Resolve context-mode BEFORE the runtime so an invalid/unavailable
   // configuration fails the run with a clear error before the agent is invoked
   // (issue #376). When unset the Codex argv is unchanged.
-  const ctxMode = resolveCodexContextMode(codex);
-  if (ctxMode.status === "error") {
-    return { error: ctxMode.error };
-  }
-
-  // Resolved BEFORE argv so the --model flag (a global Codex option) can be
-  // spliced ahead of the `exec` subcommand, same positioning rule as --profile.
-  const modelResolution = resolveCodexModel(codex);
-
-  const argv: string[] = [];
-  if (modelResolution.source !== "unset") {
-    argv.push("--model", modelResolution.model);
-  }
-  argv.push("exec");
-  argv.push("-c", `model_reasoning_effort=${codexEffortLevel}`);
-  if (ctxMode.status === "enabled") {
-    argv.push(...ctxMode.args);
-  }
-
-  return {
-    profile: {
-      phase: "implementation",
-      agentId: "codex",
-      cmd: "codex",
-      argv,
-      model: modelResolution.model,
-      modelSource: modelResolution.source === "unset" ? "default" : modelResolution.source,
-      effort,
-      effortSource,
-      // Codex does not support a per-run budget cap flag.
-      maxBudgetUsd: "n/a",
-      budgetSource: "default",
-      provider: providerForAgent("codex"),
-      contextMode: ctxMode.status === "enabled" ? "enabled" : "unset",
-      contextModeSource: ctxMode.source,
-      ...(ctxMode.status === "enabled"
-        ? { contextModeConfig: [...(ctxMode.profile ? [`profile=${ctxMode.profile}`] : []), ...ctxMode.config] }
-        : {}),
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Agent command selection
-// ---------------------------------------------------------------------------
-
-function implementationCommand(
-  agentId: string | undefined,
-  labels: string[],
-  escalatedEffort?: string,
-  codex?: CodexConfig,
-  claude?: ClaudeConfig,
-): { profile: ResolvedImplementationProfile } | { error: string } {
-  const agent = agentId ?? "claude";
-  if (agent === "claude") {
-    return { profile: resolveClaudeProfile(labels, escalatedEffort, claude) };
-  }
-  if (agent === "gemini") {
-    return { profile: resolveGeminiProfile() };
-  }
+  let ctxMode: ResolvedCodexContextMode | undefined;
+  let codexInputs: CodexLaneInputs | undefined;
   if (agent === "codex") {
-    return resolveCodexProfile(labels, escalatedEffort, codex);
+    const resolution = resolveCodexContextMode(session.codex);
+    if (resolution.status === "error") {
+      return { error: resolution.error };
+    }
+    ctxMode = resolution;
+    codexInputs =
+      resolution.status === "enabled"
+        ? {
+            contextMode: {
+              ...(resolution.profile !== undefined ? { profile: resolution.profile } : {}),
+              config: resolution.config,
+            },
+          }
+        : {};
   }
-  return { error: `Unsupported implementation agent: ${agent}. Supported: claude, codex, gemini` };
+
+  const resolution = resolveAgentPhaseRuntime({
+    task,
+    session,
+    phase: "implementation",
+    lane: "implementation",
+    agentId: agent,
+    // §9.1 (issue #911 review): the default catalog location is
+    // `agent-profiles.json` beside the sessions file this run actually
+    // loaded, not beside the home-directory default.
+    sessionsPath,
+    // §10.3 / issue #911: the review loop's escalation handoff buys a quality
+    // floor — a different profile — rather than a raw effort raise. The floor
+    // itself is fixed by slice B2; the persisted `escalatedEffort` value is
+    // only the legacy signal that a floor was offered for this run.
+    ...(escalatedEffort !== undefined ? { escalationFloor: REVIEW_LOOP_ESCALATION_QUALITY } : {}),
+    ...(codexInputs !== undefined ? { codex: codexInputs } : {}),
+  });
+  if ("error" in resolution) return resolution;
+  return {
+    runtime: resolution.runtime,
+    profile: implementationProfileFromRuntime(resolution.runtime, agent, ctxMode),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,7 +1501,18 @@ export function createImplementationHandler(
   // command runner. Defaults to the real resolver in production (issue #454).
   resolveWorktree: typeof resolveIssueWorktree = resolveIssueWorktree,
 ): PhaseHandler {
-  return async (task: AiTask): Promise<PhaseHandlerResult> => {
+  // The runtime-audit bracket (issue #911): once the runtime resolves, every
+  // outcome of the run — success, handoff, delay, or failure — carries the
+  // §13 audit trail in its context, and the non-failed outcomes carry the
+  // `agent.runtime.resolved` event. The inner function does the work; the
+  // wrapper only folds those pieces into whatever it returned.
+  const run = async (
+    task: AiTask,
+    setAgentRuntime: (runtime: AgentPhaseRuntime) => void,
+    // Issue #1154 review, P2: records Stage 1's context patch, which the wrapper
+    // folds into every outcome when no durable store carried it.
+    recordStage1ContextPatch: (patch: Record<string, unknown>) => void,
+  ): Promise<PhaseHandlerResult> => {
     const { session, runId } = context;
     let artifactDir = runArtifactDir(session.artifactRoot, runId);
     const canonicalRoot = session.repoRoot;
@@ -1352,7 +1532,7 @@ export function createImplementationHandler(
     const taskLabels = Array.isArray(task.context["labels"])
       ? task.context["labels"] as string[]
       : [];
-    const cmdSpec = implementationCommand(agentId, taskLabels, escalatedEffort, session.codex, session.claude);
+    const cmdSpec = implementationRuntime(task, session, agentId, escalatedEffort, context.sessionsPath);
     if ("error" in cmdSpec) {
       // Skip the artifact write when it would land INSIDE the not-yet-materialized
       // issue worktree (issue #732 review, P2). `writeAssignmentFailureArtifact`
@@ -1392,6 +1572,10 @@ export function createImplementationHandler(
       };
     }
     const resolvedProfile = cmdSpec.profile;
+    const agentRuntime = cmdSpec.runtime;
+    // From here on, every outcome of this run persists the §13 audit pieces
+    // (the wrapper below folds them into the returned result).
+    setAgentRuntime(agentRuntime);
 
     // Guard: fix mode requires captured review feedback so Claude doesn't run blind.
     //
@@ -1403,6 +1587,40 @@ export function createImplementationHandler(
     // prompt, and it does not gate fix mode on review structure (issue #837
     // owns disposition-aware prompting; issue #840 owns transitions).
     const disputeSettingsResolution = fixMode ? resolveReviewDisputeSettings(session.reviewDispute) : undefined;
+    // Issue #965: the same fail-closed gate the review phase already applies to
+    // an unresolvable `session.reviewDispute` (§6.1), applied on this side of the
+    // debate too.
+    //
+    // Without it the two phases disagreed about what an invalid configuration
+    // means. Review fails the run before it invokes an agent; this handler used
+    // to fall back to `REVIEW_DISPUTE_DEFAULT_LIMITS` further down and carry on —
+    // so a session that tried to LOWER a §6.1 limit and got the value wrong had
+    // its fix runs silently admit dispositions at the contract maximum instead,
+    // which is the enforcement bypass the gate exists to prevent. A malformed
+    // block is a configuration fault either way, not "protocol disabled", so both
+    // phases now stop on it with the same bounded, actionable diagnostic.
+    //
+    // Raised here, before the fix agent is invoked, so nothing is produced or
+    // persisted under limits nobody chose. Session load already rejects such a
+    // block, so reaching this means a hand-built session object.
+    if (disputeSettingsResolution !== undefined && !disputeSettingsResolution.ok) {
+      // Config errors carry only literals, paths and numbers, so the bounded
+      // context is safe to record verbatim (same shape the review phase writes).
+      const detail = disputeSettingsResolution.errors.map((e) => e.message).join("; ");
+      return {
+        result: "failed",
+        context: {
+          resolvedProfile,
+          reviewDisputeConfigError: {
+            paths: disputeSettingsResolution.errors.map((e) => e.path),
+            codes: disputeSettingsResolution.errors.map((e) => e.code),
+          },
+        },
+        error:
+          `Invalid session.reviewDispute configuration: ${detail}. `
+          + "The fix run cannot record review-dispute dispositions until the configuration is corrected.",
+      };
+    }
     const reviewCompat = fixMode
       ? resolveReviewCompatContext(task.context, {
           enabled: session.reviewDispute?.enabled === true,
@@ -1510,6 +1728,21 @@ export function createImplementationHandler(
            * safely use.
            */
           baseHeadSha?: string;
+          /**
+           * Issue #1165, decision D5: this run's attestation that it
+           * incorporated exactly `baseHeadSha` and that the predecessor was
+           * accepted AT THAT COMMIT. Present only when the predecessor's own
+           * recorded stack-ready grant names the same head — see
+           * {@link acceptedPredecessorHead}, which is what keeps a blocker PR
+           * that was force-pushed while keeping its stack-ready label from
+           * passing as an acceptance of the commit this run happened to fetch.
+           *
+           * The changed-file verification base (#1153 §4.1 rule 1) advances
+           * only on this attestation, so a blocker branch that merely moved, or
+           * a bare fetch, can never change what the Issue's cumulative diff is
+           * taken from.
+           */
+          baseHeadAccepted?: { sha: string; evidence: DependencyBaseAcceptanceEvidence };
         }
       | undefined;
     // Captured at the exact moment a branch-setup path below fetches the
@@ -1597,6 +1830,46 @@ export function createImplementationHandler(
         return { result: "failed", context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile }, error: prInfo.error };
       }
       fixPr = prInfo;
+    }
+
+    // Issue #1154 (docs/changed-file-verification-contract.md §5 rule 3, D1): a
+    // test-stage run an earlier claim allocated and never recorded may still
+    // have processes in this worktree, and the shipped ledger holds nothing that
+    // proves otherwise. Park before the worktree is materialized, prepared or
+    // touched by any command, so nothing launches over a possibly live run; the
+    // parking completion closes that allocation so an operator's requeue runs
+    // once. The guard reads the persisted allocations regardless of the current
+    // configuration: the allocation predates it, so disabling staged verification
+    // or removing the suite binding before a retry never lets new work overlap a
+    // possibly live run. A task that never recorded stage state has nothing to
+    // guard, and a stored state that cannot be read fails closed: nothing proves
+    // it holds no open allocation.
+    const testStageAtClaim = resolveTestStageContext({ session, task });
+    if (task.context[STAGED_VERIFICATION_CONTEXT_KEY] !== undefined) {
+      const storedStage = validateStagedVerificationState(task.context[STAGED_VERIFICATION_CONTEXT_KEY]);
+      if (!storedStage.valid) {
+        return {
+          result: "failed",
+          context: { artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile },
+          error:
+            `The recorded verification stage state cannot be read (${storedStage.detail}), so nothing proves an earlier `
+            + "test-stage run left no process in this worktree. Parked for an operator instead of launching work.",
+        };
+      }
+      const openRun = openStageRunGuard(storedStage.state, new Date().toISOString());
+      if (openRun.kind === "park") {
+        return {
+          result: "failed",
+          context: {
+            artifactDir, [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: true, resolvedProfile,
+            [STAGED_VERIFICATION_CONTEXT_KEY]: openRun.closedState,
+          },
+          error:
+            `Verification stage run ${openRun.stageRunKey} (allocated ${openRun.allocatedAt}) recorded no result, and `
+            + "nothing recorded proves its processes ended (termination-unknown). Parked for an operator instead of "
+            + "launching overlapping work; confirm no test process from that run is still running, then requeue.",
+        };
+      }
     }
 
     // Step 0.6: Materialize the per-issue worktree (issue #454, #455, #732). Every
@@ -2510,7 +2783,15 @@ export function createImplementationHandler(
         }
       }
       if (resolvedDepBaseSha) {
-        depBase = { ...depBase, baseHeadSha: resolvedDepBaseSha };
+        depBase = {
+          ...depBase,
+          baseHeadSha: resolvedDepBaseSha,
+          ...(await acceptedPredecessorHead(
+            resolvedDepBaseSha,
+            { sessionId: task.sessionId, issueNumber: depBase.baseIssueNumber },
+            context.taskStore,
+          )),
+        };
       } else {
         const fetchForSha = runner.run(
           "git",
@@ -2564,7 +2845,15 @@ export function createImplementationHandler(
             error: `git rev-parse origin/${depBase.baseHeadRefName} (resolve dependency review base for issue #${task.issueNumber}) failed (exit ${blockerShaResolved.exitCode}): ${(blockerShaResolved.stderr || blockerShaResolved.stdout).slice(0, 300)}`,
           };
         }
-        depBase = { ...depBase, baseHeadSha: resolvedSha };
+        depBase = {
+          ...depBase,
+          baseHeadSha: resolvedSha,
+          ...(await acceptedPredecessorHead(
+            resolvedSha,
+            { sessionId: task.sessionId, issueNumber: depBase.baseIssueNumber },
+            context.taskStore,
+          )),
+        };
       }
     }
 
@@ -3008,7 +3297,7 @@ export function createImplementationHandler(
       return failAfterBranch("environment-prepare", {
         result: "failed",
         context: { artifactDir, resolvedProfile },
-        error: `Environment preparation failed (exit ${envPrepare.exitCode ?? 1}): ${(envPrepare.output ?? "").slice(0, 500)}`,
+        error: environmentPrepareFailureMessage(envPrepare),
       });
     }
 
@@ -3047,6 +3336,36 @@ export function createImplementationHandler(
     const fixDispositionSection = fixMode
       ? resolveFixDispositionSection(task, session.artifactRoot, reviewCompat)
       : undefined;
+    // Issue #1125: the exact feedback text THIS prompt puts in front of the
+    // agent. A no-change declaration must quote it verbatim, so the corpus the
+    // quote is checked against has to be the same value the prompt rendered —
+    // not a second read of task context that a later merge could have moved.
+    // `reviewFeedback` is always present in fix mode (guarded above); the
+    // verification output joins it only when the continuation section actually
+    // rendered it, which is the only case the agent could have quoted it from.
+    const fixFeedbackCorpus = fixMode
+      ? [
+          reviewFeedback ?? "",
+          activeDirtyContinuation && typeof task.context["verificationFeedback"] === "string"
+            ? (task.context["verificationFeedback"] as string)
+            : "",
+        ]
+          .filter((part) => part.trim() !== "")
+          .join("\n\n")
+      : "";
+    // Rendered for a fix turn only, and never alongside the §3.1 disposition
+    // contract: with lineages awaiting a disposition, §3.4 already owns this
+    // run's zero-change question and this section would offer a second, weaker
+    // route around the Review Dispute protocol.
+    const noChangeSection =
+      fixMode && fixDispositionSection === undefined
+        ? buildNoChangePromptSection({
+            resolvableEvidenceKinds: reviewResolvableEvidenceKinds({
+              issueBodyAvailable:
+                typeof task.context["body"] === "string" && (task.context["body"] as string).trim() !== "",
+            }),
+          })
+        : undefined;
     const prompt = buildPrompt(
       task,
       cwd,
@@ -3055,6 +3374,7 @@ export function createImplementationHandler(
       session.verification,
       activeDirtyContinuation,
       fixDispositionSection?.lines,
+      noChangeSection,
     );
     writeFileSync(join(artifactDir, "implementation-prompt.md"), prompt, "utf8");
 
@@ -3062,17 +3382,51 @@ export function createImplementationHandler(
     // runs still have a pre-run audit record of the intended billable profile.
     // Also record the full persisted assignment (flow, source, resolvedAt, all
     // phase agents) so the run dir is self-describing for auditability — not just
-    // the per-phase resolvedProfile.
+    // the per-phase resolvedProfile — and the §13.4 runtime-audit artifact
+    // (issue #911), alongside, carrying the resolution's full provenance.
     const assignment = readResolvedAssignment(task);
     writeFileSync(join(artifactDir, "implementation-context.json"), JSON.stringify({
       issueNumber: task.issueNumber, sessionId: task.sessionId, runId, resolvedProfile,
       ...(assignment ? { assignment } : {}),
     }, null, 2), "utf8");
+    writeFileSync(
+      join(artifactDir, AGENT_RUNTIME_AUDIT_ARTIFACT_FILENAME),
+      serializeAgentRuntimeAuditRecord(agentRuntime.record),
+      "utf8",
+    );
 
-    // Step 4: Run implementation agent (file edits only; Gemini receives prompt
-    // as a --print positional arg and stdin for compatibility with agy).
-    const agentResult = runner.run(resolvedProfile.cmd, claudeArgs(resolvedProfile, prompt), { cwd, stdin: prompt });
-    writeFileSync(join(artifactDir, "implementation-output.md"), agentResult.stdout || agentResult.stderr, "utf8");
+    // Step 4: Run implementation agent through the runtime boundary's sanitized
+    // plan (issue #911; file edits only). The prompt reaches the CLI exactly as
+    // the plan declares — stdin for Claude/Codex, both the `--print` operand
+    // and stdin for Gemini/Antigravity.
+    //
+    // Issue #1106: a verification-only continuation. When the previous run's
+    // loop stage ended on a non-code termination (a host failure, not a verdict
+    // about the diff) AFTER its work was captured, and the preflight above has
+    // just validated that same capture byte for byte, the only work left is to
+    // verify it. Invoking the agent again would spend a turn with nothing to
+    // change (docs/staged-verification-contract.md §7 rule 3), so this claim
+    // skips straight to verification over the preserved tree. Nothing is
+    // discarded either way; a stale or drifted capture never reaches here.
+    const loopStageRecoveryAtClaim = readLoopStageRecovery(task.context);
+    const stagedSettings = resolveStagedVerificationSettings(session.stagedVerification);
+    const verificationOnlyResume = admitVerificationOnlyResume({
+      recovery: loopStageRecoveryAtClaim,
+      activeDirtyContinuation,
+      stagedVerificationEnabled: stagedSettings.enabled,
+      dispositionContractRendered: fixDispositionSection !== undefined,
+    });
+    const agentInvocation = planAgentPhaseInvocation(agentRuntime, prompt).invocation;
+    const agentResult: CommandRunResult = verificationOnlyResume
+      ? { stdout: "", stderr: "", exitCode: 0 }
+      : runner.run(agentInvocation.command, [...agentInvocation.args], { cwd, stdin: prompt });
+    writeFileSync(
+      join(artifactDir, "implementation-output.md"),
+      verificationOnlyResume
+        ? "Verification-only resume (issue #1106): the agent was not invoked; the preserved worktree is re-verified.\n"
+        : agentResult.stdout || agentResult.stderr,
+      "utf8",
+    );
 
     // Step 4.5: Tool Request handoff (issue #291). Detect a Tool Request block
     // here, BEFORE both the nonzero-exit failure check below and the later no-diff
@@ -3211,6 +3565,20 @@ export function createImplementationHandler(
     // Tool Request means it did not.
     let disputeEvidenceResolver: ReturnType<typeof createReviewEvidenceResolver> | undefined;
     const disputeIssueBody = typeof task.context["body"] === "string" ? (task.context["body"] as string) : "";
+    // Built on first use, exactly as the review handler builds its own: a
+    // response with no admissible evidence reference never reaches one, and must
+    // not pay for a `git ls-files` capture. The checkout it resolves against is
+    // this run's worktree as the agent left it — the tree a reviewer would see
+    // next. Shared by the §3.3 disposition evidence below and issue #1125's
+    // no-change evidence, so a run that cites both captures the index once.
+    const resolveRunEvidenceRef = (ref: EvidenceRef): boolean => {
+      disputeEvidenceResolver ??= createReviewEvidenceResolver({
+        trackedFiles: captureTrackedFiles(runner, cwd),
+        readTrackedFile: createTrackedFileReader(cwd),
+        ...(disputeIssueBody.trim() !== "" ? { issueBody: disputeIssueBody } : {}),
+      });
+      return disputeEvidenceResolver(ref);
+    };
     const disputeLimits: ReviewDisputeLimits =
       disputeSettingsResolution?.ok ? disputeSettingsResolution.settings.limits : REVIEW_DISPUTE_DEFAULT_LIMITS;
     const dispositionOutcome: FixDispositionOutcome | undefined =
@@ -3221,19 +3589,7 @@ export function createImplementationHandler(
             lineages: reviewCompat.reviewDispute.lineages,
             reviewStructure: reviewCompat.reviewDispute.reviewStructure,
             runProducedFileChanges: hasDiff || hasUntracked,
-            // Built on first use, exactly as the review handler builds its own:
-            // a response with no admissible dispute never reaches an evidence
-            // reference, and must not pay for a `git ls-files` capture. The
-            // checkout it resolves against is this run's worktree as the agent
-            // left it — the tree a reviewer would see next.
-            resolveEvidenceRef: (ref) => {
-              disputeEvidenceResolver ??= createReviewEvidenceResolver({
-                trackedFiles: captureTrackedFiles(runner, cwd),
-                readTrackedFile: createTrackedFileReader(cwd),
-                ...(disputeIssueBody.trim() !== "" ? { issueBody: disputeIssueBody } : {}),
-              });
-              return disputeEvidenceResolver(ref);
-            },
+            resolveEvidenceRef: resolveRunEvidenceRef,
             limits: disputeLimits,
           })
         : undefined;
@@ -3280,6 +3636,147 @@ export function createImplementationHandler(
     // resumed branch with such committed changes is allowed to succeed on a no-op;
     // a fresh branch (resumedFromToolRequestBranch === false) keeps today's failure.
     let resumedNoopWithCommits = false;
+
+    // -----------------------------------------------------------------------
+    // Issue #1125: the explained no-change fix turn.
+    //
+    // Everything below is inert unless this run is a fix turn that produced no
+    // diff: the parse is a thunk, both Git probes are thunks, and
+    // `admitNoChangeRun` spends none of them until its cheap gates pass — the
+    // publication probe, the only one that reaches the remote, goes last. A
+    // fresh implementation and an
+    // ordinary "the agent did nothing" fix run therefore keep their exact command
+    // sequences and their exact failure.
+    // -----------------------------------------------------------------------
+
+    /** The admitted declaration this run hands to review, when there is one. */
+    let explainedNoChange: NoChangeContinuation | undefined;
+
+    // Memoized: evidence resolution reads the checkout, so asking twice would be
+    // a second capture and, worse, two answers that could disagree if the tree
+    // moved underneath. One parse, one answer, for the whole run.
+    let noChangeParseResult: NoChangeParseResult | undefined;
+    const noChangeParse = (): NoChangeParseResult => {
+      noChangeParseResult ??= parseNoChangeDeclaration({
+        response: agentResult.stdout || agentResult.stderr,
+        feedback: fixFeedbackCorpus,
+        resolveEvidenceRef: resolveRunEvidenceRef,
+      });
+      return noChangeParseResult;
+    };
+
+    /**
+     * Does the PR head carry commits belonging to THIS Issue beyond its start
+     * point? The tri-state sibling of `branchHasCommittedChanges` above: an
+     * inconclusive probe must not be read as "empty" here, because the two
+     * refusals are different messages to an operator (a broken Git probe versus
+     * a branch with nothing on it).
+     *
+     * The start point is the recorded predecessor head for a dependency-started
+     * task and `origin/<base>` otherwise. Fix mode never re-resolves the
+     * dependency plan (`depBase` is always undefined here), so the predecessor
+     * comes from the `dependencyBase` its implementation run recorded — without
+     * it, a stacked branch holding ONLY the blocker's commits would look like a
+     * completed implementation of this Issue. Recorded dependency metadata with
+     * no head SHA is exactly the case review admission blocks on, so it is
+     * `unknown` here rather than a guess against the session base.
+     */
+    const probeIssueCommitsOnBranch = (): BranchCommitProbe => {
+      let startPoint = `origin/${baseBranch}`;
+      const recordedDepBase = resolveDependencyReviewBase(task.context);
+      if (recordedDepBase.missing) return "unknown";
+      if (recordedDepBase.base) {
+        startPoint = recordedDepBase.base.sha;
+      } else if (depBase) {
+        const fetchBlocker = runner.run("git", ["fetch", "origin", depBase.baseHeadRefName], { cwd });
+        if (fetchBlocker.exitCode !== 0) return "unknown";
+        startPoint = "FETCH_HEAD";
+      }
+      const r = runner.run("git", ["diff", "--quiet", `${startPoint}...HEAD`], { cwd });
+      if (r.exitCode === 1) return "has-issue-commits";
+      if (r.exitCode === 0) return "no-issue-commits";
+      // 128 for an unresolvable/unknown ref, or any other status: the probe did
+      // not answer, and an unanswered probe never admits.
+      return "unknown";
+    };
+
+    /**
+     * Is the revision this run would return to review the one the PR shows?
+     *
+     * The fix-mode reconcile above is `git pull origin <head> --ff-only`, which
+     * SUCCEEDS as a no-op when the local branch is ahead of origin, and the
+     * worktree resolver likewise accepts an ahead-of-origin branch. So a prior
+     * fix that committed but whose push failed leaves local-only commits here.
+     * Every other implementation path pushes before review and would surface
+     * that; an admitted no-change turn deliberately pushes nothing, so nothing
+     * downstream reconciles the branch — verification would run, the run would
+     * report success, and the reviewer would be handed a revision the PR does
+     * not contain.
+     *
+     * So fail closed on any mismatch, the same discipline the Tool Request
+     * resume path applies to its ahead-of-origin branch. `FETCH_HEAD` is
+     * preferred over the remote-tracking ref for the reason the dirty
+     * continuation prefers it (issue #571): a narrow clone's refspec may leave
+     * `refs/remotes/origin/<head>` stale, and comparing against stale data is
+     * exactly the failure this probe exists to catch.
+     */
+    const probePublishedRevision = (): PublishedRevisionProbe => {
+      const fetchPrHead = runner.run("git", ["fetch", "origin", prHeadFetchSource], { cwd });
+      if (fetchPrHead.exitCode !== 0) return { status: "unknown", detail: `fetch:${fetchPrHead.exitCode}` };
+      const fetchHead = runner.run("git", ["rev-parse", "FETCH_HEAD"], { cwd });
+      const publishedSha =
+        fetchHead.exitCode === 0
+          ? fetchHead.stdout.trim()
+          : (() => {
+              const tracking = runner.run("git", ["rev-parse", `refs/remotes/origin/${prHeadFetchSource}`], { cwd });
+              return tracking.exitCode === 0 ? tracking.stdout.trim() : null;
+            })();
+      if (publishedSha === null) return { status: "unknown", detail: "pr-head-unresolvable" };
+      const localHead = runner.run("git", ["rev-parse", "HEAD"], { cwd });
+      if (localHead.exitCode !== 0) return { status: "unknown", detail: `head:${localHead.exitCode}` };
+      const localSha = localHead.stdout.trim();
+      // Content-free locator: both are commit ids already public on the branch,
+      // never agent prose, and short-form keeps the artifact bounded.
+      if (localSha !== publishedSha) {
+        return { status: "unpublished", detail: `local ${localSha.slice(0, 12)} != origin/${prHeadFetchSource} ${publishedSha.slice(0, 12)}` };
+      }
+      return { status: "published", revision: localSha };
+    };
+
+    /**
+     * The run-local audit record of what this path decided and why — written on
+     * BOTH outcomes, because "the implementer tried to explain a no-change turn
+     * and was refused" is the diagnostic an operator needs most, and it is
+     * invisible from the run's failure message alone.
+     *
+     * Bounded by construction: the declaration's own fields are bounded by
+     * #836's limits, and a refusal records a reason token plus a content-free
+     * locator, never agent prose.
+     */
+    const writeNoChangeArtifact = (
+      outcome:
+        | { admitted: true; continuation: NoChangeContinuation }
+        | { admitted: false; admission: NoChangeAdmission },
+    ): void => {
+      // A run that is not a fix turn never engaged this contract; writing an
+      // artifact for it would report a decision nobody asked for.
+      if (!fixMode) return;
+      const decision: Record<string, unknown> = { admitted: false };
+      if (outcome.admitted) {
+        Object.assign(decision, { admitted: true }, outcome.continuation);
+      } else if (!outcome.admission.admitted) {
+        Object.assign(decision, {
+          refusal: outcome.admission.reason,
+          detail: outcome.admission.detail,
+          ...(outcome.admission.failure ? { declarationFailure: outcome.admission.failure } : {}),
+        });
+      }
+      writeFileSync(join(artifactDir, NO_CHANGE_ARTIFACT), JSON.stringify({
+        issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
+        branch, prUrl,
+        ...decision,
+      }, null, 2), "utf8");
+    };
     if (!hasDiff && !hasUntracked && !disputeZeroChangeRun) {
       const branchHasCommittedChanges = (): boolean => {
         // The start point depends on the branch mode. In dependency-start-point
@@ -3315,16 +3812,67 @@ export function createImplementationHandler(
         return r.exitCode === 1;
       };
       if (!resumedFromToolRequestBranch || !branchHasCommittedChanges()) {
-        writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
-          issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
-          exitCode: 0, success: false, step: "diff-check", artifactDir, resolvedProfile,
-        }, null, 2), "utf8");
-        return { result: "failed", context: { artifactDir, resolvedProfile }, error: `${resolvedProfile.agentId} exited 0 but produced no file changes` };
+        // Issue #1125: the resumed-recovery admission above does not cover an
+        // ORDINARY fix turn. A fix run answering review or verification feedback
+        // can legitimately need no further edit — the failure did not reproduce,
+        // the repair is already committed, a human finished it, the cause was
+        // environmental, the finding was mistaken — and failing here kills the
+        // run BEFORE the runner's own verification can say anything, so a PR
+        // that may well be correct never returns to review (observed on
+        // m2dw/yoda_form_js#766). Admit such a turn only on an evidence-backed
+        // declaration tied to the feedback it answers; every other zero-diff run,
+        // including every fresh implementation, keeps today's failure verbatim.
+        const noChangeAdmission = admitNoChangeRun({
+          fixMode,
+          // With lineages awaiting a §3.1 disposition, §3.4 already owns this
+          // run's zero-change question. Routing around it here would be a second
+          // way to end a disputed finding with no diff, outside the protocol's
+          // bounds — so this path stands down and #843's answer above stands.
+          structuredDispositionPending: fixDispositionSection !== undefined,
+          // A live handoff is authoritative over anything the agent claims: the
+          // work is waiting on an operator, not finished (issue #677's posture).
+          unresolvedToolRequest: hasUnresolvedToolRequest(task.context),
+          priorNoChangeTurns: noChangeTurnsSpent(task.context),
+          parseDeclaration: noChangeParse,
+          probeBranchCommits: probeIssueCommitsOnBranch,
+          probePublishedRevision,
+        });
+        if (noChangeAdmission.admitted) {
+          // The exact revision the runner is about to verify — the one the
+          // publication probe just confirmed origin is serving as the PR head.
+          // Captured before verification (which may repair and re-diff) so the
+          // recorded revision is the one the declaration was made about; a run
+          // whose repair commits is no longer a no-change run at all and drops
+          // the record below.
+          explainedNoChange = buildNoChangeContinuation({
+            declaration: noChangeAdmission.declaration,
+            revision: noChangeAdmission.revision,
+            runId,
+            turn: noChangeAdmission.turn,
+            feedback: fixFeedbackCorpus,
+          });
+          writeNoChangeArtifact({ admitted: true, continuation: explainedNoChange });
+        } else {
+          writeNoChangeArtifact({ admitted: false, admission: noChangeAdmission });
+          writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
+            issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
+            exitCode: 0, success: false, step: "diff-check", artifactDir, resolvedProfile,
+            ...(fixMode ? { noChange: { admitted: false, refusal: noChangeAdmission.reason } } : {}),
+          }, null, 2), "utf8");
+          return {
+            result: "failed",
+            context: { artifactDir, resolvedProfile },
+            error:
+              `${resolvedProfile.agentId} exited 0 but produced no file changes`
+              + (fixMode ? ` — ${describeNoChangeRefusal(noChangeAdmission)}` : ""),
+          };
+        }
+      } else {
+        // Resumed branch already holds the committed implementation. Skip the commit
+        // step below (nothing new to stage; the branch is already pushed) but still
+        // run verification and proceed to review like a normal implementation success.
+        resumedNoopWithCommits = true;
       }
-      // Resumed branch already holds the committed implementation. Skip the commit
-      // step below (nothing new to stage; the branch is already pushed) but still
-      // run verification and proceed to review like a normal implementation success.
-      resumedNoopWithCommits = true;
     }
 
     // Step 5.25: Handler-owned dependency sync (issue #290). When the session
@@ -3401,7 +3949,7 @@ export function createImplementationHandler(
       return failAfterBranch("environment-prepare-after-sync", {
         result: "failed",
         context: { artifactDir, resolvedProfile },
-        error: `Environment preparation (after dependency sync) failed (exit ${envPrepareAfterSync.exitCode ?? 1}): ${(envPrepareAfterSync.output ?? "").slice(0, 500)}`,
+        error: environmentPrepareFailureMessage(envPrepareAfterSync, "after dependency sync"),
       });
     }
     // If the post-sync prepare actually ran, it may have materialized new
@@ -3423,16 +3971,218 @@ export function createImplementationHandler(
     // gh pr create, so a known-broken commit is never pushed. A bounded repair
     // loop re-runs the agent once with verification feedback to fix obvious
     // failures inline, reducing expensive review/fix cycles.
-    let verification = runVerification(runner, session.verification, cwd, artifactDir);
+    //
+    // Staged verification (issue #1102, docs/staged-verification-contract.md
+    // §4.1: the `loop` stage runs at "exactly the #918 §4.1 moments,
+    // unchanged"). `runLoopStageVerification` returns the SHIPPED
+    // `VerificationOutcome` whether or not a stage applied, so everything
+    // below — the repair loop, the #934 classification, the dirty-continuation
+    // capture — routes exactly as it does today. With the feature off, or with
+    // a plan that will not reconcile, it runs the shipped full pass and says
+    // so. §7 rows 1–6 derive no new transition here (this slice records; the
+    // routing rows and the final stage are later slices).
+    const stageTaskAttempt =
+      typeof task.attempts?.implementation === "number" ? task.attempts.implementation : 0;
+    // §7 rule 5: ordinals advance per LAUNCHED stage run, so the repair
+    // re-verification below is its own run with its own bundle. The cursor is
+    // per phase run until the slice that persists it lands.
+    let stageOrdinal = 0;
+    let loopStage: LoopStageRun | undefined;
+    // Issue #1106: §7 rows 4–6, bounded by #1096 §7.3. Every launched stage run
+    // is judged by `decideLoopStageRecovery` against the consecutive non-code
+    // streak the task carries; the lane only acts on the answer. `undefined`
+    // until a stage runs, so a legacy run is untouched.
+    let loopStageStreak: number | undefined = loopStageRecoveryAtClaim.readable
+      ? loopStageRecoveryAtClaim.streak
+      : undefined;
+    let loopStageRecovery: LoopStageRecoveryDecision | undefined;
+    // Issue #1154 (docs/changed-file-verification-contract.md §5, §6 rule 2):
+    // with a suite binding, Stage 1 replaces the bound test suite entry here.
+    // The non-test checks are the rest of the required set (only the suite
+    // entry and its duplicates leave it), and the test suite never runs in
+    // full before review approval.
+    let testStage1: Stage1TestRun | undefined;
+    // The latest Stage 1 state this run recorded, kept across a repair re-run
+    // that stops before Stage 1. With no durable store it is the only copy, so
+    // the next run reads it and the outer wrapper folds it into every exit.
+    let latestStage1ContextPatch: Record<string, unknown> = {};
+    const testStageContextPatch = (): Record<string, unknown> => latestStage1ContextPatch;
+    const runTestStage1 = async (): Promise<VerificationOutcome> => {
+      loopStage = undefined;
+      testStage1 = undefined;
+      loopStageRecovery = undefined;
+      const suiteKey = testStageAtClaim.status === "ready" ? testStageAtClaim.binding.key : "test-suite";
+      const liveSessionsPathForStage = context.sessionsPath;
+      const streakBeforeNonTest = loopStageStreak;
+      // The non-test checks keep the shipped stage bundle and recovery
+      // decision; only the bound suite entry, and any duplicate of it, leaves
+      // the required set, because Stage 1 replaces it.
+      const nonTest = testStageAtClaim.status === "ready"
+        ? await runSelectedLoopStage(testStageReplacedCheck(testStageAtClaim))
+        : { passed: true, results: [] };
+      // A failing non-test check routes exactly as it does today, and the
+      // selected test files are not run over a tree that already fails. A
+      // non-code termination of the non-test run routes on its own decision.
+      if (!nonTest.passed || loopStageEndedWithoutVerdict()) return nonTest;
+      // Green non-test checks are not a verdict on the tests: Stage 1 decides
+      // the run, so its non-code streak is not reset by them.
+      loopStageStreak = streakBeforeNonTest;
+      const stage1 = await runStage1TestVerification({
+        runner,
+        session,
+        task: context.taskStore === undefined
+          ? { ...task, context: { ...task.context, ...latestStage1ContextPatch } }
+          : task,
+        cwd,
+        lane: "implementation",
+        taskAttempt: stageTaskAttempt,
+        runId,
+        baseBranch,
+        // Issue #1165 (D5): the predecessor head THIS run built the branch on,
+        // with its acceptance attestation, resolved far above and persisted only
+        // by the completion below. Stage 1 runs over a worktree that already
+        // contains those commits, so it must select against this base and not
+        // the one the stored task still names — otherwise a predecessor test
+        // added between the old and the new head counts as this Issue's change,
+        // and a failure in it can never clear: the run exits before the accepted
+        // head is written, and the next attempt selects it again.
+        //
+        // What this run resolved is passed even when it resolved no predecessor
+        // (issue #1165 review, P1): a non-fix run's completion writes `depBase`
+        // unconditionally — see `dependencyBaseForContext` below — so a rerun of
+        // an issue whose blocker has since closed clears the stored
+        // `dependencyBase`. Falling back to the stored value here would let
+        // Stage 1 pass against that predecessor moments before the same run
+        // erases it, leaving a persisted `dependency-base` Issue base that no
+        // later run can resolve. `NO_DEPENDENCY_BASE` says the absence out loud,
+        // so the mismatch surfaces now, as an unavailable selection.
+        //
+        // Fix mode never re-resolves a plan (`depBase` is undefined there) and
+        // never clears the recorded `dependencyBase`, so it keeps reading it.
+        ...(fixMode ? {} : { dependencyBase: depBase ?? NO_DEPENDENCY_BASE }),
+        artifactDir,
+        ...(context.taskStore !== undefined ? { store: context.taskStore } : {}),
+        // The end-of-run identity re-check reads the sessions file again, so a
+        // registry change mid-run cannot record a pass under a stale binding.
+        ...(liveSessionsPathForStage !== undefined
+          ? { readLiveSession: async () => new JsonSessionRegistry(liveSessionsPathForStage).getSessionById(session.sessionId) }
+          : {}),
+      });
+      testStage1 = stage1;
+      latestStage1ContextPatch = stage1.contextPatch;
+      recordStage1ContextPatch(stage1.contextPatch);
+      // The shipped bounded streak (#1106) counts Stage 1's non-code routes;
+      // a handoff route parks without consuming it.
+      const decision: LoopStageRecoveryDecision = stage1.route === "park"
+        ? { kind: "park", reason: "test-stage-handoff" }
+        : decideLoopStageRecovery({
+            outcome: stage1RecoveryOutcome(stage1.route),
+            priorStreak: loopStageStreak,
+            maxAttempts: stagedSettings.maxStageRecoveryAttempts,
+          });
+      loopStageRecovery = decision;
+      if (decision.kind === "reset") loopStageStreak = 0;
+      else if (decision.record !== undefined) loopStageStreak = decision.record.streak;
+      const results = [...nonTest.results, { name: suiteKey, passed: stage1.route === "continue" }];
+      return stage1.route === "continue"
+        ? { passed: true, results }
+        : { passed: false, results, failure: stage1VerificationFailure(stage1, suiteKey) };
+    };
+    const runLoopStage = async (): Promise<VerificationOutcome> =>
+      testStageAtClaim.status !== "not-applicable"
+        ? runTestStage1()
+        : runSelectedLoopStage();
+    const runSelectedLoopStage = async (
+      replacedByTestStage?: RunLoopStageInput["replacedByTestStage"],
+    ): Promise<VerificationOutcome> => {
+      const run = await runLoopStageVerification({
+        runner,
+        session,
+        task,
+        cwd,
+        lane: "implementation",
+        taskAttempt: stageTaskAttempt,
+        stageOrdinal,
+        artifactDir,
+        ...(replacedByTestStage !== undefined ? { replacedByTestStage } : {}),
+      });
+      loopStage = run;
+      if (run.stage) {
+        stageOrdinal += 1;
+        const decision = decideLoopStageRecovery({
+          outcome: run.stage.assembly.aggregation.outcome,
+          priorStreak: loopStageStreak,
+          maxAttempts: stagedSettings.maxStageRecoveryAttempts,
+        });
+        loopStageRecovery = decision;
+        if (decision.kind === "reset") loopStageStreak = 0;
+        else if (decision.record !== undefined) loopStageStreak = decision.record.streak;
+      } else {
+        loopStageRecovery = undefined;
+      }
+      return run.verification;
+    };
+    // Read through functions: the closure above assigns these, which the
+    // enclosing scope's control-flow narrowing cannot see.
+    const currentLoopStageRecovery = (): LoopStageRecoveryDecision | undefined => loopStageRecovery;
+    /**
+     * Issue #1155: a stage run already covers the entire required set, so
+     * #1094 §7 row 5's re-run-the-whole-set-once path is retired with the
+     * selection policy it widened. An `unknown` takes the ordinary bounded
+     * retry, and this phase run verifies once.
+     */
+    const verifyLoopStage = async (): Promise<VerificationOutcome> => runLoopStage();
+    /**
+     * The recovery record this run's completion persists. Nothing when no stage
+     * ran (a legacy run leaves the key untouched); `null` once a verdict reset
+     * the streak or a park handed the task to a human — reset on the way out
+     * exactly as #934 resets its repair budget, so an operator's requeue starts
+     * with a full budget; the streak itself on a non-code retry, bound to this
+     * run's capture when the retry is the verification-only continuation.
+     */
+    const loopStageRecoveryContext = (continuationRunId?: string): Record<string, unknown> => {
+      const decision = currentLoopStageRecovery();
+      if (decision === undefined) return {};
+      if (decision.kind === "retry") {
+        return {
+          [LOOP_STAGE_RECOVERY_CONTEXT_KEY]: {
+            ...decision.record,
+            ...(continuationRunId !== undefined
+              ? { continuation: "verification", runId: continuationRunId }
+              : {}),
+          },
+        };
+      }
+      return { [LOOP_STAGE_RECOVERY_CONTEXT_KEY]: null };
+    };
+    /** A non-code termination never reaches an agent as fix input (§7 rule 3). */
+    const loopStageEndedWithoutVerdict = (): boolean => {
+      const decision = currentLoopStageRecovery();
+      return decision !== undefined && decision.kind !== "reset";
+    };
+    /** §10 rule 5's bounded projection of the last stage run, for the surfaces below. */
+    const stageSummary = (): StageRunSummary | undefined =>
+      loopStage?.stage ? summarizeStageRun(loopStage.stage.assembly.bundle) : undefined;
+    /** The selected checks the last stage run holds no admissible verdict for, by name. */
+    const loopStageNoVerdictNames = (): string[] => {
+      const stage = loopStage?.stage;
+      if (stage === undefined) return [];
+      const ids = new Set(stage.assembly.aggregation.noVerdictCheckIds);
+      return stage.assembly.bundle.checks
+        .filter((check) => ids.has(check.checkId))
+        .map((check) => check.name ?? check.checkId);
+    };
+    let verification = await verifyLoopStage();
     for (
       let repair = 0;
-      !verification.passed && repair < MAX_VERIFICATION_REPAIR_ATTEMPTS;
+      !verification.passed && repair < MAX_VERIFICATION_REPAIR_ATTEMPTS && !loopStageEndedWithoutVerdict();
       repair++
     ) {
       const failure = verification.failure!;
-      const repairPrompt = buildRepairPrompt(task, cwd, failure);
+      const repairPrompt = buildRepairPrompt(task, cwd, failure, stageSummary());
       writeFileSync(join(artifactDir, `implementation-repair-prompt-${repair + 1}.md`), repairPrompt, "utf8");
-      const repairResult = runner.run(resolvedProfile.cmd, claudeArgs(resolvedProfile, repairPrompt), { cwd, stdin: repairPrompt });
+      const repairInvocation = planAgentPhaseInvocation(agentRuntime, repairPrompt).invocation;
+      const repairResult = runner.run(repairInvocation.command, [...repairInvocation.args], { cwd, stdin: repairPrompt });
       writeFileSync(join(artifactDir, `implementation-repair-output-${repair + 1}.md`), repairResult.stdout || repairResult.stderr, "utf8");
       // The repair agent may discover that fixing the failure needs a disallowed
       // command (e.g. an uninstalled dependency the failing test imports). Detect
@@ -3552,7 +4302,7 @@ export function createImplementationHandler(
         return failAfterBranch("environment-prepare-after-repair-sync", {
           result: "failed",
           context: { artifactDir, resolvedProfile },
-          error: `Environment preparation (after repair dependency sync) failed (exit ${envPrepareAfterRepairSync.exitCode ?? 1}): ${(envPrepareAfterRepairSync.output ?? "").slice(0, 500)}`,
+          error: environmentPrepareFailureMessage(envPrepareAfterRepairSync, "after repair dependency sync"),
         });
       }
       // Refresh the prepare baseline if this repair-path prepare actually ran.
@@ -3570,10 +4320,24 @@ export function createImplementationHandler(
           }
         }
       }
-      verification = runVerification(runner, session.verification, cwd, artifactDir);
+      verification = await verifyLoopStage();
     }
-    if (!verification.passed) {
-      const failure = verification.failure!;
+    const parkedLoopStage = ((): Extract<LoopStageRecoveryDecision, { kind: "park" }> | undefined => {
+      const decision = currentLoopStageRecovery();
+      return decision?.kind === "park" ? decision : undefined;
+    })();
+    // A parked stage takes the failure path even when the shipped outcome
+    // passed: an `unknown` loop stage proved nothing, and nothing unproven is
+    // committed or pushed. The capture below preserves the tree either way.
+    if (!verification.passed || parkedLoopStage !== undefined) {
+      const parkedNoVerdict = loopStageNoVerdictNames();
+      const failure: VerificationFailure = verification.failure ?? {
+        name: parkedNoVerdict[0] ?? "verification-stage",
+        exitCode: 1,
+        output:
+          "The loop verification stage reached no admissible verdict for: "
+          + `${parkedNoVerdict.join(", ") || "(no check named)"}.`,
+      };
       // Capture dirty state so the next phase attempt can distinguish "dirty from
       // a known prior verification failure" from "dirty for an unknown reason"
       // (docs/per-issue-worktrees.md §Follow-up work, item 1).
@@ -3623,6 +4387,19 @@ export function createImplementationHandler(
         resolvedProfile,
         verificationFailure: { name: failure.name, exitCode: failure.exitCode },
         verificationFeedback: failure.output,
+        // Issue #1102: the bounded §10 rule 5 projection of the stage run this
+        // failure came out of — stage, outcome, verdicts, counts and
+        // `selection.full`. Recorded so the next cycle's prompt and any
+        // operator surface can tell a narrowed loop from a full one; nothing
+        // routes on it in this slice. Written unconditionally, `undefined`
+        // included, so a run with no stage clears an earlier run's scope rather
+        // than leaving the next prompt describing a cycle that did not happen.
+        verificationStage: stageSummary(),
+        // Issue #1106: the loop stage's consecutive non-code streak (§7.3).
+        ...loopStageRecoveryContext(),
+        // Issue #1154: the recorded Stage 1 state (or the allocation a handoff
+        // closed). A delayed release replaces the task context, so it rides here.
+        ...testStageContextPatch(),
         dirtyContinuation,
         // Clear any stale agent-exit diagnostic from an earlier attempt on
         // this issue (issue #727 review): this failure came from
@@ -3638,6 +4415,36 @@ export function createImplementationHandler(
           ...extra,
         }, null, 2), "utf8");
       };
+      // Issue #1106: a parked loop stage is the lane's human handoff (#1096 §7.3
+      // rule 4), taken before #934 can pick a retry or a repair cycle for it.
+      // The handoff names the stage, the count, the last outcome and the checks
+      // with no admissible verdict; the worktree is preserved. Issue #1155
+      // removed #1094 §7 row 5's own park reason with the full re-run it
+      // governed, so the budget is the only bound left.
+      if (parkedLoopStage !== undefined) {
+        writeVerificationResultArtifact({
+          stageRecoveryParked: parkedLoopStage.reason,
+          ...(parkedLoopStage.record !== undefined
+            ? {
+                stageRecoveryStreak: parkedLoopStage.record.streak,
+                stageRecoveryLastOutcome: parkedLoopStage.record.lastOutcome,
+              }
+            : {}),
+        });
+        const parkDetail = parkedLoopStage.reason === "test-stage-handoff"
+          ? (testStage1?.detail ?? "the Stage 1 test result routes to the operator handoff")
+          : parkedLoopStage.record !== undefined
+            ? `${parkedLoopStage.record.streak} consecutive non-code loop-stage termination(s), last outcome ${parkedLoopStage.record.lastOutcome}`
+            : "the recorded recovery state is unreadable";
+        return {
+          result: "failed",
+          context: verificationContext,
+          error:
+            `Verification loop stage parked for an operator before commit/push (${parkedLoopStage.reason}: ${parkDetail})`
+            + (parkedNoVerdict.length > 0 ? `; no admissible verdict for: ${parkedNoVerdict.join(", ")}` : "")
+            + ". The worktree is preserved as a dirty continuation; nothing was committed.",
+        };
+      }
       // Issue #934: classify BEFORE selecting the transition. An ordinary red
       // suite is work the implementation agent can continue; a saturated host
       // and an operator-actionable setup failure are not, and each keeps its
@@ -3646,6 +4453,50 @@ export function createImplementationHandler(
         failure,
         context: task.context,
       });
+      // Issue #1106: a loop stage that ended on a non-code termination within
+      // its recovery budget is a retry with no agent turn (#1094 §7 rows 4 and
+      // 6), whatever #934 would otherwise pick. Once the legacy transient budget
+      // is spent (or the failure never matched the probe marker, e.g. an
+      // interruption), #934 falls through to code repair — which would spend a
+      // repair cycle and an agent turn on a failure that says nothing about the
+      // diff. The stage's own bounded streak is the bound here, not #934's.
+      // An `environment` disposition keeps its terminal handoff unchanged for
+      // the check-group path. Issue #1154: a Stage 1 run already classified its
+      // own result (§5), so its host-retry/rerun route is the decision here —
+      // an adapter spawn error or missing script reads as `environment` to the
+      // generic classifier, but Stage 1 routed it as infrastructure under the
+      // bounded streak, which is what this run honors.
+      const stageRetry = currentLoopStageRecovery();
+      if (
+        stageRetry?.kind === "retry"
+        && (
+          (testStage1 !== undefined && testStage1.route !== "continue")
+          || disposition.kind === "repair_requeue"
+          || disposition.kind === "repair_cap_reached"
+        )
+      ) {
+        writeVerificationResultArtifact({
+          delayed: true,
+          stageRecoveryRetry: true,
+          stageRecoveryStreak: stageRetry.record.streak,
+          stageRecoveryLastOutcome: stageRetry.record.lastOutcome,
+        });
+        return {
+          result: "delayed",
+          delayKind: "transient_verification",
+          context: {
+            ...task.context,
+            ...verificationContext,
+            ...loopStageRecoveryContext(runId),
+            [ARTIFACT_DIR_PENDING_CONTEXT_FIELD]: false,
+          },
+          message:
+            `Verification loop stage ended ${stageRetry.record.lastOutcome} on '${failure.name}', which says `
+            + `nothing about the diff; delaying a verification-only retry `
+            + `${stageRetry.record.streak}/${stagedSettings.maxStageRecoveryAttempts} without an agent turn`,
+          retryAfterMs: resolveTransientRetryDelayMs(),
+        };
+      }
       if (disposition.kind === "transient") {
         // Issue #897's policy, applied on the implementation side of the same
         // verification commands: an indeterminate CLI probe says nothing about
@@ -3668,6 +4519,10 @@ export function createImplementationHandler(
             // resume from these same edits rather than refuse the dirty tree.
             ...task.context,
             ...verificationContext,
+            // Issue #1106: the retry is a verification-only continuation bound to
+            // THIS run's capture — the next claim re-verifies it without an agent
+            // turn. (Nothing when no stage ran, so a legacy delay is unchanged.)
+            ...loopStageRecoveryContext(runId),
             // issue #611 review: the `...task.context` spread above can carry a
             // stale `artifactDirPending: true` forward from an earlier
             // pre-creation failure on this task, while `verificationContext`
@@ -3780,10 +4635,18 @@ export function createImplementationHandler(
     // branch, so there is correctly nothing new to stage (issue #404) — and,
     // since issue #843, EXCEPT for a run whose findings were all validly
     // disputed: §3.4 admits that run with no diff, so it correctly has nothing
-    // to stage either. The bounded verification repair loop above could still
-    // have introduced a real diff in either case, so gate the commit/push on
-    // whether anything is actually stageable rather than on the flags alone.
-    if (stageablePaths.length === 0 && !resumedNoopWithCommits && !disputeZeroChangeRun) {
+    // to stage either. Issue #1125 adds the third: a fix turn whose explained
+    // no-change declaration was admitted above — there is deliberately nothing
+    // to commit, and an empty commit would misrepresent the run as new work.
+    // The bounded verification repair loop above could still have introduced a
+    // real diff in any of the three cases, so gate the commit/push on whether
+    // anything is actually stageable rather than on the flags alone.
+    if (
+      stageablePaths.length === 0
+      && !resumedNoopWithCommits
+      && !disputeZeroChangeRun
+      && explainedNoChange === undefined
+    ) {
       writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
         issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
         exitCode: 0, success: false, step: "stageable-check", artifactDir, resolvedProfile,
@@ -3806,6 +4669,31 @@ export function createImplementationHandler(
         : fixDispositionsSummary;
     if (zeroChangeSupersededByRepair && dispositionOutcome) {
       writeFixDispositionsArtifact(dispositionOutcome, { ...dispositionOutcome.summary, zeroChangeAdmissible: false });
+    }
+
+    // Issue #1125, same reasoning for the no-change declaration: the bounded
+    // repair loop runs between the diff snapshot and here, and a repair that
+    // edited files makes this a run that COMMITS. "No additional changes;
+    // verified and returned for review" would then be a false description of
+    // what the reviewer is about to see, so the declaration is withdrawn and the
+    // run finalizes as an ordinary fix. The refusal is recorded rather than
+    // silently dropped — the implementer's reasoning is still the best
+    // explanation of why the run started out with nothing to commit.
+    const noChangeSupersededByRepair = stageablePaths.length > 0 ? explainedNoChange : undefined;
+    if (noChangeSupersededByRepair !== undefined) {
+      writeFileSync(join(artifactDir, NO_CHANGE_ARTIFACT), JSON.stringify({
+        // The declaration is spread first so the run identity and the refusal
+        // below always win: the continuation carries this same run's `runId`,
+        // and the record must read as a refusal, not as the admission the
+        // declaration was written to be.
+        ...noChangeSupersededByRepair,
+        issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
+        branch, prUrl,
+        admitted: false,
+        refusal: "superseded-by-verification-repair",
+        detail: `stageablePaths:${stageablePaths.length}`,
+      }, null, 2), "utf8");
+      explainedNoChange = undefined;
     }
 
     const commitMsg = fixMode
@@ -3867,7 +4755,24 @@ export function createImplementationHandler(
       const prTitle = issueTitle
         ? `${issuePrefix}${issueTitle.slice(0, 256 - issuePrefix.length)}`
         : `fix: issue #${task.issueNumber}`;
-      const prBody = buildPrBody(task, runId, "new", session.verification);
+      const prBody = buildPrBody(
+        task,
+        runId,
+        "new",
+        session.verification,
+        stageSummary(),
+        loopStage?.stage ? passedStageCheckNames(loopStage.stage.assembly.bundle) : undefined,
+        testStage1?.record !== undefined && testStageAtClaim.status === "ready"
+          ? {
+              suiteKey: testStageAtClaim.binding.key,
+              result: testStage1.record.result,
+              selectedFiles:
+                testStage1.record.selection.status === "known" ? testStage1.record.selection.files.length : 0,
+              // Only the non-test checks this run's loop selection proved green.
+              nonTestChecks: loopStage?.stage ? passedStageCheckNames(loopStage.stage.assembly.bundle) : [],
+            }
+          : undefined,
+      );
       // Every dependent PR targets the session base branch (`main` by default),
       // even when its branch was started from a blocker PR head. The branch start
       // point and the PR target are deliberately different concepts: starting from
@@ -3879,18 +4784,55 @@ export function createImplementationHandler(
       const prResult = sessionRepoHost.provider.createPullRequest({ title: prTitle, body: prBody, head: branch, base: prBase });
 
       if (!prResult.ok) {
-        writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
-          issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
-          exitCode: 1, success: false, step: "gh-pr-create", artifactDir, resolvedProfile,
-        }, null, 2), "utf8");
-        return failAfterBranch("gh-pr-create", {
-          result: "failed",
-          context: { artifactDir, resolvedProfile },
-          error: prResult.error,
+        // The PR may already exist: creation is an external side effect and this
+        // task's `prUrl`/`branch` are persisted afterwards, so a run interrupted
+        // between the two comes back here with the PR live on the host and no
+        // local memory of it (issue #998, observed on #975 / PR #997). Ask the
+        // repo host — with the exact head this run pushed — whether a single
+        // open PR is already there to adopt, and continue through the SAME
+        // success path when it is. The host's error text is never consulted: a
+        // creation failure for any other reason simply finds no PR here and
+        // falls through to the original error below.
+        const adoption = adoptExistingPrForHead(sessionRepoHost.provider, {
+          issueNumber: task.issueNumber,
+          head: branch,
+          base: prBase,
+          // The repository the provider itself addresses — for a `gitea` repo
+          // host that is its own connection block, not `session.githubRepo`.
+          repo: sessionRepoHost.repoSlug,
         });
-      }
+        writeFileSync(join(artifactDir, "pr-reconciliation.json"), JSON.stringify({
+          issueNumber: task.issueNumber, sessionId: task.sessionId, runId,
+          head: branch, base: prBase, repo: sessionRepoHost.repoSlug,
+          createError: prResult.error,
+          outcome: adoption.kind,
+          ...(adoption.kind === "adopted"
+            ? { adoptedPrUrl: adoption.url }
+            : { refusalReason: adoption.reason, refusalDetail: adoption.error }),
+        }, null, 2), "utf8");
 
-      prUrl = prResult.value.url;
+        if (adoption.kind === "adopted") {
+          // `branch` is already the adopted PR's head — the reconciliation
+          // refuses anything else — so the context this run returns records the
+          // canonical pair without a second source of truth.
+          prUrl = adoption.url;
+        } else {
+          writeFileSync(join(artifactDir, "implementation-result.json"), JSON.stringify({
+            issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
+            exitCode: 1, success: false, step: "gh-pr-create", artifactDir, resolvedProfile,
+            prReconciliation: { outcome: "refused", reason: adoption.reason },
+          }, null, 2), "utf8");
+          return failAfterBranch("gh-pr-create", {
+            result: "failed",
+            context: { artifactDir, resolvedProfile },
+            // Both halves: the host's own creation failure (what went wrong) and
+            // why the live PR could not be adopted instead (what to fix).
+            error: `${prResult.error} — could not adopt an existing pull request (${adoption.reason}): ${adoption.error}`,
+          });
+        }
+      } else {
+        prUrl = prResult.value.url;
+      }
     }
 
     // Summary of a trusted dependency-update application (issue #302), surfaced on
@@ -4025,6 +4967,12 @@ export function createImplementationHandler(
       issueNumber: task.issueNumber, sessionId: task.sessionId, runId, agentId,
       exitCode: 0, success: true, branch, prUrl, artifactDir, resolvedProfile,
       ...(resumedNoopWithCommits ? { resumedNoChanges: true } : {}),
+      // Issue #1125: distinct from `resumedNoChanges` (a Tool Request recovery)
+      // and from an ordinary committed fix. "No additional changes; verified and
+      // returned for review" is its own outcome and is recorded as one.
+      ...(explainedNoChange
+        ? { explainedNoChanges: { reason: explainedNoChange.reason, revision: explainedNoChange.revision, turn: explainedNoChange.turn } }
+        : {}),
       ...(fixDispositionsForContext ? { fixDispositions: fixDispositionsForContext } : {}),
       ...(disputePersistence ? { reviewDisputePersistence: disputePersistence.summary } : {}),
       ...(disputePersistenceFailure ? { reviewDisputePersistenceFailure: disputePersistenceFailure } : {}),
@@ -4097,6 +5045,66 @@ export function createImplementationHandler(
       }
     }
 
+    // Issue #955 review (P1): the implementer half of §8.3's party provenance.
+    // The arbitration sub-turn measures a candidate arbiter's independence
+    // against the runs that produced the debate, and it happens phases later —
+    // by then the persisted assignment may name a different agent (an operator
+    // reconfigured the task) or nothing at all (a task older than assignment
+    // persistence), so a candidate sharing this party's provider could be
+    // selected as an apparently independent one. The run that actually rebutted
+    // therefore records WHICH agent it was — the merge keeps the id and drops
+    // the rest, since a persisted provider or model cannot be authenticated by
+    // the run that reads it back — on the same condition as the
+    // `disputeArtifactDir` reference below: only when a §10.2 dispute record was
+    // really written, since a run that recorded nothing is not a party to
+    // anything — and one that recorded nothing leaves an earlier fix run's
+    // identity in place for a debate that is still open.
+    // Merged rather than assigned: task context merges shallowly, so writing
+    // this half alone would drop the review run's.
+    const disputeImplementationParty =
+      disputePersistence && disputePersistence.artifacts.length > 0
+        ? summarizeDisputeParty(resolvedProfile)
+        : undefined;
+    const disputeParties =
+      disputeImplementationParty === undefined
+        ? undefined
+        : mergeDisputeParties(task.context[REVIEW_DISPUTE_PARTIES_CONTEXT_FIELD], {
+            implementation: disputeImplementationParty,
+          });
+
+    // Issue #955 review (P1): the same two facts — where the rebuttal is and who
+    // wrote it — recorded PER LINEAGE, because both of the keys above are
+    // single-valued while the protocol can rebut different lineages in different
+    // fix runs. A row 11 material revision sends one lineage back to the
+    // implementer while another stays disputed, so the later run's directory and
+    // agent would otherwise stand in for the earlier lineage's: its reviewer or
+    // arbitration turn would look for `dispute-<lineageId>.json` in a directory
+    // that never held it (parking a resolvable dispute), and §8.3 would measure
+    // arbiter independence against the wrong implementer.
+    //
+    // One entry per lineage this run actually WROTE a record for — `persisted`
+    // and `artifacts` are minted together, entry for entry, including the replay
+    // path that re-serializes an already-recorded rebuttal into this run's own
+    // directory. Merged over what earlier fix runs recorded, one lineage at a
+    // time, because task context merges shallowly and the other lineages'
+    // entries are exactly what must survive.
+    const disputeRebuttals =
+      disputePersistence === undefined || disputePersistence.persisted.length === 0
+        ? undefined
+        : disputePersistence.persisted.reduce<unknown>(
+            (carried, written) =>
+              mergeRebuttalLineageRecord(carried, written.lineageId, {
+                version: written.version,
+                artifactDir,
+                // First-hand here — the profile this run resolved and ran — and
+                // canonicalized back down to an id alone by every later reader.
+                ...(disputeImplementationParty === undefined
+                  ? {}
+                  : { agentId: disputeImplementationParty.agentId }),
+              }),
+            task.context[REVIEW_DISPUTE_REBUTTALS_CONTEXT_FIELD],
+          );
+
     return {
       result: "success",
       // Issue #840's applied transition, carried OUTSIDE `context` because it is
@@ -4115,7 +5123,32 @@ export function createImplementationHandler(
         implementationAgentUsed: agentId,
         labels: taskLabels,
         resolvedProfile,
+        // Issue #1102: the bounded §10 rule 5 projection of the loop stage this
+        // success was verified by, written unconditionally so a legacy run
+        // clears an earlier one's. It records scope — a `full: false` success
+        // is a success of a SUBSET — and grants nothing: loop evidence never
+        // satisfies a final stage (§4.1 rule 4).
+        verificationStage: stageSummary(),
+        // Issue #1106: a verdict ends the loop stage's non-code streak.
+        ...loopStageRecoveryContext(),
+        // Issue #1154: the recorded Stage 1 state this success was verified by.
+        ...testStageContextPatch(),
         ...(resumedNoopWithCommits ? { resumedNoChanges: true } : {}),
+        // Issue #1125: what the reviewer needs to judge a turn that committed
+        // nothing — the feedback it answered, why no edit was needed, the
+        // evidence, and the exact revision the runner verified. Written
+        // unconditionally so a later fix turn that DOES commit clears the
+        // previous turn's record instead of leaving the review prompt claiming
+        // "no additional changes" about a diff.
+        //
+        // It is continuation context, not a verdict: it clears no finding,
+        // records no disposition, and carries no approval. The reviewer decides
+        // whether the explanation answers the feedback.
+        [NO_CHANGE_CONTEXT_FIELD]: explainedNoChange,
+        // The consecutive-turn counter this path is bounded by. Incremented on
+        // an admitted no-change turn and RESET by any fix run that commits, so
+        // the bound only ever applies to an unbroken run of them.
+        [NO_CHANGE_TURNS_CONTEXT_FIELD]: explainedNoChange ? explainedNoChange.turn : undefined,
         // Issue #843's typed result, reduced to the §10.1 literals-and-counters
         // form: which lineage got which disposition, what was rejected and why
         // (content-free reasons only), and whether §3.4 admitted a zero-change
@@ -4134,6 +5167,30 @@ export function createImplementationHandler(
         // exactly as they are for any other successful fix run, while the
         // disputed lineages travel here as pending protocol state.
         ...(disputePersistence ? { reviewDispute: disputePersistence.context } : {}),
+        // Issue #952: where this run wrote the §10.2 dispute records. The
+        // reviewer's reconsideration turn runs one or more phases later and
+        // re-admits `dispute-<lineageId>.json` from here, so the reference needs
+        // its own never-overwritten key — the plain `artifactDir` above is
+        // rewritten by every subsequent run, including a review run that blocks
+        // before reaching its agent. Written only when a §10.2 record was
+        // actually WRITTEN into this directory — `disputePersistence` alone is
+        // also set by a run whose every record was refused (an oversized dispute,
+        // say), and pointing the key at a directory holding no
+        // `dispute-<lineageId>.json` would send a still-disputed lineage's
+        // reviewer turn looking for a rebuttal that was never written there, and
+        // park it. A run that recorded nothing leaves any earlier reference in
+        // place for a debate that is still open.
+        ...(disputePersistence && disputePersistence.artifacts.length > 0
+          ? { [DISPUTE_ARTIFACT_DIR_CONTEXT_FIELD]: artifactDir }
+          : {}),
+        // Issue #955 review (P1/P2): who this run was, for §8.3's independence
+        // check — resolved above, and absent for a run that rebutted nothing.
+        ...(disputeParties === undefined ? {} : { [REVIEW_DISPUTE_PARTIES_CONTEXT_FIELD]: disputeParties }),
+        // Issue #955 review (P1): the per-lineage form of the two keys above,
+        // for the lineages THIS run rebutted. The single-valued keys stay exactly
+        // as they were — they are what a debate that started before this record,
+        // and every existing reader, still resolves against.
+        ...(disputeRebuttals === undefined ? {} : { [REVIEW_DISPUTE_REBUTTALS_CONTEXT_FIELD]: disputeRebuttals }),
         // Bounded, literals-only: counts, lineage ids, and content-free refusal
         // reasons. The typed routing state #840 reads to decide the reviewer
         // turn (§7.1 rule 2) is `routing` inside it. Written unconditionally —
@@ -4185,5 +5242,23 @@ export function createImplementationHandler(
         ),
       },
     };
+  };
+
+  return async (task: AiTask): Promise<PhaseHandlerResult> => {
+    let agentRuntime: AgentPhaseRuntime | undefined;
+    let stage1ContextPatch: Record<string, unknown> = {};
+    const result = await run(
+      task,
+      (resolved) => {
+        agentRuntime = resolved;
+      },
+      (patch) => {
+        stage1ContextPatch = patch;
+      },
+    );
+    return withAgentRuntimeAudit(
+      context.taskStore === undefined ? withStage1ContextPatch(task, result, stage1ContextPatch) : result,
+      agentRuntime,
+    );
   };
 }

@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -8,8 +8,21 @@ import {
   issueWorktreePath,
   canonicalizePath,
 } from '../dist/index.js';
+import { ADMIN_CLI_PATH, runAdmin } from './helpers/admin-cli.js';
 
-const CLI = new URL('../dist/cli/admin.js', import.meta.url).pathname;
+// Runs with a fake `gh` binary prepended to PATH so the live PR-discovery lookup
+// (issue #1002) resolves against a canned response instead of the real GitHub
+// CLI/network.
+async function runWithFakeGh(fakeGhDir, ...args) {
+  return runAdmin(args, { env: { PATH: `${fakeGhDir}:${process.env.PATH}` } });
+}
+
+function writeFakeGh(dir, script) {
+  const fakeGh = join(dir, 'gh');
+  writeFileSync(fakeGh, script, 'utf8');
+  chmodSync(fakeGh, 0o755);
+  return fakeGh;
+}
 
 let tmpDir;
 let repoRoot;
@@ -21,18 +34,13 @@ function git(args, cwd) {
   return execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, encoding: 'utf8' });
 }
 
-function run(...args) {
-  try {
-    const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
-    return { code: 0, stdout };
-  } catch (err) {
-    return { code: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
-  }
+async function run(...args) {
+  return runAdmin(args);
 }
 
 // Run `status` in JSON mode and parse the single-line payload.
-function statusJson(...args) {
-  const r = run('status', '--json', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, ...args);
+async function statusJson(...args) {
+  const r = await run('status', '--json', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, ...args);
   expect(r.code).toBe(0);
   return JSON.parse(r.stdout.trim());
 }
@@ -108,7 +116,7 @@ describe('admin status — worktree present', () => {
     await enqueue(101);
     const wt = createIssueWorktree(101);
 
-    const payload = statusJson('--issue-number', '101');
+    const payload = await statusJson('--issue-number', '101');
     expect(payload.ok).toBe(true);
     const e = entryFor(payload, 101);
     expect(e.classification).toBe('runnable');
@@ -125,7 +133,7 @@ describe('admin status — worktree present', () => {
 describe('admin status — worktree missing', () => {
   test('flags a missing worktree for a queued task', async () => {
     await enqueue(102);
-    const payload = statusJson('--issue-number', '102');
+    const payload = await statusJson('--issue-number', '102');
     const e = entryFor(payload, 102);
     expect(e.worktree.exists).toBe(false);
     expect(e.worktree.registered).toBe(false);
@@ -139,7 +147,7 @@ describe('admin status — dirty worktree', () => {
     const wt = createIssueWorktree(103);
     writeFileSync(join(wt.path, 'scratch.txt'), 'uncommitted\n');
 
-    const payload = statusJson('--issue-number', '103');
+    const payload = await statusJson('--issue-number', '103');
     const e = entryFor(payload, 103);
     expect(e.worktree.exists).toBe(true);
     expect(e.worktree.clean).toBe(false);
@@ -151,7 +159,7 @@ describe('admin status — dirty worktree classification', () => {
     await enqueue(110);
     createIssueWorktree(110);
 
-    const e = entryFor(statusJson('--issue-number', '110'), 110);
+    const e = entryFor(await statusJson('--issue-number', '110'), 110);
     expect(e.worktree.clean).toBe(true);
     expect(e.worktree.dirtyCategory).toBeNull();
   });
@@ -159,7 +167,7 @@ describe('admin status — dirty worktree classification', () => {
   test('dirtyCategory is null when worktree does not exist', async () => {
     await enqueue(111);
     // No worktree created
-    const e = entryFor(statusJson('--issue-number', '111'), 111);
+    const e = entryFor(await statusJson('--issue-number', '111'), 111);
     expect(e.worktree.exists).toBe(false);
     expect(e.worktree.dirtyCategory).toBeNull();
   });
@@ -169,7 +177,7 @@ describe('admin status — dirty worktree classification', () => {
     const wt = createIssueWorktree(112);
     writeFileSync(join(wt.path, 'unknown.txt'), 'unexpected dirty\n');
 
-    const e = entryFor(statusJson('--issue-number', '112'), 112);
+    const e = entryFor(await statusJson('--issue-number', '112'), 112);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('action_required');
   });
@@ -189,7 +197,7 @@ describe('admin status — dirty worktree classification', () => {
       leaseExpiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     });
 
-    const e = entryFor(statusJson('--issue-number', '123'), 123);
+    const e = entryFor(await statusJson('--issue-number', '123'), 123);
     expect(e.worktree.clean).toBe(false);
     expect(e.classification).toBe('running');
     expect(e.worktree.dirtyCategory).toBeNull();
@@ -221,7 +229,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '113'), 113);
+    const e = entryFor(await statusJson('--issue-number', '113'), 113);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('continuation_candidate');
     expect(e.classification).toBe('runnable');
@@ -265,7 +273,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '126'), 126);
+    const e = entryFor(await statusJson('--issue-number', '126'), 126);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('continuation_candidate');
     expect(e.classification).toBe('runnable');
@@ -299,7 +307,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '114'), 114);
+    const e = entryFor(await statusJson('--issue-number', '114'), 114);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('continuation_active');
     expect(e.classification).toBe('running');
@@ -326,7 +334,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '118'), 118);
+    const e = entryFor(await statusJson('--issue-number', '118'), 118);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('action_required');
   });
@@ -352,7 +360,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '119'), 119);
+    const e = entryFor(await statusJson('--issue-number', '119'), 119);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('action_required');
   });
@@ -377,7 +385,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '120'), 120);
+    const e = entryFor(await statusJson('--issue-number', '120'), 120);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('action_required');
   });
@@ -404,7 +412,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '121'), 121);
+    const e = entryFor(await statusJson('--issue-number', '121'), 121);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('action_required');
   });
@@ -431,7 +439,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '122'), 122);
+    const e = entryFor(await statusJson('--issue-number', '122'), 122);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('action_required');
   });
@@ -460,7 +468,7 @@ describe('admin status — dirty worktree classification', () => {
     // The marker is structurally valid but the artifact file is absent; the
     // implementation preflight would fail closed, so status must not advertise
     // auto-continuation — it must classify this as action_required.
-    const e = entryFor(statusJson('--issue-number', '119'), 119);
+    const e = entryFor(await statusJson('--issue-number', '119'), 119);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('action_required');
   });
@@ -504,7 +512,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const e = entryFor(statusJson('--issue-number', '127'), 127);
+    const e = entryFor(await statusJson('--issue-number', '127'), 127);
     expect(e.worktree.clean).toBe(false);
     expect(e.worktree.dirtyCategory).toBe('action_required');
     expect(e.classification).toBe('runnable');
@@ -531,7 +539,7 @@ describe('admin status — dirty worktree classification', () => {
       context: { prUrl: 'https://github.com/m2dw/test-repo/pull/1001' },
     });
 
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '128');
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '128');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('operator action required');
     // Must NOT suggest `worktree discard` — the command would refuse the non-conventional branch.
@@ -565,7 +573,7 @@ describe('admin status — dirty worktree classification', () => {
       },
     });
 
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '115');
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '115');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('continuation candidate');
     expect(r.stdout).toContain('prior verification failure');
@@ -579,7 +587,7 @@ describe('admin status — dirty worktree classification', () => {
     const wt = createIssueWorktree(116);
     writeFileSync(join(wt.path, 'unknown.txt'), 'unexpected dirty\n');
 
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '116');
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '116');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('operator action required');
     expect(r.stdout).toContain('no continuation record');
@@ -592,7 +600,7 @@ describe('admin status — dirty worktree classification', () => {
     await enqueue(117);
     writeFileSync(join(repoRoot, 'uncommitted.txt'), 'unstaged in canonical\n');
 
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '117');
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '117');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('canonical checkout:');
     expect(r.stdout).toContain('DIRTY');
@@ -612,7 +620,7 @@ describe('admin status — branch-only #404 diagnosis', () => {
       lastError: 'git push origin ai/issue-404 failed: no upstream',
     });
 
-    const payload = statusJson('--issue-number', '404');
+    const payload = await statusJson('--issue-number', '404');
     const e = entryFor(payload, 404);
     expect(e.classification).toBe('failed');
     expect(e.branch.localExists).toBe(true);
@@ -624,8 +632,8 @@ describe('admin status — branch-only #404 diagnosis', () => {
 });
 
 describe('admin status — no task', () => {
-  test('an explicit issue with no task is still shown', () => {
-    const payload = statusJson('--issue-number', '999');
+  test('an explicit issue with no task is still shown', async () => {
+    const payload = await statusJson('--issue-number', '999');
     expect(payload.count).toBe(1);
     const e = entryFor(payload, 999);
     expect(e.task).toBeNull();
@@ -641,7 +649,7 @@ describe('admin status — blocked / tool-request / capped classification', () =
       phase: 'implementation',
       context: { dependencyRecheck: { blockedBy: [{ issueNumber: 400, state: 'open' }, { issueNumber: 399, state: 'closed' }] } },
     });
-    const e = entryFor(statusJson('--issue-number', '200'), 200);
+    const e = entryFor(await statusJson('--issue-number', '200'), 200);
     expect(e.classification).toBe('blocked');
     expect(e.suggestedAction).toContain('#400');
     expect(e.suggestedAction).not.toContain('#399');
@@ -654,7 +662,7 @@ describe('admin status — blocked / tool-request / capped classification', () =
       phase: 'implementation',
       context: { toolRequest: { command: 'npm install x', resolved: false } },
     });
-    const e = entryFor(statusJson('--issue-number', '201'), 201);
+    const e = entryFor(await statusJson('--issue-number', '201'), 201);
     expect(e.classification).toBe('waiting_for_tool_request');
     expect(e.suggestedAction).toContain('tool-request list');
   });
@@ -666,7 +674,7 @@ describe('admin status — blocked / tool-request / capped classification', () =
       phase: 'review',
       context: { reviewLoopCapReached: true },
     });
-    const e = entryFor(statusJson('--issue-number', '202'), 202);
+    const e = entryFor(await statusJson('--issue-number', '202'), 202);
     expect(e.classification).toBe('capped');
     expect(e.suggestedAction).toContain('recover-cap-handoff');
   });
@@ -678,7 +686,7 @@ describe('admin status — blocked / tool-request / capped classification', () =
       phase: 'review',
       context: { missingVerificationCommands: ['npm run export -- --dry-run', 'npm run lint'] },
     });
-    const e = entryFor(statusJson('--issue-number', '203'), 203);
+    const e = entryFor(await statusJson('--issue-number', '203'), 203);
     expect(e.classification).toBe('needs_human');
     expect(e.suggestedAction).toContain('npm run export -- --dry-run');
     expect(e.suggestedAction).toContain('npm run lint');
@@ -692,15 +700,15 @@ describe('admin status — closed tasks hidden by default', () => {
     await transition(300, 'queued', { status: 'done', phase: 'implementation' });
     await enqueue(301); // remains queued/visible
 
-    const sessionView = statusJson();
+    const sessionView = await statusJson();
     expect(entryFor(sessionView, 300)).toBeUndefined();
     expect(entryFor(sessionView, 301)).toBeDefined();
 
-    const allView = statusJson('--all');
+    const allView = await statusJson('--all');
     expect(entryFor(allView, 300)).toBeDefined();
 
     // An explicit issue is always shown, even when done.
-    const explicit = statusJson('--issue-number', '300');
+    const explicit = await statusJson('--issue-number', '300');
     expect(entryFor(explicit, 300).classification).toBe('done');
   });
 });
@@ -727,7 +735,7 @@ describe('admin status — repo not inspectable', () => {
       }],
     }, null, 2));
 
-    const r = run('status', '--json', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '404');
+    const r = await run('status', '--json', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '404');
     expect(r.code).toBe(1);
     expect(`${r.stdout}${r.stderr}`).toContain('Cannot inspect repository worktree state');
   });
@@ -736,7 +744,7 @@ describe('admin status — repo not inspectable', () => {
 describe('admin status — output modes', () => {
   test('human-readable by default', async () => {
     await enqueue(500);
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '500');
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '500');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('Status for session addon-dev, issue #500');
     expect(r.stdout).toContain('RUNNABLE');
@@ -756,7 +764,7 @@ describe('admin status — output modes', () => {
       JSON.stringify({ contextId: 'ctx-crashed', sessionId: 'addon-dev', startedAt: staleStartedAt }, null, 2) + '\n',
     );
 
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '502', '--lock-dir', lockDir);
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '502', '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     expect(r.stdout).not.toContain('Repo lock: free\n');
     expect(r.stdout).toContain('Repo lock: free (stale lock');
@@ -767,11 +775,11 @@ describe('admin status — output modes', () => {
     await enqueue(501);
     createIssueWorktree(501);
     // JSON
-    const jsonOut = run('status', '--json', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '501');
+    const jsonOut = await run('status', '--json', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '501');
     expect(jsonOut.stdout).not.toContain(repoRoot);
     expect(jsonOut.stdout).not.toContain(worktreeRoot);
     // Human
-    const humanOut = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '501');
+    const humanOut = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '501');
     expect(humanOut.stdout).not.toContain(repoRoot);
     expect(humanOut.stdout).not.toContain(worktreeRoot);
   });
@@ -799,7 +807,7 @@ describe('admin status — output modes', () => {
       lastError: `git worktree add ${join(canonicalRoot, 'addon-dev', 'issue-502')} failed`,
     });
 
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '502');
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '502');
     expect(r.code).toBe(0);
     expect(r.stdout).not.toContain(canonicalRoot);
     expect(r.stdout).not.toContain(symlinkedRoot);
@@ -830,14 +838,14 @@ describe('admin status — output modes', () => {
       lastError: `git -C ${canonicalRepo} checkout -b ai/issue-503 failed`,
     });
 
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '503');
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '503');
     expect(r.code).toBe(0);
     expect(r.stdout).not.toContain(canonicalRepo);
     expect(r.stdout).not.toContain(symlinkedRepo);
   });
 
-  test('requires a session selector', () => {
-    const r = run('status', '--db-path', dbPath, '--sessions-path', sessionsPath);
+  test('requires a session selector', async () => {
+    const r = await run('status', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(r.code).toBe(1);
   });
 });
@@ -845,7 +853,7 @@ describe('admin status — output modes', () => {
 describe('admin status — canonical checkout state', () => {
   test('reports canonicalDirty:false in JSON when canonical repo is clean', async () => {
     await enqueue(600);
-    const payload = statusJson('--issue-number', '600');
+    const payload = await statusJson('--issue-number', '600');
     const e = entryFor(payload, 600);
     expect(e.canonicalDirty).toBe(false);
   });
@@ -853,7 +861,7 @@ describe('admin status — canonical checkout state', () => {
   test('reports canonicalDirty:true in JSON when canonical repo has uncommitted changes', async () => {
     await enqueue(601);
     writeFileSync(join(repoRoot, 'uncommitted.txt'), 'unstaged changes\n');
-    const payload = statusJson('--issue-number', '601');
+    const payload = await statusJson('--issue-number', '601');
     const e = entryFor(payload, 601);
     expect(e.canonicalDirty).toBe(true);
   });
@@ -861,7 +869,7 @@ describe('admin status — canonical checkout state', () => {
   test('human output shows canonical checkout state separately from worktree state', async () => {
     await enqueue(602);
     createIssueWorktree(602);
-    const r = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '602');
+    const r = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '602');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('canonical checkout:');
     expect(r.stdout).toContain('worktree addon-dev/issue-602:');
@@ -893,7 +901,7 @@ describe('admin status — stale lock worktree-aware suggestion', () => {
       startedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
     }) + '\n');
 
-    const r = run(
+    const r = await run(
       'status',
       '--json',
       '--session-id', 'addon-dev',
@@ -944,7 +952,7 @@ describe('admin status — stale lock worktree-aware suggestion', () => {
       startedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
     }) + '\n');
 
-    const r = run(
+    const r = await run(
       'status',
       '--json',
       '--session-id', 'addon-dev',
@@ -992,9 +1000,12 @@ describe('admin status — stale lock worktree-aware suggestion', () => {
       startedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
     }) + '\n');
 
+    // Stays a spawned run (issue #1018): DEFAULT_WORKTREE_LOCK_DIR is derived
+    // from homedir() at module load, so only a fresh process can be given a
+    // different HOME. The in-process harness cannot express this.
     const stdout = execFileSync(
       process.execPath,
-      [CLI, 'status', '--json', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '604'],
+      [ADMIN_CLI_PATH, 'status', '--json', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath, '--issue-number', '604'],
       { encoding: 'utf8', env: { ...process.env, HOME: tmpDir } },
     );
     const payload = JSON.parse(stdout.trim());
@@ -1013,23 +1024,23 @@ describe('admin status — stale lock worktree-aware suggestion', () => {
 describe('admin status — session pause (issue #531)', () => {
   test('an unpaused session reports sessionPause.paused=false', async () => {
     await enqueue(300);
-    const payload = statusJson();
+    const payload = await statusJson();
     expect(payload.sessionPause).toEqual({ paused: false });
   });
 
   test('a paused session surfaces the reason in JSON and human output', async () => {
     await enqueue(301);
-    const pause = run(
+    const pause = await run(
       'session', 'pause',
       '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbPath,
       '--reason', 'ops hold', '--json',
     );
     expect(pause.code).toBe(0);
 
-    const payload = statusJson();
+    const payload = await statusJson();
     expect(payload.sessionPause).toMatchObject({ paused: true, reason: 'ops hold', source: 'operator' });
 
-    const human = run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath);
+    const human = await run('status', '--session-id', 'addon-dev', '--db-path', dbPath, '--sessions-path', sessionsPath);
     expect(human.code).toBe(0);
     expect(human.stdout).toContain('SESSION PAUSED');
     expect(human.stdout).toContain('ops hold');
@@ -1059,9 +1070,234 @@ describe('admin status — tolerates non-object session entries (issue #823 revi
     writeFileSync(sessionsPath, JSON.stringify(sessions, null, 2));
 
     await enqueue(303);
-    const payload = statusJson('--issue-number', '303');
+    const payload = await statusJson('--issue-number', '303');
     expect(payload.ok).toBe(true);
     const e = entryFor(payload, 303);
     expect(e).toBeDefined();
+  });
+});
+
+// Issue #1002: `admin status` reported `pr.exists=false` / `pr.url=null` for
+// issue #975 even though PR #997 was live on the conventional branch, because
+// task context never recorded it. `--discover-pr` queries the repo host for the
+// exact expected head and reports the result SEPARATELY from persisted context,
+// without mutating the task.
+describe('admin status — live PR discovery (issue #1002)', () => {
+  test('discovers a live PR when task context lacks prUrl/branch, without touching persisted state', async () => {
+    await enqueue(975);
+    await transition(975, 'queued', {
+      status: 'failed',
+      phase: 'implementation',
+      lastError: 'gh pr create failed: a pull request for branch "ai/issue-975" already exists',
+    });
+
+    writeFakeGh(
+      tmpDir,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n' +
+        '  echo \'[{"number":997,"url":"https://github.com/m2dw/test-repo/pull/997","headRefName":"ai/issue-975","state":"OPEN","baseRefName":"main"}]\'\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 1\n',
+    );
+
+    const r = await runWithFakeGh(
+      tmpDir,
+      'status', '--json',
+      '--session-id', 'addon-dev',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--issue-number', '975',
+      '--discover-pr',
+    );
+    expect(r.code).toBe(0);
+    const payload = JSON.parse(r.stdout.trim());
+    const e = entryFor(payload, 975);
+
+    // Persisted state is exactly what it was before discovery.
+    expect(e.pr.exists).toBe(false);
+    expect(e.pr.url).toBeNull();
+
+    // The live PR is reported separately, clearly marked as not persisted.
+    expect(e.discoveredPr).toMatchObject({
+      attempted: true,
+      outcome: 'found',
+      url: 'https://github.com/m2dw/test-repo/pull/997',
+      headRefName: 'ai/issue-975',
+      number: 997,
+    });
+    expect(e.discoveredPr.recommendation).toContain('admin recover');
+    expect(e.discoveredPr.recommendation).toContain('#998');
+
+    // Human-readable output surfaces the same distinction.
+    const human = await runWithFakeGh(
+      tmpDir,
+      'status',
+      '--session-id', 'addon-dev',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--issue-number', '975',
+      '--discover-pr',
+    );
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain('LIVE PR FOUND (not persisted in task context)');
+    expect(human.stdout).toContain('pull/997');
+
+    // No task, label, branch, or PR mutation occurred.
+    const store = new SqliteTaskStore(dbPath);
+    const task = await store.getTask({ sessionId: 'addon-dev', issueNumber: 975 });
+    store.close();
+    expect(task.context.prUrl).toBeUndefined();
+    expect(task.context.branch).toBeUndefined();
+    expect(task.status).toBe('failed');
+  });
+
+  test('is not attempted by default (no --discover-pr flag) — existing behavior unchanged', async () => {
+    await enqueue(975);
+    await transition(975, 'queued', { status: 'failed', phase: 'implementation', lastError: 'boom' });
+
+    const payload = await statusJson('--issue-number', '975');
+    const e = entryFor(payload, 975);
+    expect(e.pr.exists).toBe(false);
+    expect(e.discoveredPr).toBeUndefined();
+  });
+
+  test('is skipped for a task with complete persisted PR context, even with --discover-pr', async () => {
+    await enqueue(975);
+    await transition(975, 'queued', {
+      status: 'ready_for_human',
+      phase: 'review',
+      context: { prUrl: 'https://github.com/m2dw/test-repo/pull/900', branch: 'ai/issue-975' },
+    });
+
+    // A `gh` that would fail loudly if it were ever invoked — proves discovery
+    // is skipped, not merely fast/successful, when context is complete.
+    writeFakeGh(tmpDir, '#!/bin/sh\nexit 1\n');
+
+    const r = await runWithFakeGh(
+      tmpDir,
+      'status', '--json',
+      '--session-id', 'addon-dev',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--issue-number', '975',
+      '--discover-pr',
+    );
+    expect(r.code).toBe(0);
+    const payload = JSON.parse(r.stdout.trim());
+    const e = entryFor(payload, 975);
+    expect(e.pr).toEqual({ url: 'https://github.com/m2dw/test-repo/pull/900', exists: true });
+    expect(e.discoveredPr).toBeUndefined();
+  });
+
+  test('ambiguous: two open PRs on the expected head fail closed with an actionable reason', async () => {
+    await enqueue(975);
+    await transition(975, 'queued', { status: 'failed', phase: 'implementation', lastError: 'boom' });
+    writeFakeGh(
+      tmpDir,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n' +
+        '  echo \'[{"number":10,"url":"https://github.com/m2dw/test-repo/pull/10","headRefName":"ai/issue-975","state":"OPEN","baseRefName":"main"},' +
+        '{"number":11,"url":"https://github.com/m2dw/test-repo/pull/11","headRefName":"ai/issue-975","state":"OPEN","baseRefName":"main"}]\'\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 1\n',
+    );
+
+    const r = await runWithFakeGh(
+      tmpDir,
+      'status', '--json',
+      '--session-id', 'addon-dev',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--issue-number', '975',
+      '--discover-pr',
+    );
+    const payload = JSON.parse(r.stdout.trim());
+    const e = entryFor(payload, 975);
+    expect(e.pr.exists).toBe(false);
+    expect(e.discoveredPr).toMatchObject({ attempted: true, outcome: 'not-found', reason: 'ambiguous' });
+    expect(e.discoveredPr.message).toContain('Close the duplicates');
+  });
+
+  test('closed: a non-open PR on the expected head fails closed with an actionable reason', async () => {
+    await enqueue(975);
+    await transition(975, 'queued', { status: 'failed', phase: 'implementation', lastError: 'boom' });
+    writeFakeGh(
+      tmpDir,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n' +
+        '  echo \'[{"number":12,"url":"https://github.com/m2dw/test-repo/pull/12","headRefName":"ai/issue-975","state":"CLOSED","baseRefName":"main"}]\'\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 1\n',
+    );
+
+    const r = await runWithFakeGh(
+      tmpDir,
+      'status', '--json',
+      '--session-id', 'addon-dev',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--issue-number', '975',
+      '--discover-pr',
+    );
+    const payload = JSON.parse(r.stdout.trim());
+    const e = entryFor(payload, 975);
+    expect(e.discoveredPr).toMatchObject({ attempted: true, outcome: 'not-found', reason: 'not-open' });
+  });
+
+  test('wrong base: an open PR targeting a different base fails closed with an actionable reason', async () => {
+    await enqueue(975);
+    await transition(975, 'queued', { status: 'failed', phase: 'implementation', lastError: 'boom' });
+    writeFakeGh(
+      tmpDir,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n' +
+        '  echo \'[{"number":13,"url":"https://github.com/m2dw/test-repo/pull/13","headRefName":"ai/issue-975","state":"OPEN","baseRefName":"develop"}]\'\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 1\n',
+    );
+
+    const r = await runWithFakeGh(
+      tmpDir,
+      'status', '--json',
+      '--session-id', 'addon-dev',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--issue-number', '975',
+      '--discover-pr',
+    );
+    const payload = JSON.parse(r.stdout.trim());
+    const e = entryFor(payload, 975);
+    expect(e.discoveredPr).toMatchObject({ attempted: true, outcome: 'not-found', reason: 'base-mismatch' });
+  });
+
+  test('missing: no open PR on the expected head is reported as not found, not as an error', async () => {
+    await enqueue(975);
+    await transition(975, 'queued', { status: 'failed', phase: 'implementation', lastError: 'boom' });
+    writeFakeGh(
+      tmpDir,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n' +
+        '  echo \'[]\'\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 1\n',
+    );
+
+    const r = await runWithFakeGh(
+      tmpDir,
+      'status', '--json',
+      '--session-id', 'addon-dev',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--issue-number', '975',
+      '--discover-pr',
+    );
+    const payload = JSON.parse(r.stdout.trim());
+    const e = entryFor(payload, 975);
+    expect(e.discoveredPr).toMatchObject({ attempted: true, outcome: 'not-found', reason: 'no-match' });
   });
 });

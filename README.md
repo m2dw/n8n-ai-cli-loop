@@ -34,11 +34,11 @@ configuration, workflow import order, and a smoke-test checklist.
 
 ---
 
-The maintained workflow is the **parent/child split** (`docs/n8n-thin-child-workflow.json` + `docs/n8n-thin-parent-workflow.json`). The child runs the three CLI commands (`github-intake` → `run-one-phase` → `dispatch-outbox`); the parent holds triggers and session config. The workflow JSONs are generated from `scripts/build-parent-child-workflow.mjs`.
+The maintained workflow is the **parent/child split** (`docs/n8n-thin-child-workflow.json` + `docs/n8n-thin-parent-workflow.json`). The child runs the four CLI commands (`github-intake` → `run-one-phase` → `chatops-scan` → `dispatch-outbox`); the parent holds triggers and session config. The workflow JSONs are generated from `scripts/build-parent-child-workflow.mjs`.
 
 ## What This Does
 
-The parent/child workflow runs on a schedule (every 5 minutes) or on manual trigger. One n8n execution runs three CLI steps in sequence — intake, phase execution, and outbox dispatch. Main lanes:
+The parent/child workflow runs on a schedule (every 5 minutes) or on manual trigger. One n8n execution runs four CLI steps in sequence — intake, phase execution, one bounded ChatOps pass (a no-op unless `chatOps.enabled` is set for the session), and outbox dispatch. Main lanes:
 
 - `agent:claude` + `status:needs-implementation`: Implement with Claude Code and create a PR
 - `agent:claude` + `status:needs-fix`: Apply fixes to an existing PR

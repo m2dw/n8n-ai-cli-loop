@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import Database from 'better-sqlite3';
 import { SqliteTaskStore } from '../dist/index.js';
+import { runAdmin } from './helpers/admin-cli.js';
 
 // Issue #611 — retention/archival/pruning/SQLite-backup admin commands.
 
@@ -15,7 +16,19 @@ let dbPath;
 let sessionsPath;
 let backupDir;
 
-function run(...args) {
+// In-process (issue #1114, docs/metrics/test-maintenance-optimization.md): every
+// command these cases run closes its stores and releases its maintenance lock in
+// a `finally`, and dies only before acquiring either, so no case here depends on
+// process death for cleanup or exit semantics.
+async function run(...args) {
+  return runAdmin(args);
+}
+
+// A real `node dist/cli/admin.js` process. Kept for the one case whose assertion
+// is the real process exit status a shell/n8n caller observes, which runAdmin
+// only synthesizes (test/helpers/admin-cli.js, "What this deliberately does NOT
+// replace").
+function runSpawned(...args) {
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
     return { code: 0, stdout };
@@ -78,11 +91,11 @@ describe('admin backup', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 1, phase: 'implementation' });
     store.close();
 
-    const created = parse(run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
+    const created = parse(await run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
     expect(created.ok).toBe(true);
     expect(created.entry.taskCount).toBe(1);
 
-    const listed = parse(run('backup', 'list', '--db-path', dbPath, '--backup-dir', backupDir));
+    const listed = parse(await run('backup', 'list', '--db-path', dbPath, '--backup-dir', backupDir));
     expect(listed.ok).toBe(true);
     expect(listed.entries.length).toBe(1);
     expect(listed.entries[0].id).toBe(created.entry.id);
@@ -92,13 +105,13 @@ describe('admin backup', () => {
     const store = new SqliteTaskStore(dbPath);
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 1, phase: 'implementation' });
     store.close();
-    const created = parse(run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
+    const created = parse(await run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
 
-    const preview = parse(run('backup', 'restore', '--db-path', dbPath, '--backup-dir', backupDir, '--id', created.entry.id));
+    const preview = parse(await run('backup', 'restore', '--db-path', dbPath, '--backup-dir', backupDir, '--id', created.entry.id));
     expect(preview.wouldRestore).toBe(true);
 
     const restored = parse(
-      run('backup', 'restore', '--db-path', dbPath, '--backup-dir', backupDir, '--id', created.entry.id, '--yes'),
+      await run('backup', 'restore', '--db-path', dbPath, '--backup-dir', backupDir, '--id', created.entry.id, '--yes'),
     );
     expect(restored.ok).toBe(true);
     expect(restored.preRestorePath).toBeTruthy();
@@ -116,7 +129,7 @@ describe('admin backup', () => {
     const store = new SqliteTaskStore(dbPath);
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 1, phase: 'implementation' });
     store.close();
-    const created = parse(run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
+    const created = parse(await run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
 
     // Simulate a deleted/missing live database — restore must fail closed
     // (seed a protected stub + lock) rather than skip lock acquisition, or a
@@ -127,7 +140,7 @@ describe('admin backup', () => {
     rmSync(`${dbPath}-shm`, { force: true });
 
     const restored = parse(
-      run('backup', 'restore', '--db-path', dbPath, '--backup-dir', backupDir, '--id', created.entry.id, '--yes'),
+      await run('backup', 'restore', '--db-path', dbPath, '--backup-dir', backupDir, '--id', created.entry.id, '--yes'),
     );
     expect(restored.ok).toBe(true);
 
@@ -155,10 +168,10 @@ describe('admin backup', () => {
     );
     raw.close();
 
-    const created = parse(run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
+    const created = parse(runSpawned('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
     rmSync(runDir, { recursive: true, force: true });
 
-    const restored = run(
+    const restored = runSpawned(
       'backup',
       'restore',
       '--db-path',
@@ -191,7 +204,7 @@ describe('admin maintenance preview', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 2, phase: 'implementation' }); // active — stays queued
     store.close();
 
-    const preview = parse(run('maintenance', 'preview', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
+    const preview = parse(await run('maintenance', 'preview', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
     expect(preview.eligible.map((c) => c.issueNumber)).toEqual([1]);
     expect(preview.excluded.active).toBe(1);
 
@@ -205,7 +218,7 @@ describe('admin maintenance preview', () => {
   test('never creates retention_* tables on the database (read-only, issue #611 review)', async () => {
     await seedOldDoneTaskWithReviewEvent(1);
 
-    parse(run('maintenance', 'preview', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
+    parse(await run('maintenance', 'preview', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
 
     const raw = new Database(dbPath, { readonly: true });
     const tables = raw.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'retention_%'`).all();
@@ -218,11 +231,11 @@ describe('admin prune run gating', () => {
   test('refuses without --yes to mutate, and refuses --yes without a fresh backup', async () => {
     await seedOldDoneTaskWithReviewEvent(1);
 
-    const dryRun = parse(run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
+    const dryRun = parse(await run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
     expect(dryRun.wouldPrune).toBe(true);
 
     // No backup created yet — --yes must refuse (§8's hard precondition).
-    const noBackup = parse(run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json'));
+    const noBackup = parse(await run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json'));
     expect(noBackup.ok).toBe(false);
     expect(noBackup.reason).toBe('backup_precondition_failed');
   });
@@ -251,11 +264,11 @@ describe('admin prune run gating', () => {
     // Rollup coverage starts after issue #1's updatedAt but still covers
     // issue #2's — issue #1 (never a deletion candidate) is deliberately left
     // uncovered.
-    run('archive', 'rollup', '--session-id', 'addon-dev', '--db-path', dbPath, '--since', '2024-02-01T00:00:00.000Z', '--json');
-    run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir);
+    await run('archive', 'rollup', '--session-id', 'addon-dev', '--db-path', dbPath, '--since', '2024-02-01T00:00:00.000Z', '--json');
+    await run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir);
 
     const result = parse(
-      run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json'),
+      await run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json'),
     );
     expect(result.ok).toBe(true);
     expect(result.reason).not.toBe('rollup_coverage_missing');
@@ -271,9 +284,9 @@ describe('admin prune run gating', () => {
 
   test('refuses --yes without rollup coverage even when a fresh backup exists', async () => {
     await seedOldDoneTaskWithReviewEvent(1);
-    run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir);
+    await run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir);
 
-    const result = parse(run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json'));
+    const result = parse(await run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json'));
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('rollup_coverage_missing');
   });
@@ -283,17 +296,17 @@ describe('admin interventions reproducibility after prune (§6)', () => {
   test('a rollup generated before pruning keeps the intervention count intact after the raw event row is gone', async () => {
     await seedOldDoneTaskWithReviewEvent(42);
 
-    const before = parse(run('interventions', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
+    const before = parse(await run('interventions', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
     expect(before.bySignal.human_review_return).toBe(1);
 
-    const rollup = parse(run('archive', 'rollup', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
+    const rollup = parse(await run('archive', 'rollup', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
     expect(rollup.entriesWritten).toBeGreaterThanOrEqual(1);
 
-    const backup = parse(run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
+    const backup = parse(await run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir));
     expect(backup.ok).toBe(true);
 
     const pruneResult = parse(
-      run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json'),
+      await run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json'),
     );
     expect(pruneResult.ok).toBe(true);
     expect(pruneResult.tasksDeleted).toBe(1);
@@ -305,18 +318,18 @@ describe('admin interventions reproducibility after prune (§6)', () => {
     expect(task).toBeUndefined();
 
     // ...but `admin interventions` still reports the same count, from the rollup.
-    const after = parse(run('interventions', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
+    const after = parse(await run('interventions', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
     expect(after.bySignal.human_review_return).toBe(1);
     expect(after.total).toBe(before.total);
   });
 
   test('prune status reflects a completed watermark after a successful run', async () => {
     await seedOldDoneTaskWithReviewEvent(7);
-    run('archive', 'rollup', '--session-id', 'addon-dev', '--db-path', dbPath, '--json');
-    run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir);
-    run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json');
+    await run('archive', 'rollup', '--session-id', 'addon-dev', '--db-path', dbPath, '--json');
+    await run('backup', 'create', '--db-path', dbPath, '--backup-dir', backupDir);
+    await run('prune', 'run', '--session-id', 'addon-dev', '--db-path', dbPath, '--backup-dir', backupDir, '--yes', '--json');
 
-    const status = parse(run('prune', 'status', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
+    const status = parse(await run('prune', 'status', '--session-id', 'addon-dev', '--db-path', dbPath, '--json'));
     expect(status.watermark.status).toBe('complete');
   });
 });

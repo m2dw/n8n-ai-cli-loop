@@ -50,6 +50,7 @@ nodes to call the project's CLI entry points:
 |---|---|
 | GitHub Intake | `github-intake.js --context-id … --supported-phases …` |
 | Run One Phase | `run-one-phase.js --context-id … --run-id … --supported-phases …` |
+| ChatOps Scan | `chatops-scan.js --context-id …` |
 | Dispatch Outbox | `dispatch-outbox.js --context-id …` |
 
 This works when the n8n instance has Execute Command enabled. In newer or
@@ -149,6 +150,7 @@ consideration.
 | Acquire Repo Lock | Low — lock acquisition; failure is a clean skip, not a crash | parent |
 | Release Repo Lock | Low — lock release; idempotent; already has error-path duplicate | parent |
 | GitHub Intake | Medium — reads GitHub API and mutates task store | child |
+| ChatOps Scan | Low-medium — one bounded ChatOps pass; a no-op unless `chatOps.enabled` | child |
 | Dispatch Outbox | Low-medium — posts outbox messages; runs after phase completion | child |
 | Run One Phase | High — invokes the agent; longest-running; most failure modes | child |
 
@@ -276,8 +278,9 @@ and how to fall back to the Execute Command child if needed.
 ### What is the shadow workflow?
 
 `docs/n8n-thin-child-workflow-private-node.json` is a child workflow that
-replaces all three Execute Command operations (GitHub Intake, Run One Phase,
-and Dispatch Outbox) with private `CUSTOM.aiCliLoop` node operations.
+replaces all four Execute Command operations (GitHub Intake, Run One Phase,
+ChatOps Scan, and Dispatch Outbox) with private `CUSTOM.aiCliLoop` node
+operations.
 No Execute Command nodes remain in the child workflow.
 The workflow is named **"AI Dev Loop — Phase Runner (Private Node — SHADOW TEST)"**
 and uses a distinct workflow ID (`ai-dev-loop-private-node-phase-runner`) so it

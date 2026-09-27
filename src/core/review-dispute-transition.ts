@@ -229,9 +229,14 @@ export interface DisputeTaskRouting {
   outcome: DisputeTaskOutcome;
   turn: DisputeTaskTurn;
   /**
-   * The phase the task should run next, or null when no agent run is dispatched
-   * (the runner turn of rule 2, the evidence turn's two per-party runs, and the
-   * two rule-4 outcomes, which route through the ordinary review result).
+   * The phase the task should run next, or null when no phase run is dispatched
+   * (the evidence turn's two per-party runs, and the two rule-4 outcomes, which
+   * route through the ordinary review result).
+   *
+   * The runner turn of rule 2 names `review` even though it dispatches no run of
+   * the debate's own parties: the runner that "advances arbitration between runs"
+   * is a phase run, and issue #955 made it an internal sub-turn of the review
+   * phase.
    */
   nextPhase: TaskPhase | null;
   /** Rule 1: automation stops and a human decides (§9). */
@@ -592,10 +597,19 @@ export function aggregateDisputeRouting(
       outcome: "continue",
       turn,
       // The implementer turn is today's `needs_fix` routing; the reviewer turn is
-      // the §7.1 reconsideration run, itself a review-phase run. The evidence and
-      // runner turns dispatch either two per-party runs or no agent run at all,
-      // so neither names a single phase.
-      nextPhase: turn === "implementer" ? "implementation" : turn === "reviewer" ? "review" : null,
+      // the §7.1 reconsideration run, itself a review-phase run. The RUNNER turn
+      // dispatches no agent run of the debate's own parties — §7.1 is explicit
+      // that "the runner advances arbitration between runs" — but the runner that
+      // advances it is a phase run, and issue #955 made it an internal sub-turn of
+      // the review phase (handlers/review-arbitration-subturn.ts), taken before
+      // any ordinary review work exactly as the reconsideration is. So it names
+      // `review` too: the arbiter, not the review agent, is what runs there. The
+      // EVIDENCE turn joined them in issue #964: each of its two per-party
+      // collection runs is an internal sub-turn of the review phase
+      // (handlers/review-evidence-turn.ts), one party per phase run, so it names
+      // `review` as well — the party's no-tools collector, never the review
+      // agent, is what runs there.
+      nextPhase: turn === "implementer" ? "implementation" : "review",
       readyForHuman: false,
       ...base,
       actionableLineageIds: actionable,

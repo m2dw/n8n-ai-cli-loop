@@ -1,8 +1,26 @@
 name: Metrics
 
+# Runs on a predictable daily cadence and on explicit operator request rather
+# than on every push to main, since a single calculation takes ~10 minutes
+# and stacked-PR merges previously produced many redundant runs (issue #1015).
+# See docs/feature-status.md ("Metrics and intervention-rate reporting") for
+# the resulting freshness contract.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    # 03:17 UTC daily — a non-round minute to avoid contending with other
+    # scheduled jobs that fire on the hour.
+    - cron: '17 3 * * *'
+
+# A single, stable lane shared by both triggers (schedule and
+# workflow_dispatch land in the same group). When a newer run starts, any
+# older active run is cancelled outright rather than being left to race it
+# to the `git push` — cancellation surfaces as a cancelled run, not a false
+# success, and the survivor's own actions/checkout step already pins it to
+# its own triggering revision (issue #1016).
+concurrency:
+  group: metrics-writer
+  cancel-in-progress: true
 
 jobs:
   update-metrics:

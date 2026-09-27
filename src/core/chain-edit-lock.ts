@@ -31,6 +31,13 @@
  * write. What binds is that the name is registered by the same registry
  * transaction that allocates the chain's ID, so a lost race creates no chain.
  *
+ * Which edits "overlap" is decided over a repository, not over a session: an
+ * Issue number is unique only inside the repository that issued it, and two
+ * sessions bound to one repository name the same Issue with it (issue #1045).
+ * An Issue is therefore claimed under the repository AND under every session
+ * bound to it — see {@link chainEditRepositoryIssueLockScope} and
+ * {@link chainEditLockScopes}.
+ *
  * A scope is a plain string so one table can hold both kinds. Everything about
  * how a scope is spelled lives here; the SQLite half only stores and compares
  * them.
@@ -214,11 +221,45 @@ export interface ChainEditLockStore {
  * sessions tracking the same Issue number suspend different label sets on
  * different repositories.
  *
+ * NOT sufficient on its own once two sessions may be bound to the SAME
+ * repository — see {@link chainEditRepositoryIssueLockScope}, which
+ * {@link chainEditLockScopes} claims alongside this one. That is also why an
+ * edit takes this scope once per session in its repository's scope rather than
+ * once for its own: a build that predates the repository claim recognizes
+ * nothing else.
+ *
  * The session id is percent-encoded so an id containing `:` cannot be read as a
  * different issue scope.
  */
 export function chainEditIssueLockScope(sessionId: string, issueNumber: number): string {
   return `issue:${encodeURIComponent(sessionId)}:${issueNumber}`;
+}
+
+/**
+ * One Issue, in one repository: the fence between two SESSIONS that name the
+ * same Issue (issue #1045).
+ *
+ * Duplicate ownership is judged over every session bound to one repository
+ * (`chain-ownership-scope.ts`), so two sessions bound to the same repository can
+ * be asked to edit one GitHub Issue at the same time. The session-scoped claim
+ * cannot serialize them — their scopes differ by construction — and the registry
+ * would only separate them at the very end, inside the exclusive claim of the
+ * final acceptance: by then both runs have suspended execution labels and drawn
+ * relationships on the same Issue, which is precisely the interleaving this
+ * module exists to prevent, and the loser additionally leaves an unaccepted
+ * chain behind.
+ *
+ * So an edit claims this scope as well, and the repository is what makes it
+ * shared. `repositoryKey` is an opaque equality key (`chainRepositoryKey`),
+ * percent-encoded here for the same reason a session id is. An edit whose
+ * session declares no repository identity claims no scope of this kind at all —
+ * the same fallback its ownership check makes, and narrower rather than wider.
+ */
+export function chainEditRepositoryIssueLockScope(
+  repositoryKey: string,
+  issueNumber: number,
+): string {
+  return `repo-issue:${encodeURIComponent(repositoryKey)}:${issueNumber}`;
 }
 
 /**
@@ -230,30 +271,83 @@ export function chainEditAliasLockScope(alias: string): string {
   return `alias:${alias}`;
 }
 
-/** Every scope one linear edit needs, deduplicated and in a fixed order. */
+/**
+ * Every scope one linear edit needs, deduplicated and in a fixed order.
+ *
+ * An Issue contributes the repository-scoped claim when the caller can name a
+ * repository: that is what serializes two sessions sharing one (issue #1045).
+ * The session-scoped claims are kept alongside it, and there is one per session
+ * in the repository's scope rather than only the anchor's.
+ *
+ * That breadth is what makes the compatibility half work. A process running an
+ * older build knows nothing about `repo-issue:` and claims only
+ * `issue:<its-session>:<n>`, so the two runs collide only if this run claims
+ * that same spelling. Claiming the anchor session's alone leaves the two sets
+ * disjoint whenever the older run edits the Issue through a *different* session
+ * bound to the same repository — both would then suspend labels and draw
+ * relationships on it at once, which is exactly what the repository claim was
+ * added to stop. Claiming every session in the scope closes that during a
+ * rolling upgrade; once no older build is left, the repository claim alone
+ * carries it.
+ *
+ * Acquisition is all-or-nothing, so holding several scopes per Issue refuses in
+ * exactly the cases any one of them alone would.
+ */
 export function chainEditLockScopes(input: {
+  /** The session the edit runs as. Always claimed, whatever `sessionIds` says. */
   sessionId: string;
   issueNumbers: readonly number[];
   name?: string;
+  /**
+   * Every session sharing the repository's Issue-number space
+   * (`ChainOwnershipScope.sessionIds`), so an older build editing one of these
+   * Issues under any of them is still collided with. Absent claims the anchor
+   * session alone, as it was before issue #1045.
+   */
+  sessionIds?: readonly string[];
+  /**
+   * The repository the Issue numbers belong to (`chainRepositoryKey`), when the
+   * session declares an identity to derive one from. Absent leaves the claim
+   * session-scoped, as it was before issue #1045.
+   */
+  repositoryKey?: string;
 }): string[] {
-  const scopes = input.issueNumbers.map((n) => chainEditIssueLockScope(input.sessionId, n));
+  const sessionIds = [...new Set([input.sessionId, ...(input.sessionIds ?? [])])];
+  const scopes = input.issueNumbers.flatMap((n) => [
+    ...sessionIds.map((sessionId) => chainEditIssueLockScope(sessionId, n)),
+    ...(input.repositoryKey === undefined
+      ? []
+      : [chainEditRepositoryIssueLockScope(input.repositoryKey, n)]),
+  ]);
   if (input.name !== undefined) scopes.push(chainEditAliasLockScope(input.name));
   return [...new Set(scopes)].sort();
 }
 
 /** What a scope names. `unknown` for a shape written by a later build. */
 export function chainEditLockScopeKind(scope: string): "issue" | "alias" | "unknown" {
-  if (scope.startsWith("issue:")) return "issue";
+  if (scope.startsWith("issue:") || scope.startsWith("repo-issue:")) return "issue";
   if (scope.startsWith("alias:")) return "alias";
   return "unknown";
 }
 
 /** A scope as an operator reads it. Unrecognized shapes are shown verbatim. */
 export function describeChainEditLockScope(scope: string): string {
-  if (scope.startsWith("issue:")) {
+  // Both issue spellings end in the number, and the two kinds of contention read
+  // the same to an operator — the Issue is claimed either way, and which of the
+  // two claims collided is an implementation detail of the fence.
+  if (scope.startsWith("issue:") || scope.startsWith("repo-issue:")) {
     const issueNumber = scope.slice(scope.lastIndexOf(":") + 1);
     return `issue #${issueNumber}`;
   }
   if (scope.startsWith("alias:")) return `the chain name "${scope.slice("alias:".length)}"`;
   return scope;
+}
+
+/**
+ * A set of scopes as one phrase, deduplicated by what it says rather than by
+ * what it claims: one Issue is held under two scopes (issue #1045) and both
+ * render as `issue #11`, which an operator should be told once.
+ */
+export function describeChainEditLockScopes(scopes: readonly string[]): string {
+  return [...new Set(scopes.map(describeChainEditLockScope))].join(", ");
 }

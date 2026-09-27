@@ -31,6 +31,16 @@ import type { AiTask, TaskEvent } from "./task.js";
 import type { LineageState, LineageCounters, FindingSeverity } from "./review-dispute.js";
 import { isLineageState, isTerminalLineageState } from "./review-dispute.js";
 import { REVIEW_DISPUTE_CONTEXT_KEY, REVIEW_DISPUTE_TRANSITION_EVENT } from "./review-dispute-commit.js";
+import {
+  REVIEW_DISPUTE_RECONSIDERATION_CONTEXT_KEY,
+  REVIEW_DISPUTE_RECONSIDERATIONS_CONTEXT_FIELD,
+  parseReconsiderationLineageRecord,
+} from "./review-dispute-reconsiderations.js";
+import type { DisputeEvidenceRoundStatus } from "./review-dispute-evidence-state.js";
+import {
+  REVIEW_DISPUTE_EVIDENCE_ROUND_CONTEXT_KEY,
+  projectEvidenceRoundStatus,
+} from "./review-dispute-evidence-state.js";
 
 /** One lineage, exactly as §10.1 persists it. */
 export interface DisputeLineageStatus {
@@ -107,12 +117,101 @@ export type DisputeNextAction =
       description: string;
     };
 
+/**
+ * The LAST reviewer sub-turn this task took, as an operator surface may state it
+ * (issue #1085; contract §17.6 D2, §17.16).
+ *
+ * One field here is a protocol fact rather than provenance, and it is the reason
+ * this projection exists: `toolPolicy`. A lineage decided under `read-bounded`
+ * was decided by an agent that could read outside the runner-supplied bundle, and
+ * §17.6 requires that to stay visible — so it is surfaced beside the debate
+ * rather than only inside the §10.2 record artifact, which an operator reading
+ * `dispute status` does not have in front of them.
+ *
+ * Read tolerantly and never defaulted: an unreadable or absent value reports
+ * `null`, which says "this task has no reviewer run on record" — it never says
+ * `no-tools`. Inventing the stricter posture for a record that does not state it
+ * is exactly the misreading the separate literal exists to prevent.
+ *
+ * Single-valued, like the summary it projects: a task that disputed two findings
+ * takes two reviewer runs and this describes the later one. `lineageId` is what
+ * says which — and {@link DisputeTaskStatus.reconsiderationsByLineage} is what
+ * keeps the EARLIER one's posture readable, since D2's guarantee is about a
+ * lineage rather than about a task's most recent run.
+ */
+export interface DisputeReconsiderationStatus {
+  lineageId: string | null;
+  version: number;
+  /** The agent that actually ran, as its own run recorded it. */
+  agentId: string | null;
+  /** The posture that run ENFORCED, verbatim. `null` when the record omits it. */
+  toolPolicy: string | null;
+  timedOut: boolean;
+  /** The invocation failure kind, when the run did not produce a record. */
+  failure: string | null;
+}
+
+/**
+ * One lineage's OWN reviewer run, from the per-lineage record (issue #1085
+ * review, P2).
+ *
+ * {@link DisputeReconsiderationStatus} is single-valued and therefore describes
+ * the LAST reviewer run a task took. A task that disputed two findings takes two
+ * reviewer runs, and on the second one the first lineage's posture and agent
+ * disappear from that summary entirely — which is precisely the association
+ * §17.6's D2 row requires to survive: a lineage decided under `read-bounded` must
+ * stay identifiable as such after a later lineage was decided under something
+ * else.
+ *
+ * So the posture is projected here per lineage as well, out of
+ * `reviewDisputeReconsiderations` — the record each reviewer run merges its own
+ * entry into rather than overwriting. `toolPolicy` is reported exactly as that
+ * run recorded it, or `null` for a run that recorded none (a debate from before
+ * the field, or a run that resolved no profile). Never defaulted to `no-tools`.
+ */
+export interface DisputeLineageReconsiderationStatus {
+  lineageId: string;
+  /** The §2.1 version that run answered. */
+  version: number;
+  agentId: string | null;
+  /** The posture that run ENFORCED, verbatim. `null` when it recorded none. */
+  toolPolicy: string | null;
+}
+
 export interface DisputeTaskStatus {
   reviewStructure: string | null;
   pendingReReview: boolean;
   resolvedWithoutChanges: boolean;
   lineages: DisputeLineageStatus[];
   routing: DisputeRoutingStatus | null;
+  /**
+   * §7.1's bounded evidence round, per lineage that has one (issue #956).
+   *
+   * Empty for every task that has collected no evidence, which is most of them —
+   * the record exists only between the two evidence-collection runs and only
+   * while a lineage is in `evidence_requested`. It is the one part of the debate
+   * whose stall is invisible in the lineage record itself: a lineage waiting for
+   * its second party and a lineage nothing has dispatched for look identical
+   * from §10.1, and this is what tells them apart.
+   *
+   * Counts and literals only. The admitted references, their digests, and the
+   * §10.2 artifact names stay in the record and in the artifacts — an operator
+   * surface is one comment away from being a publication surface (§11).
+   */
+  evidenceCollection: DisputeEvidenceRoundStatus[];
+  /**
+   * The last §4.1 reviewer run, or `null` for a task that has taken none — which
+   * is most of them, and every task from before issue #1085.
+   */
+  lastReconsideration: DisputeReconsiderationStatus | null;
+  /**
+   * Every lineage that has taken a §4.1 reviewer run, with the posture that run
+   * enforced — ordered by lineage id, and empty for a task that has taken none.
+   *
+   * This is what keeps an EARLIER lineage's posture readable after a later
+   * reviewer run rewrote {@link lastReconsideration} (issue #1085 review, P2).
+   */
+  reconsiderationsByLineage: DisputeLineageReconsiderationStatus[];
   /**
    * Terminal lineages an operator may still flag under §6.4. The ONE
    * contract-defined operator-initiated transition, and deliberately narrow: it
@@ -178,6 +277,53 @@ function readLineage(lineageId: string, value: unknown): DisputeLineageStatus {
     reopenRequested: raw["reopenRequested"] === true,
     counters: readCounters(raw["counters"]),
   };
+}
+
+/**
+ * Project the reviewer sub-turn summary an operator surface may state.
+ *
+ * Tolerant on every field for the reason every reader of task context here is:
+ * the value is persisted JSON that a stale or hand-edited task may carry in any
+ * shape. What it must never do is SUPPLY a posture — `toolPolicy` is reported
+ * exactly as recorded or as `null`, because "this run enforced no-tools" is a
+ * claim only the run that made it can make (issue #1085).
+ */
+function readReconsideration(value: unknown): DisputeReconsiderationStatus | null {
+  const raw = asRecord(value);
+  if (raw === null) return null;
+  const profile = asRecord(raw["profile"]);
+  const failure = asRecord(raw["failure"]);
+  return {
+    lineageId: asStringOrNull(raw["lineageId"]),
+    version: asCount(raw["version"]),
+    agentId: profile === null ? null : asStringOrNull(profile["agentId"]),
+    toolPolicy: profile === null ? null : asStringOrNull(profile["toolPolicy"]),
+    timedOut: raw["timedOut"] === true,
+    failure: failure === null ? null : asStringOrNull(failure["kind"]),
+  };
+}
+
+/**
+ * Project the PER-LINEAGE reviewer runs, ordered by lineage id.
+ *
+ * Reads the same record every later sub-turn resolves against, through the same
+ * parser — so a malformed entry is dropped here exactly as it is there, and the
+ * operator surface cannot show a reviewer run a dispatch would refuse to use. No
+ * field is defaulted: an entry with no `toolPolicy` reports `null` (issue #1085).
+ */
+function readReconsiderationsByLineage(value: unknown): DisputeLineageReconsiderationStatus[] {
+  const record = parseReconsiderationLineageRecord(value);
+  return Object.keys(record.lineages)
+    .sort()
+    .map((lineageId) => {
+      const entry = record.lineages[lineageId];
+      return {
+        lineageId,
+        version: entry.version,
+        agentId: entry.agentId ?? null,
+        toolPolicy: entry.toolPolicy ?? null,
+      };
+    });
 }
 
 /**
@@ -322,11 +468,15 @@ export function disputeNextAction(input: {
       authorized: false,
       reason: "undispatched_turn",
       description:
-        `No automated action is authorized: §7.1 selected the \`${undispatched}\` turn, whose run this ` +
-        "runner does not dispatch yet, so the task parked for a human with the lineage left exactly " +
-        "where its last transition put it. No counter was spent. Do not requeue it into review — an " +
-        "ordinary review run cannot discharge the open lineage and would finish the task with the " +
-        "dispute unresolved. The debate resumes on its own once the dispatcher lands.",
+        `No automated action is authorized: §7.1 selected the \`${undispatched}\` turn and this run ` +
+        "could not answer it, so the task parked for a human with the lineage left exactly where its " +
+        "last transition put it. No counter was spent. Every §7.1 turn has a dispatcher, so this is a " +
+        "fail-closed stop and not a missing feature: the run could not read what the turn needs — a " +
+        "§10.2 record it cannot locate in this checkout, a persisted round record it cannot parse, or " +
+        "a party whose agent identity it cannot name. Read the sub-turn summary for the specific " +
+        "reason. Requeuing the task repeats the same stop until that input is available, and " +
+        "requeuing it into an ordinary review is worse — such a run cannot discharge the open lineage " +
+        "and would finish the task with the dispute unresolved.",
     };
   }
 
@@ -415,6 +565,19 @@ export function summarizeDisputeStatus(
     resolvedWithoutChanges: block["resolvedWithoutChanges"] === true,
     lineages,
     routing,
+    // Read from the raw context value, tolerantly, for the same reason the block
+    // is: the round an operator most needs to see is the one a dispatch refused.
+    evidenceCollection: projectEvidenceRoundStatus(task.context?.[REVIEW_DISPUTE_EVIDENCE_ROUND_CONTEXT_KEY]),
+    // The posture the last reviewer run enforced, beside the debate it decided
+    // (issue #1085). Read from the raw context value on the same terms.
+    lastReconsideration: readReconsideration(task.context?.[REVIEW_DISPUTE_RECONSIDERATION_CONTEXT_KEY]),
+    // And the same posture per lineage, which is what the single-valued summary
+    // above cannot express once a task has debated two findings: the second
+    // reviewer run rewrites it, and the first lineage's posture would otherwise
+    // be readable only from that run's artifact directory (issue #1085 review, P2).
+    reconsiderationsByLineage: readReconsiderationsByLineage(
+      task.context?.[REVIEW_DISPUTE_RECONSIDERATIONS_CONTEXT_FIELD],
+    ),
     // §6.4 applies to a terminal lineage that does not already carry the flag.
     // An `escalated_human` lineage is excluded: it is already with a human, and a
     // request to reopen it would re-escalate what is already escalated.

@@ -327,11 +327,28 @@ export interface ResolvedArbiterPolicy {
   minConfidence: number;
 }
 
+/**
+ * The §4.1 reviewer turn's execution policy, resolved (§17.6 D2, §17.16).
+ *
+ * Separate from `enabled` on purpose: the protocol's master switch must never
+ * imply the weaker posture, so this resolves to `false` for every session that
+ * has not written the opt-in down.
+ */
+export interface ResolvedReconsiderationPolicy {
+  /**
+   * The D2 opt-in. `false` means a reviewer whose CLI cannot empty its tool
+   * surface takes no reconsideration turn at all — the §17.12 refusal, unchanged.
+   */
+  readBounded: boolean;
+}
+
 export interface ResolvedReviewDisputeSettings {
   /** §0: the protocol is gated behind this flag, which defaults to false. */
   enabled: boolean;
   limits: ReviewDisputeLimits;
   arbiter: ResolvedArbiterPolicy;
+  /** §17.6 D2's opt-in, defaulting to the stricter posture. */
+  reconsideration: ResolvedReconsiderationPolicy;
 }
 
 export type ReviewDisputeConfigErrorCode =
@@ -501,6 +518,21 @@ export function resolveReviewDisputeSettings(
     }
   }
 
+  // §17.6 D2: the reviewer turn's execution posture. A separate opt-in from
+  // `enabled`, and read the same fail-closed way every other boolean here is —
+  // anything that is not literally `true` leaves the stricter posture in place,
+  // and a non-boolean is refused rather than coerced, because an operator who
+  // wrote `"true"` meant to record a decision and must be told it did not land.
+  const reconsiderationCfg = cfg?.reconsideration;
+  if (reconsiderationCfg?.readBounded !== undefined && typeof reconsiderationCfg.readBounded !== "boolean") {
+    errors.push({
+      path: `${basePath}.reconsideration.readBounded`,
+      constant: null,
+      code: "not-a-boolean",
+      message: `${basePath}.reconsideration.readBounded must be a boolean`,
+    });
+  }
+
   if (errors.length > 0) return { ok: false, errors };
   return {
     ok: true,
@@ -508,6 +540,7 @@ export function resolveReviewDisputeSettings(
       enabled,
       limits,
       arbiter: { providers, allowSameProvider: arbiterCfg?.allowSameProvider === true, minConfidence },
+      reconsideration: { readBounded: reconsiderationCfg?.readBounded === true },
     },
   };
 }
@@ -554,6 +587,22 @@ export const MAX_EVIDENCE_LINE = 1_000_000;
 export const MAX_AGENT_ID_CHARS = 80;
 export const MAX_RUN_ID_CHARS = 120;
 export const MAX_MODEL_CHARS = 120;
+
+/**
+ * The highest `attempt` a §7.1 sub-turn — a reconsideration, an
+ * evidence-collection run, an arbitration — may carry (issue #951).
+ *
+ * A bound rather than an open counter for two reasons: the derived run id has to
+ * stay inside {@link MAX_RUN_ID_CHARS}, and every §6.1 counter a retry could
+ * spend is capped in single digits, so an attempt number that ran away is a bug
+ * in the caller rather than a debate the protocol authorized.
+ *
+ * It lives here, with the other bounds, rather than with the adapter that mints
+ * the identity, because the persisted evidence-round record (issue #956) reads
+ * an attempt back WITHOUT the adapter — and a record bounded by a second copy of
+ * this number is a record that can disagree with the identities it describes.
+ */
+export const MAX_DISPUTE_SUB_TURN_ATTEMPT = 99;
 
 /** Upper bound on a single serialized record payload handed to a validator. */
 export const REVIEW_DISPUTE_RECORD_MAX_BYTES = 64 * 1024;
