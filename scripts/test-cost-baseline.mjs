@@ -481,9 +481,16 @@ export function mdCell(value) {
  * backtick run in the value (and padded when the value itself starts or ends
  * with one). Pipes still need `\|`, which GFM unescapes inside code spans;
  * backslashes are otherwise literal in a code span and are left alone.
+ *
+ * Doubling backslashes first, as `mdCell` does, would be wrong here. GFM splits
+ * the row on every `|` that has no backslash directly before it, however many
+ * backslashes come before that one, and then turns each `\|` into `|` before
+ * the code span is read. So a run of backslashes before a pipe is kept as it
+ * is and exactly one backslash is added in front of the pipe: the row sees an
+ * escaped pipe, and the code span shows the original run and the pipe.
  */
 export function mdCodeCell(value) {
-  const text = String(value).replace(/\|/g, '\\|');
+  const text = String(value).replace(/\\*\|/g, (run) => `${run.slice(0, -1)}\\|`);
   const runs = [...text.matchAll(/`+/g)].map((m) => m[0].length);
   const fence = '`'.repeat(Math.max(0, ...runs) + 1);
   const pad = text.startsWith('`') || text.endsWith('`') ? ' ' : '';

@@ -9,7 +9,8 @@ import { EventEmitter } from 'events';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, isAbsolute, join } from 'path';
-import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 import {
   BUILD_COMMAND,
@@ -147,6 +148,38 @@ import {
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+
+/**
+ * The command parser Stryker's sandbox actually hands `buildCommand` to: the
+ * `execa` that `@stryker-mutator/core` resolves (its `execaCommand` is
+ * `parseCommandString` followed by a shell-less spawn), not a reimplementation.
+ */
+async function strykerCommandParser() {
+  const require = createRequire(join(ROOT, 'node_modules', '@stryker-mutator', 'core', 'package.json'));
+  const { parseCommandString } = await import(pathToFileURL(require.resolve('execa')).href);
+  return parseCommandString;
+}
+
+/**
+ * One GFM table row as the table extension reads it: split on every `|` with no
+ * backslash directly before it, then turn each `\|` into `|` before inline
+ * parsing (cmark-gfm's `unescape_pipes`). A single-cell row is `| <cell> |`.
+ */
+function gfmRowCells(row) {
+  return row
+    .replace(/^\|/, '')
+    .replace(/(?<!\\)\|$/, '')
+    .split(/(?<!\\)\|/)
+    .map((cell) => cell.trim().replace(/\\\|/g, '|'));
+}
+
+/** The text of a cell holding one code span (CommonMark: strip one pad space each side). */
+function codeSpanText(cell) {
+  const fence = cell.match(/^`+/)[0];
+  expect(cell.endsWith(fence)).toBe(true);
+  const inner = cell.slice(fence.length, -fence.length);
+  return inner.startsWith(' ') && inner.endsWith(' ') && inner.trim() !== '' ? inner.slice(1, -1) : inner;
+}
 
 describe('pilot scope is exactly the one #1110 accepted', () => {
   test('the two mutated sources and four evidence test files are named, not globbed', () => {
@@ -480,18 +513,41 @@ describe('Stryker configuration', () => {
     expect(existsSync(resolveBuildEntry())).toBe(true);
   });
 
-  test('a checkout path containing a space survives execa’s shell-less command split', () => {
+  test('a checkout path containing spaces and backslashes survives execa’s shell-less command split', async () => {
     // execa splits the command string on runs of spaces and only rejoins a token
     // whose predecessor ends in a backslash, so an unescaped path would be torn
-    // into two arguments. Reproduce that merge rather than assert a literal.
-    const root = join('/checkouts', 'my projects', 'repo');
-    const tokens = [];
-    for (const token of buildCommandFor(root).split(/ +/)) {
-      const previous = tokens.at(-1);
-      if (previous?.endsWith('\\')) tokens[tokens.length - 1] = `${previous.slice(0, -1)} ${token}`;
-      else tokens.push(token);
+    // into two arguments. Parse with the real parser Stryker uses rather than
+    // assert a literal or a reimplementation of it.
+    const parse = await strykerCommandParser();
+    const roots = [
+      '/checkouts/my projects/repo',
+      '/checkouts/two  spaces/repo',
+      '/checkouts/ leading and trailing /repo',
+      // A backslash is an ordinary file-name character on POSIX, and the path
+      // separator on Windows: neither may be doubled or dropped.
+      '/checkouts/back\\slash/repo',
+      '/checkouts/back\\ before space/repo',
+      '/checkouts/back\\\\ run before space/repo',
+      'C:\\Users\\A User\\repo',
+      'C:\\Users\\trailing \\repo',
+    ];
+    for (const root of roots) {
+      const entry = `${root}/${MUTATION_BUILD_ENTRY}`;
+      expect(parse(`node ${escapeCommandToken(entry)}`)).toEqual(['node', entry]);
     }
-    expect(tokens).toEqual(['node', join(root, MUTATION_BUILD_ENTRY)]);
+    const root = join('/checkouts', 'my projects', 'repo');
+    expect(parse(buildCommandFor(root))).toEqual(['node', join(root, MUTATION_BUILD_ENTRY)]);
+    expect(parse(BUILD_COMMAND)).toEqual(['node', resolveBuildEntry()]);
+  });
+
+  test('a token the execa command parser cannot represent is refused, not mangled', async () => {
+    const parse = await strykerCommandParser();
+    // A trailing backslash swallows the delimiter after it: shown on the parser
+    // itself, so the refusal is pinned to real behaviour, not to a guess.
+    expect(parse('node C:\\repo\\ next')).toEqual(['node', 'C:\\repo next']);
+    for (const value of ['', 'C:\\repo\\', ' leading', 'trailing ', 'tab\t', '\nnewline']) {
+      expect(() => escapeCommandToken(value)).toThrow(/cannot represent/);
+    }
   });
 
   test('the sandbox receives no dist, so a stale build cannot answer for a mutated source', () => {
@@ -2774,6 +2830,29 @@ describe('rendered summary', () => {
     expect(markdownCodeCell('`padded`')).toBe('`` `padded` ``');
     expect(markdownCodeCell('')).toBe('');
     expect(markdownCodeCell(null)).toBe('');
+  });
+
+  test('backslash runs before pipes and embedded backticks stay in one cell and read back verbatim', () => {
+    const values = [
+      'a\\|b',
+      'a\\\\|b',
+      '\\\\\\|',
+      '||',
+      'a\\',
+      '\\',
+      '`\\|`',
+      'a ``\\|`` b',
+      '`',
+      'x\\`|',
+    ];
+    for (const value of values) {
+      const cells = gfmRowCells(`| ${markdownCodeCell(value)} |`);
+      expect(cells).toHaveLength(1);
+      expect(codeSpanText(cells[0])).toBe(value);
+      // The plain-cell form stays one cell too; its backslash escapes are
+      // inline syntax, so only the cell count is a parser-independent fact.
+      expect(gfmRowCells(`| ${markdownCell(value)} |`)).toHaveLength(1);
+    }
   });
 
   test('a mutant carrying table syntax is escaped rather than splitting its row', () => {

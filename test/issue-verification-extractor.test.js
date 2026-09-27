@@ -394,6 +394,81 @@ describe('extractIssueVerificationCommands', () => {
     });
   });
 
+  describe('heading and npm echo detection is linear-time (issue #1199)', () => {
+    // The former `/^(#{1,6})\s+(.+)$/` and `/^\S+@\S*\s/` backtracked
+    // quadratically on these inputs; at 100 000 characters that is billions of
+    // steps. The bound is generous so host load cannot flake it.
+    const MAX_MS = 2000;
+    const N = 100_000;
+
+    function timed(fn) {
+      const start = Date.now();
+      const result = fn();
+      return { result, elapsed: Date.now() - start };
+    }
+
+    test('long whitespace ending in a line separator is not a heading', () => {
+      const body = [
+        '## Verification',
+        '- `npm test`',
+        '#' + ' '.repeat(N) + ' ',
+        '##' + '\t'.repeat(N) + ' ',
+        '## ' + ' '.repeat(N) + 'x\r',
+        '- `npm run lint`',
+      ].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationCommands(body));
+      // None of the adversarial lines closes the section.
+      expect(result).toEqual(['npm test', 'npm run lint']);
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+
+    test('long whitespace before a title still opens a verification section', () => {
+      const body = ['## Background', '- `npm run e2e`', '##' + ' '.repeat(N) + 'Verification', '- `npm test`'].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationSections(body));
+      expect(result).toEqual({ commands: ['npm test'], sectionFound: true });
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+
+    test('heading edge cases keep their former recognition', () => {
+      const body = [
+        '## Verification',
+        '- `npm test`',
+        // A lone space after the hashes is not a heading, and neither is a
+        // seven-hash run: the section stays open.
+        '## ',
+        '####### Verify',
+        '- `npm run lint`',
+        // Two or more whitespace characters form an empty-titled heading,
+        // which closes a section at its level.
+        '##  ',
+        '- `npm run e2e`',
+      ].join('\n');
+      expect(extractIssueVerificationCommands(body)).toEqual(['npm test', 'npm run lint']);
+    });
+
+    test('long runs of @ in transcript > lines stay fast and keep npm echo filtering', () => {
+      const body = [
+        '## Verification',
+        '```console',
+        '> x' + '@'.repeat(N),
+        '> npm test',
+        '> pkg' + '@'.repeat(N) + ' test',
+        '> jest',
+        '> ' + '@'.repeat(N) + ' test',
+        '> npm run build',
+        '$ npm run lint',
+        '```',
+      ].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationCommands(body));
+      // `x@@…` has no whitespace, so it is not a package echo and `npm test`
+      // is kept; `pkg@@… test` and `@@… test` are echoes (an `@` after the
+      // token's first character), so the `jest` and `npm run build` they echo
+      // are dropped.
+      expect(result).toEqual(['npm test', 'npm run lint']);
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+  });
+
   test('cd line before real command is prepended to preserve execution context', () => {
     const body = [
       '## Verification',

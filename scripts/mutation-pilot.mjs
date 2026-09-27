@@ -1784,12 +1784,18 @@ export function markdownCell(value) {
  * inside a code span, so only the pipe is escaped — GFM honours `\|` there —
  * and a value containing backticks is fenced with one more backtick than its
  * longest run, which is how CommonMark says to put a backtick in a code span.
+ *
+ * Backslashes are deliberately not doubled. GFM splits the row on every `|`
+ * with no backslash directly before it, whatever precedes that backslash, and
+ * turns each `\|` into `|` before the code span is read. A run of backslashes
+ * before a pipe is therefore kept as it is, with exactly one backslash added in
+ * front of the pipe: the row sees an escaped pipe and the span shows the value.
  */
 export function markdownCodeCell(value) {
   const text = String(value ?? '')
     .replace(/\s+/g, ' ')
     .trim()
-    .replace(/\|/g, '\\|');
+    .replace(/\\*\|/g, (run) => `${run.slice(0, -1)}\\|`);
   if (text === '') return '';
   const fence = '`'.repeat(Math.max(0, ...[...text.matchAll(/`+/g)].map((run) => run[0].length)) + 1);
   // A code span whose content starts or ends with a backtick needs the padding

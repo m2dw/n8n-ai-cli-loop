@@ -548,6 +548,30 @@ describe('renderReport', () => {
     expect(mdCodeCell('`a`')).toBe('`` `a` ``');
   });
 
+  test('backslash runs before pipes and embedded backticks stay in one code cell and read back verbatim', () => {
+    // A GFM row splits on every `|` with no backslash directly before it, then
+    // each `\|` becomes `|` before the code span is read (cmark-gfm's
+    // `unescape_pipes`). A code span strips one pad space from each side.
+    const cells = (row) =>
+      row
+        .replace(/^\|/, '')
+        .replace(/(?<!\\)\|$/, '')
+        .split(/(?<!\\)\|/)
+        .map((cell) => cell.trim().replace(/\\\|/g, '|'));
+    const spanText = (cell) => {
+      const fence = cell.match(/^`+/)[0];
+      const inner = cell.slice(fence.length, -fence.length);
+      return inner.startsWith(' ') && inner.endsWith(' ') && inner.trim() !== '' ? inner.slice(1, -1) : inner;
+    };
+    expect(mdCodeCell('a\\|b')).toBe('`a\\\\|b`');
+    for (const value of ['a\\|b', 'a\\\\|b', '\\\\\\|', '||', 'C:\\out\\', '`\\|`', 'a ``\\|`` b', '`', 'x\\`|']) {
+      const row = cells(`| ${mdCodeCell(value)} |`);
+      expect(row).toHaveLength(1);
+      expect(spanText(row[0])).toBe(value);
+      expect(cells(`| ${mdCell(value)} |`)).toHaveLength(1);
+    }
+  });
+
   test('metacharacters in a path do not add or break table columns', () => {
     const report = renderReport({
       environment: { out: '/tmp/o|ut' },

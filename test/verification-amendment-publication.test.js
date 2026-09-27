@@ -484,9 +484,119 @@ describe('verification amendment comment — rendering', () => {
       }),
     );
     expect(body).toContain('| Reason | a \\| b |');
-    expect(body).toContain('sh -c "a \\| b"');
+    // The label is only ever published in prose, where a pipe is no boundary
+    // (issue #1201 review, P2): it appears exactly as recorded.
+    expect(body).toContain('`sh -c "a | b"`');
+    expect(body).not.toContain('a \\| b"');
+  });
+
+  // Issue #1201: a backslash run before a pipe must not decide whether that
+  // pipe is a cell boundary, whatever its parity.
+  test.each([
+    ['one backslash before a pipe', 'a\\|b'],
+    ['two backslashes before a pipe', 'a\\\\|b'],
+    ['three backslashes before a pipe', 'a\\\\\\|b | c'],
+    ['a trailing backslash', 'a\\'],
+    ['a backtick next to a backslash-pipe', 'a`\\|`b'],
+    ['a multiline value with a backslash-pipe', 'a\\\n|b\r\n\\| c\rd'],
+  ])('%s cannot add a cell or a row', (_name, value) => {
+    const body = renderVerificationAmendmentComment(
+      buildVerificationAmendmentComment({
+        revision: revision({
+          revisionId: value,
+          source: value,
+          reason: value,
+          continuation: value,
+          planDigest: value,
+        }),
+        slots: [slot({ label: value })],
+      }),
+    );
+    const rows = tableRows(body);
+    expect(rows.map((cells) => cells[0])).toEqual([
+      'Revision', 'Source', 'Reason', 'Continuation', 'Plan digest',
+    ]);
+    expect(rows.every((cells) => cells.length === 2)).toBe(true);
+    const flat = value.replace(/\r\n|[\r\n]/g, ' ').replace(/`/g, "'");
+    // Only escaping was added: the reader still gets the value itself.
+    expect(unescapeCell(rows[4][1])).toBe(`\`${flat}\``);
+    // The label keeps its own ⏎ folding and, published only in prose, gains no
+    // table escaping at all.
+    const folded = value.replace(/\s*\n+\s*/g, ' ⏎ ').trim().replace(/\r/g, ' ').replace(/`/g, "'");
+    expect(body).toContain(`\`${folded}\``);
+  });
+
+  // Issue #1201 review (P2): the operations list, the plan bullets, and the
+  // disclosure lines are prose, not table rows, so a label with a backslash
+  // before a pipe is published exactly as recorded in every one of them.
+  test('a backslash-pipe label is published as recorded outside the table', () => {
+    const label = 'a\\|b \\\\| c';
+    const body = renderVerificationAmendmentComment(
+      buildVerificationAmendmentComment({
+        revision: revision({
+          operations: [{ kind: 'retire', commandId: 'exec:lint', reason: 'noisy' }],
+        }),
+        slots: [
+          slot({ commandId: 'exec:lint', layer: 'execution', label, state: 'retired' }),
+        ],
+      }),
+    );
+    const lines = body.split('\n').filter((line) => line.includes(`\`${label}\``));
+    // Operations list, retired-plan bullet, and the disclosure line.
+    expect(lines).toHaveLength(3);
+    expect(lines.every((line) => !line.startsWith('|'))).toBe(true);
+    expect(body).toContain(`\`retire\` — execution \`${label}\``);
+    expect(body).not.toContain('a\\\\|b');
+  });
+
+  // Issue #1201 review (P2): a code span displays backslash escapes literally,
+  // so a backslash that does not precede a pipe is left as typed there, while
+  // plain cell text still escapes it for the inline parser to consume.
+  test('a backslash without a pipe is displayed as typed inside a code span', () => {
+    const body = renderVerificationAmendmentComment(
+      buildVerificationAmendmentComment({
+        revision: revision({ revisionId: 'rev\\1', reason: 'a\\b' }),
+        slots: [slot({ label: 'lint\\' })],
+      }),
+    );
+    expect(body).toContain('(`rev\\1`) |');
+    expect(body).toContain('`lint\\`');
+    expect(body).not.toContain('lint\\\\');
+    expect(body).toContain('| Reason | a\\\\b |');
   });
 });
+
+/**
+ * Split each markdown table row the way a parity-aware renderer does: a `\`
+ * escapes the next character, and only an unescaped `|` is a boundary. The
+ * header and delimiter rows are skipped.
+ */
+function tableRows(body) {
+  return body
+    .split('\n')
+    .filter((line) => line.startsWith('|') && !/^\|\s*-/.test(line) && !/^\|\s*Field\s*\|/.test(line))
+    .map((line) => {
+      const cells = [];
+      let current = '';
+      for (let i = 0; i < line.length; i += 1) {
+        if (line[i] === '\\' && i + 1 < line.length) {
+          current += line[i] + line[i + 1];
+          i += 1;
+        } else if (line[i] === '|') {
+          cells.push(current);
+          current = '';
+        } else {
+          current += line[i];
+        }
+      }
+      cells.push(current);
+      return cells.slice(1, -1).map((c) => c.trim());
+    });
+}
+
+function unescapeCell(value) {
+  return value.replace(/\\([\\|])/g, '$1');
+}
 
 describe('verification amendment — human gate / run metadata summary', () => {
   test('an unamended task produces no summary at all', () => {

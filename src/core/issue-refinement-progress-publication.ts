@@ -421,10 +421,54 @@ const DEFAULT_NEXT_ACTIONS: Record<RefinementProgressMilestoneKind, RefinementPr
  * identifier #975 already validated character-by-character. It only keeps a
  * newline or a pipe from breaking the table. Path and secret redaction is the
  * visibility layer's, applied to the whole body on the way into the outbox.
+ *
+ * A backslash run that ends at a pipe is doubled with it (issue #1201): escaping
+ * only the pipe lets an input `\` before it turn the emitted `\\|` into an
+ * escaped backslash followed by a live cell boundary. Every literal renders
+ * inside a code span, where backslash escapes are displayed as typed, so a
+ * backslash anywhere else is left alone (issue #1201 review, P2).
+ *
+ * The cap is measured on the escaped text but cuts at a SOURCE boundary (issue
+ * #1201 review, P2): a backslash-pipe unit that does not fit keeps only the
+ * input backslashes that do, undoubled, so the ellipsis follows a prefix of the
+ * literal and never an escape count the input did not contain.
  */
 function cell(value: string): string {
-  const flat = value.replace(/\r?\n/g, " ").replace(/\|/g, "\\|").replace(/`/g, "'");
-  return flat.length > MAX_LITERAL_CHARS ? `${flat.slice(0, MAX_LITERAL_CHARS - 1)}…` : flat;
+  const flat = value.replace(/\r\n|[\r\n]/g, " ").replace(/`/g, "'");
+  // Each unit pairs a source slice with its escaped form: a backslash run (with
+  // the pipe it ends at, if any) or one other character.
+  const units: Array<{ source: string; escaped: string }> = [];
+  let index = 0;
+  while (index < flat.length) {
+    let end = index;
+    while (flat[end] === "\\") end += 1;
+    const run = flat.slice(index, end);
+    if (flat[end] === "|") {
+      units.push({ source: run, escaped: `${run}${run}\\|` });
+      index = end + 1;
+    } else if (end > index) {
+      units.push({ source: run, escaped: run });
+      index = end;
+    } else {
+      units.push({ source: flat[index], escaped: flat[index] });
+      index += 1;
+    }
+  }
+  const escaped = units.map((unit) => unit.escaped).join("");
+  if (escaped.length <= MAX_LITERAL_CHARS) return escaped;
+  let cut = "";
+  for (const unit of units) {
+    const room = MAX_LITERAL_CHARS - 1 - cut.length;
+    if (unit.escaped.length <= room) {
+      cut += unit.escaped;
+      continue;
+    }
+    // Only backslash units can be split: their leading input backslashes, no
+    // longer before a pipe, are shown as typed.
+    cut += unit.source.slice(0, room);
+    break;
+  }
+  return `${cut}…`;
 }
 
 /** `1m 20s` / `4s`, or `null` when the milestone recorded no duration. */

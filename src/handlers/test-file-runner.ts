@@ -168,7 +168,15 @@ function shellQuote(arg: string): string {
   return /^[A-Za-z0-9_\-.,/:=@%+]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
-const COMMAND_STRING_OPTION = /^-[A-Za-z]*c[A-Za-z]*$/;
+/**
+ * A single-dash letter cluster that includes `c` (`-c`, `-lc`, `-euc`). Checked
+ * as "letters only" plus "contains c" rather than `/^-[A-Za-z]*c[A-Za-z]*$/`,
+ * whose two ambiguous letter runs make a long cluster without a `c` quadratic
+ * (issue #1200).
+ */
+function isCommandStringOption(token: string): boolean {
+  return /^-[A-Za-z]+$/.test(token) && token.includes("c");
+}
 
 function isWrapperShell(token: string | undefined): boolean {
   const shell = token?.split("/").pop();
@@ -185,7 +193,7 @@ function wrappedScriptIndex(tokens: readonly string[], start = 0): number | unde
   let i = start + 1;
   while (i < tokens.length && /^[-+]/.test(tokens[i] as string)) {
     const token = tokens[i] as string;
-    if (COMMAND_STRING_OPTION.test(token)) commandString = true;
+    if (isCommandStringOption(token)) commandString = true;
     // `-o <option>` and `-O <shopt>` (also clustered, as in `-euo pipefail`),
     // `--rcfile <file>` and `--init-file <file>` consume the next word.
     const consumesOperand = /^[-+][A-Za-z]*[oO]$/.test(token) || token === "--rcfile" || token === "--init-file";
@@ -203,7 +211,7 @@ function wrappedScriptIndex(tokens: readonly string[], start = 0): number | unde
  */
 function hasCommandStringShell(tokens: readonly string[], from: number): boolean {
   for (let i = from; i < tokens.length; i += 1) {
-    if (isWrapperShell(tokens[i]) && tokens.slice(i + 1).some((token) => COMMAND_STRING_OPTION.test(token))) {
+    if (isWrapperShell(tokens[i]) && tokens.slice(i + 1).some(isCommandStringOption)) {
       return true;
     }
   }

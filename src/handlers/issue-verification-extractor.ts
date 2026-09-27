@@ -49,7 +49,41 @@
  * info string, so it is literal content, not a close.
  */
 
-const VERIFICATION_SECTION_RE = /^(#{1,6})\s+(.+)$/;
+// Characters `.` does not match in a non-multiline JavaScript regex. Built
+// from char codes: raw U+2028/U+2029 are line terminators in source text too.
+const LINE_TERMINATOR_RE = new RegExp(
+  "[" + String.fromCharCode(0x0a, 0x0d, 0x2028, 0x2029) + "]",
+);
+
+/**
+ * Parses a Markdown ATX heading, with exactly the semantics of the former
+ * `/^(#{1,6})\s+(.+)$/` (level = the `#` run, title = group 2 trimmed).
+ *
+ * This is a linear scan rather than that regex: `\s` also matches the line
+ * separators `.` rejects, so a line of long whitespace ending in U+2028 made
+ * every split between `\s+` and `.+` fail in turn — quadratic backtracking
+ * (issue #1199). The split is decided directly instead: after the `#` run and
+ * a greedy whitespace run, the rest must be non-empty and free of line
+ * terminators. When the whole rest is whitespace, the regex could still match
+ * by handing its last character to `.+`, giving an empty title — so that case
+ * needs two characters and a last one that is not a line terminator.
+ */
+function parseHeading(line: string): { level: number; title: string } | null {
+  let level = 0;
+  while (level < line.length && line[level] === "#") level++;
+  if (level < 1 || level > 6) return null;
+  const rest = line.slice(level);
+  let ws = 0;
+  while (ws < rest.length && /\s/.test(rest[ws])) ws++;
+  if (ws === 0) return null;
+  if (ws === rest.length) {
+    if (rest.length < 2 || LINE_TERMINATOR_RE.test(rest[rest.length - 1])) return null;
+    return { level, title: "" };
+  }
+  const titleText = rest.slice(ws);
+  if (LINE_TERMINATOR_RE.test(titleText)) return null;
+  return { level, title: titleText.trim() };
+}
 
 const VERIFICATION_KEYWORDS: RegExp[] = [
   /\bverification\b/i,
@@ -76,6 +110,22 @@ const PROMPT_RE = /^[$%]\s*/;
 // '>' is also used by npm/yarn to echo script names (e.g. `> package@ test`);
 // treat it as a prompt only when the remainder looks like a real shell command.
 const GT_PROMPT_RE = /^>\s*/;
+
+/**
+ * Detects npm package-echo lines like `package@ scriptname` or
+ * `package@1.2.3 scriptname`, with exactly the semantics of the former
+ * `/^\S+@\S*\s/`: the first whitespace-free token has an `@` after its first
+ * character and is followed by whitespace.
+ *
+ * The regex retried every `@` of a whitespace-free run as the split point, so
+ * a long run of `@` with no whitespace backtracked quadratically (issue #1199);
+ * locating the token end once and searching it for `@` is linear.
+ */
+function isNpmPackageEchoLine(s: string): boolean {
+  const tokenEnd = s.search(/\s/);
+  if (tokenEnd <= 0) return false;
+  return s.lastIndexOf("@", tokenEnd - 1) >= 1;
+}
 
 function extractFromFencedBlocks(text: string): string[] {
   const commands: string[] = [];
@@ -118,7 +168,7 @@ function extractFromFencedBlocks(text: string): string[] {
           if (gtMatch) {
             const candidate = trimmed.slice(gtMatch[0].length).trim();
             // Detect npm package-echo lines like `> package@ scriptname` or `> package@1.2.3 scriptname`
-            const isNpmPackageLine = /^\S+@\S*\s/.test(candidate);
+            const isNpmPackageLine = isNpmPackageEchoLine(candidate);
             if (!prevGtWasNpmPackageLine && looksLikeShellCommand(candidate)) {
               cmd = candidate;
             }
@@ -415,10 +465,9 @@ export function extractIssueVerificationSections(body: string): IssueVerificatio
       continue;
     }
 
-    const headerMatch = VERIFICATION_SECTION_RE.exec(line);
-    if (headerMatch) {
-      const level = headerMatch[1].length;
-      const title = headerMatch[2].trim();
+    const heading = parseHeading(line);
+    if (heading) {
+      const { level, title } = heading;
 
       if (inVerification && level <= verificationLevel) {
         // Exiting verification section (same or higher-level header)

@@ -412,11 +412,11 @@ export function renderVerificationAmendmentComment(
     "",
     "| Field | Value |",
     "| --- | --- |",
-    `| Revision | ${comment.revisionOrdinal} (\`${cell(comment.revisionId)}\`) |`,
-    `| Source | ${SOURCE_PHRASES[comment.source] ?? cell(comment.source)} (\`${cell(comment.source)}\`) |`,
+    `| Revision | ${comment.revisionOrdinal} (\`${codeCell(comment.revisionId)}\`) |`,
+    `| Source | ${SOURCE_PHRASES[comment.source] ?? cell(comment.source)} (\`${codeCell(comment.source)}\`) |`,
     `| Reason | ${cell(comment.reason)} |`,
-    `| Continuation | ${CONTINUATION_PHRASES[comment.continuation] ?? cell(comment.continuation)} (\`${cell(comment.continuation)}\`) |`,
-    `| Plan digest | \`${cell(comment.planDigest)}\` |`,
+    `| Continuation | ${CONTINUATION_PHRASES[comment.continuation] ?? cell(comment.continuation)} (\`${codeCell(comment.continuation)}\`) |`,
+    `| Plan digest | \`${codeCell(comment.planDigest)}\` |`,
   ];
 
   // Every disclosure below is split by layer (issue #1044 review, P2). A retired
@@ -494,7 +494,7 @@ export function renderVerificationAmendmentComment(
   const activeRequirement = comment.active.filter((slot) => slot.layer === "requirement");
   const activeExecution = comment.active.filter((slot) => slot.layer === "execution");
   const slotBullet = (slot: VerificationAmendmentPublicSlot): string =>
-    `${slot.layer} \`${cell(slot.label)}\``;
+    `${slot.layer} \`${codeSpan(slot.label)}\``;
 
   // Emitted in reading order; ALLOCATED in `priority` order, so a plan too large
   // for one comment spends its bound on what is no longer checked first.
@@ -502,7 +502,7 @@ export function renderVerificationAmendmentComment(
     {
       header: `**Operations (${comment.operations.length})**`,
       items: comment.operations.map(
-        (operation) => `\`${cell(operation.kind)}\` — ${operation.layer} \`${cell(operation.label)}\``,
+        (operation) => `\`${codeSpan(operation.kind)}\` — ${operation.layer} \`${codeSpan(operation.label)}\``,
       ),
       empty: "- (none recorded)",
       priority: 1,
@@ -849,9 +849,39 @@ function reasonText(value: string): string {
  * A markdown-table-safe cell: a pipe would end the cell and a backtick would
  * close the code span the renderer opened around it. Neither is rewritten in
  * anything stored, digested, or executed — this is presentation only.
+ *
+ * Backslashes are escaped together with pipes (issue #1201): escaping only the
+ * pipe lets an input `\` before it turn the emitted `\\|` into an escaped
+ * backslash followed by a live cell boundary. A line break would end the row,
+ * so any the caller did not already fold is flattened here too.
+ *
+ * This form is for PLAIN cell text, where inline parsing consumes the escapes
+ * and the reader sees every input backslash once. Text inside a code span goes
+ * through {@link codeCell} instead, or {@link codeSpan} outside a table.
  */
 function cell(value: string): string {
-  return value.replace(/\|/g, "\\|").replace(/`/g, "'");
+  return value.replace(/\r\n|[\r\n]/g, " ").replace(/`/g, "'").replace(/[\\|]/g, "\\$&");
+}
+
+/**
+ * {@link cell} for a value rendered inside a code span, where backslash escapes
+ * are displayed literally (issue #1201 review, P2). A backslash is doubled only
+ * in a run that ends at a pipe, which is the one place its parity can decide
+ * whether that pipe is a boundary; everywhere else the reader sees it as typed.
+ */
+function codeCell(value: string): string {
+  return value.replace(/\r\n|[\r\n]/g, " ").replace(/`/g, "'").replace(/(\\*)\|/g, "$1$1\\|");
+}
+
+/**
+ * A code span in PROSE — the bullet lists and disclosure lines, never a table
+ * row (issue #1201 review, P2). No pipe is a boundary there and a code span
+ * displays every escape literally, so escaping either would publish a label
+ * that no longer matches the recorded one. Only what would close the span or
+ * end the line is rewritten.
+ */
+function codeSpan(value: string): string {
+  return value.replace(/\r\n|[\r\n]/g, " ").replace(/`/g, "'");
 }
 
 /** Does this revision, or the plan it produced, involve the execution layer? */
@@ -878,7 +908,7 @@ function inlineLabels(
   const parts: string[] = [];
   let used = 0;
   for (const [index, operation] of operations.entries()) {
-    const part = `\`${cell(operation.label)}\``;
+    const part = `\`${codeSpan(operation.label)}\``;
     const cost = parts.length > 0 ? part.length + 2 : part.length;
     // Room for the overflow marker is held back while names remain unnamed, so
     // the list can always say how many it withheld.

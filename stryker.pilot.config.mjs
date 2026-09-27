@@ -227,14 +227,28 @@ export function disableTypeChecksFor(root = PROJECT_ROOT) {
 }
 
 /**
- * Stryker runs `buildCommand` through execa's *command* form, which has no
- * shell: it splits the string on runs of spaces and merges a token back into
- * the previous one when that one ends in a backslash. A checkout path
- * containing a space would therefore be torn into two arguments unless each
- * space is escaped that way.
+ * Stryker runs `buildCommand` through execa's *command* form (`execaCommand`,
+ * i.e. execa's exported `parseCommandString`), which has no shell. That parser
+ * trims the string, splits it on runs of spaces and, when a token ends in a
+ * backslash, drops that ONE backslash and merges the next token back in with a
+ * single space. Nothing else is special: a backslash anywhere else — `\\`
+ * included — is passed through literally, and it never unescapes anything.
+ *
+ * So the complete escape for this parser is a backslash before each space, and
+ * nothing more. Doubling backslashes, as a shell escape would, is wrong here: it
+ * would turn `C:\Work\repo` into an argument with twice the separators. A
+ * backslash already in the value before a space still round-trips (`a\ b`
+ * becomes `a\\ b`, the parser drops only the last backslash). What the parser
+ * cannot represent is refused instead of mangled: a value ending in a backslash
+ * (it would swallow the delimiter after it) and one with whitespace at either
+ * edge (the trim and the space-run split would eat it).
  */
 export function escapeCommandToken(value) {
-  return String(value).replace(/ /g, '\\ ');
+  const text = String(value);
+  if (text === '' || /^\s|\s$/.test(text) || text.endsWith('\\')) {
+    throw new Error(`cannot represent ${JSON.stringify(text)} as one execa command token`);
+  }
+  return text.split(' ').join('\\ ');
 }
 
 /**

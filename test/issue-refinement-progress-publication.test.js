@@ -259,7 +259,86 @@ describe('refinement progress comments — visibility and bounding', () => {
     const body = render({ state: 'drafting\n| injected | row |' });
     expect(body).not.toContain('| injected | row |');
   });
+
+  // Issue #1201: a backslash run before a pipe must not decide whether that
+  // pipe is a cell boundary, whatever its parity.
+  test.each([
+    ['one backslash before a pipe', 'a\\|b'],
+    ['two backslashes before a pipe', 'a\\\\|b'],
+    ['three backslashes before a pipe', 'a\\\\\\|b | c'],
+    ['a trailing backslash', 'drafting\\'],
+    ['a backtick next to a backslash-pipe', 'a`\\|`b'],
+    ['a multiline value with a backslash-pipe', 'a\\\n|b\r\n\\| c\rd'],
+  ])('%s cannot add a cell or a row', (_name, value) => {
+    const body = render({ state: value, result: value, agent: { agentId: value, provider: value, model: value, effort: value } });
+    const rows = tableRows(body);
+    expect(rows.map((row) => row.cells.length).every((n) => n === 2)).toBe(true);
+    expect(rows.map((row) => row.cells[0])).toEqual([
+      'Milestone', 'Refinement state', 'Round', 'Role', 'Result', 'Agent', 'Duration', 'Next',
+    ]);
+    // The state cell still says what the input said: only the escaping was added.
+    const state = rows.find((row) => row.cells[0] === 'Refinement state').cells[1];
+    expect(unescapeCell(state)).toBe(`\`${value.replace(/\r\n|[\r\n]/g, ' ').replace(/`/g, "'")}\``);
+  });
+
+  test('a backslash that does not precede a pipe is displayed as typed', () => {
+    // Every literal renders inside a code span, where `\\` would read as two.
+    const body = render({ state: 'draft\\ing\\', agent: { agentId: 'a\\b', provider: 'claude', model: null, effort: null } });
+    expect(body).toContain('| Refinement state | `draft\\ing\\` |');
+    expect(body).toContain('`a\\b`');
+  });
+
+  // Issue #1201 review, P2: the cap cuts at a source boundary, so a capped
+  // literal is a prefix of the input and never shows more backslashes than it had.
+  test.each([
+    // 74 + 6 + 2 = 82 escaped chars; the cut at 79 lands inside the doubled run.
+    ['three backslashes before a pipe at the cut', 'x'.repeat(74) + '\\'.repeat(3) + '|', 'x'.repeat(74) + '\\'.repeat(3)],
+    // 40 + 78 + 2 = 120 escaped chars; only 39 of the run fit, undoubled.
+    ['a long run before a pipe at the cut', 'x'.repeat(40) + '\\'.repeat(39) + '|', 'x'.repeat(40) + '\\'.repeat(39)],
+    // 76 + 4 = 80 would fit alone; the trailing `y` forces a cut inside the pair.
+    ['a whole pair that no longer fits', 'x'.repeat(76) + '\\|y', 'x'.repeat(76) + '\\'],
+    // 80 source chars escape to 20 + 50 + 20 = 90; the earlier pipes push the
+    // plain run across the cut, and only 9 of it fit.
+    ['a plain run at the cut', '|'.repeat(10) + 'x'.repeat(50) + '\\'.repeat(20), '\\|'.repeat(10) + 'x'.repeat(50) + '\\'.repeat(9)],
+  ])('%s is cut to a prefix of the input', (_name, value, prefix) => {
+    const body = render({ state: value });
+    const rows = tableRows(body);
+    expect(rows.every((row) => row.cells.length === 2)).toBe(true);
+    expect(body).toContain(`| Refinement state | \`${prefix}…\` |`);
+  });
 });
+
+/**
+ * Split each markdown table row the way a parity-aware renderer does: a `\`
+ * escapes the next character, and only an unescaped `|` is a boundary. The
+ * header and delimiter rows are skipped.
+ */
+function tableRows(body) {
+  return body
+    .split('\n')
+    .filter((line) => line.startsWith('|') && !/^\|\s*-/.test(line) && !/^\|\s*Field\s*\|/.test(line))
+    .map((line) => {
+      const cells = [];
+      let current = '';
+      for (let i = 0; i < line.length; i += 1) {
+        if (line[i] === '\\' && i + 1 < line.length) {
+          current += line[i] + line[i + 1];
+          i += 1;
+        } else if (line[i] === '|') {
+          cells.push(current);
+          current = '';
+        } else {
+          current += line[i];
+        }
+      }
+      cells.push(current);
+      return { cells: cells.slice(1, -1).map((c) => c.trim()) };
+    });
+}
+
+function unescapeCell(value) {
+  return value.replace(/\\([\\|])/g, '$1');
+}
 
 // ---------------------------------------------------------------------------
 // Failing closed

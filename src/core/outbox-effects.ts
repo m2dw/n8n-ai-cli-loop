@@ -2351,6 +2351,17 @@ function repoHostCommentTarget(session: ResolvedSession): { owner: string; repo:
 }
 
 /**
+ * `url` without its trailing `/` characters. A backward scan rather than
+ * `/\/+$/`, which retries from every slash of a long run and is quadratic in
+ * its length (issue #1200).
+ */
+function stripTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === 0x2f) end -= 1;
+  return url.slice(0, end);
+}
+
+/**
  * Two Gitea base URLs addressing the same instance.
  *
  * Normalized only where normalization is certain: a trailing slash, surrounding
@@ -2359,11 +2370,9 @@ function repoHostCommentTarget(session: ResolvedSession): { owner: string; repo:
  * `/gitea` and `/Gitea` as different places — and treating two URLs as different
  * only costs the summary its names.
  */
-function sameGiteaInstance(a: string, b: string): boolean {
+export function sameGiteaInstance(a: string, b: string): boolean {
   const normalize = (url: string): string =>
-    url
-      .trim()
-      .replace(/\/+$/, "")
+    stripTrailingSlashes(url.trim())
       .replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]*)/, (origin) => origin.toLowerCase());
   return normalize(a) === normalize(b);
 }
