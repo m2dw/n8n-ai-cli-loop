@@ -27,6 +27,13 @@
  * (a run that cannot name two independent agents escalates without spending a
  * snapshot, a draft, or a round) at the cost of firing row 9 before rows 5–7
  * when both would match.
+ *
+ * One gate sits between the snapshot and the first refiner turn: §5.2's
+ * required-evidence preflight (issue #1003, §12 row 48). It is decided on the
+ * frozen §5.1 capture record by a pure core function, and an Issue whose
+ * declared predecessor contract evidence could not be captured takes the
+ * ordinary `evidence_required` handoff here — before either agent process
+ * exists, and without spending a round on a draft the critic could only reject.
  */
 
 import { randomBytes } from "crypto";
@@ -58,7 +65,9 @@ import {
   buildRefinementSnapshot,
   refinementPredecessorRecords,
 } from "../core/issue-refinement-snapshot.js";
+import { refinementEvidencePreflight } from "../core/issue-refinement-evidence-preflight.js";
 import type {
+  EffectiveTopologyDisposition,
   RefinedContract,
   RefinementCritique,
   RefinementLoopContextBlock,
@@ -74,8 +83,11 @@ import {
   parseCriticResponse,
   parseRefinerResponse,
   renderManagedRegion,
+  routeCriticVerdict,
 } from "../core/issue-refinement-loop.js";
+import { refinementRelationshipGraph } from "../core/issue-refinement-topology.js";
 import { ARBITER_CLAUDE_NO_TOOLS_ARGS } from "../core/review-arbiter-profile.js";
+import { CODEX_READ_BOUNDED_EXEC_ARGS } from "../core/codex-runtime-adapter.js";
 import type {
   RefinementApplyContextBlock,
   RefinementApplyPort,
@@ -206,11 +218,18 @@ export function resolveRefinementRoleProfile(
       // `--model` is a GLOBAL Codex option and must precede the subcommand.
       argv.push("--model", modelResolution.model);
     }
+    // The posture flags — `exec --sandbox read-only --skip-git-repo-check
+    // --ignore-user-config` — are owned by the Codex runtime adapter
+    // (src/core/codex-runtime-adapter.ts, issue #908), which declares them as
+    // this lane's shape; they are imported rather than restated so the two
+    // cannot drift while the cutover onto that adapter is pending.
+    // `--sandbox read-only` only constrains model-generated shell commands, not
+    // Codex's own startup: a `config.toml` under CODEX_HOME configuring MCP
+    // servers or hooks would still load and could reintroduce capabilities
+    // no-tools excludes. `--ignore-user-config` refuses that file while leaving
+    // CODEX_HOME's auth reachable.
     argv.push(
-      "exec",
-      "--sandbox",
-      "read-only",
-      "--skip-git-repo-check",
+      ...CODEX_READ_BOUNDED_EXEC_ARGS,
       "-c",
       `model_reasoning_effort=${codexEffortLevel}`,
     );
@@ -476,6 +495,49 @@ function writeArtifact(state: LoopState, name: string, content: string): void {
   state.artifacts.push(name);
 }
 
+/**
+ * The critic's own execution metadata for a verdict event. `refinement.draft
+ * .recorded` has carried the refiner's since #869; the critic's verdict events
+ * carried only the confidence, which left a critic-side progress milestone
+ * (issue #975) unable to say which agent produced it. Same §15 discipline:
+ * literals and counters, no prose.
+ */
+function criticTurnMetadata(
+  profile: ResolvedRefinementRoleProfile,
+  turn: RoleTurnContext,
+): Record<string, unknown> {
+  return {
+    role: "critic",
+    agentId: profile.agentId,
+    provider: profile.provider,
+    model: profile.model ?? null,
+    modelSource: profile.modelSource,
+    effort: profile.effort ?? null,
+    effortSource: profile.effortSource,
+    attempt: turn.lastAttempt,
+    durationMs: turn.lastDurationMs,
+  };
+}
+
+/**
+ * One topology proposal as §15 audit metadata: literals, Issue-number-free
+ * classification details, and no rationale — the rationale is agent prose, and
+ * §9.1's normalization result has to be diagnosable without it (issue #982).
+ */
+function topologyEventEntry(entry: EffectiveTopologyDisposition): Record<string, unknown> {
+  return {
+    index: entry.index,
+    kind: entry.kind,
+    refinerDisposition: entry.refinerDisposition,
+    criticDisposition: entry.criticDisposition,
+    effective: entry.effective,
+    normalization: entry.normalization,
+    normalizationDetail: entry.normalizationDetail,
+    duplicateOfIndex: entry.duplicateOfIndex,
+    escalates: entry.escalates,
+  };
+}
+
 function roleRunRecord(profile: ResolvedRefinementRoleProfile): RefinementRoleRunRecord {
   return {
     agentId: profile.agentId,
@@ -514,6 +576,15 @@ interface RoleTurnContext {
   record: RefinementRoleRunRecord;
   timeoutMs: number;
   classify: RefinementFailureClassifier;
+  /**
+   * The attempt number and wall-clock cost of the LAST invocation of this role
+   * — i.e. the one whose outcome the caller is about to record. The role run
+   * record accumulates totals across every attempt, which is the right number
+   * for the §16 run manifest and the wrong one for "how long did this turn
+   * take"; the progress milestones (issue #975) want the latter.
+   */
+  lastAttempt: number;
+  lastDurationMs: number;
 }
 
 /**
@@ -544,6 +615,8 @@ function invokeRole(
   const durationMs = state.nowMs() - started;
   turn.record.invocations += 1;
   turn.record.totalDurationMs += durationMs;
+  turn.lastAttempt = attempt;
+  turn.lastDurationMs = durationMs;
   const prefix = `${turn.role}-round${round}-attempt${attempt}`;
   writeArtifact(state, `${prefix}-stdout.txt`, boundRawOutput(result.stdout));
   writeArtifact(state, `${prefix}-stderr.txt`, boundRawOutput(result.stderr));
@@ -579,11 +652,14 @@ function runRoleTurn<T>(
           agentId: turn.record.agentId,
           provider: turn.record.provider,
           model: turn.record.model,
+          modelSource: turn.record.modelSource,
           effort: turn.record.effort,
+          effortSource: turn.record.effortSource,
           failureKind: failure.kind,
           retryable: true,
           round,
           attempt,
+          durationMs: turn.lastDurationMs,
         });
         // §17: the re-run happens on a LATER phase run, after the phase-level
         // delay the existing classification prescribes — a quota or timeout
@@ -833,6 +909,62 @@ export async function executeRefinementLoop(
     touch(state);
   }
   writeArtifact(state, "snapshot.json", JSON.stringify(snapshot, null, 2));
+
+  // -------------------------------------------------------------------------
+  // Row 48 — §5.2 required-evidence preflight (#1003). Decided on the frozen
+  // §5.1 capture record alone, BEFORE either agent exists as a subprocess: an
+  // Issue whose contract rests on evidence the snapshot could not carry cannot
+  // be refined by inference, and letting the round-set run would spend the
+  // round cap reproducing the #951/#950 rejection loop and still need a human.
+  // The state has not moved to `drafting` yet, so this is a transition out of
+  // `eligible` rather than an abandoned round.
+  // -------------------------------------------------------------------------
+  const preflight = refinementEvidencePreflight(snapshot);
+  if (preflight.kind === "evidence_required") {
+    // Literals, counters, and Issue numbers — the same §15 discipline the
+    // block itself keeps. The declared PATHS stay in `snapshot.json`, which is
+    // local-only; publishing them would put repository content on a public
+    // Issue, which is exactly what §5 excludes diffs for.
+    const artifact = "evidence-preflight.json";
+    writeArtifact(
+      state,
+      artifact,
+      JSON.stringify(
+        {
+          runId: state.runId,
+          issueNumber: state.issueNumber,
+          predecessorFingerprint: snapshot.predecessorFingerprint,
+          declared: preflight.declared,
+          captured: preflight.captured,
+          optionalGaps: preflight.optionalGaps,
+          gaps: preflight.gaps,
+          // The selections themselves, paths included, so the operator has the
+          // full account locally. Never persisted to the block, never published.
+          evidence: snapshot.evidence,
+        },
+        null,
+        2,
+      ),
+    );
+    block.evidenceGate = {
+      declared: preflight.declared,
+      captured: preflight.captured,
+      optionalGaps: preflight.optionalGaps,
+      gaps: preflight.gaps,
+      artifact,
+      recordedAt: iso(state),
+    };
+    escalate(state, "evidence_required", {
+      evidence: {
+        declared: preflight.declared,
+        captured: preflight.captured,
+        optionalGaps: preflight.optionalGaps,
+        gaps: preflight.gaps,
+      },
+    });
+    return finish();
+  }
+
   if (!resuming) {
     // Rows 38/40: a resumed run re-enters with the state already at the
     // deferred role's literal — `drafting` or `critiquing` — and must not
@@ -842,6 +974,7 @@ export async function executeRefinementLoop(
   touch(state);
   emitEvent(state, "refinement.snapshot.captured", {
     predecessorCount: snapshot.manifest.predecessorCount,
+    evidenceCount: snapshot.manifest.evidenceCount,
     totalTextBytes: snapshot.manifest.totalTextBytes,
     truncatedFields: snapshot.manifest.truncatedFields.length,
   });
@@ -858,6 +991,8 @@ export async function executeRefinementLoop(
     record: refinerRecord,
     timeoutMs,
     classify,
+    lastAttempt: 0,
+    lastDurationMs: 0,
   };
   const criticTurn: RoleTurnContext = {
     role: "critic",
@@ -867,6 +1002,8 @@ export async function executeRefinementLoop(
     record: criticRecord,
     timeoutMs,
     classify,
+    lastAttempt: 0,
+    lastDurationMs: 0,
   };
 
   let objections: RefinementObjection[] | null = null;
@@ -957,10 +1094,16 @@ export async function executeRefinementLoop(
         agentId: refinerProfile.agentId,
         provider: refinerProfile.provider,
         model: refinerProfile.model ?? null,
+        modelSource: refinerProfile.modelSource,
         effort: refinerProfile.effort ?? null,
+        effortSource: refinerProfile.effortSource,
         confidence: draft.confidence,
         topologyProposals: draft.topologyProposals.length,
         regionBytes,
+        // The turn that produced this draft, not the role's running totals —
+        // the progress projection (issue #975) reports per-turn cost.
+        attempt: refinerTurn.lastAttempt,
+        durationMs: refinerTurn.lastDurationMs,
       });
     }
 
@@ -996,22 +1139,39 @@ export async function executeRefinementLoop(
     block.counters.rounds = round;
     touch(state);
 
-    if (verdictRecord.verdict === "block") {
-      // Row 19.
+    // §7.2 (issue #1176): a `block` that is only a repairable omission of an
+    // already-stated requirement takes the bounded revise path, not a handoff.
+    const route = routeCriticVerdict(verdictRecord, snapshot.evidence);
+    const objectionLiterals = verdictRecord.objections.map((o) => ({ field: o.field, kind: o.kind }));
+
+    if (route.route === "block") {
+      // Row 19. The block record is what `admin task-status` projects, so the
+      // operator can see which human blocker the handoff names (§15).
+      block.criticBlock = {
+        round,
+        blockReason: route.blockReason,
+        objections: objectionLiterals,
+        recordedAt: iso(state),
+      };
       escalate(state, "critique_blocked", {
         round,
+        blockReason: route.blockReason,
+        objections: objectionLiterals,
         criticConfidence: verdictRecord.confidence,
       });
       return finish();
     }
 
-    if (verdictRecord.verdict === "revise") {
+    if (route.route === "revise") {
+      const repairable = route.repairableBlock ? { criticVerdict: "block" } : {};
       if (round < block.limits.maxRefinementRoundsPerIssue) {
         // Row 17: the objections are the only critic output handed back.
         emitEvent(state, "refinement.critique.revise", {
           round,
-          objections: verdictRecord.objections.map((o) => ({ field: o.field, kind: o.kind })),
+          objections: objectionLiterals,
+          ...repairable,
           criticConfidence: verdictRecord.confidence,
+          ...criticTurnMetadata(criticProfile, criticTurn),
         });
         objections = verdictRecord.objections;
         previousContract = draft;
@@ -1020,27 +1180,27 @@ export async function executeRefinementLoop(
       // Row 18.
       escalate(state, "no_convergence", {
         round,
-        objections: verdictRecord.objections.map((o) => ({ field: o.field, kind: o.kind })),
+        objections: objectionLiterals,
+        ...repairable,
       });
       return finish();
     }
 
-    // `pass` — rows 14/15/16, decided by the §9 combination.
+    // `pass` — rows 14/15/16, decided by the §9 combination, over proposals
+    // §9.1 has measured against the relationships captured for this very
+    // snapshot (#982): a proposal the graph already satisfies is a no-op and
+    // never spends a handoff.
     const combined = combineTopologyDispositions(
       draft.topologyProposals,
       verdictRecord.topologyDispositions,
+      refinementRelationshipGraph(snapshot),
     );
     if (combined.anyBlocking) {
       // Row 16: nothing applied.
       escalate(state, "topology_change_required", {
         round,
-        topology: combined.effective.map((e) => ({
-          index: e.index,
-          kind: e.kind,
-          refinerDisposition: e.refinerDisposition,
-          criticDisposition: e.criticDisposition,
-          effective: e.effective,
-        })),
+        topology: combined.effective.map(topologyEventEntry),
+        normalization: combined.normalization.counts,
       });
       return finish();
     }
@@ -1061,16 +1221,12 @@ export async function executeRefinementLoop(
       round,
       refinerConfidence: draft.confidence,
       criticConfidence: verdictRecord.confidence,
+      ...criticTurnMetadata(criticProfile, criticTurn),
     });
     if (combined.effective.length > 0) {
       emitEvent(state, "refinement.topology.recorded", {
-        topology: combined.effective.map((e) => ({
-          index: e.index,
-          kind: e.kind,
-          refinerDisposition: e.refinerDisposition,
-          criticDisposition: e.criticDisposition,
-          effective: e.effective,
-        })),
+        topology: combined.effective.map(topologyEventEntry),
+        normalization: combined.normalization.counts,
       });
     }
     // The #869 acceptance artifact — persisted locally, never published (§15).

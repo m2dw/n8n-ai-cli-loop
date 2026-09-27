@@ -68,10 +68,24 @@ async function enqueue(overrides = {}) {
   }
 }
 
+/**
+ * A row whose retry is scheduled but not yet due.
+ *
+ * `markFailed` schedules `next_attempt_at` at `now + computeOutboxBackoffMs(1)`,
+ * i.e. only 60s ahead of whatever timestamp it is given. Letting it default to
+ * the real clock makes "delayed" a 60-second race against the rest of the case:
+ * on a loaded machine the CLI invocation below can land after the backoff has
+ * elapsed, at which point the row is legitimately `pending` again and the count
+ * assertion fails. Pinning `now` far ahead — the same trick `makeDead` uses to
+ * pin its dead-letter timestamp — states the intended condition ("not due")
+ * instead of approximating it with wall-clock timing.
+ */
+const NOT_DUE_AS_OF = '2126-01-01T00:00:00.000Z';
+
 async function makeDelayed(id) {
   const store = new SqliteOutboxStore(dbPath);
   try {
-    await store.markFailed(id, 'transient error');
+    await store.markFailed(id, 'transient error', NOT_DUE_AS_OF);
   } finally {
     store.close();
   }

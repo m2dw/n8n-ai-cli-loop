@@ -920,3 +920,54 @@ describe('enqueuePrSummaryEffect — verification failure with multiple commands
     expect(body).not.toContain('npm run package');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #1154 — a Stage 1 pass never reads as a full-suite pass
+// ---------------------------------------------------------------------------
+
+describe('enqueuePrSummaryEffect — changed-file test stages (issue #1154)', () => {
+  const stagedSession = () => makeSession({
+    verification: { test: 'npm test', typecheck: 'npm run typecheck' },
+    stagedVerification: { enabled: true, testSuite: { test: { adapter: 'jest' } } },
+  });
+
+  test('implementation success reports the suite pending Stage 2, not passed', async () => {
+    const s = makeStore();
+    await enqueuePrSummaryEffect(
+      s, stagedSession(), makeTask({ phase: 'implementation' }),
+      'implementation',
+      { result: 'success', context: { prUrl: 'https://github.com/org/repo/pull/42' } },
+      'run-s1', new Date().toISOString(),
+    );
+    const body = s.enqueued[0].payload.body;
+    expect(body).toContain('typecheck: ✅ passed');
+    expect(body).not.toContain('test, typecheck: ✅ passed');
+    expect(body).toContain('test: only the changed and retained test files ran (Stage 1)');
+  });
+
+  test('review needs_fix without a Stage 2 grant keeps the suite pending', async () => {
+    const s = makeStore();
+    await enqueuePrSummaryEffect(
+      s, stagedSession(), makeTask(),
+      'review',
+      { result: 'needs_fix', context: { prUrl: 'https://github.com/org/repo/pull/42' } },
+      'run-s1-review', new Date().toISOString(),
+    );
+    const body = s.enqueued[0].payload.body;
+    expect(body).toContain('typecheck: ✅ passed');
+    expect(body).toContain('pending the full-suite run after review approval');
+  });
+
+  test('a session without a suite binding keeps the shipped summary', async () => {
+    const s = makeStore();
+    await enqueuePrSummaryEffect(
+      s, makeSession({ verification: { test: 'npm test' } }), makeTask({ phase: 'implementation' }),
+      'implementation',
+      { result: 'success', context: { prUrl: 'https://github.com/org/repo/pull/42' } },
+      'run-legacy', new Date().toISOString(),
+    );
+    const body = s.enqueued[0].payload.body;
+    expect(body).toContain('test: ✅ passed');
+    expect(body).not.toContain('Stage 1');
+  });
+});

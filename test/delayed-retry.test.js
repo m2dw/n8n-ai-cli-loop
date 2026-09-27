@@ -24,6 +24,12 @@ const FUTURE = '2026-06-07T12:00:00.000Z'; // 2h after NOW
 const PAST = '2026-06-07T09:00:00.000Z'; // 1h before NOW
 const NOW_PLUS_2H = '2026-06-07T12:00:00.000Z';
 
+// A deterministic `clockMs` reporting zero elapsed handler time, so the
+// existing exact-timestamp assertions below stay pinned to `now + delay`
+// regardless of real wall-clock jitter around the (synchronous) mock
+// handlers. Duration-anchoring itself is covered separately (issue #1065).
+const INSTANT_CLOCK = () => 0;
+
 // ---------------------------------------------------------------------------
 // Store-level claim gating — runs against both store implementations.
 // ---------------------------------------------------------------------------
@@ -110,7 +116,7 @@ describe('runNextPhase — delayed (quota/rate-limit) handling', () => {
     await enqueue();
     const handler = async () => ({ result: 'delayed', message: 'quota', context: { artifactDir: '/a' } });
 
-    const outcome = await runNextPhase({ store, request, handlers: { research: handler } });
+    const outcome = await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { research: handler } });
 
     expect(outcome.status).toBe('delayed');
     expect(outcome.notBefore).toBe(NOW_PLUS_2H);
@@ -130,7 +136,7 @@ describe('runNextPhase — delayed (quota/rate-limit) handling', () => {
   test('appends a phase.delayed event (and no phase.completed)', async () => {
     await enqueue();
     const handler = async () => ({ result: 'delayed', message: 'rate limit', context: {} });
-    await runNextPhase({ store, request, handlers: { research: handler } });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { research: handler } });
 
     const events = await store.listEvents({ sessionId: 's', issueNumber: 7 });
     const types = events.map((e) => e.type);
@@ -144,6 +150,7 @@ describe('runNextPhase — delayed (quota/rate-limit) handling', () => {
     await enqueue();
     const handler = async () => ({ result: 'delayed', context: {} });
     const outcome = await runNextPhase({
+      clockMs: INSTANT_CLOCK,
       store,
       request,
       handlers: { research: handler },
@@ -156,6 +163,7 @@ describe('runNextPhase — delayed (quota/rate-limit) handling', () => {
     await enqueue();
     const handler = async () => ({ result: 'delayed', retryAfterMs: 30 * 60 * 1000, context: {} }); // 30m
     const outcome = await runNextPhase({
+      clockMs: INSTANT_CLOCK,
       store,
       request,
       handlers: { research: handler },
@@ -176,7 +184,7 @@ describe('runNextPhase — delayed (quota/rate-limit) handling', () => {
       labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:rfh' },
     };
     const handler = async () => ({ result: 'delayed', context: {} });
-    await runNextPhase({ store, request, handlers: { research: handler }, outboxStore, session });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { research: handler }, outboxStore, session });
     // A quota/rate-limit delay publishes a single status comment (issue #352) and
     // NO label side effects (the delayed-retry timing is owned by SQLite alone).
     const labelEffects = enqueued.filter((e) => e.topic === 'gh:label:add' || e.topic === 'gh:label:remove');
@@ -185,6 +193,137 @@ describe('runNextPhase — delayed (quota/rate-limit) handling', () => {
     expect(comments).toHaveLength(1);
     expect(comments[0].payload.body).toContain('quota/rate-limit delay');
   });
+});
+
+// ---------------------------------------------------------------------------
+// runNextPhase — relative delay anchored on result-observation time (issue #1065)
+//
+// A relative delayed-result retry (`retryAfterMs` / `quotaRetryDelayMs`) must
+// be measured from when the handler actually returned, not from the
+// pre-handler claim timestamp — otherwise a handler that runs longer than its
+// own intended backoff has that backoff already exhausted (or even already in
+// the past) by the time the retry is scheduled. `clockMs` is a deterministic
+// step function here, so "long handler" coverage needs no real sleep.
+// ---------------------------------------------------------------------------
+
+describe('runNextPhase — relative delay anchored on result-observation time (issue #1065)', () => {
+  let store;
+  let cleanup;
+
+  beforeEach(() => {
+    ({ store, cleanup } = makeSqlite());
+  });
+  afterEach(() => cleanup());
+
+  async function enqueue() {
+    await store.enqueueTask({ sessionId: 's', issueNumber: 7, phase: 'research', now: NOW });
+  }
+
+  const request = { sessionId: 's', workerId: 'w', runId: 'run-1', now: NOW };
+
+  // Returns `phaseStartMs` on the first call and `phaseStartMs + elapsedMs` on
+  // the second — exactly the two `clockMs()` reads `runNextPhase` makes around
+  // the handler invocation.
+  function stepClock(elapsedMs) {
+    let calls = 0;
+    return () => (calls++ === 0 ? 0 : elapsedMs);
+  }
+
+  test('a handler lasting longer than its relative delay is still ineligible until the delay elapses after the result', async () => {
+    // Mirrors the issue's repro: a 100ms retryAfterMs with a handler that took
+    // 200ms to return. Anchoring on the pre-handler `now` would already place
+    // notBefore in the past; anchoring on the observed result must not.
+    await enqueue();
+    const handler = async () => ({ result: 'delayed', retryAfterMs: 100, category: 'provider_capacity', context: {} });
+
+    const outcome = await runNextPhase({
+      clockMs: stepClock(200), store, request, handlers: { research: handler },
+    });
+
+    expect(outcome.status).toBe('delayed');
+    // now (10:00:00.000) + 200ms observed duration + 100ms relative delay.
+    expect(outcome.notBefore).toBe('2026-06-07T10:00:00.300Z');
+
+    // Still ineligible 150ms after the claim timestamp — the old anchor would
+    // already have made this claimable (now + 100ms had already elapsed).
+    expect(
+      await store.claimNextTask({ ...request, runId: 'run-2', now: '2026-06-07T10:00:00.150Z' }),
+    ).toBeUndefined();
+    // Eligible once the observed-result-anchored window actually elapses.
+    const reclaimed = await store.claimNextTask({ ...request, runId: 'run-3', now: '2026-06-07T10:00:00.301Z' });
+    expect(reclaimed?.issueNumber).toBe(7);
+  });
+
+  test('a short handler duration still shifts notBefore forward by the observed elapsed time', async () => {
+    await enqueue();
+    const handler = async () => ({ result: 'delayed', retryAfterMs: 5000, context: {} });
+
+    const outcome = await runNextPhase({
+      clockMs: stepClock(10), store, request, handlers: { research: handler },
+    });
+
+    expect(outcome.notBefore).toBe('2026-06-07T10:00:05.010Z');
+  });
+
+  test('the default relative delay (no retryAfterMs/quotaRetryDelayMs) is anchored the same way', async () => {
+    await enqueue();
+    const handler = async () => ({ result: 'delayed', context: {} });
+
+    const outcome = await runNextPhase({
+      clockMs: stepClock(500), store, request, handlers: { research: handler },
+    });
+
+    expect(outcome.notBefore).toBe(leaseAfter(DEFAULT_QUOTA_RETRY_DELAY_MS + 500));
+  });
+
+  test('the configured quotaRetryDelayMs option is anchored the same way', async () => {
+    await enqueue();
+    const handler = async () => ({ result: 'delayed', context: {} });
+
+    const outcome = await runNextPhase({
+      clockMs: stepClock(500),
+      store,
+      request,
+      handlers: { research: handler },
+      quotaRetryDelayMs: 60 * 60 * 1000, // 1h
+    });
+
+    expect(outcome.notBefore).toBe(leaseAfter(60 * 60 * 1000 + 500));
+  });
+
+  test('a zero-duration handler (existing injected-time behavior) is unaffected', async () => {
+    await enqueue();
+    const handler = async () => ({ result: 'delayed', retryAfterMs: 45 * 60 * 1000, context: {} });
+
+    const outcome = await runNextPhase({
+      clockMs: stepClock(0), store, request, handlers: { research: handler },
+    });
+
+    expect(outcome.notBefore).toBe(leaseAfter(45 * 60 * 1000));
+  });
+
+  test('the persisted phase.delayed event and the reported notBefore stay consistent with the observed anchor', async () => {
+    await enqueue();
+    const handler = async () => ({ result: 'delayed', retryAfterMs: 250, context: {} });
+
+    const outcome = await runNextPhase({
+      clockMs: stepClock(300), store, request, handlers: { research: handler },
+    });
+
+    const events = await store.listEvents({ sessionId: 's', issueNumber: 7 });
+    const delayed = events.find((e) => e.type === 'phase.delayed');
+    // `delayMs` reported on the event is the relative amount the handler asked
+    // for — unaffected by the anchor shift — while `notBefore` matches the
+    // observed-time-anchored value returned by runNextPhase and persisted on
+    // the task row.
+    expect(delayed.data).toMatchObject({ notBefore: outcome.notBefore, delayMs: 250 });
+    const persisted = await store.getTask({ sessionId: 's', issueNumber: 7 });
+    expect(persisted.notBefore).toBe(outcome.notBefore);
+  });
+
+  function leaseAfter(totalMs) {
+    return new Date(Date.parse(NOW) + totalMs).toISOString();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -231,7 +370,7 @@ describe('runNextPhase — quota/rate-limit delay comment (issue #352)', () => {
       context: {},
     });
 
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const comments = enqueued.filter((e) => e.topic === 'gh:comment');
     expect(comments).toHaveLength(1);
@@ -272,7 +411,7 @@ describe('runNextPhase — quota/rate-limit delay comment (issue #352)', () => {
     const { enqueued, store: outboxStore } = makeOutbox();
     const handler = async () => ({ result: 'delayed', context: { artifactDir: '/a' } });
 
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const comments = enqueued.filter((e) => e.topic === 'gh:comment');
     expect(comments).toHaveLength(1);
@@ -287,10 +426,10 @@ describe('runNextPhase — quota/rate-limit delay comment (issue #352)', () => {
     const handler = async () => ({ result: 'delayed', context: {} });
 
     // First delay → comment enqueued.
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
     // Re-claim at the same logical `now` (same notBefore) and delay again — a
     // duplicate scheduler tick must NOT post a second comment.
-    await runNextPhase({ store, request: { ...request, runId: 'run-2' }, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request: { ...request, runId: 'run-2' }, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const comments = enqueued.filter((e) => e.topic === 'gh:comment');
     expect(comments).toHaveLength(1);
@@ -301,10 +440,10 @@ describe('runNextPhase — quota/rate-limit delay comment (issue #352)', () => {
     const { enqueued, store: outboxStore } = makeOutbox();
     const handler = async () => ({ result: 'delayed', context: {} });
 
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
     // A later run at a different `now` produces a different notBefore → new comment.
     const later = '2026-06-07T16:00:00.000Z';
-    await runNextPhase({ store, request: { ...request, runId: 'run-2', now: later }, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request: { ...request, runId: 'run-2', now: later }, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const comments = enqueued.filter((e) => e.topic === 'gh:comment');
     expect(comments).toHaveLength(2);
@@ -313,7 +452,7 @@ describe('runNextPhase — quota/rate-limit delay comment (issue #352)', () => {
   test('no comment enqueued when no outbox store is configured', async () => {
     await enqueueImpl();
     const handler = async () => ({ result: 'delayed', context: {} });
-    const outcome = await runNextPhase({ store, request, handlers: { implementation: handler } });
+    const outcome = await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler } });
     expect(outcome.status).toBe('delayed');
   });
 
@@ -334,7 +473,7 @@ describe('runNextPhase — quota/rate-limit delay comment (issue #352)', () => {
     };
     const handler = async () => ({ result: 'delayed', context: {} });
 
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: giteaSession });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: giteaSession });
 
     // No legacy GitHub-specific row was produced.
     expect(enqueued.filter((e) => e.topic === 'gh:comment')).toHaveLength(0);
@@ -390,7 +529,7 @@ describe('runNextPhase — category-appropriate delay wording (issue #672)', () 
   test('category survives onto the phase.delayed task event', async () => {
     await enqueueImpl();
     const handler = async () => ({ result: 'delayed', context: {}, category: 'provider_capacity' });
-    await runNextPhase({ store, request, handlers: { implementation: handler } });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler } });
 
     const events = await store.listEvents({ sessionId: 's', issueNumber: 7 });
     const delayed = events.find((e) => e.type === 'phase.delayed');
@@ -400,7 +539,7 @@ describe('runNextPhase — category-appropriate delay wording (issue #672)', () 
   test('a handler that does not classify a category omits it from the event (no false category)', async () => {
     await enqueueImpl();
     const handler = async () => ({ result: 'delayed', context: {} });
-    await runNextPhase({ store, request, handlers: { implementation: handler } });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler } });
 
     const events = await store.listEvents({ sessionId: 's', issueNumber: 7 });
     const delayed = events.find((e) => e.type === 'phase.delayed');
@@ -411,7 +550,7 @@ describe('runNextPhase — category-appropriate delay wording (issue #672)', () 
     await enqueueImpl();
     const { enqueued, store: outboxStore } = makeOutbox();
     const handler = async () => ({ result: 'delayed', context: {}, category: 'usage_quota' });
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
     expect(body).toContain('Agent usage quota delay');
@@ -422,7 +561,7 @@ describe('runNextPhase — category-appropriate delay wording (issue #672)', () 
     await enqueueImpl();
     const { enqueued, store: outboxStore } = makeOutbox();
     const handler = async () => ({ result: 'delayed', context: {}, category: 'rate_limit' });
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
     expect(body).toContain('Agent rate-limit delay');
@@ -433,7 +572,7 @@ describe('runNextPhase — category-appropriate delay wording (issue #672)', () 
     await enqueueImpl();
     const { enqueued, store: outboxStore } = makeOutbox();
     const handler = async () => ({ result: 'delayed', context: {}, category: 'provider_capacity' });
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
     expect(body).toContain('Provider capacity delay');
@@ -447,7 +586,7 @@ describe('runNextPhase — category-appropriate delay wording (issue #672)', () 
     await enqueueImpl();
     const { enqueued, store: outboxStore } = makeOutbox();
     const handler = async () => ({ result: 'delayed', context: {} });
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
     expect(body).toContain('Agent quota/rate-limit delay');
@@ -460,7 +599,7 @@ describe('runNextPhase — category-appropriate delay wording (issue #672)', () 
     // probe. Wording this with the quota copy would put a statement the agent
     // never made into a public comment.
     const handler = async () => ({ result: 'delayed', context: {}, delayKind: 'transient_verification' });
-    await runNextPhase({ store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
+    await runNextPhase({ clockMs: INSTANT_CLOCK, store, request, handlers: { implementation: handler }, outboxStore, session: SESSION });
 
     const body = enqueued.find((e) => e.topic === 'gh:comment').payload.body;
     expect(body).toContain('Transient verification delay');

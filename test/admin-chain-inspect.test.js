@@ -493,3 +493,151 @@ describe('admin chain validate', () => {
     expect(parse(json).ok).toBe(true);
   });
 });
+
+/**
+ * Issue #1045: an Issue number is unique only inside the repository that issued
+ * it. Two sessions bound to different repositories can each hold a `#697`, and
+ * comparing the bare numbers reported one of them as doubly owned.
+ */
+describe('admin chain validate — repository-scoped Issue identity', () => {
+  /** Two sessions on two repositories; `extra` overrides the second one. */
+  function writeTwoRepoSessions(extra = {}) {
+    const base = {
+      repoRoot: join(tmpDir, 'repo'),
+      artifactDir: '.n8n-artifacts',
+      defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
+      verification: {},
+      labels: { active: 'ai:active', blocked: 'ai:blocked', readyForHuman: 'ai:ready-for-human' },
+    };
+    writeFileSync(
+      sessionsPath,
+      JSON.stringify({
+        sessions: [
+          { ...base, sessionId: 'yoda-form-js', repoKey: 'yoda_form_js', githubRepo: 'm2dw/yoda_form_js' },
+          { ...base, sessionId: 'ai-cli-loop', repoKey: 'ai-cli-loop', githubRepo: 'm2dw/n8n-ai-cli-loop-ai', ...extra },
+        ],
+      }),
+      'utf8',
+    );
+  }
+
+  /** The reported case: `#691 -> #692 -> #697 -> #693` in one session. */
+  async function createYodaChain() {
+    const created = await createChain({
+      sessionId: 'yoda-form-js',
+      headIssueNumber: 693,
+      members: [
+        { issueNumber: 693, role: 'head' },
+        { issueNumber: 697 },
+        { issueNumber: 692 },
+        { issueNumber: 691 },
+      ],
+      edges: [
+        { blockerIssueNumber: 691, blockedIssueNumber: 692 },
+        { blockerIssueNumber: 692, blockedIssueNumber: 697 },
+        { blockerIssueNumber: 697, blockedIssueNumber: 693 },
+      ],
+    });
+    await store.setAcceptedRevision(created.chain.chainId, created.chain.graphRevision, { now: NOW });
+    seedBlockedBy(691, []);
+    seedBlockedBy(692, [{ number: 691, state: 'OPEN' }]);
+    seedBlockedBy(697, [{ number: 692, state: 'OPEN' }]);
+    seedBlockedBy(693, [{ number: 697, state: 'OPEN' }]);
+    return created.chain.chainId;
+  }
+
+  test('the same Issue number in two repositories is not duplicate ownership', async () => {
+    writeTwoRepoSessions();
+    const yoda = await createYodaChain();
+    // The unrelated chain: another session, another repository, its own #697.
+    const other = await createChain({
+      sessionId: 'ai-cli-loop',
+      headIssueNumber: 777,
+      members: [{ issueNumber: 777, role: 'head' }, { issueNumber: 697 }],
+      edges: [{ blockerIssueNumber: 697, blockedIssueNumber: 777 }],
+    });
+    const otherChainId = other.chain.chainId;
+    await store.setAcceptedRevision(otherChainId, other.chain.graphRevision, { now: NOW });
+    seedBlockedBy(777, [{ number: 697, state: 'OPEN' }]);
+
+    const yodaOut = parse(run(['chain', 'validate', yoda, ...dbArgs(), '--json']));
+    expect(yodaOut.structural.diagnostics).toEqual([]);
+    expect(yodaOut.structural.ok).toBe(true);
+    expect(yodaOut.ok).toBe(true);
+    expect(yodaOut.ownershipScope).toEqual({
+      sessionIds: ['yoda-form-js'],
+      repository: 'm2dw/yoda_form_js',
+    });
+
+    // And symmetrically for the other repository's chain. The fake `gh`
+    // answers by Issue number alone, so it cannot hold two different #697s at
+    // once: re-seed it with the OTHER repository's relationships before asking
+    // about the other repository's chain. That the registry needs no such
+    // re-seeding is exactly the point — its ownership scope already tells the
+    // two #697s apart.
+    seedBlockedBy(697, []);
+    const otherOut = parse(run(['chain', 'validate', otherChainId, ...dbArgs(), '--json']));
+    expect(otherOut.structural.diagnostics).toEqual([]);
+    expect(otherOut.structural.ok).toBe(true);
+    expect(otherOut.ok).toBe(true);
+    expect(otherOut.ownershipScope.repository).toBe('m2dw/n8n-ai-cli-loop-ai');
+  }, 30_000);
+
+  test('the same Issue in the same repository is still duplicate ownership, named unambiguously', async () => {
+    // Both sessions point at one repository, so they share an Issue-number
+    // space and a doubled claim must still be refused.
+    writeTwoRepoSessions({ githubRepo: 'm2dw/yoda_form_js' });
+    const yoda = await createYodaChain();
+    await createChain({
+      sessionId: 'ai-cli-loop',
+      headIssueNumber: 777,
+      members: [{ issueNumber: 777, role: 'head' }, { issueNumber: 697 }],
+      edges: [{ blockerIssueNumber: 697, blockedIssueNumber: 777 }],
+    });
+
+    const r = run(['chain', 'validate', yoda, ...dbArgs(), '--json']);
+    expect(r.code).toBe(1);
+    const out = parse(r);
+    expect(out.ownershipScope).toEqual({
+      sessionIds: ['ai-cli-loop', 'yoda-form-js'],
+      repository: 'm2dw/yoda_form_js',
+    });
+    const duplicate = out.structural.diagnostics.find((d) => d.code === 'duplicate_ownership');
+    expect(duplicate).toBeDefined();
+    expect(duplicate.issues).toEqual([697]);
+    expect(duplicate.chains).toEqual(['chain_777']);
+    // The identity an operator needs to find the other chain.
+    expect(duplicate.owners).toEqual([
+      { chainId: 'chain_777', sessionId: 'ai-cli-loop', repository: 'm2dw/yoda_form_js' },
+    ]);
+    expect(duplicate.message).toContain('session ai-cli-loop');
+    expect(duplicate.message).toContain('repo m2dw/yoda_form_js');
+  }, 30_000);
+
+  test('a chain whose session is missing from the session file still validates against its own session', async () => {
+    // Backward compatibility for registry rows written before #1045: the
+    // session file cannot qualify the chain, so the scope falls back to the
+    // session alone — narrower than a repository scope, never wider.
+    writeSession();
+    const created = await createChain({
+      sessionId: 'addon-dev',
+      headIssueNumber: 697,
+      members: [{ issueNumber: 697, role: 'head' }],
+      edges: [],
+    });
+    await store.setAcceptedRevision(created.chain.chainId, created.chain.graphRevision, { now: NOW });
+    // A chain in a session the file never mentions, over the same number.
+    await createChain({
+      sessionId: 'deleted-session',
+      headIssueNumber: 700,
+      members: [{ issueNumber: 700, role: 'head' }, { issueNumber: 697 }],
+      edges: [{ blockerIssueNumber: 697, blockedIssueNumber: 700 }],
+    });
+    seedBlockedBy(697, []);
+
+    const out = parse(run(['chain', 'validate', created.chain.chainId, ...dbArgs(), '--json']));
+    expect(out.ownershipScope).toEqual({ sessionIds: ['addon-dev'], repository: 'm2dw/some-repo' });
+    expect(out.structural.ok).toBe(true);
+    expect(out.ok).toBe(true);
+  }, 30_000);
+});

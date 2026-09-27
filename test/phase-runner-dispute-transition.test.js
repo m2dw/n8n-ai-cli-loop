@@ -12,10 +12,10 @@
  *    patch and `phase.completed` event, in one transaction and under one CAS;
  *  - §7.1 routing decides where the task goes — overriding the ordinary
  *    implementation→review step when it names a dispatchable destination,
- *    PARKING the task for a human when rule 2 selects a turn whose run this
- *    codebase does not dispatch yet (the reconsideration, evidence, and
- *    arbitration turns, none of which an ordinary review run may finish), and
- *    deferring to it only for rules 3/4;
+ *    PARKING the task for a human when rule 2 selects a turn with no production
+ *    dispatcher — the standing guard for a turn added to §7.1 before its
+ *    dispatcher exists, since issue #964 gave the last of today's three one —
+ *    and deferring to it only for rules 3/4;
  *  - a lost claim commits none of it;
  *  - a replayed application appends no second audit event and moves no counter,
  *    yet still routes exactly as its first delivery did;
@@ -266,7 +266,7 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
       .toMatchObject({ rule: 1, outcome: 'human_handoff', readyForHuman: true });
   }, 30_000);
 
-  test('a disputed run parks the reviewer turn for a human and records no prose in the event', async () => {
+  test('a disputed run routes the reviewer turn to review and records no prose in the event', async () => {
     const ctx = context({ [LINEAGE_A]: lineage(LINEAGE_A) });
     await enqueue(ctx);
     const value = application(ctx, [disputeRecord(LINEAGE_A)]);
@@ -281,32 +281,33 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
       state: 'disputed',
       rebuttedVersions: [1],
     });
-    // ...but that turn is a RECONSIDERATION run, and the review handler
-    // dispatches an ordinary review: it admits new findings and applies no row
-    // 9-12, so queueing `review` here would hand a `disputed` lineage to a run
-    // that cannot consume it — and let that run finish the task. Until the
-    // reconsideration dispatch exists, the task parks for a human on the phase
-    // that ran, with the lineage left exactly where the protocol put it.
-    expect(stored.status).toBe('ready_for_human');
-    expect(stored.phase).toBe('implementation');
+    // ...and that turn is a RECONSIDERATION run rather than an ordinary review.
+    // Routing it to `review` was unsafe for exactly as long as the review handler
+    // had only its generic path; since issue #952 that handler dispatches the
+    // reconsideration as an internal sub-turn BEFORE it builds a review prompt,
+    // so the destination discharges the dispute instead of finishing the task
+    // around it. The task is queued, not parked, and the claim is released.
+    expect(stored.status).toBe('queued');
+    expect(stored.phase).toBe('review');
     expect(stored.ownerRunId ?? undefined).toBeUndefined();
     expect(stored.leaseExpiresAt ?? undefined).toBeUndefined();
 
     const events = await store.listEvents(KEY);
     const transition = events.find((e) => e.type === REVIEW_DISPUTE_TRANSITION_EVENT);
     expect(transition.data.applied[0]).toMatchObject({ lineageId: LINEAGE_A, row: 2, toState: 'disputed' });
-    // The audit record says WHY a task the protocol wanted to keep running
-    // parked — one bounded turn literal, not a rule-1 escalation.
-    expect(transition.data.undispatchedTurn).toBe('reviewer');
+    // Nothing parked, so the audit record carries no undispatched-turn literal.
+    expect(transition.data.undispatchedTurn).toBeUndefined();
     expect(transition.data.routing).toMatchObject({ rule: 2, readyForHuman: false });
     // §10.3: literals, counters, ids, and bounded reason tokens only.
     expect(JSON.stringify(transition.data)).not.toContain(ARGUMENT);
   }, 30_000);
 
-  test('a final-version dispute (row 6) parks the runner turn for a human', async () => {
+  test('a final-version dispute (row 6) routes the runner turn back to review (issue #955)', async () => {
     // Version 2 is the final response, so §6.2 admits no third round: the
     // dispute goes straight to `arbitration_pending`, and §7.1 rule 2 selects
-    // the RUNNER turn — no agent run at all.
+    // the RUNNER turn — no run of the debate's own parties, but a phase run all
+    // the same, since issue #955 made arbitration an internal sub-turn of the
+    // review phase.
     const ctx = context({
       [LINEAGE_A]: lineage(LINEAGE_A, {
         version: 2,
@@ -316,19 +317,18 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
     });
     await enqueue(ctx);
     const value = application(ctx, [disputeRecord(LINEAGE_A, 2)]);
-    expect(value.routing).toMatchObject({ rule: 2, turn: 'runner', nextPhase: null });
+    expect(value.routing).toMatchObject({ rule: 2, turn: 'runner', nextPhase: 'review' });
 
     await runNextPhase({ store, request, handlers: { implementation: handlerReturning(value) } });
 
     const stored = await store.getTask(KEY);
     expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].state).toBe('arbitration_pending');
-    // The task must NOT reach the ordinary implementation→review step: the
-    // review handler has no arbitration dispatch and would be free to complete
-    // the task with no verdict on file. Nor may it sit non-runnable with nothing
-    // scheduled to wake it — no production caller advances arbitration yet. It
-    // parks for a human on the phase that ran, claim released.
-    expect(stored.status).toBe('ready_for_human');
-    expect(stored.phase).toBe('implementation');
+    // The task is queued back onto `review`, where the arbitration sub-turn runs
+    // BEFORE any ordinary review work: the arbiter #839 selects is invoked, never
+    // the review agent, so the ordinary path can still not discharge the debate.
+    // The claim is released so `claimNextTask` can dispatch that phase.
+    expect(stored.status).toBe('queued');
+    expect(stored.phase).toBe('review');
     expect(stored.ownerRunId ?? undefined).toBeUndefined();
     expect(stored.leaseExpiresAt ?? undefined).toBeUndefined();
 
@@ -339,10 +339,11 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
       row: 6,
       toState: 'arbitration_pending',
     });
-    expect(transition.data.undispatchedTurn).toBe('runner');
+    // Nothing parked, so the audit record carries no undispatched-turn literal.
+    expect(transition.data.undispatchedTurn).toBeUndefined();
   }, 30_000);
 
-  test('a zero-reconsideration dispute (row 25) parks the runner turn for a human', async () => {
+  test('a zero-reconsideration dispute (row 25) routes the runner turn back to review', async () => {
     // §6.1 with the reconsideration round configured away: the dispute
     // arbitrates immediately instead of entering `disputed`, so rule 2 again
     // selects the runner turn from a first-version finding.
@@ -350,14 +351,14 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
     const ctx = context({ [LINEAGE_A]: lineage(LINEAGE_A) });
     await enqueue(ctx);
     const value = application(ctx, [disputeRecord(LINEAGE_A)], { limits });
-    expect(value.routing).toMatchObject({ rule: 2, turn: 'runner', nextPhase: null });
+    expect(value.routing).toMatchObject({ rule: 2, turn: 'runner', nextPhase: 'review' });
 
     await runNextPhase({ store, request, handlers: { implementation: handlerReturning(value) } });
 
     const stored = await store.getTask(KEY);
     expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].state).toBe('arbitration_pending');
-    expect(stored.status).toBe('ready_for_human');
-    expect(stored.phase).toBe('implementation');
+    expect(stored.status).toBe('queued');
+    expect(stored.phase).toBe('review');
     const events = await store.listEvents(KEY);
     expect(events.find((e) => e.type === REVIEW_DISPUTE_TRANSITION_EVENT).data.applied[0]).toMatchObject({
       row: 25,
@@ -365,11 +366,12 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
     });
   }, 30_000);
 
-  test('an evidence turn parks the task rather than routing it to review', async () => {
+  test('an evidence turn routes the task to review for the round, not off the debate', async () => {
     // A lineage already in `evidence_requested` (row 16) keeps the task in rule
-    // 2's evidence turn: two per-party collection runs, so no single phase. A
-    // sibling resolved by this run must not carry the task off to review while
-    // that round is outstanding.
+    // 2's evidence turn. Since issue #964 the per-party collection runs are
+    // internal sub-turns of the review phase, so the completion queues review —
+    // where the evidence gate, not the ordinary review prompt, takes the turn —
+    // and a sibling resolved by this run must not carry the task anywhere else.
     const ctx = context({
       [LINEAGE_A]: lineage(LINEAGE_A),
       [LINEAGE_B]: lineage(LINEAGE_B, {
@@ -380,7 +382,7 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
     });
     await enqueue(ctx);
     const value = application(ctx, [fixedRecord(LINEAGE_A)], { diff: true });
-    expect(value.routing).toMatchObject({ rule: 2, turn: 'evidence', nextPhase: null });
+    expect(value.routing).toMatchObject({ rule: 2, turn: 'evidence', nextPhase: 'review' });
 
     await runNextPhase({ store, request, handlers: { implementation: handlerReturning(value) } });
 
@@ -388,13 +390,15 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
     const block = stored.context[REVIEW_DISPUTE_CONTEXT_KEY];
     expect(block.lineages[LINEAGE_A].state).toBe('resolved_fixed');
     expect(block.lineages[LINEAGE_B].state).toBe('evidence_requested');
-    expect(stored.status).toBe('ready_for_human');
-    expect(stored.phase).toBe('implementation');
+    expect(stored.status).toBe('queued');
+    expect(stored.phase).toBe('review');
     // §7.1 rule 2: the diff this run produced is deferred, never skipped — rule
     // 3 still owes it a re-review once the evidence round closes.
     expect(block.pendingReReview).toBe(true);
     const events = await store.listEvents(KEY);
-    expect(events.find((e) => e.type === REVIEW_DISPUTE_TRANSITION_EVENT).data.undispatchedTurn).toBe('evidence');
+    // The turn has a dispatcher, so the completion routes it rather than
+    // reporting an undispatched-turn stop (issue #964).
+    expect(events.find((e) => e.type === REVIEW_DISPUTE_TRANSITION_EVENT).data.undispatchedTurn).toBeUndefined();
   }, 30_000);
 
   test('multi-lineage aggregation: one escalation outranks a resolved sibling', async () => {
@@ -473,14 +477,19 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
   }, 30_000);
 
   test('a parked route is re-parked identically when the same delivery is retried', async () => {
-    // The other half of idempotency, on the route that parks: an operator (or a
-    // recovery path) puts the parked task back in flight, the same run delivers
-    // again, and the retry must neither spend a second rebuttal nor let the task
-    // slip past the missing reconsideration dispatch this time.
-    const ctx = context({ [LINEAGE_A]: lineage(LINEAGE_A) });
+    // The other half of idempotency, on the route that still parks — §7.1 rule
+    // 1's human handoff, held open by an `escalated_human` sibling (the evidence
+    // turn was this test's park fixture until issue #964 gave it a dispatcher):
+    // an operator (or a recovery path) puts the parked task back in flight, the
+    // same run delivers again, and the retry must neither move a lineage a
+    // second time nor let the task slip past the handoff this time.
+    const ctx = context({
+      [LINEAGE_A]: lineage(LINEAGE_A),
+      [LINEAGE_B]: lineage(LINEAGE_B, { state: 'escalated_human', outcome: 'escalated_human' }),
+    });
     await enqueue(ctx);
     const findings = promptFindings(ctx);
-    const first = application(ctx, [disputeRecord(LINEAGE_A)]);
+    const first = application(ctx, [fixedRecord(LINEAGE_A)], { diff: true });
 
     await runNextPhase({ store, request, handlers: { implementation: handlerReturning(first) } });
     const afterFirst = await store.getTask(KEY);
@@ -492,7 +501,7 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
       { status: 'ready_for_human' },
       { status: 'queued', phase: 'implementation', now: '2026-08-05T12:04:00.000Z' },
     );
-    const redelivery = application(ctx, [disputeRecord(LINEAGE_A)], { current: committed, findings });
+    const redelivery = application(ctx, [fixedRecord(LINEAGE_A)], { diff: true, current: committed, findings });
     expect(redelivery.replayed).toBe(true);
     await runNextPhase({
       store,
@@ -502,8 +511,11 @@ describe.each(BACKENDS)('runNextPhase — dispute transition fold ($name)', ({ c
 
     const stored = await store.getTask(KEY);
     expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY]).toEqual(committed);
-    expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].counters.rebuttals).toBe(1);
-    expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].rebuttedVersions).toEqual([1]);
+    // The lineage the first delivery resolved stays resolved once, and the
+    // escalated sibling is exactly where the retry found it.
+    expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].state).toBe('resolved_fixed');
+    expect(stored.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_B])
+      .toEqual(committed.lineages[LINEAGE_B]);
     expect(stored.status).toBe('ready_for_human');
     expect(stored.phase).toBe('implementation');
     const events = await store.listEvents(KEY);

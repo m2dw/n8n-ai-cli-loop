@@ -14,7 +14,7 @@
 
 import { existsSync, mkdirSync, realpathSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative } from "path";
-import { homedir } from "os";
+import { resolveHomeDir } from "../core/home-dir.js";
 import type { CommandRunner } from "./command-runner.js";
 import { defaultCommandRunner } from "./command-runner.js";
 import { RepoLockStore } from "../stores/repo-lock-store.js";
@@ -594,7 +594,7 @@ export function removeWorktree(
 
 /** Default directory for per-issue worktree locks. */
 export const DEFAULT_WORKTREE_LOCK_DIR = join(
-  homedir(),
+  resolveHomeDir(),
   ".local",
   "state",
   "n8n-ai-cli-loop",

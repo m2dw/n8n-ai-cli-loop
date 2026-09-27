@@ -47,6 +47,18 @@ common source of drift:
    (or vice versa, making `--dry-run`/`--yes` implicitly global) is an
    observable behavior change, not a refactor-neutral move.
 
+`tokenizeArgs` collapses repetition into `args` (last value wins) and
+`flags` (present or absent), which is what almost every command wants. It
+*additionally* returns `occurrences`: every recognized flag in argv order,
+with its consumed value, repeats included. That exists for the one grammar
+whose meaning is positional — `admin task-verification amend` (issue
+#1042), where `--command` and `--op-reason` bind to the operation flag they
+follow and each operation flag may appear several times in one invocation
+(`docs/verification-amendment-contract.md` §11 rule 3). A command with such
+a grammar reads `occurrences` instead of hand-rolling an argv scan, so the
+unknown-flag, abbreviated-flag, and missing-value guarantees above stay in
+one place rather than being reimplemented — and lost — per command.
+
 ### Pre-existing exceptions: commands that bypass the shared parser
 
 The "everything else is owned by `tokenizeArgs`/`parseCommonOptions`"

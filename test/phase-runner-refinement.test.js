@@ -2,10 +2,18 @@
  * Refinement-phase execution through the ordinary phase runner (issue #869
  * review follow-up): a claimed `refinement` task runs on the normal tick, the
  * handler's audit events land with the completion, and the only GitHub side
- * effect any outcome may enqueue is the §13 handoff publication (issue #936).
+ * effects any outcome may enqueue are the §13 handoff publication (issue #936)
+ * and the §15 progress comments (issue #976) — the latter driven by a committed
+ * progress milestone, which the minimal blocks in these fixtures never project.
  * The loop still may not mutate Issue bodies, dependencies, branches, or PRs on
  * its own behalf, and the generic completion builders (handler comment, coarse
  * status labels, PR summary, human-gate summary) stay off this phase entirely.
+ *
+ * A session that configures a notifier adds one more (issue #981): a terminal
+ * handoff is a `ready_for_human` transition, so it carries the same
+ * provider-neutral notification every other lane's handoff does. The base session
+ * below configures none, which is what keeps every other expectation here a
+ * statement about the effect gate rather than about notification config.
  *
  * The session deliberately configures the full label set (readyForHuman,
  * needsReview, needsImplementation): for any other phase these completions
@@ -257,9 +265,145 @@ describe('runNextPhase — refinement phase (issue #869)', () => {
     const body = rows[1].payload.body;
     expect(body).toContain('`agent_unavailable`');
     expect(body).toContain('| Agent process failures (refiner / critic) | 2 / 0');
-    expect(body).toContain('admin task cancel');
+    // issue #984: never send an operator to `admin task cancel`, whose
+    // terminal row implementation intake cannot reactivate.
+    expect(body).toContain('admin recover --session-id <session-id> --issue-number 99 --from ready_for_human --phase implementation');
+    expect(body).not.toContain('admin task cancel');
     // §16: no run id, no artifact path, no raw agent output.
     expect(body).not.toContain('run-refine-1');
+  });
+
+  // Issue #981: the lane skips the generic completion builders, and
+  // `enqueueSlackNotificationEffect` is one of them — so a PIR handoff was the one
+  // `ready_for_human` transition in the system that reached a correct Issue and a
+  // silent notifier, and an operator learned about it only by opening GitHub.
+  describe('the configured notifier (issue #981)', () => {
+    const NOTIFIED_SESSION = {
+      ...SESSION,
+      notifications: { slack: { enabled: true, webhookUrlEnv: 'SLACK_WEBHOOK_URL' } },
+    };
+
+    async function runNotified(handler) {
+      return runNextPhase({
+        store: taskStore,
+        request: REQUEST,
+        handlers: { refinement: handler },
+        outboxStore,
+        session: NOTIFIED_SESSION,
+        now: NOW,
+      });
+    }
+
+    const escalate = async () => ({
+      result: 'blocked',
+      message: 'refinement escalated to human: no_convergence',
+      context: { refinement: { state: 'escalated_human', handoffReason: 'no_convergence' } },
+      extraEvents: [
+        { type: 'refinement.escalated.human', data: { issueNumber: 99, reason: 'no_convergence' } },
+      ],
+    });
+
+    test('an escalation enqueues the notification beside the §13 label and comment', async () => {
+      await enqueueRefinementTask({ refinement: { state: 'eligible' } });
+
+      const outcome = await runNotified(escalate);
+
+      expect(outcome.status).toBe('completed');
+      expect((await taskStore.getTask(KEY)).status).toBe('ready_for_human');
+
+      const rows = await outboxStore.listPending();
+      expect(rows.map((r) => r.topic)).toEqual(['gh:label:add', 'gh:comment', 'slack:notification']);
+      expect(rows[2].payload).toMatchObject({
+        webhookUrlEnv: 'SLACK_WEBHOOK_URL',
+        sessionId: 'test-session',
+        issueNumber: 99,
+        phase: 'refinement',
+        transition: 'ready_for_human',
+        reason: 'no_convergence',
+        issueUrl: 'https://github.com/org/repo/issues/99',
+      });
+      // §16: the run id is a run identifier and never leaves the lane.
+      expect(JSON.stringify(rows[2].payload)).not.toContain('run-refine-1');
+      expect(JSON.stringify(rows[2].payload)).not.toContain('/tmp/test-repo');
+    });
+
+    test('the notification commits in the SAME transaction as the transition', async () => {
+      await enqueueRefinementTask({ refinement: { state: 'eligible' } });
+
+      const calls = [];
+      const recording = new Proxy(taskStore, {
+        get(target, prop) {
+          const value = target[prop];
+          if (typeof value !== 'function') return value;
+          return (...args) => {
+            calls.push({ method: prop, args });
+            return value.apply(target, args);
+          };
+        },
+      });
+
+      await runNextPhase({
+        store: recording,
+        request: REQUEST,
+        handlers: { refinement: escalate },
+        outboxStore,
+        session: NOTIFIED_SESSION,
+        now: NOW,
+      });
+
+      const commits = calls.filter((c) => c.method === 'completePhaseWithEffects');
+      expect(commits).toHaveLength(1);
+      const [, effects] = commits[0].args;
+      expect(effects.map((e) => e.input.topic)).toEqual([
+        'gh:label:add',
+        'gh:comment',
+        'slack:notification',
+      ]);
+    });
+
+    test('a re-run that re-derives the same handoff notifies once', async () => {
+      await enqueueRefinementTask({ refinement: { state: 'eligible' } });
+      await runNotified(escalate);
+      // The phase runs a second time and re-derives the same escalation: same
+      // session, same Issue, same reason, same recovery ordinal — so the same key.
+      const recovered = await taskStore.recoverHandoff(KEY, {
+        fromStatus: 'ready_for_human',
+        phase: 'refinement',
+        now: NOW,
+      });
+      expect(recovered.ok).toBe(true);
+      await runNotified(escalate);
+
+      const rows = await outboxStore.listPending();
+      expect(rows.filter((r) => r.topic === 'slack:notification')).toHaveLength(1);
+    });
+
+    test('a mid-lane outcome notifies nobody', async () => {
+      await enqueueRefinementTask({ refinement: { state: 'eligible' } });
+      const outcome = await runNotified(async () => ({
+        result: 'success',
+        message: 'refinement accepted after 1 round(s)',
+        context: { refinement: { state: 'accepted' } },
+      }));
+
+      expect(outcome.status).toBe('completed');
+      expect(await outboxStore.listPending()).toHaveLength(0);
+    });
+
+    test('a claimed task whose block was ALREADY escalated notifies nobody', async () => {
+      await enqueueRefinementTask({
+        refinement: { state: 'escalated_human', handoffReason: 'no_convergence' },
+      });
+      const outcome = await runNotified(async () => ({
+        result: 'failed',
+        error: 'refinement block is not runnable (state=escalated_human)',
+      }));
+
+      expect(outcome.status).toBe('completed');
+      // Nothing escalated in THIS delivery, so nothing is re-announced — the
+      // notification is gated on the same publication as the label and comment.
+      expect(await outboxStore.listPending()).toHaveLength(0);
+    });
   });
 
   test('a claimed task whose block was ALREADY escalated republishes nothing', async () => {

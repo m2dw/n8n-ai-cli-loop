@@ -614,8 +614,12 @@ function dispositionPhrase(disposition: ToolRequestDisposition): string {
  * output remains in the local run artifact. */
 const MAX_CAPTURED_OUTPUT_CHARS = 4000;
 
+// `trimEnd()` strips exactly the `\s` set (WhiteSpace + LineTerminator) by
+// scanning back from the end, so it is linear in the trailing run. A `/\s+$/`
+// regex retries from every whitespace start and is quadratic on a long
+// whitespace run followed by a non-whitespace character (issue #1191).
 function boundCaptured(text: string): string {
-  const trimmed = text.replace(/\s+$/u, "");
+  const trimmed = text.trimEnd();
   return trimmed.length > MAX_CAPTURED_OUTPUT_CHARS
     ? `${trimmed.slice(0, MAX_CAPTURED_OUTPUT_CHARS)}\n…(output truncated)`
     : trimmed;

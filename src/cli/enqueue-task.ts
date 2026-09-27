@@ -23,6 +23,8 @@ import {
 import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
 import { ASSIGNMENT_CONTEXT_KEY, resolveAssignment } from "../core/assignment.js";
 import type { ResolvedAssignment } from "../core/assignment.js";
+import { AgentQualityError, QUALITY_CONTEXT_KEY, resolveRequestedQuality } from "../core/agent-quality.js";
+import type { ResolvedTaskQuality } from "../core/agent-quality.js";
 import type { AgentId, TaskPhase, TaskPriority } from "../core/task.js";
 import { emit, die } from "./cli-io.js";
 import { tokenizeArgs } from "./admin-command.js";
@@ -188,8 +190,26 @@ async function main(): Promise<void> {
     ...(parsed.reviewAgent ? { reviewAgent: parsed.reviewAgent } : {}),
     ...(parsed.researchAgent ? { researchAgent: parsed.researchAgent } : {}),
   };
+  // The quality request is snapshotted from the same trusted labels, beside the
+  // assignment and for the same reason (issue #905,
+  // docs/agent-runtime-profiles-contract.md §9.3). An explicit
+  // `requestedQuality` in --context-json still wins, matching how an explicit
+  // `assignment` pins the agents. Nothing reads it yet: every lane keeps
+  // resolving its own model/effort/budget until slice B3 cuts them over.
+  let requestedQuality: ResolvedTaskQuality;
+  try {
+    requestedQuality = resolveRequestedQuality({
+      labels: contextLabels,
+      session,
+      now: new Date().toISOString(),
+    });
+  } catch (err) {
+    if (!(err instanceof AgentQualityError)) throw err;
+    die(`Invalid quality request: ${err.message}`);
+  }
   const resolvedContext: Record<string, unknown> = {
     [ASSIGNMENT_CONTEXT_KEY]: assignment,
+    [QUALITY_CONTEXT_KEY]: requestedQuality,
     ...(context ?? {}),
   };
 

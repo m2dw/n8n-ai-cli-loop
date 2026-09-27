@@ -11,9 +11,67 @@
  */
 
 import type { DiffClassification } from "./review-diff-context.js";
+import type { VerificationAmendmentGateSummary } from "./verification-amendment-publication.js";
 
 /** Stable HTML comment marker for the sticky human-gate decision summary. */
 export const HUMAN_GATE_MARKER = "<!-- n8n-ai-human-gate -->";
+
+/**
+ * Issue #1107: the staged final stage as the gate comment states it — read
+ * structurally from the completion's `finalStageVerification` record (#1103),
+ * which already holds only #1094 §10 rule 5's public fields. No names are
+ * rendered from it: counts, the outcome, `full` and the fixed reason only, so the
+ * line is equally safe on a split-provider session.
+ */
+export interface HumanGateFinalStage {
+  /** `absent` — enabled session, no final-stage record on this completion. */
+  status: "recorded" | "withheld" | "absent";
+  granted?: boolean;
+  reused?: boolean;
+  outcome?: string;
+  full?: boolean;
+  complete?: boolean;
+  selected?: number;
+  passed?: number;
+  /** Withheld reason or the §7 disposition — a fixed code, never prose. */
+  reason?: string;
+  /**
+   * Whether this completion actually publishes stack-ready — the publication
+   * decision, set by the caller. `granted` only says the final bundle passed.
+   */
+  stackReady?: boolean;
+  /** The approval is retained while the final stage re-runs (a delayed release). */
+  pending?: boolean;
+}
+
+/**
+ * Project a stored `finalStageVerification` record onto {@link HumanGateFinalStage}.
+ * Structural on purpose: this module stays free of the staged-state cluster.
+ * Anything unrecognizable reads `absent` — never a pass.
+ */
+export function humanGateFinalStageOf(record: unknown): HumanGateFinalStage {
+  if (typeof record !== "object" || record === null || Array.isArray(record)) return { status: "absent" };
+  const value = record as Record<string, unknown>;
+  if (value.status === "withheld") {
+    return { status: "withheld", ...(typeof value.reason === "string" ? { reason: value.reason } : {}) };
+  }
+  if (value.status !== "recorded") return { status: "absent" };
+  const summary =
+    typeof value.summary === "object" && value.summary !== null ? (value.summary as Record<string, unknown>) : {};
+  const counts =
+    typeof summary.counts === "object" && summary.counts !== null ? (summary.counts as Record<string, unknown>) : {};
+  return {
+    status: "recorded",
+    granted: value.granted === true,
+    ...(value.reused === true ? { reused: true } : {}),
+    ...(typeof summary.outcome === "string" ? { outcome: summary.outcome } : {}),
+    full: summary.full === true,
+    complete: summary.complete === true,
+    ...(typeof counts.selected === "number" ? { selected: counts.selected } : {}),
+    ...(typeof counts.passed === "number" ? { passed: counts.passed } : {}),
+    ...(value.granted !== true && typeof value.disposition === "string" ? { reason: value.disposition } : {}),
+  };
+}
 
 export interface HumanGateSummaryInput {
   issueNumber: number;
@@ -29,6 +87,24 @@ export interface HumanGateSummaryInput {
   verificationNames?: string[];
   /** Whether verification passed overall. */
   verificationPassed?: boolean;
+  /**
+   * §12.2 (issue #1044): the task's verification amendment record, when an
+   * operator amended the plan. Present only for an amended task, so an
+   * unamended summary is byte-identical to what it was before.
+   *
+   * This is the one place a hidden plan change would still be able to do
+   * damage: the summary above reports that verification passed, and a human
+   * merges on the strength of it. A retirement that this section did not name
+   * would make that pass a statement about a plan nobody outside the database
+   * ever saw.
+   */
+  verificationAmendment?: VerificationAmendmentGateSummary;
+  /**
+   * Issue #1107: present only for a session with staged verification enabled,
+   * so every other summary is byte-identical to what it was before. Separates
+   * "the review approved" from "the full required set passed at this head".
+   */
+  finalStage?: HumanGateFinalStage;
   /** Agent ID that performed the review (e.g. "claude", "codex"). */
   reviewAgentUsed?: string;
   /**
@@ -83,6 +159,8 @@ export function renderHumanGateSummary(input: HumanGateSummaryInput): string {
     diffClassification,
     verificationNames = [],
     verificationPassed,
+    verificationAmendment,
+    finalStage,
     reviewAgentUsed,
     classifierReason,
     resolvedProfile,
@@ -94,7 +172,8 @@ export function renderHumanGateSummary(input: HumanGateSummaryInput): string {
   lines.push("## Human Gate Decision Summary", "");
 
   // Issue / PR header
-  const titleSuffix = issueTitle ? ` — ${issueTitle}` : "";
+  const inertTitle = issueTitle ? htmlInertText(issueTitle) : "";
+  const titleSuffix = inertTitle ? ` — ${inertTitle}` : "";
   lines.push(`**Issue #${issueNumber}**${titleSuffix}`);
   if (prNumber !== undefined) {
     const branchNote = branch ? ` (branch: \`${branch}\`)` : "";
@@ -104,9 +183,9 @@ export function renderHumanGateSummary(input: HumanGateSummaryInput): string {
 
   // Implementation intent
   lines.push("### Implementation Intent");
-  if (issueTitle) {
+  if (inertTitle) {
     lines.push(
-      `This PR addresses Issue #${issueNumber} — ${issueTitle}. ` +
+      `This PR addresses Issue #${issueNumber} — ${inertTitle}. ` +
         `Refer to the linked issue for full requirements and acceptance criteria.`,
     );
   } else {
@@ -147,8 +226,18 @@ export function renderHumanGateSummary(input: HumanGateSummaryInput): string {
     const status = verificationPassed ? "✅ passed" : "❌ failed";
     const names = verificationNames.length > 0 ? verificationNames.join(", ") : "verification";
     lines.push(`${names}: ${status}`);
-  } else {
+  } else if (!finalStage || finalStage.status === "absent") {
     lines.push("unknown — not recorded for this phase.");
+  }
+  if (finalStage) {
+    lines.push(finalStageLine(finalStage));
+  }
+  // Issue #1044 (§12.2): an amended plan is stated here, beside the pass it
+  // qualifies, rather than in a section a reader could skip. Names, counts,
+  // digests, and the operator's own reason only — no command output, no paths.
+  if (verificationAmendment) {
+    lines.push("");
+    lines.push(...verificationAmendmentLines(verificationAmendment));
   }
   lines.push("");
 
@@ -238,6 +327,45 @@ export function renderHumanGateSummary(input: HumanGateSummaryInput): string {
     lines.push("- [ ] Guardrail/tooling file changes are justified");
   }
   lines.push("- [ ] Verification has passed (see above)");
+  // Issue #1044: a removal gets its own box. A checklist that never mentions the
+  // retirement would let a reviewer tick "verification has passed" over a plan
+  // that no longer runs the check they believe it does.
+  const anyRetired =
+    verificationAmendment !== undefined &&
+    (verificationAmendment.retiredTotal ?? verificationAmendment.retiredLabels.length) > 0;
+  // An execution-layer retirement gets its own box for the same reason it gets
+  // its own line: it is a recorded plan change that does not alter what the loop
+  // runs, so the box that says "intentionally not run" would be false of it.
+  const anyExecutionRetired =
+    verificationAmendment !== undefined &&
+    (verificationAmendment.executionRetiredTotal ??
+      verificationAmendment.executionRetiredLabels?.length ??
+      0) > 0;
+  if (anyRetired) {
+    lines.push(
+      "- [ ] The operator-retired verification command(s) above are intentionally not run",
+    );
+  }
+  if (anyExecutionRetired) {
+    lines.push(
+      "- [ ] The execution-layer entry(ies) retired above are intended (recorded only — the " +
+        "session's configured commands still decide what runs)",
+    );
+  }
+  // An execution-layer amendment that retired nothing still needs its own box:
+  // ticking "verification has passed" over an added or replaced execution entry
+  // would credit a plan change the loop never executed (issue #1044 review, P1).
+  const executionAmendedOnly =
+    verificationAmendment?.executionAmended === true && !anyExecutionRetired;
+  if (executionAmendedOnly) {
+    lines.push(
+      "- [ ] The execution-layer plan change(s) above are intended (recorded only — the session's " +
+        "configured commands still decide what runs)",
+    );
+  }
+  if (!anyRetired && !anyExecutionRetired && !executionAmendedOnly && verificationAmendment) {
+    lines.push("- [ ] The operator amendment to the verification plan is intended");
+  }
   lines.push("- [ ] Risk areas and behavior changes have been reviewed");
   lines.push("- [ ] Ready to merge");
   lines.push("");
@@ -246,6 +374,296 @@ export function renderHumanGateSummary(input: HumanGateSummaryInput): string {
   const durNote = durationMs !== undefined ? ` | Duration: ${formatDurationMs(durationMs)}` : "";
   lines.push("---");
   lines.push(`_Phase: ${phase} | Result: ${phaseResult} | Run: ${runId}${durNote}_`);
+
+  return lines.join("\n");
+}
+
+/**
+ * The amendment block of the summary (issue #1044, §12.2).
+ *
+ * Extracted so the summary and the superseded-handoff notice below make the SAME
+ * statements about the same plan: counts, digests, the operator's own reason, and
+ * — above all — what is no longer checked. Two hand-written versions of this
+ * block would be two chances for the merge gate to understate a removal.
+ */
+/**
+ * Issue #1107: one line that keeps the three states apart — review approved with
+ * final verification still pending, final verification withheld, and completed
+ * final evidence. Counts, outcome and scope only (#1094 §10 rule 5).
+ */
+function finalStageLine(stage: HumanGateFinalStage): string {
+  const codeText = (value: string): string => value.replace(/[^a-z0-9-]/gi, "");
+  if (stage.pending === true) {
+    return (
+      "Final verification (full required set): ⏳ pending — the review approval is retained, " +
+      "but final verification did not reach a verdict at this head and will re-run; stack-ready is not granted."
+    );
+  }
+  if (stage.status === "absent") {
+    return (
+      "Final verification (full required set): ⏳ pending — the review approved this head, " +
+      "but no final-stage evidence is recorded; stack-ready is not granted."
+    );
+  }
+  if (stage.status === "withheld") {
+    const reason = stage.reason !== undefined ? ` (${codeText(stage.reason)})` : "";
+    return `Final verification (full required set): ⏳ withheld${reason} — stack-ready is not granted.`;
+  }
+  const counts =
+    stage.selected !== undefined && stage.passed !== undefined ? `${stage.passed}/${stage.selected} checks passed` : "";
+  const scope = stage.full === true ? "full required set" : "PARTIAL set";
+  const detail = [counts, scope, stage.complete === false ? "incomplete" : undefined, stage.reused === true ? "satisfied by retained evidence" : undefined]
+    .filter((part): part is string => part !== undefined && part.length > 0)
+    .join(", ");
+  if (stage.granted === true) {
+    const publication = stage.stackReady === true ? "stack-ready granted" : "stack-ready not granted by this completion";
+    return `Final verification (full required set): ✅ passed — ${detail}; ${publication}.`;
+  }
+  const outcome = stage.outcome !== undefined ? codeText(stage.outcome) : "not passed";
+  const reason = stage.reason !== undefined ? ` (${codeText(stage.reason)})` : "";
+  return `Final verification (full required set): ❌ ${outcome} — ${detail}; stack-ready withheld${reason}.`;
+}
+
+function verificationAmendmentLines(a: VerificationAmendmentGateSummary): string[] {
+  const lines: string[] = [];
+  lines.push(
+    `⚠️ **This task's verification plan was amended by an operator** — ` +
+      `${a.revisionCount} revision(s), latest #${a.latestOrdinal} via \`${a.latestSource}\`.`,
+  );
+  // The reason is the one operator-authored string this block renders as prose
+  // rather than inside a code span, and Markdown passes raw HTML through: an
+  // unmatched `<!--` in it would comment out every line below — the retired
+  // list, the "not a pass" statement, the checklist, the footer — and leave the
+  // human who merges looking at a summary that reads as complete (issue #1044
+  // review, P1). The projection escapes `<` at the source; this repeats it
+  // because a summary PERSISTED in a task context before it did is re-rendered
+  // here unchanged. Escaping is idempotent: `&lt;` holds no `<` to escape again.
+  lines.push(`- Reason (latest): ${a.latestReason.replace(/</g, "&lt;")}`);
+  // The active count is stated per LAYER (issue #1044 review, P1). Review Step
+  // 4 still executes this session's configured commands and Step 4.5 credits
+  // only what it ran, so an execution-layer entry an amendment added or
+  // replaced is a recorded plan change and not a check that ran. Printing the
+  // combined total as "active check(s)" beside the ✅ above would tell the
+  // human who merges that such an entry had been checked.
+  //
+  // The fallback is for a summary persisted before the split was carried: it
+  // reports the old combined number rather than printing `(undefined)`.
+  const activeRequirementCount = a.activeRequirementCount ?? a.activeCount;
+  const activeExecutionCount = a.activeExecutionCount ?? 0;
+  lines.push(
+    `- Effective plan digest: \`${a.planDigest}\` ` +
+      `(${activeRequirementCount} active required check(s) gated at review)`,
+  );
+  if (activeExecutionCount > 0) {
+    lines.push(
+      `- Execution-layer plan entries (${activeExecutionCount}): recorded in this task's plan. ` +
+        "The review step runs this session's configured commands, so a verification result covers " +
+        "these only insofar as that configuration lists them.",
+    );
+  }
+  // A command label is command BYTES, so it may hold anything an operator or an
+  // Issue's verification section put there — including a backtick, which closes
+  // the single-backtick code span this line opens around it. A label such as
+  // ``npm test` <!--`` would escape the span and open an HTML comment that
+  // Markdown passes straight through, hiding every line below it: the "not run,
+  // not passed" statement, the merge checklist, the footer — precisely the
+  // mandatory disclosures §8.4 rule 1 exists to publish (issue #1044 review, P1).
+  //
+  // Neutralizing the backtick is what closes that hole, and it closes it for the
+  // raw HTML too: with none surviving, the span ends where this renderer intended
+  // and CommonMark treats everything inside it as literal text, so no `<` in a
+  // label can begin a tag or a comment. This is the amendment comment renderer's
+  // `cell()` protection, made here rather than imported because this module takes
+  // no value import from the publication module — the projection imports the
+  // summary model from it, and the cycle would be real.
+  //
+  // The `<` is deliberately NOT entity-escaped: entities are literal text inside
+  // a code span, so `&lt;` would DISPLAY as `&lt;` — and `show`'s redaction emits
+  // `<path>` placeholders routinely, which would then be unreadable at the one
+  // gate that must state plainly what is no longer checked.
+  //
+  // Both replacements are idempotent, and the newline collapse repeats the
+  // projection's own, because a summary PERSISTED in a task context before this
+  // existed is re-rendered here unchanged.
+  const inertLabel = (value: string): string =>
+    value.replace(/\s*\n+\s*/g, " ").replace(/`/g, "'");
+  // The names are absent, rather than merely bounded, on a summary projected
+  // for a repo host that is not the work item's own host (issue #1044 review,
+  // P1). The count still has to be printed, so the line says where the names
+  // are instead of trailing off after the colon.
+  const named = (labels: readonly string[], total: number): string => {
+    if (labels.length === 0) {
+      return a.namesWithheld === true
+        ? " — names withheld: this work item is tracked on a separate, private surface. " +
+            "See `admin task-verification show`."
+        : " — see `admin task-verification show`.";
+    }
+    const overflow = total - labels.length;
+    return (
+      ": " +
+      labels.map((label) => `\`${inertLabel(label)}\``).join(", ") +
+      (overflow > 0 ? ` _(+${overflow} more — see \`admin task-verification show\`)_` : "")
+    );
+  };
+  // The count is the plan's TRUE retired total, not the length of the bounded
+  // label list (issue #1044 review, P2): a gate that reported "(20)" for a
+  // plan retiring twenty-five checks would hide five removals at the merge
+  // decision — the one place §8.4 rule 1 must hold hardest. The overflow is
+  // named too, with the surface that lists the rest.
+  //
+  // The fallback is for a summary persisted in a task context before the
+  // total was carried: it under-reports rather than printing `(undefined)`,
+  // and every summary written since carries the real number.
+  const retiredTotal = a.retiredTotal ?? a.retiredLabels.length;
+  if (retiredTotal > 0) {
+    lines.push(
+      `- **Retired — not run, not passed (${retiredTotal})**` + named(a.retiredLabels, retiredTotal),
+    );
+    lines.push(
+      "- A retired verification command is **not** a passing result: it is no longer run, " +
+        "and no evidence claims it passed. Confirm the removal was intended before merging.",
+    );
+  }
+  // An execution-layer retirement is reported separately and never as "not
+  // run" (issue #1044 review, P2): review Step 4 executes this session's own
+  // verification configuration and reads no amendment, so the retirement
+  // stopped nothing. It is equally never reported as "still executed" (issue
+  // #1044 review, P1) — a task-local entry an `--add-execution` created under
+  // a name that configuration does not hold was never run by the loop at all,
+  // and this summary is the last place an unrun check may be credited. Both
+  // cases share one true statement: session execution is unchanged.
+  const executionRetiredLabels = a.executionRetiredLabels ?? [];
+  const executionRetiredTotal = a.executionRetiredTotal ?? executionRetiredLabels.length;
+  if (executionRetiredTotal > 0) {
+    lines.push(
+      `- **Retired in the recorded plan — session execution unchanged (${executionRetiredTotal})**` +
+        named(executionRetiredLabels, executionRetiredTotal),
+    );
+    lines.push(
+      "- These execution-layer entries are retired in the task's recorded plan only, and that " +
+        "retirement neither stopped a command from running nor asserts that one ran: the review " +
+        "step runs this session's configured commands, so an entry that configuration names keeps " +
+        "being run and reported, and one it does not name was never run. Change the session " +
+        "configuration to change what runs.",
+    );
+  }
+  // The execution-layer limitation is stated whenever an amendment TOUCHED
+  // that layer, not only when it retired something (issue #1044 review, P1):
+  // an amendment that adds or replaces an execution entry retires nothing, so
+  // the block above stays silent and the summary would otherwise report a plan
+  // change without saying that the change does not alter what the loop runs.
+  if (a.executionAmended === true && executionRetiredTotal === 0) {
+    lines.push(
+      "- This amendment changed the plan's **execution-layer** entries. Those changes are " +
+        "recorded only: the review step still runs this session's configured commands, so an " +
+        "entry added or replaced here was neither executed nor credited by the requirement " +
+        "gate. Change the session's verification configuration to change what runs.",
+    );
+  }
+  lines.push("- Full record: `admin task-verification show`.");
+  return lines;
+}
+
+/**
+ * The published form of an issue title: single-line and HTML-inert.
+ *
+ * The title is upstream text this module interpolates as prose ABOVE the
+ * verification-amendment disclosures, and Markdown passes raw HTML through — so
+ * an unmatched `<!--` in it comments out every line pushed afterwards, and a
+ * reader sees a gate summary that looks complete while precisely the amended
+ * plan, the retirement disclosures, and the checklist are hidden (issue #1044
+ * review, P1). `sanitizeBody` runs later on the composed body but redacts paths
+ * only, so the escape has to happen here.
+ *
+ * Escaping `<` is enough and is all that is done: with no `<` to open one, `>`
+ * and `&` are ordinary text, so the reader still sees the title's literal
+ * characters. This mirrors `escapeRawHtml`'s guarantee for the HTML channel and
+ * `reasonText` in verification-amendment-publication.ts, inlined rather than
+ * imported for the same reason as there — that helper reads whole Markdown
+ * LINES, so a title opening with a ``` run would be taken for a fence and passed
+ * through unescaped, while this value is a fragment embedded mid-line.
+ */
+function htmlInertText(value: string): string {
+  return value.replace(/\s*\n+\s*/g, " ").trim().replace(/</g, "&lt;");
+}
+
+/**
+ * The line a superseded handoff opens with; also the marker a reader (and a
+ * test) recognizes the state by.
+ */
+export const HUMAN_GATE_SUPERSEDED_HEADLINE =
+  "## Human Gate Decision Summary — superseded by a verification amendment";
+
+/**
+ * Render the sticky human-gate body for a handoff whose verification plan was
+ * amended UNDER it (issue #1044 review, P1).
+ *
+ * `task-verification amend --continue none` is the record-only continuation: it
+ * applies the revision and deliberately leaves the task where it is. On a
+ * `ready_for_human` review task that is precisely the dangerous case — the task
+ * stays actionable at the merge gate while the sticky summary beside the merge
+ * button keeps reporting the verification pass of a plan that no longer exists,
+ * and keeps omitting whatever the amendment just retired. The reader who merges
+ * on the strength of it is reading a statement about a superseded plan.
+ *
+ * So the amendment REPLACES that body under the same {@link HUMAN_GATE_MARKER}
+ * rather than appending beside it: an invalidation the reader has to scroll to
+ * find is not an invalidation. What the replaced body said about the diff and the
+ * risk areas is recoverable from the run and the PR itself; what it said about
+ * verification was the part that had to stop being displayed. A later review that
+ * passes re-renders this comment in full, so the notice is self-clearing.
+ */
+export function renderHumanGateAmendmentSupersededSummary(input: {
+  issueNumber: number;
+  issueTitle?: string;
+  prNumber?: number;
+  branch?: string;
+  verificationAmendment: VerificationAmendmentGateSummary;
+}): string {
+  const { issueNumber, issueTitle, prNumber, branch, verificationAmendment: a } = input;
+  const lines: string[] = [HUMAN_GATE_MARKER, ""];
+  lines.push(HUMAN_GATE_SUPERSEDED_HEADLINE, "");
+
+  const titleSuffix = issueTitle ? ` — ${htmlInertText(issueTitle)}` : "";
+  lines.push(`**Issue #${issueNumber}**${titleSuffix}`);
+  if (prNumber !== undefined) {
+    const branchNote = branch ? ` (branch: \`${branch}\`)` : "";
+    lines.push(`**PR #${prNumber}**${branchNote}`);
+  }
+  lines.push("");
+
+  lines.push(
+    `An operator amended this task's verification plan after it was handed to the human merge ` +
+      `gate, and recorded the amendment without re-queuing a review (revision ` +
+      `#${a.latestOrdinal}, \`${a.latestRevisionId}\`).`,
+  );
+  lines.push("");
+  lines.push(
+    "**Any decision summary previously posted here is superseded.** It described the plan as it " +
+      "was before this revision, and no review has run against the amended plan — so its " +
+      "verification result must not be read as a pass of what this pull request is now measured " +
+      "against.",
+  );
+  lines.push("");
+
+  lines.push("### Amended verification plan");
+  lines.push(...verificationAmendmentLines(a));
+  lines.push("");
+
+  lines.push("### Go / No-go Checklist");
+  lines.push("- [ ] The amendment above is intended");
+  lines.push(
+    "- [ ] The amended plan has been checked — re-queue a review (`admin task-verification amend " +
+      "--continue review`, or requeue the task) or verify the active required check(s) by hand",
+  );
+  lines.push("- [ ] Ready to merge");
+  lines.push("");
+
+  lines.push("---");
+  lines.push(
+    `_Superseded by verification amendment revision #${a.latestOrdinal} — recorded only ` +
+      `(\`--continue none\`); no review has run since._`,
+  );
 
   return lines.join("\n");
 }

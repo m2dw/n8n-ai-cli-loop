@@ -186,6 +186,17 @@ describe('content-review handler — artifacts', () => {
     expect(ctx.resolvedProfile).toMatchObject({ phase: 'content_review', agentId: 'gemini' });
   });
 
+  test('writes agent-runtime.json and folds the §13 audit onto the result (issue #912 review)', async () => {
+    // §13.4: a billable run persists the resolution on every surface — the run
+    // artifact, the task-context trail, and the `agent.runtime.resolved` event.
+    const handler = createContentReviewHandler(CONTEXT(), fakePass());
+    const result = await handler(makeTask());
+    const record = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-review-1', 'agent-runtime.json'), 'utf8'));
+    expect(record).toMatchObject({ phase: 'content_review', lane: 'content_review', provider: 'google' });
+    expect(result.context.agentRuntimeAudit).toBeDefined();
+    expect((result.extraEvents ?? []).map((event) => event.type)).toContain('agent.runtime.resolved');
+  });
+
   test('artifacts written even on agent failure', async () => {
     const handler = createContentReviewHandler(CONTEXT(), fakeFail());
     await handler(makeTask());
@@ -741,12 +752,14 @@ describe('content-review handler — command execution', () => {
     expect(spy.calls[0].cmd).toBe('agy');
   });
 
-  test('passes --print as first arg', async () => {
+  test('passes --print-timeout then --print (issue #912: the built-in google profile carries 15m)', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const handler = createContentReviewHandler(CONTEXT(), spy);
     await handler(makeTask());
-    expect(spy.calls[0].args[0]).toBe('--print');
+    expect(spy.calls[0].args[0]).toBe('--print-timeout');
+    expect(spy.calls[0].args[1]).toBe('15m');
+    expect(spy.calls[0].args[2]).toBe('--print');
   });
 
   test('passes the prompt as the final positional arg and via stdin', async () => {
@@ -754,19 +767,45 @@ describe('content-review handler — command execution', () => {
     delete process.env['ANTIGRAVITY_BIN'];
     const handler = createContentReviewHandler(CONTEXT(), spy);
     await handler(makeTask());
-    expect(spy.calls[0].args[1]).toContain('Content Review Task');
+    expect(spy.calls[0].args[3]).toContain('Content Review Task');
     expect(spy.calls[0].opts.stdin).toContain('Content Review Task');
   });
 
-  test('configured model: passes --model before --print', async () => {
+  test('session.research.antigravity.model is no longer read by the cut-over lane (issue #912)', async () => {
+    // Pre-cutover this spliced --model before --print; the read-only cutover
+    // deleted the per-lane chain, so the model comes from a google profile in
+    // agent-profiles.json instead.
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const session = SESSION({ research: { antigravity: { model: 'Gemini 3.1 Pro (Low)' } } });
     const handler = createContentReviewHandler(CONTEXT({ session }), spy);
     await handler(makeTask());
+    expect(spy.calls[0].args).not.toContain('--model');
+    expect(spy.calls[0].args).not.toContain('Gemini 3.1 Pro (Low)');
+  });
+
+  test('an agent-profiles.json overlay model passes --model before --print', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const sessionsDir = join(tmpDir, 'custom-config');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, 'agent-profiles.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        providers: { google: { profiles: { 'agy-normal': { model: 'Gemini 3.1 Pro (Low)' } } } },
+      }),
+      'utf8',
+    );
+    const handler = createContentReviewHandler(
+      CONTEXT({ sessionsPath: join(sessionsDir, 'sessions.json') }),
+      spy,
+    );
+    await handler(makeTask());
     expect(spy.calls[0].args[0]).toBe('--model');
     expect(spy.calls[0].args[1]).toBe('Gemini 3.1 Pro (Low)');
-    expect(spy.calls[0].args[2]).toBe('--print');
+    expect(spy.calls[0].args[2]).toBe('--print-timeout');
+    expect(spy.calls[0].args[4]).toBe('--print');
   });
 
   test('returns failed for unsupported agent', async () => {

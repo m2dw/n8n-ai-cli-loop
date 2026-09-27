@@ -12,6 +12,7 @@ import type {
 } from "../core/task.js";
 import { applyTaskPatch, isClaimExpired, isRunnable, leaseExpiry, priorityRank } from "../core/transitions.js";
 import { ASSIGNMENT_CONTEXT_KEY } from "../core/assignment.js";
+import { QUALITY_CONTEXT_KEY } from "../core/agent-quality.js";
 import { hasUnresolvedToolRequest } from "../core/tool-request.js";
 import type { OutboxEffect, PhaseCompletionTransition, TaskStore } from "../core/task-store.js";
 
@@ -64,6 +65,12 @@ export class MemoryTaskStore implements TaskStore {
           freshContext[ASSIGNMENT_CONTEXT_KEY] = existing.context[ASSIGNMENT_CONTEXT_KEY];
         } else {
           delete freshContext[ASSIGNMENT_CONTEXT_KEY];
+        }
+        // Mirror SqliteTaskStore for the intake-pinned quality request (issue
+        // #905): restore the pinned one when it exists, and leave the freshly
+        // resolved one in place for a task created before it existed.
+        if (existing.context[QUALITY_CONTEXT_KEY] !== undefined) {
+          freshContext[QUALITY_CONTEXT_KEY] = existing.context[QUALITY_CONTEXT_KEY];
         }
         const updated: AiTask = {
           ...existing,
@@ -422,6 +429,18 @@ export class MemoryTaskStore implements TaskStore {
   }
 
   #applyOutboxEffect(effect: OutboxEffect): void {
+    // Issue #980 review: this store retains effects rather than dispatching
+    // them, so "never delivered" is modelled by dropping the retained row —
+    // there is no delivery state for a cancellation to record. Retiring a row
+    // that was never retained is a no-op, exactly as it is in SQLite.
+    //
+    // `refuseWhileClaimed` is likewise vacuous here rather than unimplemented:
+    // nothing dispatches these rows, so no row can ever be in flight and the
+    // refusal it asks for has no case to fire on.
+    if (effect.kind === "cancelPending") {
+      this.#outboxEntries.delete(effect.idempotencyKey);
+      return;
+    }
     if (this.#outboxEntries.has(effect.input.idempotencyKey)) return;
     if (effect.kind === "replacePendingPrSummary") {
       for (const [key, entry] of this.#outboxEntries) {

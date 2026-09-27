@@ -3,6 +3,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteOutboxStore } from '../dist/stores/sqlite-outbox-store.js';
 import { dispatchOutbox } from '../dist/handlers/gh-dispatcher.js';
+import { OUTBOX_GH_CALL_DEADLINE_MS } from '../dist/core/outbox-transport-deadline.js';
 import {
   enqueueWorkItemComment,
   enqueueWorkItemTransition,
@@ -190,8 +191,9 @@ describe('dispatchOutbox — split-auth runner routing', () => {
     await store.enqueue(REPO_HOST_ROW);
     // Two distinct runner identities — the work-item one must never reach the
     // repo-host provider (that is exactly the split-auth credential mix-up).
-    const workItemRunner = { id: 'work-item', run() { throw new Error('fake provider must not invoke runner'); } };
-    const repoHostRunner = { id: 'repo-host', run() { throw new Error('fake provider must not invoke runner'); } };
+    const reached = [];
+    const workItemRunner = { id: 'work-item', run() { reached.push('work-item'); return okResult(); } };
+    const repoHostRunner = { id: 'repo-host', run() { reached.push('repo-host'); return okResult(); } };
     const { factory } = fakeProviderFactory();
 
     const result = await dispatchOutbox(store, workItemRunner, { cwd: CWD, providers: factory, repoHostRunner });
@@ -199,19 +201,25 @@ describe('dispatchOutbox — split-auth runner routing', () => {
     expect(result.dispatched).toBe(2);
     const workItemBuild = factory.builds.find((b) => b.role === 'workItem');
     const repoHostBuild = factory.builds.find((b) => b.role === 'repoHost');
-    expect(workItemBuild.runner).toBe(workItemRunner);
-    expect(repoHostBuild.runner).toBe(repoHostRunner);
+    // Each provider is built with a deadline-bounded wrapper around its domain's
+    // runner (issue #1064), so the assertion is delegation rather than object
+    // identity: whose credentials a dispatched call actually reaches.
+    workItemBuild.runner.run(['api'], { cwd: CWD });
+    repoHostBuild.runner.run(['api'], { cwd: CWD });
+    expect(reached).toEqual(['work-item', 'repo-host']);
   });
 
   test('repoHostRunner defaults to runner when omitted (single-auth behavior preserved)', async () => {
     await store.enqueue(REPO_HOST_ROW);
-    const runner = { id: 'only-runner', run() { throw new Error('fake provider must not invoke runner'); } };
+    const reached = [];
+    const runner = { id: 'only-runner', run() { reached.push('only-runner'); return okResult(); } };
     const { factory } = fakeProviderFactory();
 
     const result = await dispatchOutbox(store, runner, { cwd: CWD, providers: factory });
 
     expect(result.dispatched).toBe(1);
-    expect(factory.builds.find((b) => b.role === 'repoHost').runner).toBe(runner);
+    factory.builds.find((b) => b.role === 'repoHost').runner.run(['api'], { cwd: CWD });
+    expect(reached).toEqual(['only-runner']);
   });
 
   test('repoHostRunner factory is not resolved when no repo-host row is pending', async () => {
@@ -386,7 +394,10 @@ describe('dispatchOutbox — github-issues kind preserves legacy gh argv', () =>
       '--method', 'POST',
       '--field', 'body=test body',
     ]);
-    expect(gh.calls[0].opts).toEqual({ cwd: CWD });
+    // The argv is unchanged, but every dispatched call now carries the outbox
+    // transport deadline (issue #1064) — the provider builds its argv exactly as
+    // before and the dispatcher's wrapped runner supplies the bound.
+    expect(gh.calls[0].opts).toEqual({ cwd: CWD, timeout: OUTBOX_GH_CALL_DEADLINE_MS });
   });
 
   test('workitem:transition add-label matches the legacy gh:label:add argv', async () => {

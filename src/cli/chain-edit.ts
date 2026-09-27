@@ -95,6 +95,8 @@ import {
 } from "../core/issue-activation.js";
 import type { IssueActivationOutcome, IssueActivationStore } from "../core/issue-activation.js";
 import { acceptChainGraph, collectChainOwnership } from "../core/chain-acceptance.js";
+import { resolveChainOwnershipScopeFor } from "../core/chain-ownership-scope.js";
+import type { ChainOwnershipScope } from "../core/chain-ownership-scope.js";
 import { checkFrozenPrefixes } from "../core/chain-frozen-prefix.js";
 import type { FrozenPrefixSnapshot } from "../core/chain-frozen-prefix.js";
 import { frozenPrefixRefusal } from "../core/chain-sync.js";
@@ -107,6 +109,7 @@ import {
   chainEditLockScopeKind,
   chainEditLockScopes,
   describeChainEditLockScope,
+  describeChainEditLockScopes,
 } from "../core/chain-edit-lock.js";
 import type { ChainEditLockHolder } from "../core/chain-edit-lock.js";
 import type { ChainEdgeInput, ChainMemberInput } from "../core/chain-registry.js";
@@ -519,6 +522,13 @@ interface ChainEditContext {
   provider: WorkItemProvider;
   chainStore: SqliteChainRegistryStore;
   activationStore: IssueActivationStore;
+  /**
+   * The Issue-number space this edit's duplicate-ownership checks are asked
+   * over: every session bound to the same repository as `session` (issue
+   * #1045). Resolved once for the whole run, so the ownership a plan is judged
+   * against and the ownership the acceptance claims are the same question.
+   */
+  ownershipScope: ChainOwnershipScope;
   now: string;
   /**
    * The scopes of step 0 this run has stopped holding, re-checked against the
@@ -879,6 +889,12 @@ async function runChainEdit(argv: string[], operation: ChainLinearOperation): Pr
       die(messageOf(err));
     }
 
+    // Resolved BEFORE step 0, because it decides what step 0 claims: the Issue
+    // numbers this edit touches are shared with every session bound to the same
+    // repository (issue #1045), so the claim has to be made over that
+    // repository and not over this session alone.
+    const ownershipScope = await resolveChainOwnershipScopeFor(session.sessionId, registry);
+
     const now = new Date().toISOString();
     const request: ChainEditRequest = {
       operation,
@@ -907,6 +923,15 @@ async function runChainEdit(argv: string[], operation: ChainLinearOperation): Pr
         // subset would leave the overlap this exists to prevent.
         issueNumbers: [...(target?.members ?? []).map((m) => m.issueNumber), ...issueNumbers],
         ...(name === undefined ? {} : { name }),
+        // The same repository the duplicate-ownership check below is asked
+        // over, so an Issue another session in that repository is editing is
+        // refused here rather than at the final registry claim, after both runs
+        // have already relabeled it (issue #1045). Its sessions come along so an
+        // older build editing through one of them still collides.
+        sessionIds: ownershipScope.sessionIds,
+        ...(ownershipScope.repositoryKey === undefined
+          ? {}
+          : { repositoryKey: ownershipScope.repositoryKey }),
       });
       const acquired = await chainStore.acquireChainEditLocks({
         scopes,
@@ -962,6 +987,7 @@ async function runChainEdit(argv: string[], operation: ChainLinearOperation): Pr
       provider,
       chainStore,
       activationStore,
+      ownershipScope,
       now,
       ...(apply ? { verifyLocks } : {}),
     };
@@ -1046,7 +1072,7 @@ async function executeChainEdit(
     kind: "lock_contended",
     transient: true,
     message:
-      `this edit no longer holds ${lost.map(describeChainEditLockScope).join(", ")}: another chain edit took the ` +
+      `this edit no longer holds ${describeChainEditLockScopes(lost)}: another chain edit took the ` +
       "claim over while this one was running",
     remediation,
     recovery,
@@ -1064,7 +1090,8 @@ async function executeChainEdit(
   const observation = await readObservation(provider, observedIssues);
 
   const owners = await collectChainOwnership(chainStore, observedIssues, {
-    filter: { sessionId },
+    filter: context.ownershipScope.filter,
+    repositoryBySessionId: context.ownershipScope.repositoryBySessionId,
     ...(target === undefined ? {} : { excludeChainId: target.chainId }),
   });
 
@@ -1728,7 +1755,8 @@ async function commitVerifiedGraph(
     edges: plan.edges,
     headIssueNumber: plan.headIssueNumber,
     ...(expectedRev === undefined ? {} : { expectedRev }),
-    ownershipScope: { sessionId },
+    ownershipScope: context.ownershipScope.filter,
+    repositoryBySessionId: context.ownershipScope.repositoryBySessionId,
     // The last word on the frozen prefixes, taken inside the transaction that
     // moves the accepted pointer. Steps 1 and 3 both read them outside a write,
     // and a freeze bumps no chain row for a compare-and-set to catch — so this

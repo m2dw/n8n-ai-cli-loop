@@ -33,7 +33,41 @@ export const ANTIGRAVITY_PRINT_TIMEOUT_MAX_MS = 60 * 60 * 1000;
 
 const UNIT_MS: Record<string, number> = { h: 3_600_000, m: 60_000, s: 1_000 };
 
-const DURATION_SEGMENT_RE = /(\d+(?:\.\d+)?)(h|m|s)/g;
+function isDigit(ch: string | undefined): boolean {
+  return ch !== undefined && ch >= "0" && ch <= "9";
+}
+
+/**
+ * Reads one `<digits>[.<digits>]<unit>` segment starting exactly at `start`,
+ * or `undefined` when none starts there. A single forward scan (issue #1200):
+ * a global regex resumed after junk rescans a long digit run once per start
+ * position, which is quadratic in the input length.
+ */
+function readSegment(text: string, start: number): { numStr: string; unit: string; end: number } | undefined {
+  let i = start;
+  while (isDigit(text[i])) i += 1;
+  if (i === start) return undefined;
+  if (text[i] === "." && isDigit(text[i + 1])) {
+    i += 1;
+    while (isDigit(text[i])) i += 1;
+  }
+  const unit = text[i];
+  if (unit !== "h" && unit !== "m" && unit !== "s") return undefined;
+  return { numStr: text.slice(start, i), unit, end: i + 1 };
+}
+
+/**
+ * Whether any segment starts at or after `from`. Every segment ends in a digit
+ * immediately followed by its unit, and a digit followed by a unit is itself a
+ * segment, so this is a linear scan for that pair.
+ */
+function segmentStartsAtOrAfter(text: string, from: number): boolean {
+  for (let i = from; i + 1 < text.length; i += 1) {
+    const next = text[i + 1];
+    if (isDigit(text[i]) && (next === "h" || next === "m" || next === "s")) return true;
+  }
+  return false;
+}
 
 export interface ResolvedAntigravityPrintTimeout {
   /** The trimmed duration string, passed through verbatim as the `--print-timeout` value. */
@@ -59,24 +93,28 @@ export function parseAntigravityPrintTimeout(raw: string): ResolvedAntigravityPr
     throw new Error('must be a non-empty duration string (e.g. "15m", "90s", "1h30m")');
   }
   const trimmed = raw.trim();
-  DURATION_SEGMENT_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
   let consumed = 0;
   let totalMs = 0;
   const seenUnits = new Set<string>();
-  while ((match = DURATION_SEGMENT_RE.exec(trimmed)) !== null) {
-    if (match.index !== consumed) {
-      throw new Error(
-        `is not a valid duration (expected a value like "15m", "90s", or "1h30m"): unexpected characters at position ${consumed}`,
-      );
+  while (consumed < trimmed.length) {
+    const segment = readSegment(trimmed, consumed);
+    if (segment === undefined) {
+      // Junk followed by a later segment is reported by position; trailing
+      // junk (or no segment at all) falls through to the generic message.
+      if (segmentStartsAtOrAfter(trimmed, consumed)) {
+        throw new Error(
+          `is not a valid duration (expected a value like "15m", "90s", or "1h30m"): unexpected characters at position ${consumed}`,
+        );
+      }
+      break;
     }
-    const [full, numStr, unit] = match;
+    const { numStr, unit, end } = segment;
     if (seenUnits.has(unit)) {
       throw new Error(`is not a valid duration: unit "${unit}" is repeated`);
     }
     seenUnits.add(unit);
     totalMs += parseFloat(numStr) * UNIT_MS[unit];
-    consumed += full.length;
+    consumed = end;
   }
   if (consumed === 0 || consumed !== trimmed.length) {
     throw new Error('is not a valid duration (expected a value like "15m", "90s", or "1h30m")');

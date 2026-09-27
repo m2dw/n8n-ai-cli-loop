@@ -192,6 +192,22 @@ passed explicitly (`review:medium` -> `medium`, no label -> `high`; see
 nor its effort is ever influenced by an assignment profile — profiles
 continue to select only the agent (issue #694 decision 5, below).
 
+**Forward direction (issue #903).** The per-lane resolution chains described
+in this section are what
+[agent-runtime-profiles-contract.md](agent-runtime-profiles-contract.md)
+targets for replacement: four provider-neutral quality levels
+(`light`/`normal`/`strong`/`maximum`) resolved against a per-provider catalog
+of named runtime profiles held outside `sessions.json`. Its first two slices
+have landed — the catalog (#904) and the shared quality resolver plus its
+intake snapshot (#905, `session.agentRuntime.defaultQuality`) — and neither
+resolves an invocation, so nothing in this section changes until the adapter
+slice cuts the lanes over. The contract explicitly preserves the boundary
+above: **assignment profiles select the agent and never its runtime
+settings**, so an `assignmentProfiles` entry
+still MUST NOT carry a `model`, `effort`, `budget`, `quality`, or `profile`
+field. The two mechanisms are joined by exactly one value, the resolved agent
+id.
+
 `complexity:xhigh` implementation work resolves to Claude Fable 5
 (`--model fable`) at `--effort xhigh` (issue #857, a follow-up policy
 correction to #748) — the strongest available implementation profile. Issue

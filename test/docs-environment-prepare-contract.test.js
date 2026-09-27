@@ -131,6 +131,86 @@ describe('docs/environment-prepare-contract.md — environmentPrepare contract',
     expect(doc).toMatch(/task event|environment_prepare_failed/i);
   });
 
+  // -------------------------------------------------------------------------
+  // Stop-reason classification (#1060)
+  // -------------------------------------------------------------------------
+
+  test('names every stop reason a failed prepare run is classified into', () => {
+    for (const reason of ['command-failed', 'timeout', 'signal', 'spawn-error', 'refused']) {
+      expect(doc).toContain(`\`${reason}\``);
+    }
+  });
+
+  test('fixes the classification order as most-determinate first', () => {
+    expect(doc).toMatch(/`timeout` precedes `signal` and\s*\n?`spawn-error`/);
+    expect(doc).toMatch(/`command-failed` is the fallback/);
+  });
+
+  test('forbids reporting a killed process as a non-zero exit', () => {
+    expect(doc).toMatch(/killed process is never reported as a non-zero exit/i);
+  });
+
+  test('forbids presenting captured output as the cause of a stop the command did not choose', () => {
+    expect(doc).toMatch(/[Cc]aptured output is never presented as the cause/);
+    expect(doc).toMatch(/deprecation warnings/i);
+  });
+
+  test('requires one classified sentence across lastError, admin status, and the public comment', () => {
+    expect(doc).toMatch(/task\.lastError/);
+    expect(doc).toMatch(/admin\s*\n?status/);
+    expect(doc).toMatch(/public failure comment/i);
+  });
+
+  test('requires the timed-out process tree to be terminated, not just the direct child', () => {
+    expect(doc).toMatch(/own process group/i);
+    expect(doc).toMatch(/only the direct child/i);
+  });
+
+  test('refuses to treat a merely-configured deadline as evidence of a timeout', () => {
+    expect(doc).toMatch(/A configured deadline is evidence of nothing on its own/);
+    expect(doc).toMatch(/known to have \*elapsed\*/);
+  });
+
+  test('requires the deadline to be enforced against a command that ignores it', () => {
+    expect(doc).toMatch(/deadline is enforced even against a command that ignores it/i);
+    expect(doc).toMatch(/traps or ignores that signal/i);
+    expect(doc).toMatch(/external watchdog/i);
+  });
+
+  test('forbids recording an unconfirmed process-tree sweep as a success', () => {
+    expect(doc).toMatch(/could not confirm termination is recorded as such/i);
+    // The artifact-level statement of the same rule: a group that could not be
+    // signalled carries the refusing errno rather than a `terminated` flag.
+    expect(doc).toMatch(/processGroupSignalError/);
+    expect(doc).toMatch(/claimed only on evidence/i);
+  });
+
+  test('states that raising timeoutMs is not a classification', () => {
+    expect(doc).toMatch(/Raising `timeoutMs` is not a classification/);
+  });
+
+  test('records the termination facts and runner context in the run artifact', () => {
+    for (const field of [
+      'stopReason',
+      'stopSummary',
+      'timedOut',
+      'deadlineEscalated',
+      'signal',
+      'spawnErrorCode',
+      'spawnError',
+      'durationMs',
+      'processTreeCleanup',
+      'runnerContext',
+    ]) {
+      expect(doc).toContain(`\`${field}\``);
+    }
+  });
+
+  test('records environment variables by name only, never by value', () => {
+    expect(doc).toMatch(/by \*\*name only\*\*, never by value/);
+    expect(doc).toMatch(/registry token/i);
+  });
+
   test('states it is not a separate n8n node', () => {
     expect(doc).toMatch(/not.*n8n node|run-one-phase/i);
   });

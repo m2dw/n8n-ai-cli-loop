@@ -23,6 +23,12 @@ export interface PrSummaryInput {
   verificationNames?: string[];
   /** Whether verification passed overall. */
   verificationPassed?: boolean;
+  /**
+   * Issue #1154: the bound test suite entry whose full run has not yet passed at
+   * this revision (only Stage 1's changed and retained files ran). Never counted
+   * among the passed names.
+   */
+  pendingFullSuiteName?: string;
   /** Issue-required verification commands and their run status. */
   issueRequiredVerifications?: IssueRequiredVerification[];
 }
@@ -61,6 +67,7 @@ export function renderPrSummary(input: PrSummaryInput): string {
     diffClassification,
     verificationNames = [],
     verificationPassed,
+    pendingFullSuiteName,
     issueRequiredVerifications,
   } = input;
 
@@ -149,12 +156,18 @@ export function renderPrSummary(input: PrSummaryInput): string {
 
   // Verification section
   lines.push("### Verification");
-  if (verificationPassed !== undefined) {
+  if (verificationPassed !== undefined && (verificationNames.length > 0 || pendingFullSuiteName === undefined)) {
     const status = verificationPassed ? "✅ passed" : "❌ failed";
     const names = verificationNames.length > 0 ? verificationNames.join(", ") : "verification";
     lines.push(`${names}: ${status}`);
-  } else {
+  } else if (pendingFullSuiteName === undefined) {
     lines.push("Unknown — not recorded for this phase.");
+  }
+  if (pendingFullSuiteName !== undefined) {
+    lines.push(
+      `${pendingFullSuiteName}: only the changed and retained test files ran (Stage 1); `
+        + "pending the full-suite run after review approval (Stage 2; not a passing result)",
+    );
   }
   if (issueRequiredVerifications && issueRequiredVerifications.length > 0) {
     lines.push("");
@@ -165,6 +178,10 @@ export function renderPrSummary(input: PrSummaryInput): string {
           ? "✅ passed"
           : v.status === "failed"
           ? `❌ failed${v.exitCode !== undefined ? ` (exit ${v.exitCode})` : ""}`
+          : v.status === "retired"
+          ? "retired by operator amendment (not a passing result)"
+          : v.status === "pending_full_suite"
+          ? "pending the full-suite run after review approval (Stage 2; not a passing result)"
           : "⚠️ not run";
       lines.push(`- \`${v.command}\`: ${label}`);
     }

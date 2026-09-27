@@ -97,6 +97,18 @@ export interface SessionRepoHost {
   kind: RepoHostProviderKind;
   /** Resolved `gh` executor — present only when `kind === "github"`. */
   ghRunner?: GhRunner;
+  /**
+   * The `owner/name` slug of the repository `provider` actually addresses
+   * (issue #998).
+   *
+   * Not always `session.githubRepo`: a `gitea` repo host declares its own
+   * `owner`/`repo` connection block, which may point at a different repository
+   * than the GitHub-shaped session field. A caller validating that a PR it found
+   * belongs to the configured repository has to compare against the repository
+   * the provider queried, not against a field that only happens to agree on the
+   * GitHub path.
+   */
+  repoSlug: string;
 }
 
 /**
@@ -134,7 +146,7 @@ export async function resolveSessionRepoHost(
       githubRepo: opts.githubRepo,
       cwd: opts.cwd,
     });
-    return { provider, kind: "github", ghRunner };
+    return { provider, kind: "github", ghRunner, repoSlug: opts.githubRepo };
   }
 
   // Non-GitHub (gitea, …): the REST provider needs no `gh` runner. `ghRunner` in
@@ -146,7 +158,14 @@ export async function resolveSessionRepoHost(
     cwd: opts.cwd,
     giteaClient: opts.giteaClient ?? defaultGiteaClientBuilder(),
   });
-  return { provider, kind: resolved.provider };
+  // Gitea addresses its own declared code repository; every other non-GitHub kind
+  // has no connection block of its own yet, so the session field is the only
+  // repository identity available.
+  const repoSlug =
+    resolved.provider === "gitea" && resolved.gitea
+      ? `${resolved.gitea.owner}/${resolved.gitea.repo}`
+      : opts.githubRepo;
+  return { provider, kind: resolved.provider, repoSlug };
 }
 
 /** Injectable secret sources for token resolution; defaults to `process.env`. */

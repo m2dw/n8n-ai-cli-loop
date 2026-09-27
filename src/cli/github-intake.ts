@@ -30,6 +30,8 @@ import { workItemOutbox } from "../core/outbox-effects.js";
 import { parseCandidates } from "../core/github-intake.js";
 import { resolveAssignment } from "../core/assignment.js";
 import type { ResolvedAssignment } from "../core/assignment.js";
+import { AgentQualityError, QUALITY_CONTEXT_KEY, resolveRequestedQuality } from "../core/agent-quality.js";
+import type { ResolvedTaskQuality } from "../core/agent-quality.js";
 import type { GhIssue, DependencyChecker, BlockedByEntry, StackReadyResolver, IssueCandidateWithDecision, DependencyDecision, RefinementIntakeRefusal } from "../core/github-intake.js";
 import {
   REFINEMENT_CONTEXT_KEY,
@@ -50,6 +52,7 @@ import type {
 } from "../core/issue-refinement-snapshot.js";
 import type {
   RefinementEligibilitySource,
+  RefinementIntakeEligibility,
   RefinementPredecessorHoldRecord,
 } from "../core/issue-refinement-eligibility.js";
 import {
@@ -63,6 +66,8 @@ import {
 import { readChainAgreementFromRegistry } from "../core/issue-refinement-chain-agreement.js";
 import { SqliteChainRegistryStore } from "../stores/sqlite-chain-registry-store.js";
 import { acceptChainGraph, collectChainOwnership } from "../core/chain-acceptance.js";
+import { resolveChainOwnershipScopeFor } from "../core/chain-ownership-scope.js";
+import type { ChainOwnershipScope } from "../core/chain-ownership-scope.js";
 import { buildFrozenPrefix, checkFrozenPrefixes } from "../core/chain-frozen-prefix.js";
 import type { ChainBaseDecision, FrozenPrefixSnapshot } from "../core/chain-frozen-prefix.js";
 import type { ChainGraph } from "../core/chain-registry.js";
@@ -89,7 +94,7 @@ import { GiteaWorkItemProvider } from "../providers/gitea/gitea-work-item-provid
 import { resolveGiteaToken, redactGiteaSecrets } from "../providers/gitea/gitea-client.js";
 import type { GiteaHttpRequest } from "../providers/gitea/gitea-client.js";
 import type { WorkItem } from "../providers/types.js";
-import type { TaskEvent, TaskPhase } from "../core/task.js";
+import type { AiTask, TaskEvent, TaskPhase } from "../core/task.js";
 import { REPORT_ONLY_BLOCKED_PHASES, describeReportOnlyDeferral } from "../handlers/report-only-admission.js";
 import { emit, die } from "./cli-io.js";
 import { tokenizeArgs } from "./admin-command.js";
@@ -443,6 +448,14 @@ type StackBaseFacts = ReadonlyMap<number, { baseIssueNumber: number; baseHeadRef
 interface ChainIntakeCtx {
   sessionId: string;
   session: ResolvedSession;
+  /**
+   * The Issue-number space duplicate ownership is judged over: every session
+   * bound to this session's repository (issue #1045). Which chain intake may
+   * *extend* stays session-scoped — a chain belongs to one session — but which
+   * chains already claim an Issue does not, because two sessions on one
+   * repository see one set of Issues.
+   */
+  ownershipScope: ChainOwnershipScope;
   registry: SqliteChainRegistryStore;
   /** Work-item-aware outbox: effects land on the session's work-item repo. */
   outbox: OutboxStore;
@@ -667,7 +680,8 @@ async function registerCandidateChain(
       ...new Set([issueNumber, ...observedBlockers, ...(targetGraph?.members.map((m) => m.issueNumber) ?? [])]),
     ];
     ownership = await collectChainOwnership(ctx.registry, involved, {
-      filter: { sessionId: ctx.sessionId },
+      filter: ctx.ownershipScope.filter,
+      repositoryBySessionId: ctx.ownershipScope.repositoryBySessionId,
       ...(target.kind === "extend" ? { excludeChainId: target.chainId } : {}),
     });
   } catch (err) {
@@ -737,7 +751,8 @@ async function registerCandidateChain(
       members: plan.members,
       edges: plan.edges,
       expectedRev,
-      ownershipScope: { sessionId: ctx.sessionId },
+      ownershipScope: ctx.ownershipScope.filter,
+      repositoryBySessionId: ctx.ownershipScope.repositoryBySessionId,
       commitGuard: (guardCtx) => {
         const verdict = checkFrozenPrefixes({
           candidate: candidateSnapshot,
@@ -1155,6 +1170,7 @@ export async function runIntake(
     const chainCtx: ChainIntakeCtx = {
       sessionId,
       session,
+      ownershipScope: await resolveChainOwnershipScopeFor(sessionId, registry),
       registry: chainRegistry,
       outbox: workItemOutboxStore,
       now,
@@ -1273,6 +1289,101 @@ export async function runIntake(
       return "deferred";
     };
 
+    // §4's `hold_existing` write (issue #967), in one place because two callers
+    // need it: the reconciliation gate below — which runs BEFORE any admission
+    // refusal — and the ordinary admission path, which reaches the same
+    // disposition on its own fresh read.
+    //
+    // A claimable row for an Issue §4 does not admit yet: either one admitted
+    // before this gate existed, or one the handler's own hold delayed back to
+    // `queued`. Park it under a CAS on what was just read — this is the
+    // reconciliation that makes the fix converge without an operator touching
+    // the database.
+    const parkExistingRefinementRow = async (
+      key: { sessionId: string; issueNumber: number },
+      existing: AiTask,
+      eligibility: Extract<RefinementIntakeEligibility, { kind: "hold" }>,
+    ): Promise<"held" | "deferred"> => {
+      const record = buildRefinementPredecessorHold({
+        eligibility,
+        previousStatus: existing.status,
+        now,
+      });
+      const parked = await store.completePhaseWithEffects(
+        {
+          key,
+          expected: {
+            status: existing.status,
+            phase: existing.phase,
+            revision: existing.revision,
+          },
+          patch: {
+            status: "blocked",
+            ownerRunId: undefined,
+            leaseExpiresAt: undefined,
+            notBefore: undefined,
+            lastError: describeRefinementPredecessorHold(record),
+            context: { [REFINEMENT_PREDECESSOR_HOLD_KEY]: record },
+            now,
+          },
+          event: refinementHoldEvent(key, record, now),
+        },
+        [],
+      );
+      if (parked.ok) {
+        refinementHeldCount++;
+        results.push({
+          issueNumber: key.issueNumber,
+          action: "refinement_held",
+          phase: "refinement",
+          reason: "predecessor_not_ready",
+          previousStatus: existing.status,
+          predecessors: record.predecessorIssueNumbers,
+        });
+        return "held";
+      }
+      // A raced transition or a held maintenance lock: nothing was written, and
+      // the identical guard runs again on the next poll.
+      results.push({
+        issueNumber: key.issueNumber,
+        action: "refinement_hold_deferred",
+        phase: "refinement",
+        reason: parked.code,
+      });
+      return "deferred";
+    };
+
+    // §4 reconciliation for the row an Issue ALREADY owns, run before the
+    // per-candidate admission refusals below (issue #905 review follow-up).
+    //
+    // Those refusals decide one thing only: whether a NEW row is created this
+    // poll. A malformed `quality:` label or an unresolvable assignment must not
+    // also decide the fate of the row the Issue already had — the same
+    // separation §3.1's suspension guard makes, which deliberately excludes
+    // refinement rows and so cannot cover this one. Without it, an Issue whose
+    // predecessors are not ready keeps a `queued` refinement row for as long as
+    // the typo survives, and the worker starvation #967 exists to stop returns
+    // on every poll.
+    //
+    // Only the state-CHANGING answer is hoisted. `leave` writes nothing, and
+    // `reactivate` would make a row claimable — the opposite direction from
+    // this gate's fail-closed purpose — so both stay on the admission path,
+    // where a refusal reports itself and the next clean poll acts on them.
+    const reconcileExistingRefinementHold = async (
+      candidate: { issueNumber: number; refinementEligibility?: RefinementIntakeEligibility },
+    ): Promise<"held" | "deferred" | "not_applicable"> => {
+      if (candidate.refinementEligibility === undefined) return "not_applicable";
+      const key = { sessionId, issueNumber: candidate.issueNumber };
+      const existing = await store.getTask(key);
+      if (existing === undefined) return "not_applicable";
+      const disposition = decideRefinementIntakeDisposition({
+        eligibility: candidate.refinementEligibility,
+        existing,
+      });
+      if (disposition.kind !== "hold_existing") return "not_applicable";
+      return parkExistingRefinementRow(key, existing, disposition.eligibility);
+    };
+
     try {
       // Row 2 refusals first: those Issues produce no candidate at all, so this
       // is the only place their pre-existing task is reachable.
@@ -1282,6 +1393,25 @@ export async function runIntake(
       }
 
       for (const candidate of candidates) {
+        // §3.1's suspension guard runs BEFORE any per-candidate admission
+        // refusal below. The two decide different things: a refusal says only
+        // that no NEW row is created this poll, while the guard stops the row
+        // the Issue ALREADY had when the marker was applied. Letting a refusal
+        // skip the guard would leave a queued implementation row claimable
+        // under a refinement marker — exactly the execution §3.1 exists to
+        // stop — for an Issue whose only fault is a malformed `quality:` label
+        // or an unresolvable assignment. Suspending and admitting nothing this
+        // poll is the same handoff the clean-label path takes below; the next
+        // poll re-evaluates the refusal against the parked row.
+        if (candidate.phase === "refinement") {
+          const outcome = await suspendLiveExecution(candidate.issueNumber, []);
+          if (outcome !== "not_applicable") continue;
+          // Same reasoning as the guard above, for §4's own reconciliation: a
+          // refusal below must not leave a predecessor-ineligible row claimable.
+          const reconciled = await reconcileExistingRefinementHold(candidate);
+          if (reconciled !== "not_applicable") continue;
+        }
+
         // Resolve the assignment before any report-only deferral so an invalid
         // assignment profile (e.g. an unsupported conflict_resolution agent)
         // still fails intake the same way normal (non-report-only) intake does,
@@ -1311,6 +1441,38 @@ export async function runIntake(
             reason: "no_implementation_agent",
             markerLabel: refinementLabels.marker,
             conflictingLabels: [],
+          });
+          continue;
+        }
+
+        // Resolve the provider-neutral quality request from the same trusted
+        // labels, and persist it beside the assignment (issue #905,
+        // docs/agent-runtime-profiles-contract.md §9.3): quality is a property
+        // of the work, so it is snapshotted once and never moves under a task
+        // in flight. Nothing reads it yet — every lane still resolves its own
+        // model/effort/budget — so this write changes no invocation.
+        //
+        // A malformed request (a `quality:` label outside the vocabulary, or two
+        // naming different levels) refuses THIS candidate only. Admitting it
+        // with a silently defaulted quality is the substitution §12.3 forbids,
+        // and failing the whole intake run would let one Issue's typo stop
+        // every other Issue's automation.
+        let requestedQuality: ResolvedTaskQuality;
+        try {
+          requestedQuality = resolveRequestedQuality({
+            labels: candidate.labels,
+            session,
+            now,
+          });
+        } catch (err) {
+          if (!(err instanceof AgentQualityError)) throw err;
+          results.push({
+            issueNumber: candidate.issueNumber,
+            action: "quality_request_refused",
+            phase: candidate.phase,
+            title: candidate.title,
+            reason: err.reason,
+            message: err.message,
           });
           continue;
         }
@@ -1348,6 +1510,7 @@ export async function runIntake(
               ...(candidate.body !== undefined ? { body: candidate.body } : {}),
               intakeAt: now,
               assignment,
+              [QUALITY_CONTEXT_KEY]: requestedQuality,
               [REFINEMENT_CONTEXT_KEY]: buildRefinementContextBlock({
                 issueNumber: candidate.issueNumber,
                 title: candidate.title,
@@ -1388,12 +1551,18 @@ export async function runIntake(
           const refinementKey = { sessionId, issueNumber: candidate.issueNumber };
           const existing = await store.getTask(refinementKey);
 
+          // Normally the §3.1 guard at the top of this loop already stopped a
+          // row still live at an executable phase. It is re-checked against
+          // THIS read because the two reads are not one transaction: an
+          // operator (or a handler) requeueing a parked implementation row in
+          // that window makes it live again, and the replacement below would
+          // win its CAS on the freshly read revision — discarding the row's
+          // context and skipping the §13 handoff the marker exists to raise.
+          // Suspend it instead and admit nothing this poll; the row then
+          // belongs to a human, and the next poll finds it parked and replaces
+          // it below — the lane still starts on its own, without this pass
+          // overwriting the handoff in the same breath as raising it.
           if (existing !== undefined && isSuspendableForRefinement(existing)) {
-            // Still live at an executable phase: stop it first (§3.1) and admit
-            // nothing this poll. The row now belongs to a human, and the next
-            // poll finds it parked and replaces it below — so the lane still
-            // starts on its own, without this pass overwriting the handoff in
-            // the same breath as raising it.
             const outcome = await suspendLiveExecution(candidate.issueNumber, []);
             if (outcome !== "not_applicable") continue;
           }
@@ -1497,57 +1666,12 @@ export async function runIntake(
           }
 
           if (disposition.kind === "hold_existing" && existing !== undefined) {
-            // A claimable row for an Issue §4 does not admit yet: either one
-            // admitted before this gate existed, or one the handler's own hold
-            // delayed back to `queued`. Park it under a CAS on what was just
-            // read — this is the reconciliation that makes the fix converge
-            // without an operator touching the database.
-            const record = buildRefinementPredecessorHold({
-              eligibility: disposition.eligibility,
-              previousStatus: existing.status,
-              now,
-            });
-            const parked = await store.completePhaseWithEffects(
-              {
-                key: refinementKey,
-                expected: {
-                  status: existing.status,
-                  phase: existing.phase,
-                  revision: existing.revision,
-                },
-                patch: {
-                  status: "blocked",
-                  ownerRunId: undefined,
-                  leaseExpiresAt: undefined,
-                  notBefore: undefined,
-                  lastError: describeRefinementPredecessorHold(record),
-                  context: { [REFINEMENT_PREDECESSOR_HOLD_KEY]: record },
-                  now,
-                },
-                event: refinementHoldEvent(refinementKey, record, now),
-              },
-              [],
-            );
-            if (parked.ok) {
-              refinementHeldCount++;
-              results.push({
-                issueNumber: candidate.issueNumber,
-                action: "refinement_held",
-                phase: "refinement",
-                reason: "predecessor_not_ready",
-                previousStatus: existing.status,
-                predecessors: record.predecessorIssueNumbers,
-              });
-            } else {
-              // A raced transition or a held maintenance lock: nothing was
-              // written, and the identical guard runs again on the next poll.
-              results.push({
-                issueNumber: candidate.issueNumber,
-                action: "refinement_hold_deferred",
-                phase: "refinement",
-                reason: parked.code,
-              });
-            }
+            // Normally already handled by the reconciliation gate at the top of
+            // this loop, which reads the same row before any refusal can skip
+            // it. Reachable when a concurrent requeue made the row claimable
+            // between the two reads, so the write stays here too — under the
+            // same CAS, from the same helper.
+            await parkExistingRefinementRow(refinementKey, existing, disposition.eligibility);
             continue;
           }
 
@@ -1701,6 +1825,10 @@ export async function runIntake(
             // over the session's built-in default (issue #260). Persisted verbatim so
             // later edits to sessions.json never change this task's agents (issue #259).
             assignment,
+            // Resolved from the same trusted labels as the assignment and
+            // persisted for the same reason (issue #905): a later relabelling
+            // never changes what a task already in flight asked for.
+            [QUALITY_CONTEXT_KEY]: requestedQuality,
             ...(candidate.implementationMode !== undefined
               ? { implementationMode: candidate.implementationMode }
               : {}),
@@ -1855,6 +1983,23 @@ export async function runIntake(
           phase: candidate.phase,
           title: candidate.title,
           message: describeReportOnlyDeferral(session, candidate.issueNumber, candidate.phase),
+        });
+        continue;
+      }
+      // Preview the quality-request gate for the same reason (issue #905): an
+      // Issue a live poll would refuse for a malformed `quality:` label must
+      // not preview as a task that would be enqueued.
+      try {
+        resolveRequestedQuality({ labels: candidate.labels, session, now });
+      } catch (err) {
+        if (!(err instanceof AgentQualityError)) throw err;
+        results.push({
+          issueNumber: candidate.issueNumber,
+          action: "quality_request_refused",
+          phase: candidate.phase,
+          title: candidate.title,
+          reason: err.reason,
+          message: err.message,
         });
         continue;
       }

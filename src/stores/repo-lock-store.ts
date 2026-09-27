@@ -1,9 +1,9 @@
 import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
-import { homedir } from "os";
 import { join } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 
 export const DEFAULT_LOCK_DIR = join(
-  homedir(),
+  resolveHomeDir(),
   ".local",
   "state",
   "n8n-ai-cli-loop",

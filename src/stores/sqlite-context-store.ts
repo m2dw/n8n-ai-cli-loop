@@ -1,10 +1,10 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { resolveHomeDir } from "../core/home-dir.js";
 
 export const DEFAULT_DB_PATH = join(
-  homedir(),
+  resolveHomeDir(),
   ".config",
   "n8n-ai-cli-loop",
   "dev_loop.db",

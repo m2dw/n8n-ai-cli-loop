@@ -83,6 +83,8 @@ import type { ChainGraphDiagnostic, ChainGraphEdge, ChainGraphSnapshot } from ".
 import { checkFrozenPrefixes } from "../core/chain-frozen-prefix.js";
 import type { FrozenPrefixViolation } from "../core/chain-frozen-prefix.js";
 import { acceptChainGraph, collectChainOwnership } from "../core/chain-acceptance.js";
+import { resolveChainOwnershipScopeFor } from "../core/chain-ownership-scope.js";
+import type { ChainOwnershipScope } from "../core/chain-ownership-scope.js";
 import { frozenPrefixRefusal, planChainSync } from "../core/chain-sync.js";
 import type { ChainSyncPlan, ChainSyncRefusal, ChainSyncRefusalKind } from "../core/chain-sync.js";
 import type { WorkItemProvider } from "../providers/types.js";
@@ -382,6 +384,7 @@ function refusalFailure(refusal: ChainSyncRefusal): ChainSyncFailure {
 async function syncOneChain(
   store: SqliteChainRegistryStore,
   providerFor: (sessionId: string) => Promise<ProviderEntry>,
+  scopeFor: (sessionId: string) => Promise<ChainOwnershipScope>,
   chainId: string,
   apply: boolean,
   now: string,
@@ -418,10 +421,18 @@ async function syncOneChain(
   const { edges: observedEdges, errors: providerErrors } = await fetchObservedEdges(entry.provider, members);
   const observedSnapshot: ChainGraphSnapshot = { members, edges: observedEdges };
 
+  // Repository-scoped, not session-scoped: two sessions bound to one repository
+  // share an Issue-number space and must still see each other's claims, while
+  // two bound to different repositories never do (issue #1045).
+  const scope = await scopeFor(chain.sessionId);
   const ownership = await collectChainOwnership(
     store,
     members.map((m) => m.issueNumber),
-    { filter: { sessionId: chain.sessionId }, excludeChainId: chainId },
+    {
+      filter: scope.filter,
+      excludeChainId: chainId,
+      repositoryBySessionId: scope.repositoryBySessionId,
+    },
   );
 
   const plan: ChainSyncPlan = planChainSync({
@@ -496,7 +507,8 @@ async function syncOneChain(
     members,
     edges: observedEdges,
     expectedRev: chain.rev,
-    ownershipScope: { sessionId: chain.sessionId },
+    ownershipScope: scope.filter,
+    repositoryBySessionId: scope.repositoryBySessionId,
     commitGuard: ({ frozenPrefixes }) => {
       const frozen = checkFrozenPrefixes({
         candidate: observedSnapshot,
@@ -694,6 +706,18 @@ export async function runChainSync(argv: string[]): Promise<void> {
     return entry;
   };
 
+  // Memoized for the same reason providers are: `--all` walks many chains, most
+  // of them in a handful of sessions, and the scope is a pure function of the
+  // session file this run already holds open.
+  const scopes = new Map<string, ChainOwnershipScope>();
+  const scopeFor = async (chainSessionId: string): Promise<ChainOwnershipScope> => {
+    const cached = scopes.get(chainSessionId);
+    if (cached !== undefined) return cached;
+    const scope = await resolveChainOwnershipScopeFor(chainSessionId, registry);
+    scopes.set(chainSessionId, scope);
+    return scope;
+  };
+
   const now = new Date().toISOString();
   const store = new SqliteChainRegistryStore(dbPath);
   try {
@@ -718,7 +742,7 @@ export async function runChainSync(argv: string[]): Promise<void> {
     const results: ChainSyncResult[] = [];
     for (const id of chainIds) {
       try {
-        const result = await syncOneChain(store, providerFor, id, apply, now);
+        const result = await syncOneChain(store, providerFor, scopeFor, id, apply, now);
         if (result !== undefined) results.push(result);
       } catch (err) {
         // Batch isolation: an unexpected throw for one chain (a store read that

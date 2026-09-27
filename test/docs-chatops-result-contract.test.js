@@ -40,7 +40,10 @@ const domainTest = domain === null ? test.skip : test;
 
 describe(`${DOC_PATH} — status and scope`, () => {
   test('is marked approved design, not yet implemented', () => {
-    expect(doc).toMatch(/Status: \*\*approved design, not yet implemented\*\* \(issue #785\)/);
+    // Issue #1024 implemented this layer (`src/core/chatops-result.ts`) and wired
+    // it into the bounded pass, so the status line moved off "not yet
+    // implemented". The policy the rest of this file pins is unchanged.
+    expect(doc).toMatch(/Status: \*\*approved design, implemented\*\* \(issue #785/);
   });
 
   test('names itself split part 3 of #779 and what it supersedes', () => {

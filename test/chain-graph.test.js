@@ -5,6 +5,7 @@
  */
 import {
   CHAIN_GRAPH_DIAGNOSTIC_CODES,
+  MAX_DIAGNOSTIC_TOKEN_CHARS,
   chainGraphFingerprint,
   chainGraphTopologicalOrder,
   compareChainGraphs,
@@ -404,6 +405,69 @@ describe('duplicate chain ownership', () => {
     const duplicate = findDiagnostic(result, 'duplicate_ownership');
     expect(duplicate.issues).toEqual([2, 3]);
     expect(duplicate.chains).toEqual(['chain_9']);
+  });
+
+  test('a duplicate names the session and repository of the chain that already owns it', () => {
+    // An Issue number identifies an Issue only within one repository (issue
+    // #1045), so "697 belongs to chain_777" is unactionable on its own.
+    const result = validateChainGraph(
+      { chainId: 'chain_693', headIssueNumber: 1, members: [HEAD, { issueNumber: 697 }], edges: [] },
+      {
+        ownership: [
+          {
+            issueNumber: 697,
+            chainId: 'chain_777',
+            sessionId: 'ai-cli-loop',
+            repository: 'm2dw/yoda_form_js',
+          },
+        ],
+      },
+    );
+    const duplicate = findDiagnostic(result, 'duplicate_ownership');
+    expect(duplicate.message).toBe(
+      'issues 697 already belong to chain chain_777 (session ai-cli-loop, repo m2dw/yoda_form_js)',
+    );
+    expect(duplicate.owners).toEqual([
+      { chainId: 'chain_777', sessionId: 'ai-cli-loop', repository: 'm2dw/yoda_form_js' },
+    ]);
+  });
+
+  test('an ownership entry with no identity keeps the pre-#1045 diagnostic shape', () => {
+    const result = validateChainGraph(
+      { chainId: 'chain_1', headIssueNumber: 1, members: [HEAD, { issueNumber: 2 }], edges: [] },
+      { ownership: [{ issueNumber: 2, chainId: 'chain_9' }] },
+    );
+    const duplicate = findDiagnostic(result, 'duplicate_ownership');
+    expect(duplicate.message).toBe('issues 2 already belong to chain chain_9');
+    expect(duplicate.owners).toBeUndefined();
+  });
+
+  test('a partial identity renders only the half it knows', () => {
+    const result = validateChainGraph(
+      { chainId: 'chain_1', headIssueNumber: 1, members: [HEAD, { issueNumber: 2 }], edges: [] },
+      { ownership: [{ issueNumber: 2, chainId: 'chain_9', sessionId: 'other-session' }] },
+    );
+    expect(findDiagnostic(result, 'duplicate_ownership').message).toBe(
+      'issues 2 already belong to chain chain_9 (session other-session)',
+    );
+  });
+
+  test('an over-long identity is clipped in the message but kept whole in owners', () => {
+    // The message is bounded because it ends up in logs; `owners` is the
+    // structured half a consumer looks back up in the registry, so clipping it
+    // would make two identities sharing a prefix indistinguishable.
+    const shared = 'a'.repeat(MAX_DIAGNOSTIC_TOKEN_CHARS);
+    const sessionId = `${shared}-session-one`;
+    const repository = `m2dw/${shared}-repo-one`;
+    const result = validateChainGraph(
+      { chainId: 'chain_1', headIssueNumber: 1, members: [HEAD, { issueNumber: 2 }], edges: [] },
+      { ownership: [{ issueNumber: 2, chainId: 'chain_9', sessionId, repository }] },
+    );
+    const duplicate = findDiagnostic(result, 'duplicate_ownership');
+    expect(duplicate.message).toBe(
+      `issues 2 already belong to chain chain_9 (session ${shared}…, repo ${repository.slice(0, MAX_DIAGNOSTIC_TOKEN_CHARS)}…)`,
+    );
+    expect(duplicate.owners).toEqual([{ chainId: 'chain_9', sessionId, repository }]);
   });
 
   test('the chain re-declaring its own members is not duplicate ownership', () => {

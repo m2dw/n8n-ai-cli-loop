@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
-import { homedir } from "os";
 import { mkdirSync } from "fs";
 import { join } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 import type {
   AiTask,
   ClaimNextTaskRequest,
@@ -18,9 +18,11 @@ import type {
 } from "../core/task.js";
 import { applyTaskPatch, isClaimExpired, isRunnable, leaseExpiry, priorityRank } from "../core/transitions.js";
 import { ASSIGNMENT_CONTEXT_KEY } from "../core/assignment.js";
+import { QUALITY_CONTEXT_KEY } from "../core/agent-quality.js";
 import { hasUnresolvedToolRequest } from "../core/tool-request.js";
 import type { OutboxEffect, PhaseCompletionTransition, TaskStore } from "../core/task-store.js";
 import type { OutboxEnqueueInput } from "../core/outbox.js";
+import { OUTBOX_CLAIM_STALE_MS } from "../core/outbox.js";
 import type {
   ChainPrefixFreezeStore,
   FreezeChainPrefixInput,
@@ -33,7 +35,12 @@ import type {
   EnqueueTaskWithChainFreezeResult,
 } from "../core/chain-intake.js";
 import { sqliteBackendId } from "./sqlite-backend-id.js";
-import { migrateOutboxTable, migrateOutboxRetryColumns } from "./outbox-migration.js";
+import {
+  migrateOutboxTable,
+  migrateOutboxRetryColumns,
+  migrateOutboxCancelColumn,
+  migrateOutboxClaimColumn,
+} from "./outbox-migration.js";
 import { migrateChainRegistrySchema } from "./chain-registry-migration.js";
 import {
   INSERT_FROZEN_PREFIX,
@@ -47,7 +54,7 @@ import { isMaintenanceLockHeld } from "./maintenance-lock-guard.js";
 const DEFAULT_LEASE_MS = 30 * 60 * 1000;
 
 const DEFAULT_DB_PATH = join(
-  homedir(),
+  resolveHomeDir(),
   ".config",
   "n8n-ai-cli-loop",
   "dev_loop.db",
@@ -122,7 +129,15 @@ CREATE TABLE IF NOT EXISTS outbox (
   attempt_count     INTEGER NOT NULL DEFAULT 0,
   last_error        TEXT,
   next_attempt_at   TEXT,
-  dead_letter_at    TEXT
+  dead_letter_at    TEXT,
+  -- issue #980: completePhaseWithEffects retires pending rows in the same
+  -- transaction as the transition (see cancelOutboxPending), so the column has
+  -- to exist even on a file this store — not SqliteOutboxStore — created first.
+  cancelled_at      TEXT,
+  -- issue #980 review: and it READS this one in the same transaction, to refuse
+  -- a retirement that would race a dispatch already on the wire (see
+  -- outboxEffectRefusal), so it has to exist here for the same reason.
+  claimed_at        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
@@ -192,6 +207,17 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
     migrateOutboxTable(this.#db);
     this.#db.exec(SCHEMA);
     migrateOutboxRetryColumns(this.#db);
+    // Additive and guarded (issue #980): a database an older build of this store
+    // created has an `outbox` table without `cancelled_at`, which
+    // `#cancelOutboxPending` writes. CREATE TABLE IF NOT EXISTS above never
+    // alters it, so the column arrives here for exactly the same reason
+    // SqliteOutboxStore runs this migration on its own schema.
+    migrateOutboxCancelColumn(this.#db);
+    // Additive and guarded for the same reason as the line above (issue #980
+    // review): `#outboxEffectRefusal` reads `claimed_at` on this connection, and
+    // a database an older build of this store created has an `outbox` table
+    // without it.
+    migrateOutboxClaimColumn(this.#db);
     migrateTasksNotBefore(this.#db);
     migrateTasksRevision(this.#db);
     // The dependency-chain tables live in this same file (issue #788), and
@@ -292,6 +318,16 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
             // following the original columns instead of preferring a new
             // context.assignment derived from the changed config.
             delete freshContext[ASSIGNMENT_CONTEXT_KEY];
+          }
+          // The quality request is snapshotted at intake for the same reason and
+          // is restored the same way (issue #905,
+          // docs/agent-runtime-profiles-contract.md §9.3): relabelling an Issue
+          // while its task waits must not change what that task asked for. A
+          // task created before the snapshot existed keeps the freshly resolved
+          // one — it has no pinned request to protect, and resolution would fall
+          // back to these same labels anyway.
+          if (existingTask.context[QUALITY_CONTEXT_KEY] !== undefined) {
+            freshContext[QUALITY_CONTEXT_KEY] = existingTask.context[QUALITY_CONTEXT_KEY];
           }
           this.#db
             .prepare(
@@ -634,6 +670,10 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
   ): Promise<StoreResult<AiTask>> {
     const run = this.#db.transaction((): StoreResult<AiTask> => {
       if (isMaintenanceLockHeld(this.#db)) return { ok: false, code: "maintenance_locked" };
+      // Before the first write, so the refusal leaves nothing behind (issue
+      // #980 review).
+      const refused = this.#outboxEffectRefusal(effects);
+      if (refused) return refused;
       const result = this.#applyTransition(transition.key, transition.expected, transition.patch);
       if (!result.ok) return result;
 
@@ -642,13 +682,7 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
       // refused CAS or a held maintenance lock rolls back the protocol block and
       // the audit record of its move together.
       for (const extra of transition.extraEvents ?? []) this.#insertEvent(extra);
-      for (const effect of effects) {
-        if (effect.kind === "enqueue") {
-          this.#insertOutboxEnqueue(effect.input);
-        } else {
-          this.#insertOutboxReplacePendingPrSummary(effect.input, effect.key);
-        }
-      }
+      for (const effect of effects) this.#applyOutboxEffect(effect);
 
       return result;
     });
@@ -686,16 +720,12 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
   ): Promise<StoreResult<AiTask>> {
     const run = this.#db.transaction((): StoreResult<AiTask> => {
       if (isMaintenanceLockHeld(this.#db)) return { ok: false, code: "maintenance_locked" };
+      const refused = this.#outboxEffectRefusal(effects);
+      if (refused) return refused;
       const result = this.#applyTransition(key, expected, patch);
       if (!result.ok) return result;
 
-      for (const effect of effects) {
-        if (effect.kind === "enqueue") {
-          this.#insertOutboxEnqueue(effect.input);
-        } else {
-          this.#insertOutboxReplacePendingPrSummary(effect.input, effect.key);
-        }
-      }
+      for (const effect of effects) this.#applyOutboxEffect(effect);
 
       return result;
     });
@@ -980,6 +1010,68 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
       );
   }
 
+  /**
+   * Apply one effect of a compound commit, inside the caller's transaction and
+   * behind the maintenance-lock read it has already performed. Shared by every
+   * `*WithEffects` method so a new effect kind cannot be honoured on one of
+   * them and silently dropped on the others.
+   */
+  #applyOutboxEffect(effect: OutboxEffect): void {
+    switch (effect.kind) {
+      case "enqueue":
+        this.#insertOutboxEnqueue(effect.input);
+        return;
+      case "replacePendingPrSummary":
+        this.#insertOutboxReplacePendingPrSummary(effect.input, effect.key);
+        return;
+      case "cancelPending":
+        this.#cancelOutboxPending(effect.idempotencyKey, effect.now);
+        return;
+    }
+  }
+
+  /**
+   * The pre-flight half of `#applyOutboxEffect`: whether this effect set must be
+   * refused OUTRIGHT rather than applied (issue #980 review).
+   *
+   * Called from inside the caller's transaction and BEFORE its first write —
+   * which is what makes the refusal total. better-sqlite3 commits a transaction
+   * function that returns normally, so a check performed after the transition
+   * had already been written would have to throw to roll it back; evaluated
+   * first, returning a code is enough, and the caller reports ordinary retryable
+   * contention exactly as it does for a held maintenance lock.
+   *
+   * Only `cancelPending` effects that opted into `refuseWhileClaimed` are
+   * consulted, and only against a LIVE claim — a `claimed_at` newer than
+   * {@link OUTBOX_CLAIM_STALE_MS}. A stale claim is an abandoned attempt that
+   * `claimForDispatch` itself would steal, so refusing on one would make a row
+   * a crashed dispatcher touched permanently unrecoverable. Rows that are sent,
+   * already cancelled, or absent cannot be in flight and never refuse.
+   *
+   * Being inside the transaction is the whole mechanism: a dispatcher's claim is
+   * its own write on this same file, so it either commits before this read (seen
+   * here, refused) or after this transaction's cancellation (impossible —
+   * `claimForDispatch` requires `cancelled_at IS NULL`). There is no window in
+   * between for a claim to open.
+   */
+  #outboxEffectRefusal(effects: readonly OutboxEffect[]): StoreResult<AiTask> | null {
+    for (const effect of effects) {
+      if (effect.kind !== "cancelPending" || effect.refuseWhileClaimed !== true) continue;
+      const asOf = effect.now ?? new Date().toISOString();
+      const staleBefore = new Date(new Date(asOf).getTime() - OUTBOX_CLAIM_STALE_MS).toISOString();
+      const inFlight = this.#db
+        .prepare(
+          `SELECT id FROM outbox
+           WHERE idempotency_key = ? AND sent_at IS NULL AND cancelled_at IS NULL
+             AND claimed_at IS NOT NULL AND claimed_at > ?
+           LIMIT 1`,
+        )
+        .get(effect.idempotencyKey, staleBefore) as { id: number } | undefined;
+      if (inFlight) return { ok: false, code: "effect_in_flight" };
+    }
+    return null;
+  }
+
   #insertOutboxEnqueue(input: OutboxEnqueueInput): void {
     const now = input.now ?? new Date().toISOString();
     this.#db
@@ -1020,6 +1112,33 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
         )
         .run(input.idempotencyKey, key.owner, key.repo, key.prNumber, key.marker);
     }
+  }
+
+  /**
+   * Retire every unsent row carrying `idempotencyKey` (issue #980 review) — see
+   * `OutboxEffectCancelPending` in core/task-store.ts for why a transition may
+   * need this rather than a compensating row alone.
+   *
+   * Mirrors `SqliteOutboxStore.cancelEntry`'s write (`cancelled_at` set,
+   * `dead_letter_at` left alone if the row already exhausted its retries) with
+   * two deliberate differences: it addresses rows by idempotency key rather than
+   * by id, because the caller derives the effect it is undoing rather than
+   * reading a row first; and it does NOT exclude a claimed row, because what has
+   * to stop is the retry. `cancelled_at IS NULL` keeps it idempotent, so a
+   * re-run commit cannot overwrite when the row was first cancelled.
+   *
+   * Whether cancelling an in-flight row is ACCEPTABLE is decided before this
+   * runs, by `#outboxEffectRefusal`: an effect that cannot tolerate the
+   * claimed case refuses the whole transaction there rather than reaching here.
+   */
+  #cancelOutboxPending(idempotencyKey: string, now?: string): void {
+    const asOf = now ?? new Date().toISOString();
+    this.#db
+      .prepare(
+        `UPDATE outbox SET dead_letter_at = COALESCE(dead_letter_at, ?), cancelled_at = ?
+         WHERE idempotency_key = ? AND sent_at IS NULL AND cancelled_at IS NULL`,
+      )
+      .run(asOf, asOf, idempotencyKey);
   }
 
   async releaseClaim(
@@ -1255,17 +1374,13 @@ export class SqliteTaskStore implements TaskStore, ChainPrefixFreezeStore, Chain
 
     const run = this.#db.transaction((): StoreResult<AiTask> => {
       if (isMaintenanceLockHeld(this.#db)) return { ok: false, code: "maintenance_locked" };
+      const refused = this.#outboxEffectRefusal(effects);
+      if (refused) return refused;
       const result = this.#applyCancel(key, options, now);
       if (!result.ok) return result;
 
       this.#insertEvent(event);
-      for (const effect of effects) {
-        if (effect.kind === "enqueue") {
-          this.#insertOutboxEnqueue(effect.input);
-        } else {
-          this.#insertOutboxReplacePendingPrSummary(effect.input, effect.key);
-        }
-      }
+      for (const effect of effects) this.#applyOutboxEffect(effect);
 
       return result;
     });

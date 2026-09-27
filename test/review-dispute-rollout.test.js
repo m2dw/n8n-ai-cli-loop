@@ -51,6 +51,7 @@ const SESSION = 'rollout-session';
 const ISSUE = 849;
 const KEY = { sessionId: SESSION, issueNumber: ISSUE };
 const LINEAGE_A = 'ln-aaaaaaaaaaaa';
+const LINEAGE_B = 'ln-bbbbbbbbbbbb';
 const BOUNDARY = 'src/auth/handler.ts';
 const ARGUMENT = 'The null session is already rejected by the middleware, so the cited crash cannot occur.';
 const LEGACY_FEEDBACK = 'Legacy prose from before the protocol was ever enabled.';
@@ -128,14 +129,14 @@ function context(lineages) {
   return { version: 1, reviewStructure: 'structured', lineages };
 }
 
-function record(id, disposition) {
-  if (disposition === 'fixed') return { lineageId: id, version: 1, disposition: 'fixed', note: 'Added the guard.' };
+function record(id, disposition, version = 1) {
+  if (disposition === 'fixed') return { lineageId: id, version, disposition: 'fixed', note: 'Added the guard.' };
   return {
     lineageId: id,
-    version: 1,
+    version,
     disposition: 'review_disputed',
     dispute: {
-      challenged: { lineageId: id, version: 1 },
+      challenged: { lineageId: id, version },
       rebuttalReason: 'false_premise',
       argument: ARGUMENT,
       evidenceRefs: [{ kind: 'file', path: BOUNDARY, startLine: 30, endLine: 36 }],
@@ -147,14 +148,18 @@ function record(id, disposition) {
 function application(ctx, records, { diff = false, runId = 'run-impl-1' } = {}) {
   const outcome = parseFixDispositionResponse({
     response: `\`\`\`json\n${JSON.stringify(records)}\n\`\`\``,
-    findings: Object.values(ctx.lineages).map((l) => ({
-      lineageId: l.lineageId,
-      version: l.version,
-      state: l.state,
-      severity: l.severity,
-      affectedBoundary: l.affectedBoundary,
-      allowedDispositions: ['fixed', 'review_disputed', 'blocked'],
-    })),
+    // Only the ACTIONABLE lineages reach a fix prompt (§7.1 rule 2): a lineage
+    // mid-debate — `evidence_requested`, say — is not one the run may disposition.
+    findings: Object.values(ctx.lineages)
+      .filter((l) => l.state === 'open' || l.state === 'binding')
+      .map((l) => ({
+        lineageId: l.lineageId,
+        version: l.version,
+        state: l.state,
+        severity: l.severity,
+        affectedBoundary: l.affectedBoundary,
+        allowedDispositions: ['fixed', 'review_disputed', 'blocked'],
+      })),
     lineages: ctx.lineages,
     reviewStructure: ctx.reviewStructure,
     runProducedFileChanges: diff,
@@ -374,18 +379,32 @@ describe('rollback distinguishes disablement from recovery', () => {
   });
 
   test('an in-flight task parked by the protocol is recovered with the ordinary handoff command', async () => {
-    const ctx = context({ [LINEAGE_A]: lineage(LINEAGE_A) });
+    // §7.1 rule 1, the route that still parks (every turn's run has a
+    // dispatcher now: the reviewer's since issue #952, the runner's since #955,
+    // and the evidence turn's since #964, so an undispatched turn can no longer
+    // park a task). A version-2 finding is the final response (§6.2), so
+    // disputing it goes straight to `arbitration_pending` via row 6 — but the
+    // sibling already escalated to a human outranks every turn, and the task
+    // parks.
+    const ctx = context({
+      [LINEAGE_A]: lineage(LINEAGE_A, {
+        version: 2,
+        rebuttedVersions: [1],
+        counters: { rebuttals: 1, reconsiderations: 1 },
+      }),
+      [LINEAGE_B]: lineage(LINEAGE_B, { state: 'escalated_human', outcome: 'escalated_human' }),
+    });
     await enqueue({ [REVIEW_DISPUTE_CONTEXT_KEY]: ctx });
     await runPhase({
       session: { ...BASE_SESSION, reviewDispute: { enabled: true } },
-      value: application(ctx, [record(LINEAGE_A, 'review_disputed')]),
+      value: application(ctx, [record(LINEAGE_A, 'review_disputed', 2)]),
     });
     const parked = await store.getTask(KEY);
     expect(parked.status).toBe('ready_for_human');
     // The stop reason an operator reads before deciding anything.
     const summary = summarizeDisputeStatus(parked, await store.listEvents(KEY));
     expect(summary.nextAction.authorized).toBe(false);
-    expect(summary.nextAction.reason).toBe('undispatched_turn');
+    expect(summary.nextAction.reason).toBe('lineage_escalated_human');
 
     // The protocol is turned off mid-flight; the task is recovered as an
     // ordinary human handoff, which is a task action and not a protocol one.
@@ -399,9 +418,9 @@ describe('rollback distinguishes disablement from recovery', () => {
     expect(recovered.status).toBe('queued');
     expect(recovered.phase).toBe('implementation');
     // Recovery is a task transition, never an edit of the audit block: the
-    // `disputed` lineage is still on file exactly as the protocol left it.
+    // arbitrating lineage is still on file exactly as the protocol left it.
     expect(recovered.context[REVIEW_DISPUTE_CONTEXT_KEY]).toEqual(parked.context[REVIEW_DISPUTE_CONTEXT_KEY]);
-    expect(recovered.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].state).toBe('disputed');
+    expect(recovered.context[REVIEW_DISPUTE_CONTEXT_KEY].lineages[LINEAGE_A].state).toBe('arbitration_pending');
   });
 
   test('a disabled session runs the recovered task on the legacy path, block untouched', async () => {
@@ -412,8 +431,10 @@ describe('rollback distinguishes disablement from recovery', () => {
       value: application(ctx, [record(LINEAGE_A, 'review_disputed')]),
     });
     const parked = await store.getTask(KEY);
+    // §7.1 routed the reviewer turn to `review` (issue #952); the operator moves
+    // it back to the phase this scenario re-runs, which is the same store port.
     const recovered = await store.recoverHandoff(KEY, {
-      fromStatus: 'ready_for_human',
+      fromStatus: 'queued',
       phase: 'implementation',
       now: NOW,
     });

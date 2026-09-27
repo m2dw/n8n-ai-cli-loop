@@ -195,6 +195,34 @@ export interface ChatOpsLedgerRow {
   detail: string | null;
 }
 
+/**
+ * Whether two readings of one ledger row are the same *version* of it.
+ *
+ * The ledger has no version column, so the mutable fields stand in for one: any
+ * transition the state machine can apply changes at least one of them. That is
+ * enough for every compare-and-swap over a row — the bounded pass's dispatch
+ * write-ahead and result commit, and the operator CLI's `--resolve`/`--retry`.
+ * The question is never "are these deeply equal" but "has anything happened to
+ * this row since I read it", and every transition that could have happened is a
+ * state change, an attempt bump, an epoch bump, an outcome, or a publication
+ * move.
+ *
+ * `evidence` is deliberately excluded: reconciliation folds observed markers into
+ * it without the row otherwise moving, and treating that as a conflicting write
+ * would stall dispatch on a scan that merely re-saw the same provider comments.
+ */
+export function sameChatOpsLedgerVersion(a: ChatOpsLedgerRow, b: ChatOpsLedgerRow): boolean {
+  return (
+    a.state === b.state &&
+    a.outcome === b.outcome &&
+    a.attempts === b.attempts &&
+    a.epoch === b.epoch &&
+    a.ackPublication === b.ackPublication &&
+    a.ackAttempts === b.ackAttempts &&
+    a.reconcileAttempts === b.reconcileAttempts
+  );
+}
+
 /** A fresh row for a newly claimed or refused comment (contract rows 1 and 2). */
 function newRow(commentId: string, state: ChatOpsLedgerState): ChatOpsLedgerRow {
   return {

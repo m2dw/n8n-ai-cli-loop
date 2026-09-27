@@ -183,6 +183,68 @@ These print text by default and JSON with `--json`:
   the accepted revision is current, and frozen-prefix conflicts (#891) — all
   without writing anything back to the registry or to GitHub. Per-member
   provider fetch failures are reported separately from structural findings.
+
+  Duplicate ownership is judged over a *repository*, never over bare Issue
+  numbers (issue #1045). An Issue number is unique only inside the repository
+  that issued it, so the chains a member is compared against are those of every
+  session bound to the same work-item repository as the chain's own session —
+  which is the same scope `chain new`, `append`, `prepend`, `fork`, `merge`,
+  `sync`, and intake claim their members under. Two sessions on one repository
+  therefore still refuse a doubled claim, two sessions on different repositories
+  never collide over a shared number, and a chain whose session the session file
+  no longer describes falls back to that session alone. Two sessions are on the
+  same repository when their provider, endpoint, owner, and repository name
+  match case-insensitively — both providers resolve a slug that way, so
+  `M2DW/Repo` and `m2dw/repo` are one Issue-number space — while the spelling
+  each session declared is what is shown back. `validate` reports the
+  scope it used as `ownershipScope`, and a `duplicate_ownership` finding names
+  the offending chain's session and repository so it can be identified
+  unambiguously.
+- `agent-profile list` / `agent-profile show` / `agent-profile validate` (issue
+  #913): read-only inspection and validation of the agent runtime profile
+  catalog ([agent-runtime-profiles-contract.md](agent-runtime-profiles-contract.md)
+  §11.4). `list` shows the effective catalog after the `agent-profiles.json`
+  overlay is merged over the built-in one, with every value labelled built-in or
+  overridden; `show <agent> [--quality <level>]` reports all four quality levels
+  with the profile each binds and the concrete model, effort, budget, binary,
+  and provider options the precedence ladder resolves for it, each value
+  carrying its own source (an env break-glass override, an operator pin, the
+  overlay, or the built-in catalog); `validate [--file <path>] [--probe]`
+  re-runs the load-time gate against the effective catalog or a candidate file
+  and then resolves every agent at every level under the current environment and
+  session pins, so a bad override or an undeclared pin is reported before a
+  phase spends a token. All three work with no catalog file present (the
+  built-in defaults are what they show), address a catalog and a session rather
+  than one task, and write nothing. `--probe` additionally runs each provider's
+  declared version probe and reports `available` / `unavailable` /
+  `indeterminate` in a section of its own: capability discovery is
+  informational, never a verdict on a profile, and never feeds the catalog.
+  `show` and `validate` exit non-zero when a resolution or a check fails, with
+  the contract's own refusal reason (`catalog-invalid`, `unknown-profile`,
+  `unsupported-value`, `invalid-override`, ...) on the finding.
+- `agent-profile refresh` (issue #914): the safe update path for the same
+  catalog ([agent-runtime-profiles-contract.md](agent-runtime-profiles-contract.md)
+  §11.6). Compares the `agent-profiles.json` overlay against the release's
+  recommended (built-in) catalog and the installed provider CLIs — a bounded,
+  non-interactive model listing where a provider offers one, the bundled
+  catalog otherwise, with the source reported — and previews a diff: removed
+  or no-longer-recommended models, effort tiers the release does not declare,
+  redundant overrides, and overrides shadowing a newer recommendation.
+  Previews by default, applies with `--yes` like every other state-changing
+  admin command; applying removes only tool-managed values (overrides
+  identical to the recommendation — the proposed and current effective
+  catalogs must produce the same digest, so no resolved setting can change),
+  records the refresh provenance in the file, and writes a timestamped backup
+  of the previous file first. A catalog edited concurrently — between the
+  planning read and the apply — refuses with `refresh-conflict` instead of
+  being overwritten. Model listings are scoped per resolved executable, so a
+  profile is only compared against the inventory of the binary that would
+  run it; a listing the probe interpreter truncated at its bound proves
+  nothing absent, so it flags no configured model as removed and the
+  inventory reason reports the truncation. Operator-created profiles and custom bindings
+  are never modified; there is no force/replace mode. `--offline` skips every
+  probe. With no catalog file present it reports that the built-in defaults
+  apply and writes nothing.
 - `chain sync` (issue #892): the mutating counterpart to `chain validate` —
   the explicit way GitHub Issue Relationship changes are imported into the
   registry. Takes a `<chain-ref>` or `--all`; previews by default, applies
@@ -296,6 +358,17 @@ These print text by default and JSON with `--json`:
   retry can run; one left behind by a killed process is taken over after 30
   minutes.
 
+  "Overlap on an Issue" is decided over the same repository the ownership check
+  above is (issue #1045): an Issue is claimed under the work-item repository its
+  number belongs to, so two sessions bound to one repository serialize against
+  each other, while two sessions bound to different repositories that happen to
+  share a number never block one another. A session that declares no repository
+  identity claims its Issues under itself alone, exactly as before — narrower,
+  never wider. Without the repository claim, two sessions on one repository
+  would take disjoint claims and separate only at the final registry
+  transaction, after both had already suspended labels and drawn relationships
+  on the same Issue.
+
   A claim also has to still be this run's at the moment it writes. It is renewed
   on a timer, and re-asserted against the store immediately before each
   mutation — the suspension, every relationship write, the registry update, and
@@ -388,6 +461,128 @@ These print text by default and JSON with `--json`:
   the combined graph is finished by re-running the same merge, which detects
   the merged state and performs only the retirement.
 
+- `task-verification show` / `amend` / `refresh-from-issue` / `reset` (issue
+  #1042): the task-scoped verification surface of
+  [verification-amendment-contract.md](verification-amendment-contract.md) §11.
+  They address one task, identified by `--session-id` and `--issue-number`, and
+  they are the supported way to inspect and correct its verification plan —
+  editing `sessions.json`, the task row, or SQLite by hand is not an operational
+  flow, and a chain edited that way fails closed rather than being repaired.
+
+  `show` is read-only: it resolves the **effective** plan (session defaults,
+  Issue-derived requirements, and the applied revision chain, in that
+  precedence) and reports each slot's stable command identity, origin, state
+  (`active`/`retired`), the revisions that touched it, each requirement's
+  evidence status (`passed`/`not_run`/`retired`), the plan digest, the recorded
+  revisions, and any session-default drift. It re-anchors nothing.
+
+  `amend` authors one append-only revision from `--replace <commandId>
+  --command <bytes>`, `--add-execution <name> --command <bytes>`,
+  `--add-requirement --command <bytes>`, `--retire`, `--restore`, and
+  `--annotate`, each repeatable. `--command` and `--op-reason` bind to the
+  operation flag they follow; a `--reason` is mandatory and becomes the reason
+  of every operation that carries no `--op-reason` of its own.
+  `refresh-from-issue` is the resource-oriented spelling of
+  `review-verification refresh` — the same runner, flags, outcomes, and exit
+  codes. `reset` returns the plan to its unamended baseline as one ordinary
+  revision: retired slots restored, replaced slots reverted to their origin
+  bytes, and task-local additions retired — withheld unless `--allow-retire`
+  is passed, because retiring one removes a check the task currently runs.
+  A reset derives its operations from the plan, so a request key derived from
+  them cannot survive the reset's own success: its preview names the
+  `--request-key` to pass back, and a rerun carrying that key is reported as a
+  replay of the revision already recorded — even when it still carries the
+  `--expect-plan-digest` the apply itself moved.
+
+  All three mutations preview by default and apply only with `--yes`; a preview
+  and an apply both report the old and the new plan digest. An outcome that
+  proposes no revision has no such pair and reports the plan it did resolve as
+  `plan digest: <digest> (unchanged)`, so a caller carrying a preview into an
+  apply always has the digest that preview computed against.
+  `--expect-plan-digest` (or `--expect-issue-digest` on the refresh) is the
+  concurrent-edit guard between the two. A claimed or running task, a terminal
+  task, a stale plan, a pinned preflight entry, an invalid operation, and a
+  malformed `--reason` or `--request-key` each refuse whole, exit non-zero, and
+  write nothing — including when the invocation would otherwise have had
+  nothing to do. A recognized replay of an
+  already-applied request, and a no-change preview or apply, exit zero. There
+  is no `--force` and no `--all`: nothing overrides a refusal and no invocation
+  addresses more than one task. `review-verification resolve` remains the
+  evidence surface, with one addition (issue #1044, §13.1): on a task carrying
+  an amendment chain it refuses a command the effective plan no longer requires
+  — replaced, retired, or orphaned — naming the revision that moved the slot,
+  rather than recording evidence against a requirement that is gone.
+
+  An applied revision is publicly visible (issue #1044, §12.2): it enqueues one
+  bounded comment on the work item through the outbox, keyed on the revision id
+  and on no run identifier, naming the operations with their affected command
+  names, the operator's reason, the resulting active and retired commands, and
+  the continuation — with every retirement and restoration stated explicitly
+  and "a retired verification command is not a passing result" beside them.
+  Local paths are redacted and long text bounded, exactly as the command's own
+  output is — with the bound spent on the plan listings and never on the
+  retirement disclosures, each bounded section stating its own overflow. The
+  comment separates the two layers rather than presenting them as one set of
+  running checks: review Step 4 still executes the raw `session.verification`
+  entries, so an execution-layer entry is published as a recorded plan change
+  the loop neither runs nor credits at the gate — and an execution entry the
+  revision RETIRED is published as retired in the recorded plan only, with
+  session execution stated as unchanged rather than as still running it: Step 4
+  reads the session's own configuration, so a command that configuration names
+  keeps running and being reported while a task-local entry it never held was
+  never run at all. Only the requirement layer carries the "not run, not
+  passed" statement. A refusal, a recognized replay, and a session-default
+  rebase each publish nothing, and no amendment changes a label. The same facts
+  reach the human merge gate: an amended task's Human Gate Decision Summary
+  states that the plan was amended, why, and what is no longer checked — with
+  the plan's true retired total, a named overflow when the label list is
+  bounded, and the digest of the RECONCILED plan the gate actually read rather
+  than the latest revision's checkpoint. On a split-provider session (private
+  work-item tracker, public repo host) that summary carries only the public-safe
+  aggregate: the counts and digests are published, the operator's reason and the
+  command labels stay on the work item, exactly as the Issue title already does.
+  A session counts as split when its two providers do not address the same
+  repository — `github-issues` + `github`, and a `gitea-issues` + `gitea` pair
+  naming the same instance, owner, and repository, are each one surface and
+  publish the names in full.
+  A `--continue none` amendment applied to a task already parked at
+  `ready_for_human` moves no status, so it also rewrites that PR's sticky
+  summary in the same transaction — superseding a decision summary that
+  describes the plan the revision replaced, and naming what the revision
+  retired. A routing continuation retracts the handoff instead and rewrites
+  nothing.
+
+  `admin ui` offers the same flow from its task menu (issue #1044): the
+  Verification entry renders the `show` payload, prefills the current plan and
+  the previous revision's reason, previews every correction, and applies only on
+  an explicit confirmation — running these exact commands, with everything the
+  preview reported carried into the apply: the plan digest it displayed as
+  `--expect-plan-digest`; on `refresh-from-issue` BOTH the live Issue body
+  digest as `--expect-issue-digest` and the plan digest the preview itself
+  resolved as `--expect-plan-digest`, because a refresh's difference is derived
+  from two inputs and a concurrent amendment moves it while the Issue body is
+  untouched — the `base -> new` pair of a proposed revision, or the
+  `(unchanged)` digest a no-change preview reports, and never a digest read from
+  an earlier screen: a preview that names neither offers no apply at all. Each
+  correction also mints one `--request-key` for that flow and names it on both
+  the preview and the apply, including on `reset`, whose preview names the key
+  to pass back. A key is minted rather than left to the content-derived default
+  because two UI corrections can be byte-identical and still be different
+  requests — retiring a slot, restoring it, and retiring it again — and the
+  derived key would make the third one a replay of the first, reporting a
+  superseded revision while the slot stays active. Carrying the same key into
+  the apply keeps the printed apply line replayable: re-running it names the
+  revision already recorded instead of recording a second one, so a reset whose
+  apply commits and loses its response is recognized as the replay it is rather
+  than reported as "nothing left to undo". One thing it deliberately does not carry
+  over: the plan view redacts local paths out of the commands it prints, so a
+  replacement for a redacted command is typed in full rather than prefilled —
+  accepting a `<path>` placeholder as the corrected bytes would store a
+  non-executable command and break the check the correction was meant to fix.
+  It resolves no plan and writes
+  no state of its own, so the CLI and the UI produce the same plan, the same
+  transition, and the same audit trail.
+
 Examples:
 
 ```sh
@@ -447,6 +642,63 @@ commands accepted only `--session-id`.
 
 Commands are migrated to this framework incrementally; `task-status`,
 `recover-cap-handoff`, and the `tool-request` commands are the first wave.
+
+## How the admin CLI is tested (issue #1018)
+
+The executable is a thin boundary over one dispatcher, and the test surface is
+split along exactly that seam.
+
+- `src/cli/admin.ts` exports `main(argv)` (the dispatcher) and `runAdminCli(argv)`
+  (dispatch plus the top-level failure contract that turns an unexpected throw
+  into the same `die()` output any other failure produces). Invoked as a program,
+  `dist/cli/admin.js` does nothing but call `runAdminCli(process.argv.slice(2))`.
+- `src/cli/cli-io.ts` owns the three process effects — stdout, stderr, and exit —
+  behind a `CliIoSink`. Production binds it to the real process. No other module
+  in the admin CLI writes to `process.stdout`/`process.stderr` or calls
+  `process.exit` directly, so replacing the sink captures the whole output and
+  exit contract.
+
+**In-process (the default).** `test/helpers/admin-cli.js` exposes `runAdmin(args,
+{ env, cwd })`, which installs a buffering sink whose `exit` throws `CliExit`,
+runs `runAdminCli`, and returns the same `{ code, stdout, stderr }` a spawned run
+would. It snapshots and restores `process.env`, the working directory,
+`process.exitCode`, and the resolved output mode around every run. Behavioural
+cases — what a command decided, what it wrote, what it refused — belong here.
+There is one harness; suites do not add their own.
+
+**Subprocess (the contract set).** `test/admin-cli-subprocess.test.js` keeps a
+small, documented set of spawned cases for the things the harness can only
+simulate:
+
+1. real `process.argv` parsing, including unknown-option rejection;
+2. the real process exit status a shell or an n8n `Execute Command` node reads;
+3. genuine stdout/stderr file-descriptor separation and the JSON stdout contract;
+4. environment isolation.
+
+A case belongs there only when the process boundary *is* the assertion. Three
+divergences decide borderline cases:
+
+- `die()` unwinds by throwing under the harness, so `finally` blocks a real exit
+  would skip do run. Every such block in `admin.ts` is an idempotent lock release
+  or store close that the `die()` path already performs explicitly, so the
+  observable outcome is unchanged — but a case asserting that a resource is
+  *still held* after a death must stay spawned.
+- Module-load-time constants (`DEFAULT_SESSIONS_PATH`, `DEFAULT_WORKTREE_LOCK_DIR`)
+  read `homedir()` once per worker, so a case that needs a different `HOME` must
+  stay spawned. `test/admin-status.test.js` keeps exactly one such case.
+- An `env` override reaches a child process only through a spawn site that
+  passes it. Jest hands every module a *copy* of `process.env`, while
+  `execFileSync`/`spawnSync` read their default `env` from the real process
+  object — so a spawn site that omits `env` resolves `PATH` against the host and
+  silently ignores a stub the case installed. Every spawn site the admin CLI
+  reaches passes `spawnEnv()` (`src/handlers/command-runner.ts`), which is the
+  same value the default already is in production; a new spawn site must do the
+  same or its case has to stay spawned.
+
+**Measuring.** Per-suite timing comes from
+`npx jest test/admin-cli.test.js --verbose` (Jest prints the suite time), and
+whole-run timing from `time npm test`. Compare on one machine; CI runtime varies
+between runners.
 
 ## Migration notes
 

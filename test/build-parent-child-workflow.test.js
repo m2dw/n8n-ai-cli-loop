@@ -514,8 +514,8 @@ describe('buildChildWorkflow structure', () => {
     expect(wf.name.length).toBeGreaterThan(0);
   });
 
-  test('has exactly 5 nodes: trigger + GitHub Intake + Run One Phase + Dispatch Outbox + Return Context', () => {
-    expect(wf.nodes).toHaveLength(5);
+  test('has exactly 6 nodes: trigger + GitHub Intake + Run One Phase + ChatOps Scan + Dispatch Outbox + Return Context', () => {
+    expect(wf.nodes).toHaveLength(6);
   });
 
   test('has an Execute Workflow Trigger node', () => {
@@ -530,9 +530,9 @@ describe('buildChildWorkflow structure', () => {
     expect(node).toBeUndefined();
   });
 
-  test('has exactly 3 Execute Command nodes (GitHub Intake, Run One Phase, Dispatch Outbox)', () => {
+  test('has exactly 4 Execute Command nodes (GitHub Intake, Run One Phase, ChatOps Scan, Dispatch Outbox)', () => {
     const nodes = wf.nodes.filter((n) => n.type === 'n8n-nodes-base.executeCommand');
-    expect(nodes).toHaveLength(3);
+    expect(nodes).toHaveLength(4);
   });
 
   test('has a GitHub Intake Execute Command node', () => {
@@ -547,6 +547,13 @@ describe('buildChildWorkflow structure', () => {
     expect(node).toBeDefined();
     expect(node.type).toBe('n8n-nodes-base.executeCommand');
     expect(node.name).toBe('Run One Phase');
+  });
+
+  test('has a ChatOps Scan Execute Command node', () => {
+    const node = wf.nodes.find((n) => n.id === 'chatops-scan');
+    expect(node).toBeDefined();
+    expect(node.type).toBe('n8n-nodes-base.executeCommand');
+    expect(node.name).toBe('ChatOps Scan');
   });
 
   test('has a Dispatch Outbox Execute Command node', () => {
@@ -677,6 +684,39 @@ describe('buildChildWorkflow — Run One Phase command', () => {
 // Child — Dispatch Outbox command
 // ---------------------------------------------------------------------------
 
+describe('buildChildWorkflow — ChatOps Scan command', () => {
+  const wf = buildChildWorkflow();
+  const node = wf.nodes.find((n) => n.id === 'chatops-scan');
+  const cmd = node.parameters.command;
+
+  test('command is an n8n expression', () => {
+    expect(cmd.startsWith('=')).toBe(true);
+  });
+
+  test('invokes the chatops-scan CLI', () => {
+    expect(cmd).toContain('chatops-scan.js');
+  });
+
+  test('uses only --context-id for session lookup (no --session-id)', () => {
+    expect(cmd).toContain('--context-id');
+    expect(cmd).toContain('$("When Called by Parent").first().json.contextId');
+    expect(cmd).not.toContain('--session-id');
+    expect(cmd).not.toContain('sessionId');
+  });
+
+  // The point of the entrypoint being this small: enablement, allowed logins,
+  // the verb table, and the result shape are session config, never workflow JSON.
+  test('encodes no ChatOps policy in the workflow JSON', () => {
+    expect(cmd).not.toContain('--issue-number');
+    expect(cmd).not.toContain('chatOps');
+    expect(cmd).not.toMatch(/--(allow|login|enabled)/);
+  });
+
+  test('does not contain a newline character', () => {
+    expect(cmd).not.toContain('\n');
+  });
+});
+
 describe('buildChildWorkflow — Dispatch Outbox command', () => {
   const wf = buildChildWorkflow();
   const node = wf.nodes.find((n) => n.id === 'dispatch-outbox');
@@ -784,8 +824,14 @@ describe('buildChildWorkflow connections', () => {
     expect(wf.connections['GitHub Intake'].main[0][0].node).toBe('Run One Phase');
   });
 
-  test('Run One Phase connects to Dispatch Outbox', () => {
-    expect(wf.connections['Run One Phase'].main[0][0].node).toBe('Dispatch Outbox');
+  test('Run One Phase connects to ChatOps Scan', () => {
+    expect(wf.connections['Run One Phase'].main[0][0].node).toBe('ChatOps Scan');
+  });
+
+  // ChatOps publishes claim/ack/result comments through the outbox, so the scan
+  // has to sit upstream of Dispatch Outbox for them to leave in the same run.
+  test('ChatOps Scan connects to Dispatch Outbox', () => {
+    expect(wf.connections['ChatOps Scan'].main[0][0].node).toBe('Dispatch Outbox');
   });
 
   test('Dispatch Outbox connects to Return Context', () => {
@@ -1547,8 +1593,8 @@ describe('buildPrivateNodeChildWorkflow structure', () => {
     expect(wf.name).toContain('SHADOW TEST');
   });
 
-  test('has exactly 5 nodes: trigger + GitHub Intake + Run One Phase + Dispatch Outbox + Return Context', () => {
-    expect(wf.nodes).toHaveLength(5);
+  test('has exactly 6 nodes: trigger + GitHub Intake + Run One Phase + ChatOps Scan + Dispatch Outbox + Return Context', () => {
+    expect(wf.nodes).toHaveLength(6);
   });
 
   test('workflow ID matches PRIVATE_NODE_CHILD_WORKFLOW_ID constant', () => {
@@ -1585,6 +1631,41 @@ describe('buildPrivateNodeChildWorkflow structure', () => {
       expect(typeof node.type).toBe('string');
       expect(Array.isArray(node.position)).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Private-node shadow child — ChatOps Scan operation wiring
+// ---------------------------------------------------------------------------
+
+describe('buildPrivateNodeChildWorkflow — ChatOps Scan operation wiring', () => {
+  const wf = buildPrivateNodeChildWorkflow();
+  const node = wf.nodes.find((n) => n.id === 'chatops-scan');
+
+  test('ChatOps Scan node exists', () => {
+    expect(node).toBeDefined();
+    expect(node.name).toBe('ChatOps Scan');
+  });
+
+  test('ChatOps Scan uses the private node type, not executeCommand', () => {
+    expect(node.type).toBe(PRIVATE_NODE_TYPE);
+    expect(node.type).not.toBe('n8n-nodes-base.executeCommand');
+  });
+
+  test('ChatOps Scan operation parameter is chatopsScan', () => {
+    expect(node.parameters.operation).toBe('chatopsScan');
+  });
+
+  test('ChatOps Scan contextId references the trigger node', () => {
+    expect(node.parameters.contextId).toContain('$("When Called by Parent").first().json.contextId');
+  });
+
+  test('ChatOps Scan node has no command parameter (not an Execute Command node)', () => {
+    expect(node.parameters.command).toBeUndefined();
+  });
+
+  test('ChatOps Scan uses typeVersion 1', () => {
+    expect(node.typeVersion).toBe(1);
   });
 });
 
@@ -1757,8 +1838,12 @@ describe('buildPrivateNodeChildWorkflow connections', () => {
     expect(wf.connections['GitHub Intake'].main[0][0].node).toBe('Run One Phase');
   });
 
-  test('Run One Phase connects to Dispatch Outbox', () => {
-    expect(wf.connections['Run One Phase'].main[0][0].node).toBe('Dispatch Outbox');
+  test('Run One Phase connects to ChatOps Scan', () => {
+    expect(wf.connections['Run One Phase'].main[0][0].node).toBe('ChatOps Scan');
+  });
+
+  test('ChatOps Scan connects to Dispatch Outbox', () => {
+    expect(wf.connections['ChatOps Scan'].main[0][0].node).toBe('Dispatch Outbox');
   });
 
   test('Dispatch Outbox connects to Return Context', () => {

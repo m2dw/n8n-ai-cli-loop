@@ -469,12 +469,19 @@ async function main(): Promise<void> {
     die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
+  // Opened before the handler map so the review handler's final verification
+  // stage can allocate its run durably before launch (issue #1103 review, P2).
+  const store = new SqliteTaskStore(dbPath);
+
   // Build handler map after session is resolved so handlers can close over
   // session.repoRoot and runId for deterministic artifact paths.
   let handlers: PhaseHandlers;
   try {
     handlers = await createPhaseHandlers(
-      { session, runId, workerId, contextId },
+      // `sessionsPath` rides along so the write-capable runtime resolution
+      // finds the default agent-profile catalog beside the sessions file this
+      // run actually loaded (issue #911 review).
+      { session, runId, workerId, contextId, sessionsPath, taskStore: store },
       undefined,
       undefined,
       { dbPath },
@@ -484,7 +491,6 @@ async function main(): Promise<void> {
   }
 
   // Open SQLite stores (outbox and session control share the same DB file as tasks)
-  const store = new SqliteTaskStore(dbPath);
   const outboxStore = new SqliteOutboxStore(dbPath);
   const sessionControlStore = new SqliteSessionControlStore(dbPath);
 

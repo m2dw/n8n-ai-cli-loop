@@ -1,13 +1,30 @@
 import { OUTBOX_CLAIM_STALE_MS, type OutboxEntry, type OutboxStore, type SlackNotificationPayload } from "../core/outbox.js";
 import { deriveScanCursorKey } from "../core/outbox-scan-cursor.js";
 import { sanitizeLegacyPrCommentBody } from "../core/outbox-visibility.js";
+import {
+  describeOutboxTransportTimeout,
+  resolveOutboxTransportDeadlines,
+  startOutboxAttemptBudget,
+  type OutboxAttemptBudget,
+  type OutboxTransportDeadlineOverrides,
+  type OutboxTransportDeadlines,
+  type OutboxTransportTimeoutFacts,
+} from "../core/outbox-transport-deadline.js";
 
-/** Minimal fetch-compatible function type for Slack webhook dispatch (issue #465). */
-export type FetchFn = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
+/**
+ * Minimal fetch-compatible function type for Slack webhook dispatch (issue #465).
+ *
+ * `signal` is how the delivery is actually cancelled when its deadline expires
+ * (issue #1064) — for the real `fetch` it ends the request AND the response body
+ * stream, which a promise race around them could not. Optional so every existing
+ * injected fake stays assignable; a fake that ignores it is still bounded, but by
+ * the race alone.
+ */
+export type FetchFn = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 import { GhWorkItemProvider } from "../providers/github/gh-work-item-provider.js";
 import { GhRepoHostProvider } from "../providers/github/gh-repo-host-provider.js";
 import type { GhRunner, GhRunResult } from "../providers/github/gh-runner.js";
-import { defaultGhRunner } from "../providers/github/gh-runner.js";
+import { boundedGhRunner, defaultGhRunner } from "../providers/github/gh-runner.js";
 import type { WorkItemProvider, RepoHostProvider } from "../providers/types.js";
 
 // The injectable `gh` executor now lives with the providers; re-exported here so
@@ -99,6 +116,14 @@ export interface DispatchResult {
    * shape.
    */
   cursorFenceStale?: boolean;
+  /**
+   * Rows whose attempt was cut short by a transport deadline this run (issue
+   * #1064). Included in `failed` above — a bounded hang is an ordinary failed
+   * attempt as far as attempt accounting, backoff and dead-lettering are
+   * concerned — so this is a breakdown, not an additional bucket. Omitted
+   * entirely when nothing timed out, so a normal run's shape is unchanged.
+   */
+  transportTimeouts?: number;
 }
 
 export interface DispatchOptions {
@@ -224,6 +249,25 @@ export interface DispatchOptions {
    * deferral, not a loss.
    */
   onDeadLettered?: (entry: OutboxEntry) => Promise<void>;
+  /**
+   * Wall-clock bounds on the external I/O a dispatch attempt performs (issue
+   * #1064). Anything omitted keeps the default policy in
+   * `core/outbox-transport-deadline.ts`; supplied in tests to make a hung
+   * transport resolve in milliseconds rather than minutes.
+   *
+   * Validated before the run claims anything, so an unusable configuration is a
+   * setup failure with no external side effect rather than a drain running under
+   * bounds it cannot keep — see {@link resolveOutboxTransportDeadlines}. Note
+   * that lowering `attemptMs` below a per-call default is itself refused: the
+   * per-call bounds have to come down with it, or one of them would name a
+   * deadline that can never be reached.
+   */
+  deadlines?: OutboxTransportDeadlineOverrides;
+  /**
+   * Clock the attempt budget is measured against. Injectable so a test can
+   * exhaust a budget without waiting for it; defaults to `Date.now`.
+   */
+  monotonicNow?: () => number;
 }
 
 /**
@@ -258,6 +302,13 @@ export async function dispatchOutbox(
   runner: GhRunnerResolver,
   opts: DispatchOptions,
 ): Promise<DispatchResult> {
+  // Resolve the transport deadlines FIRST (issue #1064): an unusable bound is a
+  // configuration error, and raising it here — before the maintenance probe, the
+  // scan, any credential resolution and any claim — keeps it a setup failure
+  // with no external side effect, rather than a drain that has already
+  // dispatched some rows under bounds it cannot keep.
+  const deadlines = resolveOutboxTransportDeadlines(opts.deadlines);
+  const monotonicNow = opts.monotonicNow ?? Date.now;
   // Fail closed before ANY external side effect while maintenance is in
   // progress (issue #818). This pre-check is the reporting path — it is what
   // turns contention into a typed idle outcome instead of a silent zero-work
@@ -503,6 +554,7 @@ export async function dispatchOutbox(
   let dispatched = 0;
   let failed = 0;
   let deadLettered = 0;
+  let transportTimeouts = 0;
   const errors: DispatchResult["errors"] = [];
 
   const providers = opts.providers ?? defaultOutboxProviderFactory;
@@ -587,12 +639,51 @@ export async function dispatchOutbox(
       }
       continue;
     }
+    // One budget per attempt, started the moment the claim is held (issue
+    // #1064). It spans EVERY external call this row makes — a dedupe-marked
+    // comment pages through the whole comment history before its POST — because
+    // a per-call bound alone multiplies by however many calls a provider
+    // happens to make, and it is the total that has to stay inside the claim
+    // lease.
+    const budget = startOutboxAttemptBudget(deadlines.attemptMs, monotonicNow);
+    // Deadlines observed during this attempt, in the order they happened. The
+    // FIRST one is the root cause: a later failure is usually just the shape a
+    // cut-short call takes as it unwinds through the provider.
+    const attemptTimeouts: OutboxTransportTimeoutFacts[] = [];
     // Pick the runner for this row's auth domain. The selected runner is
     // guaranteed resolved: its domain was detected as pending above. Slack notification rows
     // (`slack:notification`) use `fetch` directly and never need a runner — they
     // are given `undefined` so a Slack-only batch never triggers credential
     // resolution (e.g. a GitHub App token exchange) for an unrelated auth domain.
-    const entryRunner = isRepoHostEntry(entry) ? repoHostRunner : isSlackEntry(entry) ? undefined : workItemRunner;
+    //
+    // Wrapped per row rather than once per run: the wrapper carries this
+    // attempt's budget, so it must not outlive the attempt.
+    const baseRunner = isRepoHostEntry(entry) ? repoHostRunner : isSlackEntry(entry) ? undefined : workItemRunner;
+    const entryRunner =
+      baseRunner === undefined
+        ? undefined
+        : boundedGhRunner(baseRunner, {
+            perCallMs: deadlines.ghCallMs,
+            budget,
+            onTimeout: (timeout) => {
+              attemptTimeouts.push({
+                transport: "gh",
+                stage: timeout.stage,
+                limitMs: timeout.limitMs,
+                attemptMs: deadlines.attemptMs,
+                // A call that was issued may have applied its write before the
+                // deadline cut the response off; one refused for want of budget
+                // never reached the network at all.
+                outcomeUnknown: timeout.stage !== "attempt-budget",
+                ...(timeout.elapsedMs === undefined ? {} : { elapsedMs: timeout.elapsedMs }),
+                ...(timeout.escalated === undefined ? {} : { escalated: timeout.escalated }),
+                ...(timeout.processGroupTerminated === undefined
+                  ? {}
+                  : { processGroupTerminated: timeout.processGroupTerminated }),
+                ...(timeout.detail === undefined ? {} : { detail: timeout.detail }),
+              });
+            },
+          });
     // Constructing a row's provider can throw, not just its dispatch: a provider
     // factory that resolves credentials lazily while building its client (e.g. the
     // `gitea` repo-host factory, whose client builder throws when the configured
@@ -606,11 +697,14 @@ export async function dispatchOutbox(
     // and re-running drains it.
     //
     // The claim is renewed on a timer while the external call is in flight
-    // (P1 review follow-up): `gh` and the Slack webhook fetch have no
-    // request timeout, so a single slow call can outlive
-    // `OUTBOX_CLAIM_STALE_MS`. Without renewal, a concurrent dispatcher's
-    // `claimForDispatch` would then treat this still-live claim as abandoned
-    // and reclaim + re-dispatch the same row, duplicating the external
+    // (P1 review follow-up): a slow call could outlive `OUTBOX_CLAIM_STALE_MS`.
+    // Since issue #1064 the attempt budget above is validated to fit inside that
+    // lease with a margin to spare, so renewal is no longer what keeps a live
+    // attempt from being reclaimed — the bound is. It is kept because it costs
+    // nothing on the paths where the loop IS free and it extends the lease for
+    // the row's post-attempt bookkeeping. Without either, a concurrent
+    // dispatcher's `claimForDispatch` would treat a still-live claim as
+    // abandoned and reclaim + re-dispatch the same row, duplicating the external
     // effect. `renewClaim` is a compare-and-swap on the claim token this
     // attempt currently holds, so a renewal that loses the race (claim
     // already released or reclaimed) is a safe no-op rather than
@@ -642,11 +736,46 @@ export async function dispatchOutbox(
     };
     let result: Awaited<ReturnType<typeof dispatchEntry>>;
     try {
-      result = await dispatchEntry(entry, entryRunner, opts.cwd, providers, fetchImpl, env, holdsClaim);
+      result = await dispatchEntry(
+        entry,
+        entryRunner,
+        opts.cwd,
+        providers,
+        fetchImpl,
+        env,
+        { deadlines, budget, onTimeout: (facts) => attemptTimeouts.push(facts) },
+        holdsClaim,
+      );
     } catch (err) {
       result = { ok: false, error: err instanceof Error ? err.message : String(err) };
     } finally {
       clearInterval(renewTimer);
+    }
+    // A deadline that fired is the root cause of whatever the provider
+    // eventually reported, so it — not the unwound provider message — is what
+    // the row records (issue #1064). The diagnostic is built from typed facts
+    // and a sanitized tail, so it carries no local path, token, or raw child
+    // output, and it says explicitly whether the remote write's outcome is in
+    // doubt. Everything downstream is unchanged: this is an ordinary failed
+    // attempt for attempt accounting, backoff and dead-lettering.
+    //
+    // Applied whatever the attempt claimed, including a reported SUCCESS (P2
+    // review follow-up): the transports raise a deadline rather than returning
+    // it, so an `ok` alongside a recorded timeout means some layer caught the
+    // throw and carried on. The delivery is then exactly as unverified as any
+    // other cut-short call, and "sent" is the one outcome that cannot be walked
+    // back — a row marked sent is never retried and its dedupe marker never
+    // re-checked. Failing closed keeps this a normal retry instead.
+    if (attemptTimeouts.length > 0) {
+      transportTimeouts++;
+      const rootCause = attemptTimeouts[0];
+      result = {
+        ok: false,
+        error: describeOutboxTransportTimeout({
+          ...rootCause,
+          detail: rootCause.detail ?? (result.ok ? undefined : result.error),
+        }),
+      };
     }
     if (result.ok) {
       // Fenced on `claimToken` (P2 review follow-up), the current (possibly
@@ -800,6 +929,7 @@ export async function dispatchOutbox(
     deadLettered,
     ...(maintenanceLocked ? { maintenanceLocked: true } : {}),
     ...(cursorFenceStale ? { cursorFenceStale: true } : {}),
+    ...(transportTimeouts > 0 ? { transportTimeouts } : {}),
   };
 }
 
@@ -960,6 +1090,17 @@ async function claimStillHeld(
   };
 }
 
+/**
+ * The deadline context one dispatch attempt runs under (issue #1064). Only the
+ * Slack path reads it directly — the `gh` paths are bounded by the wrapped
+ * runner they were handed, which carries the same budget.
+ */
+interface AttemptDeadlineContext {
+  deadlines: OutboxTransportDeadlines;
+  budget: OutboxAttemptBudget;
+  onTimeout: (facts: OutboxTransportTimeoutFacts) => void;
+}
+
 async function dispatchEntry(
   entry: OutboxEntry,
   runner: GhRunner | undefined,
@@ -967,6 +1108,7 @@ async function dispatchEntry(
   providers: OutboxProviderFactory,
   fetchImpl: FetchFn,
   env: Record<string, string | undefined>,
+  deadline: AttemptDeadlineContext,
   /**
    * Re-asserts (and extends) this attempt's outbox claim. Supplied by the
    * dispatch loop; see {@link claimStillHeld}. Optional so a caller without a
@@ -1039,7 +1181,7 @@ async function dispatchEntry(
     }
 
     case "slack:notification": {
-      return dispatchSlackNotification(payload, fetchImpl, env);
+      return dispatchSlackNotification(payload, fetchImpl, env, deadline);
     }
 
     default: {
@@ -1073,41 +1215,130 @@ function buildSlackMessage(payload: SlackNotificationPayload): Record<string, un
   return { text: lines.join("\n") };
 }
 
+/**
+ * Deliver one Slack webhook notification under a single wall-clock deadline
+ * (issue #1064).
+ *
+ * The deadline covers the request AND the reading of its response body: a
+ * server that accepts the POST and then stalls mid-body hangs the dispatcher
+ * exactly as completely as one that never answers, and slicing a body after
+ * reading it does not bound that read.
+ *
+ * Cancellation is the `AbortSignal`, not the race around it. Aborting is what
+ * actually ends a real `fetch` — request and response stream both — so nothing
+ * is left running once this returns. The race exists only as the bound of last
+ * resort for an injected transport that ignores the signal: it guarantees this
+ * function returns on time even then, at the cost of leaving that
+ * (uncancellable by construction) promise pending.
+ *
+ * Slack offers no delivery idempotency, so a timed-out POST leaves the outcome
+ * genuinely unknown: the retry the failure schedules may post a duplicate. That
+ * is recorded in the diagnostic rather than papered over — exactly-once is not
+ * available here.
+ */
 async function dispatchSlackNotification(
   payload: SlackNotificationPayload,
   fetchImpl: FetchFn,
   env: Record<string, string | undefined>,
+  deadline: AttemptDeadlineContext,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const webhookUrl = env[payload.webhookUrlEnv];
   if (!webhookUrl) {
     return { ok: false, error: `Slack webhook URL env var not set: ${payload.webhookUrlEnv}` };
   }
-  let response: Awaited<ReturnType<FetchFn>>;
-  try {
-    response = await fetchImpl(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildSlackMessage(payload)),
+  const limitMs = deadline.budget.callTimeoutMs(deadline.deadlines.slackRequestMs);
+  if (limitMs <= 0) {
+    // The attempt is already over — do not open a connection just to abandon it.
+    deadline.onTimeout({
+      transport: "slack",
+      stage: "attempt-budget",
+      limitMs: deadline.budget.attemptMs,
+      attemptMs: deadline.budget.attemptMs,
+      outcomeUnknown: false,
     });
-  } catch (err) {
-    return {
-      ok: false,
-      error: `Slack webhook request failed: ${err instanceof Error ? err.message : String(err)}`,
-    };
+    return { ok: false, error: "Slack webhook not sent: the outbox attempt budget was already spent" };
   }
-  if (!response.ok) {
-    // Read body text for the error message but cap it to avoid huge payloads
-    // entering the error log. Failure to read the body is a soft error — the
-    // HTTP status is still surfaced.
-    let detail = "";
+
+  const controller = new AbortController();
+  let expired = false;
+  let rejectExpired: ((err: Error) => void) | undefined;
+  const timer = setTimeout(() => {
+    expired = true;
+    controller.abort();
+    rejectExpired?.(new Error(`Slack webhook deadline of ${limitMs}ms expired`));
+  }, limitMs);
+  const startedAt = Date.now();
+  /** Await `work`, but never past the shared deadline. */
+  const bounded = <T>(work: Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      rejectExpired = reject;
+      if (expired) {
+        reject(new Error(`Slack webhook deadline of ${limitMs}ms expired`));
+        return;
+      }
+      work.then(resolve, reject);
+    });
+  const timedOut = (stage: "request" | "response-body", outcomeUnknown: boolean): void => {
+    deadline.onTimeout({
+      transport: "slack",
+      stage,
+      limitMs,
+      attemptMs: deadline.budget.attemptMs,
+      elapsedMs: Date.now() - startedAt,
+      outcomeUnknown,
+    });
+  };
+
+  try {
+    let response: Awaited<ReturnType<FetchFn>>;
     try {
-      detail = ` — ${(await response.text()).slice(0, 200)}`;
-    } catch {
-      // body unreadable — status alone is enough
+      response = await bounded(
+        fetchImpl(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildSlackMessage(payload)),
+          signal: controller.signal,
+        }),
+      );
+    } catch (err) {
+      if (expired) {
+        // The POST may or may not have reached Slack; the retry this schedules
+        // is therefore not a safe replay, and the diagnostic says so.
+        timedOut("request", true);
+        return { ok: false, error: "Slack webhook request did not complete within its deadline" };
+      }
+      return {
+        ok: false,
+        error: `Slack webhook request failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
-    return { ok: false, error: `Slack webhook returned HTTP ${response.status}${detail}` };
+    if (!response.ok) {
+      // Read body text for the error message but cap it to avoid huge payloads
+      // entering the error log. Failure to read the body is a soft error — the
+      // HTTP status is still surfaced.
+      let detail = "";
+      try {
+        detail = ` — ${(await bounded(response.text())).slice(0, 200)}`;
+      } catch {
+        // Body unreadable or cut off by the deadline: the status alone is
+        // enough, and Slack having answered non-2xx already settles the
+        // delivery — nothing about the remote outcome is in doubt here.
+        if (expired) timedOut("response-body", false);
+      }
+      return { ok: false, error: `Slack webhook returned HTTP ${response.status}${detail}` };
+    }
+    return { ok: true };
+  } finally {
+    clearTimeout(timer);
+    // Release anything still attached to the request — most importantly a
+    // response body this function never read (the 2xx path does not need it).
+    // On an already-completed exchange this is a no-op.
+    try {
+      controller.abort();
+    } catch {
+      // Nothing to release.
+    }
   }
-  return { ok: true };
 }
 
 /**

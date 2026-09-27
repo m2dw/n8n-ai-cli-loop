@@ -2,7 +2,9 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
+  classifyEnvironmentPrepareStop,
   ensureEnvironmentPrepared,
+  environmentPrepareFailureMessage,
   ENVIRONMENT_PREPARE_DEFAULT_TIMEOUT_MS,
   MAX_ENVIRONMENT_PREPARE_BUFFER_BYTES,
 } from '../dist/handlers/environment-prepare.js';
@@ -561,5 +563,306 @@ describe('ensureEnvironmentPrepared — non-npm command', () => {
     expect(out.status).toBe('ran');
     expect(runner.calls[0].cmd).toBe('composer');
     expect(runner.calls[0].args).toEqual(['install', '--no-interaction', '--no-scripts']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stop-reason classification (issue #1060)
+//
+// The reproduction: a 5-minute `environmentPrepare.timeoutMs` expired three
+// runs in a row and every one of them was persisted and published as
+// "Environment preparation failed (exit 1)" followed by npm deprecation
+// warnings — pointing the operator at the package manager instead of the
+// deadline, when the same `npm ci` finished in ~10s by hand in that worktree.
+// ---------------------------------------------------------------------------
+
+/** What the real runner reports for a command killed on its deadline. */
+const TIMED_OUT_RESULT = {
+  stdout: '',
+  stderr: 'npm warn deprecated left-pad@1.3.0: use String.prototype.padStart\n',
+  exitCode: 1,
+  timedOut: true,
+  signal: 'SIGTERM',
+  spawnErrorCode: 'ETIMEDOUT',
+  durationMs: 300_134,
+  pid: 4242,
+  processTreeCleanup: {
+    pid: 4242,
+    processGroupTerminated: true,
+    terminatedDescendants: [4243, 4244],
+    forceKilled: [],
+  },
+};
+
+function runFailingPrepare(result, configOverrides = {}) {
+  const runner = sequenceRunner([result]);
+  const out = ensureEnvironmentPrepared({
+    config: CONFIG({ command: 'npm ci', allowLifecycleScripts: true, timeoutMs: 300_000, ...configOverrides }),
+    cwd: tmpDir,
+    worktreeIdentity: tmpDir,
+    artifactRoot,
+    artifactDir,
+    runner,
+  });
+  const artifact = JSON.parse(readFileSync(join(artifactDir, 'environment-prepare-result.json'), 'utf8'));
+  return { out, artifact, runner };
+}
+
+describe('classifyEnvironmentPrepareStop', () => {
+  test('a deadline kill classifies as timeout even though it is also a signal and an errno', () => {
+    expect(classifyEnvironmentPrepareStop(TIMED_OUT_RESULT)).toBe('timeout');
+  });
+
+  test('a signal kill with no errno classifies as signal', () => {
+    expect(classifyEnvironmentPrepareStop({ signal: 'SIGKILL' })).toBe('signal');
+  });
+
+  test('a spawn-level errno classifies as spawn-error', () => {
+    expect(classifyEnvironmentPrepareStop({ spawnErrorCode: 'ENOENT' })).toBe('spawn-error');
+  });
+
+  test('an ordinary non-zero exit classifies as command-failed', () => {
+    expect(classifyEnvironmentPrepareStop({})).toBe('command-failed');
+  });
+
+  test('a watchdog escalation classifies as timeout, not as the SIGKILL it needed', () => {
+    // The watchdog only fires after the deadline has demonstrably elapsed, so its
+    // force-kill is evidence of a timeout — never of an external signal.
+    expect(
+      classifyEnvironmentPrepareStop({ deadlineEscalated: true, signal: 'SIGKILL' }),
+    ).toBe('timeout');
+  });
+});
+
+describe('ensureEnvironmentPrepared — timeout is not a generic exit 1', () => {
+  test('reports the timeout, its deadline, and the elapsed time', () => {
+    const { out } = runFailingPrepare(TIMED_OUT_RESULT);
+
+    expect(out.status).toBe('failed');
+    expect(out.stopReason).toBe('timeout');
+    expect(out.timedOut).toBe(true);
+    expect(out.timeoutMs).toBe(300_000);
+    expect(out.durationMs).toBe(300_134);
+    expect(out.signal).toBe('SIGTERM');
+    expect(out.spawnErrorCode).toBe('ETIMEDOUT');
+    expect(out.stopSummary).toContain('timed out after 300000 ms');
+    expect(out.stopSummary).toContain('300134');
+    expect(out.stopSummary).toContain('SIGTERM');
+  });
+
+  test('partial stderr printed before the deadline stays available and bounded', () => {
+    const noisy = 'x'.repeat(20_000);
+    const { out } = runFailingPrepare({ ...TIMED_OUT_RESULT, stderr: `npm warn deprecated\n${noisy}` });
+
+    expect(out.output).toContain('…(truncated)');
+    expect(out.output.length).toBeLessThanOrEqual(4_100);
+    expect(out.stopReason).toBe('timeout');
+  });
+
+  test('the npm deprecation warning is labelled as partial output, not the cause', () => {
+    const { out } = runFailingPrepare(TIMED_OUT_RESULT);
+    const message = environmentPrepareFailureMessage(out);
+
+    expect(message).toContain('Environment preparation timed out after 300000 ms');
+    expect(message).toContain('not the cause');
+    // The output is still there for the operator; it is just not the headline.
+    expect(message).toContain('npm warn deprecated');
+    expect(message).not.toContain('failed (exit 1)');
+  });
+
+  test('records the timeout and the process-tree cleanup in the run artifact', () => {
+    const { artifact } = runFailingPrepare(TIMED_OUT_RESULT);
+
+    expect(artifact.outcome).toBe('failed');
+    expect(artifact.stopReason).toBe('timeout');
+    expect(artifact.timedOut).toBe(true);
+    expect(artifact.signal).toBe('SIGTERM');
+    expect(artifact.spawnErrorCode).toBe('ETIMEDOUT');
+    expect(artifact.timeoutMs).toBe(300_000);
+    expect(artifact.durationMs).toBe(300_134);
+    expect(artifact.processTreeCleanup.processGroupTerminated).toBe(true);
+    expect(artifact.processTreeCleanup.terminatedDescendants).toEqual([4243, 4244]);
+  });
+
+  test('a command that had to be force-killed says so on every surface', () => {
+    const { out, artifact } = runFailingPrepare({
+      ...TIMED_OUT_RESULT,
+      // What the runner reports for a command that ignored the deadline's
+      // SIGTERM and had to be taken down by the external watchdog.
+      deadlineEscalated: true,
+      signal: 'SIGKILL',
+    });
+
+    expect(out.stopReason).toBe('timeout');
+    expect(out.deadlineEscalated).toBe(true);
+    expect(out.stopSummary).toContain('force-killed');
+    expect(environmentPrepareFailureMessage(out)).toContain('force-killed');
+    expect(artifact.deadlineEscalated).toBe(true);
+  });
+
+  test('a cleanup that could not confirm termination says so instead of claiming success', () => {
+    // What the sweep records when the surviving group is not ours to signal:
+    // the operator must not read "process group terminated" for processes that
+    // are still holding the cache locks the next attempt will block on.
+    const { out, artifact } = runFailingPrepare({
+      ...TIMED_OUT_RESULT,
+      processTreeCleanup: {
+        pid: 4242,
+        processGroupTerminated: false,
+        processGroupSignalError: 'EPERM',
+        terminatedDescendants: [],
+        forceKilled: [],
+        note: "the child's process group could not be signalled (EPERM); processes in it may still be running and holding locks",
+      },
+    });
+
+    expect(out.stopSummary).toContain('could NOT be terminated (EPERM)');
+    expect(out.stopSummary).not.toContain('no process group to terminate');
+    expect(environmentPrepareFailureMessage(out)).toContain('could NOT be terminated');
+    expect(artifact.processTreeCleanup.processGroupTerminated).toBe(false);
+    expect(artifact.processTreeCleanup.processGroupSignalError).toBe('EPERM');
+  });
+
+  test('asks the runner to isolate the process group so the tree can be killed', () => {
+    const { runner } = runFailingPrepare(TIMED_OUT_RESULT);
+    expect(runner.calls[0].opts.isolateProcessGroup).toBe(true);
+    expect(runner.calls[0].opts.timeout).toBe(300_000);
+  });
+
+  test('records runner context an operator can compare against a direct run', () => {
+    const { artifact } = runFailingPrepare(TIMED_OUT_RESULT);
+    const context = artifact.runnerContext;
+
+    expect(context.command).toBe('npm ci');
+    expect(context.cwd).toBe(tmpDir);
+    expect(context.timeoutMs).toBe(300_000);
+    expect(context.durationMs).toBe(300_134);
+    expect(context.pid).toBe(4242);
+    expect(context.runnerPid).toBe(process.pid);
+    expect(context.runnerParentPid).toBe(process.ppid);
+    expect(context.nodeVersion).toBe(process.version);
+    expect(context.cpuCount).toBeGreaterThan(0);
+    expect(Array.isArray(context.loadAverage)).toBe(true);
+    expect(typeof context.startedAt).toBe('string');
+    expect(typeof context.finishedAt).toBe('string');
+  });
+
+  test('records environment variable NAMES only, never their values', () => {
+    // A package-manager env var is exactly where a registry credential lives, so
+    // the artifact must carry the name and nothing else.
+    const valueThatMustNotBeRecorded = ['must', 'not', 'be', 'recorded'].join('-');
+    process.env.NPM_CONFIG__AUTH = valueThatMustNotBeRecorded;
+    try {
+      const { artifact } = runFailingPrepare(TIMED_OUT_RESULT);
+      expect(artifact.runnerContext.executionEnvNames).toContain('NPM_CONFIG__AUTH');
+      expect(JSON.stringify(artifact)).not.toContain(valueThatMustNotBeRecorded);
+    } finally {
+      delete process.env.NPM_CONFIG__AUTH;
+    }
+  });
+});
+
+describe('ensureEnvironmentPrepared — other stop reasons', () => {
+  test('a signal kill is reported as termination, not as something the command said', () => {
+    const { out, artifact } = runFailingPrepare({
+      stdout: '',
+      stderr: 'partial install output',
+      exitCode: 1,
+      signal: 'SIGKILL',
+      durationMs: 8_100,
+    });
+
+    expect(out.stopReason).toBe('signal');
+    expect(out.signal).toBe('SIGKILL');
+    expect(out.stopSummary).toContain('terminated by signal SIGKILL');
+    expect(artifact.stopReason).toBe('signal');
+    expect(environmentPrepareFailureMessage(out)).toContain('not the cause');
+  });
+
+  test('a spawn failure is reported as the command never having started', () => {
+    const { out, artifact } = runFailingPrepare({
+      stdout: '',
+      stderr: 'Error: spawnSync npm ENOENT',
+      exitCode: 1,
+      spawnError: 'Error: spawnSync npm ENOENT',
+      spawnErrorCode: 'ENOENT',
+      durationMs: 4,
+    });
+
+    expect(out.stopReason).toBe('spawn-error');
+    expect(out.spawnErrorCode).toBe('ENOENT');
+    expect(out.spawnError).toBe('Error: spawnSync npm ENOENT');
+    expect(out.stopSummary).toContain('could not be started (ENOENT)');
+    expect(artifact.stopReason).toBe('spawn-error');
+  });
+
+  test('an ordinary non-zero exit is still reported as a command failure', () => {
+    const { out, artifact } = runFailingPrepare({
+      stdout: '',
+      stderr: 'npm ERR! code EUSAGE\nnpm ERR! lockfile out of sync',
+      exitCode: 1,
+      durationMs: 9_500,
+    });
+
+    expect(out.stopReason).toBe('command-failed');
+    expect(out.exitCode).toBe(1);
+    expect(out.timedOut).toBeUndefined();
+    expect(out.signal).toBeUndefined();
+    expect(artifact.stopReason).toBe('command-failed');
+    const message = environmentPrepareFailureMessage(out);
+    expect(message).toBe(
+      'Environment preparation failed (exit 1): npm ERR! code EUSAGE\nnpm ERR! lockfile out of sync',
+    );
+    expect(message).not.toContain('not the cause');
+  });
+
+  test('a safe-mode refusal is reported as a refusal, not as exit 0', () => {
+    const runner = sequenceRunner([]);
+    const out = ensureEnvironmentPrepared({
+      config: CONFIG({ command: 'npm ci' }),
+      cwd: tmpDir,
+      worktreeIdentity: tmpDir,
+      artifactRoot,
+      artifactDir,
+      runner,
+    });
+
+    expect(out.status).toBe('failed');
+    expect(out.stopReason).toBe('refused');
+    expect(runner.calls).toHaveLength(0);
+    expect(environmentPrepareFailureMessage(out)).toContain('was refused before it ran');
+  });
+
+  test('the stage is named so the four prepare call sites stay distinguishable', () => {
+    const { out } = runFailingPrepare(TIMED_OUT_RESULT);
+    expect(environmentPrepareFailureMessage(out, 'before review verification')).toContain(
+      'Environment preparation (before review verification) timed out',
+    );
+  });
+});
+
+describe('ensureEnvironmentPrepared — success is unchanged', () => {
+  test('a successful run still reports ran/exit 0 with its output', () => {
+    const runner = sequenceRunner([{ stdout: 'added 1 package', stderr: '', exitCode: 0, durationMs: 9_800 }]);
+    const out = ensureEnvironmentPrepared({
+      config: CONFIG({ command: 'npm ci --ignore-scripts' }),
+      cwd: tmpDir,
+      worktreeIdentity: tmpDir,
+      artifactRoot,
+      artifactDir,
+      runner,
+    });
+
+    expect(out.status).toBe('ran');
+    expect(out.exitCode).toBe(0);
+    expect(out.output).toBe('added 1 package');
+    expect(out.stopReason).toBeUndefined();
+    expect(out.stopSummary).toBeUndefined();
+
+    const artifact = JSON.parse(readFileSync(join(artifactDir, 'environment-prepare-result.json'), 'utf8'));
+    expect(artifact.outcome).toBe('run');
+    expect(artifact.exitCode).toBe(0);
+    expect(artifact.durationMs).toBe(9_800);
+    expect(artifact.stamp).toBeDefined();
   });
 });

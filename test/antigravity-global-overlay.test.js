@@ -115,6 +115,71 @@ const refusalReason = (fn) => refusal(fn).reason;
 const pastTtl = () => new Date(Date.now() - 13 * 60 * 60 * 1_000).toISOString();
 
 /**
+ * The production budgets the two wait loops are given, mirrored here.
+ *
+ * They are asserted rather than assumed: a contended run is supposed to spend
+ * its whole budget before failing closed, so a budget quietly shortened to make
+ * this suite faster would take the "waits" out of "waits and fails closed"
+ * without failing any assertion. These pin it (issue #1017).
+ */
+const LOCK_ACQUIRE_BUDGET_MS = 10_000;
+const OVERLAY_EXCLUSIVE_BUDGET_MS = 10_000;
+
+/**
+ * A clock that advances only by what the code under test asked to sleep.
+ *
+ * The wait loops compare their deadline against the same `now()` their sleeps
+ * advance, so this changes nothing about how many times they poll, what they
+ * observe on each pass, or when they give up — it only stops the giving-up from
+ * taking ten seconds of wall clock. `waited()` is the budget the loop actually
+ * spent, which is what the assertions turn on.
+ */
+function budgetedWait() {
+  let now = Date.now();
+  let waited = 0;
+  let polls = 0;
+  return {
+    strategy: {
+      now: () => now,
+      sleep: (ms) => {
+        now += ms;
+        waited += ms;
+        polls += 1;
+      },
+    },
+    waited: () => waited,
+    polls: () => polls,
+  };
+}
+
+/**
+ * The same clock, plus a one-shot action taken the first time the run blocks.
+ *
+ * A run that is inside this callback has reached its wait loop and not gone
+ * past it: it is exactly the state the racing helper thread has to be timed
+ * into. Acting here — revoking trust, handing the lock over — pins that
+ * interleaving instead of racing for it, so the ordering under test is decided
+ * by the call stack rather than by a wall-clock guess (issue #1017).
+ */
+function handoffWait(onFirstWait) {
+  const clock = budgetedWait();
+  let fired = false;
+  return {
+    strategy: {
+      now: clock.strategy.now,
+      sleep: (ms) => {
+        clock.strategy.sleep(ms);
+        if (fired) return;
+        fired = true;
+        onFirstWait();
+      },
+    },
+    waited: clock.waited,
+    fired: () => fired,
+  };
+}
+
+/**
  * The revoking helper: it waits for `triggerPath` to appear, writes `revoked`
  * over the store, and hands the lock over by removing it.
  *
@@ -502,7 +567,13 @@ describe('global permission overlay — concurrency and crash safety (issue #830
     writeFileSync(globalSettingsPath, original);
 
     const foreign = foreignOverlay(second);
-    expect(refusalReason(() => prepare(first))).toBe('global-overlay-contended');
+    const wait = budgetedWait();
+    expect(refusalReason(() => prepare(first, { waitStrategy: wait.strategy })))
+      .toBe('global-overlay-contended');
+    // It waited for the release before failing closed — repeatedly, and for the
+    // whole exclusivity budget — rather than refusing on the first look.
+    expect(wait.waited()).toBeGreaterThanOrEqual(OVERLAY_EXCLUSIVE_BUDGET_MS);
+    expect(wait.polls()).toBeGreaterThan(1);
     // The other workspace's overlay is left exactly as it was, and nothing of
     // this run was installed or journalled.
     expect(readGlobal().permissions.allow).toEqual([`read_file(${second}/**)`]);
@@ -560,8 +631,12 @@ describe('global permission overlay — concurrency and crash safety (issue #830
     const edit = { theirs: { command: '/usr/local/bin/tool-server' } };
     writeFileSync(globalSettingsPath, JSON.stringify({ ...readGlobal(), mcpServers: edit }, null, 2) + '\n');
 
-    const err = refusal(() => prepare(root));
+    const wait = budgetedWait();
+    const err = refusal(() => prepare(root, { waitStrategy: wait.strategy }));
     expect(err.reason).toBe('global-overlay-contended');
+    // The co-tenant was waited out — its release is what would have made this
+    // installable — for the whole exclusivity budget before failing closed.
+    expect(wait.waited()).toBeGreaterThanOrEqual(OVERLAY_EXCLUSIVE_BUDGET_MS);
     // Actionable: the key that could not be handed over, and the journal holding
     // it — file name only, never its directory.
     expect(err.detail).toContain('mcpServers');
@@ -738,8 +813,12 @@ describe('global permission overlay — concurrency and crash safety (issue #830
     writeFileSync(globalSettingsPath, original);
     const elderly = foreignOverlay(other, process.ppid, pastTtl());
 
-    const err = refusal(() => prepare(root));
+    const wait = budgetedWait();
+    const err = refusal(() => prepare(root, { waitStrategy: wait.strategy }));
     expect(err.reason).toBe('global-overlay-contended');
+    // Age is not what ends the wait: the full exclusivity budget is spent on an
+    // elderly blocker exactly as it is on a fresh one.
+    expect(wait.waited()).toBeGreaterThanOrEqual(OVERLAY_EXCLUSIVE_BUDGET_MS);
     expect(err.detail).toContain(elderly);
     expect(err.detail).toMatch(/may have been reused/);
     // A journal file NAME, never a path: this detail reaches a bounded artifact.
@@ -803,7 +882,13 @@ describe('global permission overlay — concurrency and crash safety (issue #830
     const longAgo = new Date(Date.now() - 10 * 60 * 1_000);
     utimesSync(lockPath, longAgo, longAgo);
 
-    expect(refusalReason(() => prepare(root))).toBe('global-settings-locked');
+    const wait = budgetedWait();
+    expect(refusalReason(() => prepare(root, { waitStrategy: wait.strategy })))
+      .toBe('global-settings-locked');
+    // Waited, rather than declared it stale on sight: the holder was re-examined
+    // on every pass for the whole acquisition budget, and the lock outlived it.
+    expect(wait.waited()).toBeGreaterThanOrEqual(LOCK_ACQUIRE_BUDGET_MS);
+    expect(wait.polls()).toBeGreaterThan(1);
     expect(existsSync(lockPath)).toBe(true);
     expect(journals()).toHaveLength(0);
     expect(readGlobal().permissions).toBeUndefined();
@@ -821,7 +906,12 @@ describe('global permission overlay — concurrency and crash safety (issue #830
     // Another contender is mid-takeover of exactly this lock.
     writeFileSync(`${lockPath}.takeover`, '');
 
-    expect(refusalReason(() => prepare(root))).toBe('global-settings-locked');
+    const wait = budgetedWait();
+    expect(refusalReason(() => prepare(root, { waitStrategy: wait.strategy })))
+      .toBe('global-settings-locked');
+    // The marker deferred the takeover for the whole acquisition budget: this
+    // contender never stopped retrying, it simply never unlinked.
+    expect(wait.waited()).toBeGreaterThanOrEqual(LOCK_ACQUIRE_BUDGET_MS);
     // The lock the other contender is working on was not unlinked by this one.
     expect(existsSync(lockPath)).toBe(true);
     expect(journals()).toHaveLength(0);
@@ -1294,6 +1384,14 @@ describe('global permission overlay — trust registration races (issue #830 rev
     // until the revocation is on disk, so the locked read never sees the
     // pre-revocation document. A run slow enough to reach even its unlocked read
     // late simply refuses one step earlier, for the same reason.
+    //
+    // This one keeps the real second thread of control (issue #1017). Its two
+    // companions below drive the same window through the runner's own wait seam,
+    // which is deterministic and free — but a seam is this module's account of
+    // when it blocks, and something has to hold that account to a genuinely
+    // concurrent writer it does not cooperate with. This is that test, and it is
+    // the registration path: the one where the runner's next act is a WRITE to
+    // the document the other side just changed.
     const lockPath = `${globalSettingsPath}.n8n-ai-cli-loop.lock`;
     const revoked = JSON.stringify({ theme: 'dark', trustedFolders: { [root]: 'DO_NOT_TRUST' } }, null, 2) + '\n';
     const revoker = startRevoker({
@@ -1330,14 +1428,14 @@ describe('global permission overlay — trust registration races (issue #830 rev
     const trusted = JSON.stringify({ theme: 'dark', trustedWorkspaces: [root] }, null, 2) + '\n';
     writeFileSync(globalSettingsPath, trusted);
 
-    // Same construction as above — the helper is watching before this run starts,
-    // so its startup is paid outside the runner's lock wait — but it watches for
-    // the workspace profile rather than for the lock. That file is written
-    // *after* the unlocked trust read and *before* the overlay lock is taken, so
-    // the revocation is pinned to the exact window this test is about: the run
-    // has already decided the workspace is trusted, and has not yet installed
-    // anything. The lock below is held by this process until the helper hands it
-    // over, so the runner cannot reach the store before then.
+    // The window is pinned from inside the run rather than raced for. This
+    // process holds the store's lock — a live holder is waited on, never taken
+    // over — so the run reaches its wait loop and stops there, and the revoking
+    // write happens in the callback that loop calls (`handoffWait`). Being in
+    // that callback IS the window: the run has read trust (unlocked, trusted)
+    // and written the workspace profile, and it has installed nothing, both of
+    // which are asserted below rather than assumed. Handing the lock over from
+    // the same callback then lets it proceed into the store it may not have.
     const lockPath = `${globalSettingsPath}.n8n-ai-cli-loop.lock`;
     const profilePath = join(root, '.gemini', 'settings.json');
     const revoked = JSON.stringify(
@@ -1345,27 +1443,36 @@ describe('global permission overlay — trust registration races (issue #830 rev
       null,
       2,
     ) + '\n';
-    const revoker = startRevoker({
-      triggerPath: profilePath,
-      settingsPath: globalSettingsPath,
-      revoked,
-      lockPath,
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + '\n');
+    let observed;
+    const handoff = handoffWait(() => {
+      // Recorded, not asserted here: an assertion thrown from inside the run
+      // would surface as whatever that run does with it.
+      observed = { profileWritten: existsSync(profilePath), journals: journals().length };
+      writeFileSync(globalSettingsPath, revoked);
+      rmSync(lockPath, { force: true });
     });
-    try {
-      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + '\n');
-      expect(refusalReason(() => prepare(root))).toBe('workspace-distrusted');
-      // The revocation survived untouched and no permission entry was installed
-      // on top of it.
-      expect(readFileSync(globalSettingsPath, 'utf8')).toBe(revoked);
-      expect(journals()).toHaveLength(0);
-      // The refusal comes after the workspace profile is written, so the file
-      // may still be there — but it is excluded, and the target repository is
-      // clean on this failure path too.
-      expect(execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim()).toBe('');
-    } finally {
-      void revoker.terminate();
-    }
-  }, 60_000);
+
+    expect(refusalReason(() => prepare(root, { waitStrategy: handoff.strategy })))
+      .toBe('workspace-distrusted');
+    // The workspace profile is written after the unlocked trust read and before
+    // the overlay lock, so the revocation landed in the exact window this test
+    // is about: past the decision that the workspace is trusted, short of
+    // anything installed.
+    expect(observed).toEqual({ profileWritten: true, journals: 0 });
+    // The run really did block on the lock and really did get it: this is the
+    // recheck refusing, not the acquisition timing out short of the store.
+    expect(handoff.fired()).toBe(true);
+    expect(handoff.waited()).toBeLessThan(LOCK_ACQUIRE_BUDGET_MS);
+    // The revocation survived untouched and no permission entry was installed
+    // on top of it.
+    expect(readFileSync(globalSettingsPath, 'utf8')).toBe(revoked);
+    expect(journals()).toHaveLength(0);
+    // The refusal comes after the workspace profile is written, so the file
+    // may still be there — but it is excluded, and the target repository is
+    // clean on this failure path too.
+    expect(execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim()).toBe('');
+  });
 
   test('a trust grant WITHDRAWN before the overlay lock refuses the run too', () => {
     // The same window, but the operator removes the grant instead of writing an
@@ -1377,28 +1484,31 @@ describe('global permission overlay — trust registration races (issue #830 rev
     const trusted = JSON.stringify({ theme: 'dark', trustedWorkspaces: [root] }, null, 2) + '\n';
     writeFileSync(globalSettingsPath, trusted);
 
+    // Same construction as the test above: the run is stopped inside its wait
+    // loop, the store is changed from there, and the lock is handed over.
     const lockPath = `${globalSettingsPath}.n8n-ai-cli-loop.lock`;
     const profilePath = join(root, '.gemini', 'settings.json');
     // Withdrawn, not revoked: the workspace is simply absent from the list.
     const withdrawn = JSON.stringify({ theme: 'dark', trustedWorkspaces: [] }, null, 2) + '\n';
-    const revoker = startRevoker({
-      triggerPath: profilePath,
-      settingsPath: globalSettingsPath,
-      revoked: withdrawn,
-      lockPath,
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + '\n');
+    let observed;
+    const handoff = handoffWait(() => {
+      observed = { profileWritten: existsSync(profilePath), journals: journals().length };
+      writeFileSync(globalSettingsPath, withdrawn);
+      rmSync(lockPath, { force: true });
     });
-    try {
-      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }) + '\n');
-      expect(refusalReason(() => prepare(root))).toBe('workspace-not-trusted');
-      // The withdrawal survived untouched — no trust entry was re-appended and
-      // no permission entry was installed on top of it.
-      expect(readFileSync(globalSettingsPath, 'utf8')).toBe(withdrawn);
-      expect(journals()).toHaveLength(0);
-      expect(execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim()).toBe('');
-    } finally {
-      void revoker.terminate();
-    }
-  }, 60_000);
+
+    expect(refusalReason(() => prepare(root, { waitStrategy: handoff.strategy })))
+      .toBe('workspace-not-trusted');
+    expect(observed).toEqual({ profileWritten: true, journals: 0 });
+    expect(handoff.fired()).toBe(true);
+    expect(handoff.waited()).toBeLessThan(LOCK_ACQUIRE_BUDGET_MS);
+    // The withdrawal survived untouched — no trust entry was re-appended and
+    // no permission entry was installed on top of it.
+    expect(readFileSync(globalSettingsPath, 'utf8')).toBe(withdrawn);
+    expect(journals()).toHaveLength(0);
+    expect(execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim()).toBe('');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1447,7 +1557,12 @@ describe('global permission overlay — symlinked store (issue #830 review)', ()
     const longAgo = new Date(Date.now() - 10 * 60 * 1_000);
     utimesSync(lockPath, longAgo, longAgo);
 
-    expect(refusalReason(() => prepare(root))).toBe('global-settings-locked');
+    const wait = budgetedWait();
+    expect(refusalReason(() => prepare(root, { waitStrategy: wait.strategy })))
+      .toBe('global-settings-locked');
+    // It contended for the peer's lock — the whole budget of it — which is only
+    // possible if the lock it went for was the one on the resolved target.
+    expect(wait.waited()).toBeGreaterThanOrEqual(LOCK_ACQUIRE_BUDGET_MS);
     expect(existsSync(lockPath)).toBe(true);
     expect(JSON.parse(readFileSync(target, 'utf8')).permissions).toBeUndefined();
   }, 30_000);

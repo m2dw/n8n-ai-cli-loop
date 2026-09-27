@@ -14,15 +14,20 @@
  * that lands while the command runs is caught by the read-back rather than
  * imported.
  */
-import { execFileSync } from 'child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createRequire } from 'module';
 import Database from 'better-sqlite3';
-import { SqliteChainRegistryStore, buildFrozenPrefix, chainGraphFingerprint } from '../dist/index.js';
+import {
+  SqliteChainRegistryStore,
+  buildFrozenPrefix,
+  chainEditRepositoryIssueLockScope,
+  chainGraphFingerprint,
+  chainRepositoryKey,
+} from '../dist/index.js';
+import { runAdmin } from './helpers/admin-cli.js';
 
-const CLI = new URL('../dist/cli/admin.js', import.meta.url).pathname;
 /** Importable from a child script written into the temp dir, unlike a bare path. */
 const LIB_URL = new URL('../dist/index.js', import.meta.url).href;
 /** Lets a child script written into the temp dir load this repo's better-sqlite3. */
@@ -209,21 +214,14 @@ function readLabels(issueNumber) {
   return JSON.parse(readFileSync(file, 'utf8')).slice().sort();
 }
 
-function run(args, envOverrides = {}) {
-  try {
-    const stdout = execFileSync(process.execPath, [CLI, ...args], {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PATH: `${binDir}:${process.env.PATH}`,
-        FAKE_GH_STATE_DIR: stateDir,
-        ...envOverrides,
-      },
-    });
-    return { code: 0, stdout };
-  } catch (err) {
-    return { code: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
-  }
+async function run(args, envOverrides = {}) {
+  return runAdmin(args, {
+    env: {
+      PATH: `${binDir}:${process.env.PATH}`,
+      FAKE_GH_STATE_DIR: stateDir,
+      ...envOverrides,
+    },
+  });
 }
 
 function parse(result) {
@@ -277,43 +275,43 @@ async function seedAcceptedChain() {
 }
 
 describe('admin chain new|append|prepend — argument handling', () => {
-  test('rejects unknown options', () => {
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--bogus']);
+  test('rejects unknown options', async () => {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--bogus']);
     expect(r.code).toBe(1);
   }, 30_000);
 
-  test('rejects a misspelled --yes rather than silently previewing', () => {
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yess']);
+  test('rejects a misspelled --yes rather than silently previewing', async () => {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yess']);
     expect(r.code).toBe(1);
     expect(parse(r).error).toContain('--yess');
   }, 30_000);
 
-  test('chain new requires a session selector', () => {
-    const r = run(['chain', 'new', '10,11', ...dbArgs()]);
+  test('chain new requires a session selector', async () => {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs()]);
     expect(r.code).toBe(1);
     expect(parse(r).error).toContain('--session-id or --session-ref is required');
   }, 30_000);
 
-  test('chain append requires a chain reference and issues', () => {
-    const r = run(['chain', 'append', 'chain_21', ...dbArgs()]);
+  test('chain append requires a chain reference and issues', async () => {
+    const r = await run(['chain', 'append', 'chain_21', ...dbArgs()]);
     expect(r.code).toBe(1);
     expect(parse(r).error).toContain('chain reference and issue number');
   }, 30_000);
 
-  test('refuses a third positional argument', () => {
-    const r = run(['chain', 'new', '10,11', 'name', 'extra', ...dbArgs(), '--session-id', 'addon-dev']);
+  test('refuses a third positional argument', async () => {
+    const r = await run(['chain', 'new', '10,11', 'name', 'extra', ...dbArgs(), '--session-id', 'addon-dev']);
     expect(r.code).toBe(1);
     expect(parse(r).error).toContain('Unexpected argument: extra');
   }, 30_000);
 
-  test('refuses a malformed chain name before touching anything', () => {
-    const r = run(['chain', 'new', '10,11', 'not a name', ...dbArgs(), '--session-id', 'addon-dev']);
+  test('refuses a malformed chain name before touching anything', async () => {
+    const r = await run(['chain', 'new', '10,11', 'not a name', ...dbArgs(), '--session-id', 'addon-dev']);
     expect(r.code).toBe(1);
     expect(parse(r).error).toContain('Invalid chain name');
   }, 30_000);
 
-  test('reports not_found for an unknown chain-ref', () => {
-    const r = run(['chain', 'append', 'chain_999', '30', ...dbArgs()]);
+  test('reports not_found for an unknown chain-ref', async () => {
+    const r = await run(['chain', 'append', 'chain_999', '30', ...dbArgs()]);
     expect(r.code).toBe(1);
     expect(parse(r).reason).toBe('not_found');
   }, 30_000);
@@ -322,22 +320,212 @@ describe('admin chain new|append|prepend — argument handling', () => {
     // The list is a SEQUENCE: `10,11,10` asks for a cycle, and executing it as
     // `10,11` would apply a graph the operator never described (issue #791
     // review).
-    const r = run(['chain', 'new', '10,11,10', ...dbArgs(), '--session-id', 'addon-dev']);
+    const r = await run(['chain', 'new', '10,11,10', ...dbArgs(), '--session-id', 'addon-dev']);
     expect(r.code).toBe(1);
     expect(parse(r).error).toContain('#10 is named more than once');
     expect(await store.listChains()).toEqual([]);
 
     const chainId = await seedAcceptedChain();
-    const appended = run(['chain', 'append', chainId, '22,22', ...dbArgs()]);
+    const appended = await run(['chain', 'append', chainId, '22,22', ...dbArgs()]);
     expect(appended.code).toBe(1);
     expect(parse(appended).error).toContain('#22 is named more than once');
+  }, 30_000);
+});
+
+describe('admin chain new — repository-scoped Issue identity (issue #1045)', () => {
+  /** `addon-dev` plus a second session; `githubRepo` decides whether they share Issues. */
+  function writeSecondSession(githubRepo) {
+    writeFileSync(
+      sessionsPath,
+      JSON.stringify({
+        sessions: [
+          session(),
+          session({ sessionId: 'other-dev', repoKey: 'other-repo', githubRepo }),
+        ],
+      }),
+      'utf8',
+    );
+  }
+
+  /** A chain in `other-dev` that already owns Issue 11. */
+  async function seedOtherSessionChain() {
+    const created = await store.createChain({
+      sessionId: 'other-dev',
+      headIssueNumber: 11,
+      members: [{ issueNumber: 11, role: 'head' }],
+      now: NOW,
+    });
+    if (!created.ok) throw new Error(`createChain failed: ${created.code}`);
+    return created.value.chain.chainId;
+  }
+
+  test('an Issue of the same number in another repository does not block a new chain', async () => {
+    writeSecondSession('m2dw/unrelated-repo');
+    await seedOtherSessionChain();
+
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    expect(r.code).toBe(0);
+    const payload = parse(r);
+    expect(payload.ok).toBe(true);
+    expect(payload.status).toBe('applied');
+    // Both chains stand: two repositories, two distinct Issues that share a number.
+    expect((await store.listChains()).map((c) => c.chainId).sort()).toEqual(['chain_11', 'chain_11_2']);
+  }, 30_000);
+
+  test('an Issue another session in the SAME repository owns still refuses the edit', async () => {
+    writeSecondSession('m2dw/some-repo');
+    const owner = await seedOtherSessionChain();
+
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    expect(r.code).toBe(1);
+    const payload = parse(r);
+    expect(payload.ok).toBe(false);
+    const duplicate = payload.failure.diagnostics.find((d) => d.code === 'duplicate_ownership');
+    expect(duplicate).toBeDefined();
+    expect(duplicate.issues).toEqual([11]);
+    expect(duplicate.chains).toEqual([owner]);
+    // Named well enough to go find it: an Issue number alone would not be.
+    expect(duplicate.owners).toEqual([
+      { chainId: owner, sessionId: 'other-dev', repository: 'm2dw/some-repo' },
+    ]);
+    // Refused before anything was written.
+    expect(readBlockedBy(11)).toEqual([]);
+    expect((await store.listChains()).map((c) => c.chainId)).toEqual([owner]);
+  }, 30_000);
+
+  /**
+   * The claim of step 0 has to be scoped the same way the ownership check is
+   * (issue #1045 review). Widening ownership to every session on a repository
+   * while still claiming Issues per session would let two such sessions run at
+   * once: their session-scoped claims are disjoint by construction, so both
+   * would suspend labels and draw relationships on the same GitHub Issue and
+   * only separate at the final registry claim — after the damage, and with an
+   * unaccepted chain left behind.
+   *
+   * The concurrent run is stood in for by holding its scope directly, as the
+   * overlapping-edits tests below do.
+   */
+  const repositoryScope = (githubRepo, issueNumber) => {
+    const [owner, repo] = githubRepo.split('/');
+    return chainEditRepositoryIssueLockScope(
+      chainRepositoryKey({ provider: 'github-issues', endpoint: 'github.com', owner, repo }),
+      issueNumber,
+    );
+  };
+
+  async function holdRepositoryScope(githubRepo, issueNumber) {
+    const held = await store.acquireChainEditLocks({
+      scopes: [repositoryScope(githubRepo, issueNumber)],
+      ownerId: 'other-session-run-0000',
+      operationId: 'admin chain new-11,12',
+      now: new Date().toISOString(),
+    });
+    expect(held.ok).toBe(true);
+  }
+
+  test('an Issue another session in the same repository is editing is refused at step 0', async () => {
+    writeSecondSession('m2dw/some-repo');
+    seedLabels(10, [STATUS_LABEL]);
+    seedLabels(11, [STATUS_LABEL, AGENT_LABEL]);
+    await holdRepositoryScope('m2dw/some-repo', 11);
+
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    expect(r.code).toBe(1);
+    const payload = parse(r);
+    expect(payload.failure.kind).toBe('lock_contended');
+    expect(payload.failure.transient).toBe(true);
+    expect(payload.failure.message).toContain('issue #11');
+
+    // Before the first side effect: no label moved, no relationship drawn, no
+    // half-built chain for the other run to collide with.
+    expect(readLabels(11)).toEqual([AGENT_LABEL, STATUS_LABEL].sort());
+    expect(readBlockedBy(11)).toEqual([]);
+    expect(await store.listChains()).toEqual([]);
+  }, 30_000);
+
+  test('a differently-spelled slug is the same repository, so it still serializes', async () => {
+    // GitHub resolves `M2DW/Some-Repo` and `m2dw/some-repo` to one repository;
+    // a byte-for-byte claim would let both edit Issue 11 at once.
+    seedLabels(11, [STATUS_LABEL]);
+    await holdRepositoryScope('M2DW/Some-Repo', 11);
+
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    expect(r.code).toBe(1);
+    expect(parse(r).failure.kind).toBe('lock_contended');
+    expect(await store.listChains()).toEqual([]);
+  }, 30_000);
+
+  test('an older build editing through the other session of this repository still serializes', async () => {
+    // Rolling upgrade: the overlapping process predates the repository claim, so
+    // it holds only `issue:other-dev:11`. Claiming the anchor session's spelling
+    // alone would leave the two sets disjoint and let both relabel Issue 11
+    // (issue #1045 review).
+    writeSecondSession('m2dw/some-repo');
+    seedLabels(10, [STATUS_LABEL]);
+    seedLabels(11, [STATUS_LABEL, AGENT_LABEL]);
+    const held = await store.acquireChainEditLocks({
+      scopes: ['issue:other-dev:11'],
+      ownerId: 'older-build-run-0000',
+      operationId: 'admin chain new-11,12',
+      now: new Date().toISOString(),
+    });
+    expect(held.ok).toBe(true);
+
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    expect(r.code).toBe(1);
+    const payload = parse(r);
+    expect(payload.failure.kind).toBe('lock_contended');
+    expect(payload.failure.transient).toBe(true);
+    expect(payload.failure.message).toContain('issue #11');
+
+    // Refused at step 0, before the first side effect.
+    expect(readLabels(11)).toEqual([AGENT_LABEL, STATUS_LABEL].sort());
+    expect(readBlockedBy(11)).toEqual([]);
+    expect(await store.listChains()).toEqual([]);
+  }, 30_000);
+
+  test('a session bound to another repository holds no scope this edit needs', async () => {
+    // The mirror image: the other session's session-scoped claim is only
+    // collided with because it shares the repository. One that does not is
+    // outside the scope, and claiming its spelling would be the global
+    // over-reach issue #1045 removed.
+    writeSecondSession('m2dw/unrelated-repo');
+    seedLabels(11, [STATUS_LABEL]);
+    const held = await store.acquireChainEditLocks({
+      scopes: ['issue:other-dev:11'],
+      ownerId: 'older-build-run-0001',
+      operationId: 'admin chain new-11,12',
+      now: new Date().toISOString(),
+    });
+    expect(held.ok).toBe(true);
+
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    expect(r.code).toBe(0);
+    expect(parse(r).status).toBe('applied');
+  }, 30_000);
+
+  test('an edit in another repository claims a different scope and is not blocked', async () => {
+    seedLabels(11, [STATUS_LABEL]);
+    await holdRepositoryScope('m2dw/unrelated-repo', 11);
+
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    expect(r.code).toBe(0);
+    expect(parse(r).status).toBe('applied');
+    // And the claim it took is given back, so the next edit here can run.
+    const reclaimed = await store.acquireChainEditLocks({
+      scopes: [repositoryScope('m2dw/some-repo', 11)],
+      ownerId: 'probe-0000',
+      operationId: 'probe',
+      now: new Date().toISOString(),
+    });
+    expect(reclaimed.ok).toBe(true);
   }, 30_000);
 });
 
 describe('admin chain new', () => {
   test('preview writes nothing — no relationship, no label, no chain', async () => {
     seedLabels(11, [STATUS_LABEL, AGENT_LABEL, 'kind:bug']);
-    const r = run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev']);
+    const r = await run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev']);
     expect(r.code).toBe(0);
     const payload = parse(r);
     expect(payload.ok).toBe(true);
@@ -357,7 +545,7 @@ describe('admin chain new', () => {
     seedLabels(10, [STATUS_LABEL, AGENT_LABEL]);
     seedLabels(11, [STATUS_LABEL, AGENT_LABEL, 'kind:bug']);
     seedLabels(12, []);
-    const r = run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const r = await run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(r.code).toBe(0);
     const payload = parse(r);
     expect(payload.ok).toBe(true);
@@ -389,11 +577,11 @@ describe('admin chain new', () => {
     expect(restored.withheld).toEqual([]);
   }, 30_000);
 
-  test('the human rendering names the planned edges and the label changes', () => {
+  test('the human rendering names the planned edges and the label changes', async () => {
     seedLabels(11, [STATUS_LABEL]);
     // Operator-facing by default: no --json, so this is the text an operator
     // actually reads before deciding to pass --yes.
-    const r = run(['chain', 'new', '10,11', '--db-path', dbPath, '--sessions-path', sessionsPath, '--session-id', 'addon-dev']);
+    const r = await run(['chain', 'new', '10,11', '--db-path', dbPath, '--sessions-path', sessionsPath, '--session-id', 'addon-dev']);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('10->11');
     expect(r.stdout).toContain('would suspend');
@@ -402,11 +590,11 @@ describe('admin chain new', () => {
   }, 30_000);
 
   test('a name becomes an alias, and a taken one is refused before anything is created', async () => {
-    const first = run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const first = await run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(first.code).toBe(0);
     expect(await store.resolveChainHandle('auth-work')).toBe('chain_11');
 
-    const second = run(['chain', 'new', '30,31', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const second = await run(['chain', 'new', '30,31', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(second.code).toBe(1);
     expect(parse(second).error).toContain('already resolves to chain chain_11');
     expect(readBlockedBy(31)).toEqual([]);
@@ -437,7 +625,7 @@ if (!created.ok) { console.error(created.code); process.exit(1); }
       'utf8',
     );
 
-    const r = run(
+    const r = await run(
       ['chain', 'new', '10,11', 'chain_42', ...dbArgs(), '--session-id', 'addon-dev', '--yes'],
       { FAKE_GH_RACE_SCRIPT: raceScript },
     );
@@ -458,7 +646,7 @@ if (!created.ok) { console.error(created.code); process.exit(1); }
     expect(readLabels(11)).toEqual([]);
     expect(payload.failure.recovery.join(' ')).toContain('admin issue activate');
 
-    const retry = run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const retry = await run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(retry.code).toBe(0);
     const done = parse(retry);
     expect(done.status).toBe('applied');
@@ -491,7 +679,7 @@ if (!created.ok) { console.error(created.code); process.exit(1); }
     expect(created.ok).toBe(true);
     seedBlockedBy(11, [{ number: 10, state: 'open' }]);
 
-    const retry = run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const retry = await run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(retry.code).toBe(0);
     const done = parse(retry);
     expect(done.status).toBe('applied');
@@ -525,7 +713,7 @@ if (!created.ok) { console.error(created.code); process.exit(1); }
     expect(created.value.chain.title).toBeUndefined();
     seedBlockedBy(11, [{ number: 10, state: 'open' }]);
 
-    const retry = run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const retry = await run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(retry.code).toBe(0);
     const done = parse(retry);
     expect(done.status).toBe('applied');
@@ -576,7 +764,7 @@ db.close();
       'utf8',
     );
 
-    const retry = run(
+    const retry = await run(
       ['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes'],
       { FAKE_GH_AFTER_SUSPEND_SCRIPT: concurrent },
     );
@@ -600,7 +788,7 @@ db.close();
   }, 30_000);
 
   test('an ID collision walks the deterministic suffix sequence', async () => {
-    const first = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const first = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(first.code).toBe(0);
     expect(parse(first).chainId).toBe('chain_11');
 
@@ -611,17 +799,17 @@ db.close();
     const alias = await store.putChainAlias({ alias: 'chain_13', chainId: 'chain_11', now: NOW });
     expect(alias.ok).toBe(true);
 
-    const second = run(['chain', 'new', '12,13', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const second = await run(['chain', 'new', '12,13', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(second.code).toBe(0);
     expect(parse(second).chainId).toBe('chain_13_2');
   }, 30_000);
 
   test('refuses an Issue another chain already owns, naming the advanced merge operation', async () => {
-    const created = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const created = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(created.code).toBe(0);
     seedLabels(30, [STATUS_LABEL]);
 
-    const r = run(['chain', 'new', '30,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const r = await run(['chain', 'new', '30,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(r.code).toBe(1);
     const payload = parse(r);
     expect(payload.failure.kind).toBe('structural');
@@ -633,9 +821,9 @@ db.close();
     expect(readBlockedBy(11)).toEqual([10]);
   }, 30_000);
 
-  test('a transient provider read refuses the whole edit without suspending anything', () => {
+  test('a transient provider read refuses the whole edit without suspending anything', async () => {
     seedLabels(11, [STATUS_LABEL]);
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_FAIL_BLOCKED_BY: '11',
     });
     expect(r.code).toBe(1);
@@ -652,7 +840,7 @@ describe('admin chain append / prepend', () => {
     const chainId = await seedAcceptedChain();
     seedLabels(22, [STATUS_LABEL, AGENT_LABEL]);
 
-    const r = run(['chain', 'append', chainId, '22,23', ...dbArgs(), '--yes']);
+    const r = await run(['chain', 'append', chainId, '22,23', ...dbArgs(), '--yes']);
     expect(r.code).toBe(0);
     const payload = parse(r);
     expect(payload.status).toBe('applied');
@@ -668,16 +856,16 @@ describe('admin chain append / prepend', () => {
 
   test('append accepts a session assertion and refuses a wrong one', async () => {
     const chainId = await seedAcceptedChain();
-    const ok = run(['chain', 'append', chainId, '22', ...dbArgs(), '--session-id', 'addon-dev']);
+    const ok = await run(['chain', 'append', chainId, '22', ...dbArgs(), '--session-id', 'addon-dev']);
     expect(ok.code).toBe(0);
-    const wrong = run(['chain', 'append', chainId, '22', ...dbArgs(), '--session-id', 'other-session']);
+    const wrong = await run(['chain', 'append', chainId, '22', ...dbArgs(), '--session-id', 'other-session']);
     expect(wrong.code).toBe(1);
     expect(parse(wrong).error).toContain('belongs to session addon-dev');
   }, 30_000);
 
   test('prepend attaches ahead of the root and leaves the head alone', async () => {
     const chainId = await seedAcceptedChain();
-    const r = run(['chain', 'prepend', chainId, '18,19', ...dbArgs(), '--yes']);
+    const r = await run(['chain', 'prepend', chainId, '18,19', ...dbArgs(), '--yes']);
     expect(r.code).toBe(0);
     expect(readBlockedBy(19)).toEqual([18]);
     expect(readBlockedBy(20)).toEqual([19]);
@@ -698,7 +886,7 @@ describe('admin chain append / prepend', () => {
     seedLabels(21, [STATUS_LABEL, AGENT_LABEL]);
     seedLabels(22, [STATUS_LABEL]);
 
-    const r = run(['chain', 'append', chainId, '22', ...dbArgs(), '--yes']);
+    const r = await run(['chain', 'append', chainId, '22', ...dbArgs(), '--yes']);
     expect(r.code).toBe(1);
     const payload = parse(r);
     expect(payload.failure.kind).toBe('structural');
@@ -738,13 +926,13 @@ describe('admin chain append / prepend', () => {
     );
     expect(frozen.ok).toBe(true);
 
-    const prepend = run(['chain', 'prepend', chainId, '19', ...dbArgs(), '--yes']);
+    const prepend = await run(['chain', 'prepend', chainId, '19', ...dbArgs(), '--yes']);
     expect(prepend.code).toBe(1);
     const refused = parse(prepend);
     expect(refused.failure.kind).toBe('frozen_prefix');
     expect(readBlockedBy(20)).toEqual([]);
 
-    const append = run(['chain', 'append', chainId, '22', ...dbArgs(), '--yes']);
+    const append = await run(['chain', 'append', chainId, '22', ...dbArgs(), '--yes']);
     expect(append.code).toBe(0);
     expect(readBlockedBy(22)).toEqual([21]);
   }, 30_000);
@@ -756,7 +944,7 @@ describe('admin chain edit — failure and recovery', () => {
     seedLabels(11, [STATUS_LABEL, AGENT_LABEL]);
     seedLabels(12, [STATUS_LABEL]);
 
-    const r = run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_FAIL_DEP: '11:12',
     });
     expect(r.code).toBe(1);
@@ -776,7 +964,7 @@ describe('admin chain edit — failure and recovery', () => {
 
     // Retry: the relationship that already exists is not re-created, the
     // missing one is, and the edit completes.
-    const retry = run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const retry = await run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(retry.code).toBe(0);
     const done = parse(retry);
     expect(done.status).toBe('applied');
@@ -795,14 +983,14 @@ describe('admin chain edit — failure and recovery', () => {
     seedLabels(11, [STATUS_LABEL]);
 
     // An operator parks #10 for reasons of their own, before any chain work.
-    const parked = run([
+    const parked = await run([
       'issue', 'suspend', '10',
       '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbPath, '--json', '--yes',
     ]);
     expect(parked.code).toBe(0);
     expect(readLabels(10)).toEqual([]);
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(r.code).toBe(0);
     const payload = parse(r);
     expect(payload.status).toBe('applied');
@@ -829,7 +1017,7 @@ describe('admin chain edit — failure and recovery', () => {
     seedLabels(22, [STATUS_LABEL]);
     seedLabels(23, [STATUS_LABEL]);
 
-    const first = run(['chain', 'append', chainId, '22,23', ...dbArgs(), '--yes'], {
+    const first = await run(['chain', 'append', chainId, '22,23', ...dbArgs(), '--yes'], {
       FAKE_GH_FAIL_DEP: '22:23',
     });
     expect(first.code).toBe(1);
@@ -838,7 +1026,7 @@ describe('admin chain edit — failure and recovery', () => {
     expect(readBlockedBy(23)).toEqual([]);
     expect(readLabels(21)).toEqual([]);
 
-    const retry = run(['chain', 'append', chainId, '22,23', ...dbArgs(), '--yes']);
+    const retry = await run(['chain', 'append', chainId, '22,23', ...dbArgs(), '--yes']);
     expect(retry.code).toBe(0);
     const done = parse(retry);
     expect(done.status).toBe('applied');
@@ -860,21 +1048,21 @@ describe('admin chain edit — failure and recovery', () => {
     // only at record level would leave it withheld for good (issue #791 review).
     seedLabels(10, [STATUS_LABEL, AGENT_LABEL]);
     seedLabels(11, [STATUS_LABEL]);
-    const parked = run([
+    const parked = await run([
       'issue', 'suspend', '10',
       '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbPath, '--json', '--yes',
     ]);
     expect(parked.code).toBe(0);
     seedLabels(10, [STATUS_LABEL]);
 
-    const first = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const first = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_FAIL_DEP: '10:11',
     });
     expect(first.code).toBe(1);
     expect(parse(first).failure.kind).toBe('relationship_error');
     expect(readLabels(10)).toEqual([]);
 
-    const retry = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const retry = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(retry.code).toBe(0);
     const done = parse(retry);
     expect(done.status).toBe('applied');
@@ -909,7 +1097,7 @@ describe('admin chain edit — failure and recovery', () => {
     expect(created.value.chain.acceptedRevision).toBeUndefined();
     seedBlockedBy(11, [{ number: 10, state: 'open' }]);
 
-    const retry = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const retry = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(retry.code).toBe(0);
     const done = parse(retry);
     expect(done.status).toBe('applied');
@@ -940,7 +1128,7 @@ describe('admin chain edit — failure and recovery', () => {
     });
     expect(created.ok).toBe(true);
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(r.code).toBe(1);
     const payload = parse(r);
     expect(payload.failure.kind).toBe('structural');
@@ -957,14 +1145,14 @@ describe('admin chain edit — failure and recovery', () => {
     // Another operation parks #10 (recording both labels), and the status label
     // is put back on the Issue afterwards — so this edit removes one label into
     // a record it does not own.
-    const parked = run([
+    const parked = await run([
       'issue', 'suspend', '10',
       '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbPath, '--json', '--yes',
     ]);
     expect(parked.code).toBe(0);
     seedLabels(10, [STATUS_LABEL]);
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_FAIL_DEP: '10:11',
     });
     expect(r.code).toBe(1);
@@ -1002,7 +1190,7 @@ describe('admin chain edit — failure and recovery', () => {
     );
     db.close();
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_FAIL_LABEL_ADD: STATUS_LABEL,
     });
     expect(r.code).toBe(1);
@@ -1045,7 +1233,7 @@ db.close();
       'utf8',
     );
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_AFTER_SUSPEND_SCRIPT: sabotage,
     });
     expect(r.code).toBe(1);
@@ -1074,7 +1262,7 @@ db.close();
 
   test('a GitHub edit that lands mid-run is caught by the read-back, not imported', async () => {
     seedLabels(11, [STATUS_LABEL]);
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       // #77 starts blocking #11 the moment this command's own write lands.
       FAKE_GH_INJECT_AFTER_WRITE: '77:11',
     });
@@ -1089,7 +1277,7 @@ db.close();
 
   test('a label that cannot be restored is reported as a non-executable state, with the graph applied', async () => {
     seedLabels(11, [STATUS_LABEL]);
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_FAIL_LABEL_ADD: STATUS_LABEL,
     });
     expect(r.code).toBe(1);
@@ -1124,7 +1312,7 @@ if (!result.ok) { console.error(result.code); process.exit(1); }
       'utf8',
     );
 
-    const r = run(['chain', 'append', chainId, '22', ...dbArgs(), '--yes'], { FAKE_GH_RACE_SCRIPT: raceScript });
+    const r = await run(['chain', 'append', chainId, '22', ...dbArgs(), '--yes'], { FAKE_GH_RACE_SCRIPT: raceScript });
     expect(r.code).toBe(1);
     const payload = parse(r);
     expect(payload.failure.kind).toBe('conflict');
@@ -1182,7 +1370,7 @@ describe('admin chain edit — overlapping edits', () => {
     seedLabels(11, [STATUS_LABEL, AGENT_LABEL]);
     await holdScope('issue:addon-dev:11');
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(r.code).toBe(1);
     const payload = parse(r);
     expect(payload.failure.kind).toBe('lock_contended');
@@ -1204,7 +1392,7 @@ describe('admin chain edit — overlapping edits', () => {
 
   test('an edit gives its claims back when it finishes, so the next one can run', async () => {
     seedLabels(11, [STATUS_LABEL]);
-    const first = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const first = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(first.code).toBe(0);
 
     expect(await scopeIsFree('issue:addon-dev:10')).toBe(true);
@@ -1212,14 +1400,14 @@ describe('admin chain edit — overlapping edits', () => {
 
     // And an append over the same chain — which claims the existing members too
     // — is not blocked by the run that created it.
-    const second = run(['chain', 'append', 'chain_11', '12', ...dbArgs(), '--yes']);
+    const second = await run(['chain', 'append', 'chain_11', '12', ...dbArgs(), '--yes']);
     expect(second.code).toBe(0);
     expect(parse(second).status).toBe('applied');
   }, 30_000);
 
   test('a failed edit gives its claims back too, so the documented retry can actually run', async () => {
     seedLabels(11, [STATUS_LABEL]);
-    const r = run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11,12', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_FAIL_DEP: '11:12',
     });
     expect(r.code).toBe(1);
@@ -1234,7 +1422,7 @@ describe('admin chain edit — overlapping edits', () => {
     seedLabels(31, [STATUS_LABEL]);
     await holdScope('alias:auth-work');
 
-    const r = run(['chain', 'new', '30,31', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const r = await run(['chain', 'new', '30,31', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(r.code).toBe(1);
     const payload = parse(r);
     expect(payload.failure.kind).toBe('lock_contended');
@@ -1249,7 +1437,7 @@ describe('admin chain edit — overlapping edits', () => {
   }, 30_000);
 
   test('a claim released after the edit lets the name be checked and registered as one step', async () => {
-    const first = run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const first = await run(['chain', 'new', '10,11', 'auth-work', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(first.code).toBe(0);
     expect(await store.resolveChainHandle('auth-work')).toBe('chain_11');
     expect(await scopeIsFree('alias:auth-work')).toBe(true);
@@ -1260,7 +1448,7 @@ describe('admin chain edit — overlapping edits', () => {
     // Yesterday: far past the staleness window, so the run that took it is gone.
     await holdScope('issue:addon-dev:11', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes']);
     expect(r.code).toBe(0);
     expect(parse(r).status).toBe('applied');
     expect(readBlockedBy(11)).toEqual([10]);
@@ -1291,7 +1479,7 @@ db.close();
       'utf8',
     );
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_AFTER_SUSPEND_SCRIPT: steal,
     });
     expect(r.code).toBe(1);
@@ -1349,7 +1537,7 @@ writeFileSync(${JSON.stringify(join(stateDir, 'takeover.json'))}, JSON.stringify
       'utf8',
     );
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_AFTER_SUSPEND_SCRIPT: probe,
     });
     expect(r.code).toBe(0);
@@ -1391,7 +1579,7 @@ db.close();
       'utf8',
     );
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev', '--yes'], {
       FAKE_GH_AFTER_LABEL_ADD_SCRIPT: steal,
     });
     expect(r.code).toBe(1);
@@ -1423,7 +1611,7 @@ db.close();
     seedLabels(11, [STATUS_LABEL]);
     await holdScope('issue:addon-dev:11');
 
-    const r = run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev']);
+    const r = await run(['chain', 'new', '10,11', ...dbArgs(), '--session-id', 'addon-dev']);
     expect(r.code).toBe(0);
     expect(parse(r).status).toBe('would_apply');
     // A preview writes nothing, so it has nothing to protect and must not block

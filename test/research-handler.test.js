@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createResearchHandler as createResearchHandlerRaw } from '../dist/handlers/research.js';
@@ -146,6 +146,32 @@ describe('research handler — artifacts', () => {
     expect(existsSync(join(dir, 'research-prompt.md'))).toBe(true);
     expect(existsSync(join(dir, 'research-output.md'))).toBe(true);
     expect(existsSync(join(dir, 'research-result.json'))).toBe(true);
+  });
+
+  test('writes agent-runtime.json — the §13.4 run artifact of the billable resolution (issue #912 review)', async () => {
+    // The outer wrapper folds the context trail and the event onto the result;
+    // the run-artifact bytes are the handler's own write, beside the prompt.
+    const handler = createResearchHandler(CONTEXT(), fakeOk());
+    await handler(makeTask());
+
+    const record = JSON.parse(readFileSync(join(artifactRoot, 'runs', 'run-test-1', 'agent-runtime.json'), 'utf8'));
+    expect(record).toMatchObject({ phase: 'research', lane: 'research', provider: 'google' });
+  });
+
+  test('refuses to write agent-runtime.json through a pre-planted symlink (issue #912 review)', async () => {
+    // A symlink leaf inside an already-existing run dir passes the
+    // directory-level isSafeArtifactDirAfterRun check, so without the
+    // rejectSymlink guard this write would follow it and overwrite a file
+    // outside the artifact root.
+    const dir = join(artifactRoot, 'runs', 'run-test-1');
+    mkdirSync(dir, { recursive: true });
+    const sentinel = join(tmpDir, 'external-sentinel.json');
+    writeFileSync(sentinel, 'untouched', 'utf8');
+    symlinkSync(sentinel, join(dir, 'agent-runtime.json'));
+
+    const handler = createResearchHandler(CONTEXT(), fakeOk());
+    await expect(handler(makeTask())).rejects.toThrow(/Refusing to write artifact at symlink path/);
+    expect(readFileSync(sentinel, 'utf8')).toBe('untouched');
   });
 
   test('research-prompt.md includes issue number, title, and repo root', async () => {
@@ -1080,11 +1106,20 @@ describe('research handler — resolved profile metadata', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Antigravity model configuration (issue #493)
+// Antigravity model configuration (issue #493; catalog-resolved since #912)
 // ---------------------------------------------------------------------------
 
 describe('research handler — Antigravity model configuration', () => {
   const dir = () => join(artifactRoot, 'runs', 'run-test-1');
+
+  // Writes an agent-profiles.json overlay beside a sessions file and returns the
+  // sessions path the handler context threads to catalog resolution (§9.1).
+  function writeSiblingCatalog(document) {
+    const sessionsDir = join(tmpDir, 'custom-config');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'agent-profiles.json'), JSON.stringify(document), 'utf8');
+    return join(sessionsDir, 'sessions.json');
+  }
 
   test('no configured model: uses agy --print-timeout 15m --print (default behavior otherwise unchanged)', async () => {
     const spy = spyRunner();
@@ -1098,11 +1133,27 @@ describe('research handler — Antigravity model configuration', () => {
     expect(spy.calls[0].args).not.toContain('--model');
   });
 
-  test('configured model: passes --model <model> before --print-timeout and --print', async () => {
+  test('session.research.antigravity.model is no longer read by the cut-over lane (issue #912)', async () => {
+    // Pre-cutover this spliced --model before --print-timeout; the read-only
+    // cutover deleted the per-lane chain, so the model comes from a google
+    // profile in agent-profiles.json instead.
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const session = SESSION({ research: { antigravity: { model: 'Gemini 3.1 Pro (Low)' } } });
     const handler = createResearchHandler(CONTEXT({ session }), spy);
+    await handler(makeTask());
+    expect(spy.calls[0].args).not.toContain('--model');
+    expect(spy.calls[0].args).not.toContain('Gemini 3.1 Pro (Low)');
+  });
+
+  test('overlay model: passes --model <model> before --print-timeout and --print', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { model: 'Gemini 3.1 Pro (Low)' } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     await handler(makeTask());
     expect(spy.calls[0].cmd).toBe('agy');
     expect(spy.calls[0].args[0]).toBe('--model');
@@ -1112,33 +1163,42 @@ describe('research handler — Antigravity model configuration', () => {
     expect(spy.calls[0].args[4]).toBe('--print');
   });
 
-  test('configured model: prompt still appended after --print', async () => {
+  test('overlay model: prompt still appended after --print', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({ research: { antigravity: { model: 'Gemini 3.1 Pro (Low)' } } });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { model: 'Gemini 3.1 Pro (Low)' } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     await handler(makeTask());
     // args: ['--model', 'Gemini 3.1 Pro (Low)', '--print-timeout', '15m', '--print', <prompt>]
     expect(spy.calls[0].args).toHaveLength(6);
     expect(spy.calls[0].args[5]).toContain('Research Task');
   });
 
-  test('configured model: resolvedProfile records modelSource as session-config', async () => {
+  test('overlay model: resolvedProfile records modelSource as catalog-overlay', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({ research: { antigravity: { model: 'Gemini 3.1 Pro (Low)' } } });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { model: 'Gemini 3.1 Pro (Low)' } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     await handler(makeTask());
     const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
-    expect(ctx.resolvedProfile.modelSource).toBe('session-config');
+    expect(ctx.resolvedProfile.modelSource).toBe('catalog-overlay');
     expect(ctx.resolvedProfile.model).toBe('Gemini 3.1 Pro (Low)');
   });
 
-  test('configured model: resolvedProfile argv reflects --model flag', async () => {
+  test('overlay model: resolvedProfile argv reflects --model flag', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({ research: { antigravity: { model: 'Gemini 3.5 Flash (Medium)' } } });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { model: 'Gemini 3.5 Flash (Medium)' } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     await handler(makeTask());
     const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
     expect(ctx.resolvedProfile.argv).toEqual([
@@ -1157,14 +1217,17 @@ describe('research handler — Antigravity model configuration', () => {
     expect(ctx.resolvedProfile.argv).toEqual(['--print-timeout', '15m', '--print']);
   });
 
-  test('configured model: research-result.json includes model and modelSource', async () => {
+  test('overlay model: research-result.json includes model and modelSource', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({ research: { antigravity: { model: 'Claude Opus 4.6 (Thinking)' } } });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { model: 'Claude Opus 4.6 (Thinking)' } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     await handler(makeTask());
     const result = JSON.parse(readFileSync(join(dir(), 'research-result.json'), 'utf8'));
-    expect(result.resolvedProfile.modelSource).toBe('session-config');
+    expect(result.resolvedProfile.modelSource).toBe('catalog-overlay');
     expect(result.resolvedProfile.model).toBe('Claude Opus 4.6 (Thinking)');
   });
 });
@@ -1176,7 +1239,14 @@ describe('research handler — Antigravity model configuration', () => {
 describe('research handler — Antigravity print-timeout configuration', () => {
   const dir = () => join(artifactRoot, 'runs', 'run-test-1');
 
-  test('default: resolvedProfile records printTimeout 15m from cli-default', async () => {
+  function writeSiblingCatalog(document) {
+    const sessionsDir = join(tmpDir, 'custom-config');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, 'agent-profiles.json'), JSON.stringify(document), 'utf8');
+    return join(sessionsDir, 'sessions.json');
+  }
+
+  test('default: resolvedProfile records printTimeout 15m from the built-in google profile', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const handler = createResearchHandler(CONTEXT(), spy);
@@ -1184,29 +1254,54 @@ describe('research handler — Antigravity print-timeout configuration', () => {
     const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
     expect(ctx.resolvedProfile.printTimeout).toBe('15m');
     expect(ctx.resolvedProfile.printTimeoutMs).toBe(15 * 60 * 1000);
-    expect(ctx.resolvedProfile.printTimeoutSource).toBe('cli-default');
+    expect(ctx.resolvedProfile.printTimeoutSource).toBe('catalog-builtin');
   });
 
-  test('configured printTimeout overrides the default in argv and resolvedProfile', async () => {
+  test('session.research.antigravity.printTimeout is no longer read by the cut-over lane (issue #912)', async () => {
+    // Pre-cutover this replaced the default in argv; the read-only cutover
+    // deleted the per-lane chain, so the value comes from the profile's
+    // providerOptions.printTimeout in agent-profiles.json instead.
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
     const session = SESSION({ research: { antigravity: { printTimeout: '25m' } } });
     const handler = createResearchHandler(CONTEXT({ session }), spy);
     await handler(makeTask());
+    expect(spy.calls[0].args).toEqual(['--print-timeout', '15m', '--print', expect.any(String)]);
+    const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
+    expect(ctx.resolvedProfile.printTimeout).toBe('15m');
+    expect(ctx.resolvedProfile.printTimeoutSource).toBe('catalog-builtin');
+  });
+
+  test('overlay printTimeout overrides the default in argv and resolvedProfile', async () => {
+    const spy = spyRunner();
+    delete process.env['ANTIGRAVITY_BIN'];
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { providerOptions: { printTimeout: '25m' } } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
+    await handler(makeTask());
     expect(spy.calls[0].args).toEqual(['--print-timeout', '25m', '--print', expect.any(String)]);
     const ctx = JSON.parse(readFileSync(join(dir(), 'research-context.json'), 'utf8'));
     expect(ctx.resolvedProfile.printTimeout).toBe('25m');
     expect(ctx.resolvedProfile.printTimeoutMs).toBe(25 * 60 * 1000);
-    expect(ctx.resolvedProfile.printTimeoutSource).toBe('session-config');
+    expect(ctx.resolvedProfile.printTimeoutSource).toBe('catalog-overlay');
   });
 
   test('model and printTimeout are emitted together in a stable argv order', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({
-      research: { antigravity: { model: 'Gemini 3.1 Pro (Low)', printTimeout: '10m' } },
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: {
+        google: {
+          profiles: {
+            'agy-normal': { model: 'Gemini 3.1 Pro (Low)', providerOptions: { printTimeout: '10m' } },
+          },
+        },
+      },
     });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     await handler(makeTask());
     expect(spy.calls[0].args.slice(0, 5)).toEqual([
       '--model', 'Gemini 3.1 Pro (Low)', '--print-timeout', '10m', '--print',
@@ -1216,41 +1311,53 @@ describe('research handler — Antigravity print-timeout configuration', () => {
   test('research-result.json includes printTimeout and printTimeoutSource', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({ research: { antigravity: { printTimeout: '45m' } } });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { providerOptions: { printTimeout: '45m' } } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     await handler(makeTask());
     const result = JSON.parse(readFileSync(join(dir(), 'research-result.json'), 'utf8'));
     expect(result.resolvedProfile.printTimeout).toBe('45m');
-    expect(result.resolvedProfile.printTimeoutSource).toBe('session-config');
+    expect(result.resolvedProfile.printTimeoutSource).toBe('catalog-overlay');
   });
 
-  test('a malformed printTimeout fails the run before the agent is invoked', async () => {
+  test('a malformed overlay printTimeout fails the run before the agent is invoked', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({ research: { antigravity: { printTimeout: 'not-a-duration' } } });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { providerOptions: { printTimeout: 'not-a-duration' } } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     const result = await handler(makeTask());
     expect(result.result).toBe('failed');
     expect(result.error).toContain('printTimeout');
     expect(spy.calls).toHaveLength(0);
   });
 
-  test('a zero printTimeout fails the run before the agent is invoked', async () => {
+  test('a zero overlay printTimeout fails the run before the agent is invoked', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({ research: { antigravity: { printTimeout: '0m' } } });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { providerOptions: { printTimeout: '0m' } } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     const result = await handler(makeTask());
     expect(result.result).toBe('failed');
     expect(result.error).toContain('printTimeout');
     expect(spy.calls).toHaveLength(0);
   });
 
-  test('an excessive printTimeout fails the run before the agent is invoked', async () => {
+  test('an excessive overlay printTimeout fails the run before the agent is invoked', async () => {
     const spy = spyRunner();
     delete process.env['ANTIGRAVITY_BIN'];
-    const session = SESSION({ research: { antigravity: { printTimeout: '10h' } } });
-    const handler = createResearchHandler(CONTEXT({ session }), spy);
+    const sessionsPath = writeSiblingCatalog({
+      schemaVersion: 1,
+      providers: { google: { profiles: { 'agy-normal': { providerOptions: { printTimeout: '10h' } } } } },
+    });
+    const handler = createResearchHandler(CONTEXT({ sessionsPath }), spy);
     const result = await handler(makeTask());
     expect(result.result).toBe('failed');
     expect(result.error).toContain('printTimeout');

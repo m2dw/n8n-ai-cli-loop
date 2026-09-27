@@ -5,11 +5,21 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege GITHUB_TOKEN (issue #1189): checkout, npm ci and npm test
+# only need to read repository contents. Nothing in this workflow writes back
+# to the repository, so no write scope is granted.
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # No later step pushes or fetches with the token, so do not leave
+          # it in .git/config for npm scripts or tests to pick up.
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22

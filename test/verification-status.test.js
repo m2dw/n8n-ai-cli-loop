@@ -1,4 +1,5 @@
 import { buildIssueVerificationStatus } from '../dist/handlers/verification.js';
+import { deriveRequirementCommandId } from '../dist/index.js';
 
 describe('buildIssueVerificationStatus', () => {
   test('exact match marks command as passed', () => {
@@ -152,5 +153,140 @@ describe('buildIssueVerificationStatus — manual evidence', () => {
       undefined,
     );
     expect(result).toEqual([{ command: 'npm run export -- --dry-run', status: 'not_run' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Evidence binding (issue #1040): with expectations supplied, a manual entry
+// satisfies a required command only for the plan slot, identity, and reviewed
+// HEAD it was recorded against.
+// ---------------------------------------------------------------------------
+
+describe('buildIssueVerificationStatus — evidence binding (issue #1040)', () => {
+  const HEAD = 'a'.repeat(40);
+  const OTHER_HEAD = 'b'.repeat(40);
+  const DIGEST = 'c'.repeat(64);
+  const CMD = 'npm run export -- --dry-run';
+  const CMD_ID = deriveRequirementCommandId(CMD);
+
+  const boundEvidence = (overrides = {}) => ({
+    command: CMD,
+    exitCode: 0,
+    output: 'ok',
+    recordedAt: '2026-01-01T00:00:00.000Z',
+    source: 'operator_input',
+    headSha: HEAD,
+    planDigest: DIGEST,
+    planRevisionOrdinal: 0,
+    commandId: CMD_ID,
+    ...overrides,
+  });
+
+  const expectations = (overrides = {}) => ({
+    headSha: HEAD,
+    planDigest: DIGEST,
+    commandIds: { [CMD]: CMD_ID },
+    ...overrides,
+  });
+
+  test('bound evidence at the expected HEAD passes', () => {
+    const result = buildIssueVerificationStatus([CMD], {}, [boundEvidence()], expectations());
+    expect(result).toEqual([{ command: CMD, status: 'passed' }]);
+  });
+
+  test('evidence bound to a different HEAD is rejected with head_mismatch', () => {
+    const result = buildIssueVerificationStatus(
+      [CMD],
+      {},
+      [boundEvidence({ headSha: OTHER_HEAD })],
+      expectations(),
+    );
+    expect(result).toEqual([
+      { command: CMD, status: 'not_run', evidenceRejections: ['head_mismatch'] },
+    ]);
+  });
+
+  test('legacy evidence without binding fields is conservatively rejected', () => {
+    const legacy = {
+      command: CMD,
+      exitCode: 0,
+      output: 'ok',
+      recordedAt: '2026-01-01T00:00:00.000Z',
+      source: 'operator_input',
+    };
+    const result = buildIssueVerificationStatus([CMD], {}, [legacy], expectations());
+    expect(result).toEqual([
+      { command: CMD, status: 'not_run', evidenceRejections: ['legacy_unbound'] },
+    ]);
+  });
+
+  test('a required command with no slot in the current plan fails closed', () => {
+    const result = buildIssueVerificationStatus(
+      [CMD],
+      {},
+      [boundEvidence()],
+      expectations({ commandIds: {} }),
+    );
+    expect(result).toEqual([
+      { command: CMD, status: 'not_run', evidenceRejections: ['slot_not_in_plan'] },
+    ]);
+  });
+
+  test('an unresolvable plan digest fails closed', () => {
+    const result = buildIssueVerificationStatus(
+      [CMD],
+      {},
+      [boundEvidence()],
+      expectations({ planDigest: undefined }),
+    );
+    expect(result).toEqual([
+      { command: CMD, status: 'not_run', evidenceRejections: ['plan_unresolvable'] },
+    ]);
+  });
+
+  test('evidence recorded for a different identity is rejected', () => {
+    const result = buildIssueVerificationStatus(
+      [CMD],
+      {},
+      [boundEvidence({ commandId: deriveRequirementCommandId('npm run other') })],
+      expectations(),
+    );
+    expect(result).toEqual([
+      { command: CMD, status: 'not_run', evidenceRejections: ['identity_mismatch'] },
+    ]);
+  });
+
+  test('failed evidence reports failed_exit and never satisfies', () => {
+    const result = buildIssueVerificationStatus(
+      [CMD],
+      {},
+      [boundEvidence({ exitCode: 1 })],
+      expectations(),
+    );
+    expect(result).toEqual([
+      { command: CMD, status: 'not_run', evidenceRejections: ['failed_exit'] },
+    ]);
+  });
+
+  test('session-verification matches are untouched by evidence binding', () => {
+    const result = buildIssueVerificationStatus(
+      ['npm test'],
+      { test: 'npm test' },
+      [],
+      expectations(),
+    );
+    expect(result).toEqual([{ command: 'npm test', status: 'passed' }]);
+  });
+
+  test('distinct rejection reasons accumulate across candidate entries', () => {
+    const result = buildIssueVerificationStatus(
+      [CMD],
+      {},
+      [boundEvidence({ exitCode: 1 }), boundEvidence({ headSha: OTHER_HEAD })],
+      expectations(),
+    );
+    expect(result).toEqual([
+      { command: CMD, status: 'not_run', evidenceRejections: ['failed_exit', 'head_mismatch'] },
+    ]);
   });
 });

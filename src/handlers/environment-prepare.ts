@@ -1,8 +1,10 @@
 import { createHash } from "crypto";
 import { mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { arch, cpus, freemem, loadavg, platform, totalmem } from "os";
 import { dirname, join } from "path";
-import type { CommandRunner } from "./command-runner.js";
+import type { CommandRunResult, CommandRunner, ProcessTreeCleanup } from "./command-runner.js";
 import type { EnvironmentPrepareConfig } from "../core/session.js";
+import type { DeclaredEnvironmentSource } from "../core/stage-evidence-validity.js";
 import { parseShellTokens, boundVerificationOutput } from "./verification.js";
 
 // ---------------------------------------------------------------------------
@@ -254,13 +256,275 @@ function writeStamp(artifactRoot: string, identityHash: string, stamp: PrepareSt
   }
 }
 
+// ---------------------------------------------------------------------------
+// Stop-reason classification (issue #1060)
+//
+// A prepare run that is killed on its deadline and one that runs to completion
+// and reports a broken dependency tree are different problems with different
+// fixes, and before this they were the same `exit 1` carrying whatever the
+// command had printed so far. That made a timed-out `npm ci` look like a package
+// manager failure, and pointed the operator at the npm deprecation warnings that
+// happened to be the tail of the captured output rather than at the deadline.
+//
+// The reason is therefore classified once, here, and the same classified
+// sentence reaches every surface: the run artifact, `task.lastError` (hence
+// `admin status`), and the public failure comment.
+// ---------------------------------------------------------------------------
+
+/** Why a prepare run stopped. `command-failed` is the only one the command itself chose. */
+export type EnvironmentPrepareStopReason =
+  /** The command ran to completion and exited non-zero — a real command failure. */
+  | "command-failed"
+  /** `timeoutMs` expired and the runner killed the command. */
+  | "timeout"
+  /** The command was terminated by a signal (OOM killer, operator, supervisor). */
+  | "signal"
+  /** The command never ran: the binary was missing, unexecutable, or the host could not fork. */
+  | "spawn-error"
+  /** Safe mode refused the command before anything was spawned (see `isLifecycleRunningNpmInstall`). */
+  | "refused";
+
+/** Bound on the runner-synthesized diagnostic carried out of a prepare failure. */
+export const MAX_ENVIRONMENT_PREPARE_DIAGNOSTIC_CHARS = 500;
+
+/** Bound on the command-output excerpt carried into `lastError` / the failure comment. */
+export const MAX_ENVIRONMENT_PREPARE_ERROR_OUTPUT_CHARS = 500;
+
 export interface EnvironmentPrepareOutcome {
   /** `skipped` = stamp matched or config disabled; `ran` = command succeeded; `failed` = command failed. */
   status: "skipped" | "ran" | "failed";
-  /** Present when the command ran (ran or failed). */
+  /**
+   * Present when the command ran (ran or failed).
+   *
+   * For every `stopReason` other than `command-failed` this is the RUNNER's
+   * stand-in for a process that never reported a status of its own, so it must
+   * not be presented as something the command said — read `stopReason` first.
+   */
   exitCode?: number;
   /** Bounded combined stdout+stderr when the command ran. */
   output?: string;
+  /** Why the run stopped. Present on every `failed` outcome. */
+  stopReason?: EnvironmentPrepareStopReason;
+  /**
+   * The classified stop reason as one operator-facing clause, with no local
+   * paths or command output in it, so it is safe on a public comment. This is
+   * the string every surface renders; see {@link environmentPrepareFailureMessage}.
+   */
+  stopSummary?: string;
+  /** The deadline that was in force, so a timeout can be read against it. */
+  timeoutMs?: number;
+  /** Wall-clock milliseconds the command occupied. */
+  durationMs?: number;
+  /** Set when the runner killed the command on its deadline. */
+  timedOut?: boolean;
+  /**
+   * Set when the command ignored the deadline's termination signal and had to be
+   * force-killed by the runner's external watchdog — the difference between a
+   * command that stopped when asked and one that had to be taken down.
+   */
+  deadlineEscalated?: boolean;
+  /** The signal that terminated the command, when one did. */
+  signal?: string;
+  /** Errno of a spawn-level failure (`ETIMEDOUT`, `ENOENT`, `ENOBUFS`, …). */
+  spawnErrorCode?: string;
+  /** Bounded runner-synthesized spawn diagnostic — bytes the command never wrote. */
+  spawnError?: string;
+  /** What the runner did about the command's surviving child processes. */
+  processTreeCleanup?: ProcessTreeCleanup;
+}
+
+/**
+ * Classify a failed prepare run, most-determinate first.
+ *
+ * `timeout` precedes `signal` and `spawn-error` because a deadline kill IS all
+ * three at the OS level — an `ETIMEDOUT` errno on a child killed with `SIGTERM`
+ * — and the deadline is the fact the operator needs. `command-failed` is the
+ * fallback, so an unrecognised shape stays the plain command failure it already
+ * was rather than being upgraded into a scarier claim.
+ */
+export function classifyEnvironmentPrepareStop(
+  result: Pick<
+    CommandRunResult,
+    "timedOut" | "deadlineEscalated" | "spawnErrorCode" | "spawnError" | "signal"
+  >,
+): EnvironmentPrepareStopReason {
+  // A watchdog escalation is proof the deadline elapsed with the command still
+  // running, so it decides the reason on its own — the `SIGKILL` it had to use
+  // must not be read back as an ordinary signal termination.
+  if (result.timedOut === true || result.deadlineEscalated === true) return "timeout";
+  if (result.spawnErrorCode !== undefined) return "spawn-error";
+  if (typeof result.signal === "string" && result.signal !== "") return "signal";
+  if (result.spawnError !== undefined) return "spawn-error";
+  return "command-failed";
+}
+
+function summarizeStop(
+  reason: EnvironmentPrepareStopReason,
+  facts: {
+    exitCode?: number;
+    timeoutMs?: number;
+    durationMs?: number;
+    signal?: string;
+    spawnErrorCode?: string;
+    deadlineEscalated?: boolean;
+    processTreeCleanup?: ProcessTreeCleanup;
+  },
+): string {
+  const elapsed = facts.durationMs === undefined ? "" : `, elapsed ${facts.durationMs} ms`;
+  const killedWith = facts.signal === undefined ? "" : `, killed with ${facts.signal}`;
+  const escalated = facts.deadlineEscalated
+    ? ", force-killed after it ignored the deadline's termination signal"
+    : "";
+  const tree = facts.processTreeCleanup;
+  const swept = tree?.terminatedDescendants.length ?? 0;
+  // Three states, not two: a sweep that was REFUSED must not render as one that
+  // found nothing to do, or the operator reads "cleanup done" for processes that
+  // are still running and still holding the locks the next attempt will block on
+  // (issue #1060 review, P2).
+  const groupCleanup = tree?.processGroupTerminated
+    ? "process group terminated"
+    : tree?.processGroupSignalError !== undefined
+      ? `process group could NOT be terminated (${tree.processGroupSignalError}); processes may still be running`
+      : "no process group to terminate";
+  const cleanup =
+    tree === undefined
+      ? ""
+      : "; process tree cleanup: " +
+        groupCleanup +
+        (swept > 0 ? `, ${swept} surviving descendant process(es) terminated` : "");
+  switch (reason) {
+    case "timeout":
+      return `timed out after ${facts.timeoutMs ?? "?"} ms (deadline reached${elapsed}${killedWith}${escalated}${cleanup})`;
+    case "signal":
+      return `was terminated by signal ${facts.signal ?? "?"} before it could exit (elapsed ${
+        facts.durationMs ?? "?"
+      } ms${cleanup})`;
+    case "spawn-error":
+      // ENOBUFS is the one spawn-level errno that means the command DID start —
+      // it outgrew the runner's capture buffer and was killed for it. Saying
+      // "could not be started" there would send the operator looking for a
+      // missing binary.
+      return facts.spawnErrorCode === "ENOBUFS"
+        ? `wrote more output than the runner's capture buffer allows (ENOBUFS)`
+        : `could not be started (${facts.spawnErrorCode ?? "spawn error"})`;
+    case "refused":
+      return "was refused before it ran";
+    case "command-failed":
+      return `failed (exit ${facts.exitCode ?? 1})`;
+  }
+}
+
+/**
+ * The one failure sentence every surface renders (issue #1060).
+ *
+ * Shared rather than formatted per call site so `task.lastError`, `admin status`
+ * and the public GitHub comment cannot disagree about why a prepare run stopped
+ * — they all read this string. The command output is appended, but for any stop
+ * the command did not choose it is labelled as what it is: the partial bytes
+ * printed before the stop, not the cause. Without that label a timed-out
+ * `npm ci` reads as an npm failure whose cause is the last deprecation warning
+ * it happened to print.
+ *
+ * @param stage Optional parenthetical naming which prepare call this was
+ *              (`after dependency sync`, `before review verification`).
+ */
+export function environmentPrepareFailureMessage(
+  outcome: EnvironmentPrepareOutcome,
+  stage?: string,
+): string {
+  const scope = stage === undefined ? "" : ` (${stage})`;
+  const summary = outcome.stopSummary ?? summarizeStop("command-failed", { exitCode: outcome.exitCode });
+  const excerpt = (outcome.output ?? "").slice(0, MAX_ENVIRONMENT_PREPARE_ERROR_OUTPUT_CHARS);
+  if (excerpt === "") return `Environment preparation${scope} ${summary}.`;
+  const label =
+    outcome.stopReason === undefined || outcome.stopReason === "command-failed" || outcome.stopReason === "refused"
+      ? ":"
+      : ". Partial output captured before the stop (not the cause):";
+  return `Environment preparation${scope} ${summary}${label} ${excerpt}`;
+}
+
+// ---------------------------------------------------------------------------
+// Runner-context diagnostics (issue #1060)
+//
+// The reproduction that motivated this had `npm ci` finish in ~10 s when run by
+// hand in the very same worktree and hit a 5-minute deadline under the runner,
+// three times. Nothing in the artifacts could distinguish the two executions, so
+// the investigation had nowhere to start. This block records the parts of the
+// execution context that plausibly differ between "an operator's shell" and
+// "inside the n8n/runner process tree": host pressure at the moment of the run,
+// which process was the parent, and which package-manager environment variables
+// were in force.
+//
+// Names only for the environment — never values. A package-manager env var is
+// exactly where a registry token lives (`NPM_CONFIG__AUTH`, `NPM_TOKEN`), and
+// this artifact is written on a failure path an operator will be reading.
+// ---------------------------------------------------------------------------
+
+/** Cap on the env-var names recorded, so an unusual host cannot grow the artifact. */
+const MAX_RECORDED_ENV_NAMES = 60;
+
+/** Env vars that plausibly change how a package manager behaves. Matched on NAME only. */
+const EXECUTION_ENV_NAME_PATTERN =
+  /^(npm_|NPM_|YARN_|PNPM_|NODE_|COREPACK_|CI$|HOME$|PATH$|TMPDIR$|HTTP_PROXY$|HTTPS_PROXY$|NO_PROXY$)/i;
+
+export interface EnvironmentPrepareRunnerContext {
+  /** The exact command string the operator configured. Local artifact only. */
+  command: string;
+  /** Where it ran. Local artifact only — never posted to a public comment. */
+  cwd: string;
+  timeoutMs: number;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  /** The prepare command's own pid, when the runner reported one. */
+  pid?: number;
+  /** The runner process, and what spawned it — a CLI shell vs the n8n worker. */
+  runnerPid: number;
+  runnerParentPid: number;
+  nodeVersion: string;
+  platform: string;
+  arch: string;
+  cpuCount: number;
+  /** 1/5/15-minute load averages at the moment the run finished. Zeroes on Windows. */
+  loadAverage: number[];
+  freeMemBytes: number;
+  totalMemBytes: number;
+  /** Names (never values) of the package-manager-relevant env vars in force. */
+  executionEnvNames: string[];
+}
+
+function captureRunnerContext(input: {
+  command: string;
+  cwd: string;
+  timeoutMs: number;
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
+  pid?: number;
+}): EnvironmentPrepareRunnerContext {
+  const executionEnvNames = Object.keys(process.env)
+    .filter((name) => EXECUTION_ENV_NAME_PATTERN.test(name))
+    .sort()
+    .slice(0, MAX_RECORDED_ENV_NAMES);
+  return {
+    command: input.command,
+    cwd: input.cwd,
+    timeoutMs: input.timeoutMs,
+    startedAt: new Date(input.startedAt).toISOString(),
+    finishedAt: new Date(input.finishedAt).toISOString(),
+    durationMs: input.durationMs,
+    ...(input.pid === undefined ? {} : { pid: input.pid }),
+    runnerPid: process.pid,
+    runnerParentPid: process.ppid,
+    nodeVersion: process.version,
+    platform: platform(),
+    arch: arch(),
+    cpuCount: cpus().length,
+    loadAverage: loadavg(),
+    freeMemBytes: freemem(),
+    totalMemBytes: totalmem(),
+    executionEnvNames,
+  };
 }
 
 export interface EnsureEnvironmentPreparedOptions {
@@ -371,6 +635,7 @@ export function ensureEnvironmentPrepared(
         JSON.stringify({
           outcome: "refused",
           kind: "unsafe-command",
+          stopReason: "refused" satisfies EnvironmentPrepareStopReason,
           output,
           worktreeIdentity,
           commandHash,
@@ -382,26 +647,88 @@ export function ensureEnvironmentPrepared(
     } catch {
       // Best-effort.
     }
-    return { status: "failed", exitCode: 0, output };
+    return {
+      status: "failed",
+      exitCode: 0,
+      output,
+      stopReason: "refused",
+      stopSummary: summarizeStop("refused", {}),
+    };
   }
 
+  const timeoutMs = config.timeoutMs ?? ENVIRONMENT_PREPARE_DEFAULT_TIMEOUT_MS;
+  const startedAt = Date.now();
   const result = runner.run(cmd, args, {
     cwd,
-    timeout: config.timeoutMs ?? ENVIRONMENT_PREPARE_DEFAULT_TIMEOUT_MS,
+    timeout: timeoutMs,
     maxBuffer: MAX_ENVIRONMENT_PREPARE_BUFFER_BYTES,
+    // A prepare command is a process TREE — `npm ci` forks a fetch pool, other
+    // package managers start daemons. Killing only the direct child on the
+    // deadline strands those descendants: they keep running, keep holding the
+    // package-manager cache locks the retry will block on, and are invisible to
+    // the next run (issue #1060).
+    isolateProcessGroup: true,
   });
+  const finishedAt = Date.now();
+  // Prefer the runner's own measurement (it brackets the spawn itself); fall
+  // back to ours so a stubbed runner still yields a duration.
+  const durationMs = result.durationMs ?? finishedAt - startedAt;
 
   const output = boundVerificationOutput(
     [result.stdout, result.stderr].filter(Boolean).join("\n"),
   );
 
   if (result.exitCode !== 0) {
+    const stopReason = classifyEnvironmentPrepareStop(result);
+    const facts = {
+      exitCode: result.exitCode,
+      timeoutMs,
+      durationMs,
+      ...(result.signal === undefined ? {} : { signal: result.signal }),
+      ...(result.spawnErrorCode === undefined ? {} : { spawnErrorCode: result.spawnErrorCode }),
+      ...(result.deadlineEscalated === true ? { deadlineEscalated: true } : {}),
+      ...(result.processTreeCleanup === undefined
+        ? {}
+        : { processTreeCleanup: result.processTreeCleanup }),
+    };
+    const failure: EnvironmentPrepareOutcome = {
+      status: "failed",
+      output,
+      stopReason,
+      stopSummary: summarizeStop(stopReason, facts),
+      // `facts` carries exitCode (plus timeout/signal/spawn diagnostics) so the
+      // artifact and the outcome cannot disagree.
+      ...facts,
+      ...(result.timedOut === true ? { timedOut: true } : {}),
+      ...(result.spawnError === undefined
+        ? {}
+        : { spawnError: result.spawnError.slice(0, MAX_ENVIRONMENT_PREPARE_DIAGNOSTIC_CHARS) }),
+    };
     try {
       writeFileSync(
         join(artifactDir, "environment-prepare-result.json"),
         JSON.stringify({
           outcome: "failed",
           exitCode: result.exitCode,
+          stopReason,
+          stopSummary: failure.stopSummary,
+          timedOut: result.timedOut === true,
+          deadlineEscalated: result.deadlineEscalated === true,
+          signal: result.signal ?? null,
+          spawnErrorCode: result.spawnErrorCode ?? null,
+          spawnError: failure.spawnError ?? null,
+          timeoutMs,
+          durationMs,
+          processTreeCleanup: result.processTreeCleanup ?? null,
+          runnerContext: captureRunnerContext({
+            command: config.command,
+            cwd,
+            timeoutMs,
+            startedAt,
+            finishedAt,
+            durationMs,
+            ...(result.pid === undefined ? {} : { pid: result.pid }),
+          }),
           output,
           worktreeIdentity,
           commandHash,
@@ -414,7 +741,7 @@ export function ensureEnvironmentPrepared(
       // Best-effort.
     }
     // No stamp written on failure — next run retries.
-    return { status: "failed", exitCode: result.exitCode, output };
+    return failure;
   }
 
   // Success: persist the stamp so the next call with the same key is a no-op.
@@ -435,14 +762,55 @@ export function ensureEnvironmentPrepared(
   try {
     writeFileSync(
       join(artifactDir, "environment-prepare-result.json"),
-      JSON.stringify({ outcome: "run", exitCode: 0, output, stamp }, null, 2),
+      // `durationMs` rides along on success too: the reproduction behind issue
+      // #1060 is a command that finishes in seconds by hand and minutes under the
+      // runner, and that comparison needs a successful run's timing to compare
+      // against, not only the failures.
+      JSON.stringify({ outcome: "run", exitCode: 0, durationMs, output, stamp }, null, 2),
       "utf8",
     );
   } catch {
     // Best-effort.
   }
 
-  return { status: "ran", exitCode: 0, output };
+  return { status: "ran", exitCode: 0, output, durationMs, timeoutMs };
+}
+
+/**
+ * The prepare stamp of the last successful prepare in this worktree, as the
+ * `environmentIdentity` component's declared source (#1096 §4.5). Reads only;
+ * never runs the prepare.
+ *
+ * `absent` when no prepare is declared. A declared prepare whose stamp is
+ * missing, no longer matches the current command/config/cacheKeyFiles, or whose
+ * worktree-lifetime sentinel is gone is `unreadable` — the installed state the
+ * stamp stood for cannot be vouched for. The value moves with every successful
+ * prepare, so a re-prepare between two reads compares unequal.
+ */
+export function readCurrentPrepareStamp(
+  opts: Pick<EnsureEnvironmentPreparedOptions, "config" | "cwd" | "worktreeIdentity" | "artifactRoot">,
+): DeclaredEnvironmentSource {
+  const { config, cwd, worktreeIdentity, artifactRoot } = opts;
+  if (!config || !config.enabled || parseShellTokens(config.command).length === 0) {
+    return { state: "absent" };
+  }
+  const commandHash = sha256(config.command.trim().replace(/\s+/g, " "));
+  const configHash = computeConfigHash(config);
+  const cacheKeyFilesHash = computeCacheKeyFilesHash(cwd, config.cacheKeyFiles);
+  const stampKey = sha256([worktreeIdentity, commandHash, configHash, cacheKeyFilesHash].join("|"));
+  const existing = readStamp(artifactRoot, sha256(worktreeIdentity));
+  if (existing === undefined) return { state: "unreadable", reason: "prepare_stamp_missing" };
+  if (
+    existing.worktreeIdentity !== worktreeIdentity ||
+    existing.commandHash !== commandHash ||
+    existing.configHash !== configHash ||
+    existing.cacheKeyFilesHash !== cacheKeyFilesHash ||
+    typeof existing.succeededAt !== "string"
+  ) {
+    return { state: "unreadable", reason: "prepare_stamp_stale" };
+  }
+  if (!isSentinelValid(cwd, stampKey)) return { state: "unreadable", reason: "prepare_sentinel_missing" };
+  return { state: "declared", value: sha256(`${stampKey}|${existing.succeededAt}`) };
 }
 
 /**

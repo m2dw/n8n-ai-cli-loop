@@ -7,6 +7,22 @@ import { join } from 'path';
 import { SqliteTaskStore, SqliteOutboxStore, SqliteContextStore, JsonSessionRegistry } from '../dist/index.js';
 import { acquireIssuePhaseLock, createPhaseHandlers } from '../dist/cli/run-one-phase.js';
 import { IssueWorktreeLock } from '../dist/handlers/worktree.js';
+import { DISPATCHABLE_DISPUTE_TURNS } from '../dist/core/review-dispute-commit.js';
+
+/** §7.1's turns and the phase each one names (null where it names no run). */
+const DISPUTE_TURN_PHASES = {
+  implementer: 'implementation',
+  reviewer: 'review',
+  // The evidence turn's per-party collection runs became internal sub-turns of
+  // the review phase in issue #964, so the turn names `review`.
+  evidence: 'review',
+  // The runner turn dispatches no run of the debate's own parties, but the
+  // runner that advances arbitration is a phase run: issue #955 made it an
+  // internal sub-turn of the review phase, so the turn names `review`.
+  runner: 'review',
+  re_review: 'review',
+  none: null,
+};
 
 const CLI = new URL('../dist/cli/run-one-phase.js', import.meta.url).pathname;
 
@@ -33,16 +49,31 @@ let repoRoot;
 let artifactRoot;
 let fakeAgyPath;
 let worktreeRoot;
+let homeDir;
 
 function git(args, cwd) {
   return execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, encoding: 'utf8' });
+}
+
+// Every store the CLI opens is addressed explicitly (--db-path, --sessions-path)
+// and the worktree root by env, but the per-issue worktree lock the research
+// phase takes for itself (issue #855) is not: `IssueWorktreeLock` defaults to
+// `$HOME/.local/state/n8n-ai-cli-loop/worktree-locks`, which is machine-global
+// and outlives the run. A CLI process killed mid-research — a jest worker torn
+// down, an interrupted suite — leaves `addon-dev::issue-<n>` held there for the
+// store's 24h stale TTL, and every later run of these tests then takes the
+// handler's lock-contention path (`blocked` → `ready_for_human`) instead of the
+// behaviour under test. A per-test HOME keeps that lock inside `tmpDir` with
+// everything else, so the suite neither reads nor leaks machine state.
+function childEnv(overrides) {
+  return { ...process.env, HOME: homeDir, N8N_AI_WORKTREE_ROOT: worktreeRoot, ...overrides };
 }
 
 function run(...args) {
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], {
       encoding: 'utf8',
-      env: { ...process.env, ANTIGRAVITY_BIN: fakeAgyPath, N8N_AI_WORKTREE_ROOT: worktreeRoot },
+      env: childEnv({ ANTIGRAVITY_BIN: fakeAgyPath }),
     });
     return { code: 0, stdout };
   } catch (err) {
@@ -56,7 +87,7 @@ function run(...args) {
 // ANTIGRAVITY_BIN-overridden binary's stderr cannot be shown to originate
 // from the vetted CLI, so it is withheld from automatic retry classification).
 function runWithAgyOnPath(binDir, ...args) {
-  const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}`, N8N_AI_WORKTREE_ROOT: worktreeRoot };
+  const env = childEnv({ PATH: `${binDir}:${process.env.PATH}` });
   delete env.ANTIGRAVITY_BIN;
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env });
@@ -77,6 +108,10 @@ beforeEach(() => {
   repoRoot = join(tmpDir, 'repo');
   artifactRoot = join(tmpDir, 'artifacts');
   worktreeRoot = join(tmpDir, 'state', 'worktrees');
+  // See `childEnv`: this is where the CLI's default worktree-lock directory
+  // lands, so a lock leaked by one run cannot outlive its own `tmpDir`.
+  homeDir = join(tmpDir, 'home');
+  mkdirSync(homeDir, { recursive: true });
 
   // A real repository with a real `origin` (issue #855): the research phase now
   // fetches the base branch and creates a detached per-run worktree from the
@@ -232,6 +267,35 @@ describe('createPhaseHandlers — dependency checker auth wiring (issue #217)', 
 
     expect(typeof handlers.implementation).toBe('function');
     expect(http.calls).toHaveLength(0);
+  });
+
+  test('every §7.1 turn the routing layer calls dispatchable has a handler in this runtime (issue #952)', async () => {
+    // The reviewer turn's own destination is `review`, and issue #952 made it
+    // dispatchable — which is only safe because the review phase handler is
+    // registered here AND takes the reconsideration sub-turn before it builds an
+    // ordinary review prompt. This pins the construction half of that pair: a
+    // turn routing calls dispatchable must name a phase this runtime can run.
+    const context = {
+      session: resolvedSession({ mode: 'gh' }),
+      runId: 'run-dispute',
+      workerId: 'test',
+    };
+
+    const handlers = await createPhaseHandlers(context, {});
+
+    expect(DISPATCHABLE_DISPUTE_TURNS).toContain('reviewer');
+    for (const [turn, phase] of Object.entries(DISPUTE_TURN_PHASES)) {
+      if (!DISPATCHABLE_DISPUTE_TURNS.includes(turn)) continue;
+      if (phase === null) continue;
+      expect(typeof handlers[phase]).toBe('function');
+    }
+    // The arbitration turn joined the list in issue #955: the review handler
+    // dispatches it as an internal sub-turn, so the phase it names has a handler.
+    expect(DISPATCHABLE_DISPUTE_TURNS).toContain('runner');
+    // The evidence turn closed the set in issue #964: the review handler
+    // dispatches one per-party collection run per phase run, so every §7.1 turn
+    // the routing layer calls dispatchable names a phase this runtime can run.
+    expect(DISPATCHABLE_DISPUTE_TURNS).toContain('evidence');
   });
 
   test('registers the refinement phase handler so admitted refinement tasks run on the normal tick (issue #869)', async () => {

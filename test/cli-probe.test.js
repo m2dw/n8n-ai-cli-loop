@@ -14,6 +14,7 @@ import {
   CLI_PROBE_STUB_ENV,
   MAX_PROBE_DETAIL_CHARS,
   TRANSIENT_SPAWN_ERROR_CODES,
+  TRANSIENT_SPAWN_RETRY_BACKOFF_MS,
   classifyProbeFailure,
   describeProbeOutcome,
   hasIndeterminateProbeSignal,
@@ -82,6 +83,28 @@ describe('cli-probe — status classification', () => {
     // A timeout already spent the whole time budget, so re-spending it in-process
     // would only stall the probe again.
     expect(isRetryableProbeFailure(classifyProbeFailure(spawnError({ code: 'ETIMEDOUT' })))).toBe(false);
+  });
+
+  test('an executable that was being written is transient, not a broken binary', () => {
+    // ETXTBSY says the file was open for writing at the instant of the exec —
+    // a moment on the host, not a property of the command. Reading it as
+    // "this CLI could not be started" turns a self-clearing race into a
+    // reported misconfiguration.
+    const outcome = classifyProbeFailure(spawnError({ code: 'ETXTBSY' }));
+    expect(outcome).toMatchObject({ status: 'spawn-error', transient: true, code: 'ETXTBSY' });
+    expect(isRetryableProbeFailure(outcome)).toBe(true);
+    expect(hasIndeterminateProbeSignal(describeProbeOutcome('gh', outcome))).toBe(true);
+  });
+
+  test('the retry schedule is shared, ascending, and reaches past one second', () => {
+    // Every caller that classifies with TRANSIENT_SPAWN_ERROR_CODES waits on
+    // this same schedule; a host that cannot fork usually stays that way for
+    // longer than a few hundred milliseconds, so giving up inside that window
+    // is what makes a refused fork look like an absent CLI.
+    const schedule = [...TRANSIENT_SPAWN_RETRY_BACKOFF_MS];
+    expect(schedule.length).toBeGreaterThanOrEqual(3);
+    expect([...schedule].sort((a, b) => a - b)).toEqual(schedule);
+    expect(schedule[schedule.length - 1]).toBeGreaterThanOrEqual(1000);
   });
 
   test('a non-executable file is a spawn error but NOT a transient one', () => {

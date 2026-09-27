@@ -1299,7 +1299,12 @@ describe('§7.1 run-level aggregation', () => {
     expect(aggregateDisputeRouting(build({ [LINEAGE_A]: 'disputed' })).turn).toBe('reviewer');
     expect(aggregateDisputeRouting(build({ [LINEAGE_A]: 'evidence_requested' })).turn).toBe('evidence');
     expect(aggregateDisputeRouting(build({ [LINEAGE_A]: 'arbitration_pending' })).turn).toBe('runner');
-    expect(aggregateDisputeRouting(build({ [LINEAGE_A]: 'arbitration_pending' })).nextPhase).toBeNull();
+    // Every internal sub-turn names the review phase: the runner turn since
+    // issue #955, and the evidence turn since issue #964 — one per-party
+    // collection run per review-phase run, with the round record deciding which
+    // party is still owed.
+    expect(aggregateDisputeRouting(build({ [LINEAGE_A]: 'evidence_requested' })).nextPhase).toBe('review');
+    expect(aggregateDisputeRouting(build({ [LINEAGE_A]: 'arbitration_pending' })).nextPhase).toBe('review');
   });
 
   test('rule 3 routes an unreviewed diff back to review and clears the deferred flag', () => {

@@ -7,6 +7,11 @@
  * round cap, malformed output per role, timeout/provider failure, role
  * independence, topology fail-closed, the no-GitHub-write surface, and the
  * per-role agent/company/model/effort/duration metadata.
+ *
+ * Issue #982 adds §9.1: proposals are normalized against the relationship
+ * graph captured for the snapshot before their dispositions are read, so a
+ * proposal the graph already satisfies (the reported #951/#950 run: adding an
+ * edge that already existed) never spends a human handoff.
  */
 
 import { execFileSync } from 'child_process';
@@ -20,21 +25,32 @@ import {
   IMPLEMENTATION_STATUS_LABEL,
   IssueWorktreeLock,
   MANAGED_REGION_END,
+  REFINEMENT_RECORD_MAX_BYTES,
+  REFINEMENT_TOPOLOGY_NORMALIZATIONS,
   SqliteChainRegistryStore,
   SqliteOutboxStore,
   SqliteTaskStore,
+  buildCriticPrompt,
   buildRefinementContextBlock,
   buildRefinerPrompt,
   combineTopologyDispositions,
   containsFilesystemPath,
   evaluateRefinementRoleIndependence,
   extractRefinementRecord,
+  normalizeTopologyProposals,
   parseCriticResponse,
   parseRefinerResponse,
+  planRefinementRecovery,
+  refinementEvidenceComplete,
+  refinementRelationshipGraph,
   renderManagedRegion,
+  renderRefinementLines,
   resolveIssueRefinementSettings,
+  routeCriticVerdict,
   scanManagedRegion,
+  summarizeRefinementStatus,
 } from '../dist/index.js';
+import { formatRefinementDetail } from '../dist/cli/admin-ui.js';
 import {
   REFINEMENT_RETRY_DELAY_MS,
   createRefinementAgentRunner,
@@ -154,6 +170,14 @@ function makeSource(world, opts = {}) {
       return null;
     },
   };
+  // §5.1: an absent resolver is itself an outcome (`resolver_unavailable`), so
+  // the port only grows the read when a test wires one.
+  if (opts.evidence) {
+    port.readPredecessorEvidence = async (request) => {
+      calls.push(['readPredecessorEvidence', request.issueNumber, request.path]);
+      return opts.evidence(request);
+    };
+  }
   return { port, calls };
 }
 
@@ -457,6 +481,441 @@ describe('issue-refinement loop — revise then pass', () => {
     expect(result.outcome).toEqual({ kind: 'escalated', reason: 'critique_blocked' });
     expect(result.block.counters.rounds).toBe(1);
   });
+
+  // #999: a risk imported from an unrelated defect (not the target Issue or a
+  // snapshot predecessor) is not grounded evidence — the critic rejects it as
+  // `unsupported` and the refiner drops it, same as any other objection.
+  test('a risk citing an unrelated defect is rejected as unsupported and dropped on revise', async () => {
+    const unsupportedRiskObjection = {
+      field: 'risks',
+      kind: 'unsupported',
+      detail: 'risk cites #998, which is not the target Issue or a snapshot predecessor',
+    };
+    const critic = makeAgent([
+      ok(fenced(criticRecord({ verdict: 'revise', objections: [unsupportedRiskObjection] }))),
+      ok(fenced(criticRecord())),
+    ]);
+    const refiner = makeAgent([
+      ok(fenced(refinerRecord({ risks: ['risk one', 'unrelated risk from #998'] }))),
+      ok(fenced(refinerRecord({ risks: ['risk one'] }))),
+    ]);
+    const { result } = await run({ refiner, critic });
+
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    expect(result.block.accepted.contract.risks).toEqual(['risk one']);
+    expect(result.events.map((e) => e.type)).toContain('refinement.critique.revise');
+
+    const secondPrompt = refiner.calls[1].prompt;
+    expect(secondPrompt).toContain('unsupported');
+    expect(secondPrompt).toContain('#998');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1176 — a draft that drops a requirement the Issue already states is a
+// repairable omission: it goes back to the refiner through the SAME bounded
+// revise rows (§12 17/18), and only genuine human blockers reach row 19.
+// ---------------------------------------------------------------------------
+
+describe('issue-refinement loop — repairable omissions (§7.2, #1176)', () => {
+  // The two requirements the #1111 draft dropped, stated in the Issue itself.
+  const MUTATION_LIMITS =
+    'Mutation scores and coverage do not guarantee that every defect is detected, do not establish redundancy, and do not by themselves justify deleting a test; lost detection requires repair or restoration, or rejection of the optimization.';
+  const PROHIBITIONS =
+    'Do not introduce new runner policy, global locks, live sessions.json changes, or behavioral specification edits.';
+
+  // #1111's Issue declared three predecessor excerpts, all captured whole.
+  const SELECTIONS = [
+    { issue: 10, path: 'src/core/test-maintenance.ts', export: 'MaintenanceCandidate' },
+    { issue: 10, path: 'src/core/test-maintenance.ts', export: 'PilotSuite' },
+    { issue: 10, path: 'docs/test-maintenance-candidates.md', lines: [1, 2] },
+  ];
+  const EXCERPT = [
+    'export interface MaintenanceCandidate { suite: string; }',
+    'export type PilotSuite = "chain-linear" | "tool-request-grant";',
+  ].join('\n');
+
+  function incidentWorld(selections = SELECTIONS) {
+    const world = defaultWorld();
+    world[500].issue = targetIssue({
+      body: [
+        'Run the mutation-testing pilot on the selected suites.',
+        '',
+        '## Constraints',
+        `- ${MUTATION_LIMITS}`,
+        `- ${PROHIBITIONS}`,
+        '',
+        '```refinement-evidence',
+        JSON.stringify(selections, null, 2),
+        '```',
+      ].join('\n'),
+    });
+    return world;
+  }
+
+  const serve = (request) => ({ kind: 'found', content: EXCERPT, resolvedCommitSha: request.commitSha });
+
+  // Round 1's draft: grounded, but silently drops both constraints.
+  const omittingDraft = refinerRecord({
+    acceptanceCriteria: ['Run the pilot on the chain-linear and tool-request-grant suites.'],
+  });
+  // Round 2's draft: the same contract with both constraints restored verbatim.
+  const repairedDraft = refinerRecord({
+    acceptanceCriteria: [
+      'Run the pilot on the chain-linear and tool-request-grant suites.',
+      MUTATION_LIMITS,
+      PROHIBITIONS,
+    ],
+  });
+
+  // The critic output #1111 actually received (run 241760): `block` with two
+  // `lost_requirement` objections and no named human blocker.
+  const INCIDENT_OBJECTIONS = [
+    {
+      field: 'acceptanceCriteria',
+      kind: 'lost_requirement',
+      detail:
+        'Restore the explicit limits on interpreting mutation evidence: scores and coverage do not guarantee all-defect detection, establish redundancy, or justify deletion by themselves; lost detection requires repair or restoration, or rejection of the optimization.',
+    },
+    {
+      field: 'acceptanceCriteria',
+      kind: 'lost_requirement',
+      detail:
+        'Restore the explicit prohibitions on new runner policy, global locks, live sessions.json changes, and behavioral specification edits.',
+    },
+  ];
+  const incidentBlock = criticRecord({ verdict: 'block', objections: INCIDENT_OBJECTIONS });
+  const incidentRevise = criticRecord({ verdict: 'revise', objections: INCIDENT_OBJECTIONS });
+
+  const escalation = (result) => result.events.find((e) => e.type === 'refinement.escalated.human');
+  // The critic prompt's draft section — the Issue body is in the snapshot of
+  // every critic prompt, so only this section proves what the critic judged.
+  const draftUnderReview = (prompt) =>
+    prompt.slice(
+      prompt.indexOf('Refiner draft under review:'),
+      prompt.indexOf('The snapshot between the markers'),
+    );
+
+  test('the #1111 regression: block / lost_requirement is routed to a bounded revision, and the repaired draft is accepted', async () => {
+    const refiner = makeAgent([ok(fenced(omittingDraft)), ok(fenced(repairedDraft))]);
+    const critic = makeAgent([ok(fenced(incidentBlock)), ok(fenced(criticRecord()))]);
+    const { result, calls, artifactDir } = await run({
+      world: incidentWorld(),
+      sourceOpts: { evidence: serve },
+      refiner,
+      critic,
+    });
+
+    // The incident's precondition: every declared excerpt captured whole.
+    const snapshot = JSON.parse(readFileSync(join(artifactDir, 'snapshot.json'), 'utf8'));
+    expect(snapshot.evidence.map((e) => [e.status, e.truncated])).toEqual([
+      ['captured', false],
+      ['captured', false],
+      ['captured', false],
+    ]);
+
+    // Before #1176 this stopped at round 1 of 2 with `critique_blocked`.
+    expect(escalation(result)).toBeUndefined();
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    expect(result.taskStatus).toBeNull();
+    expect(result.block.handoffReason).toBeNull();
+    expect(result.block.counters.rounds).toBe(2);
+    expect(refiner.calls).toHaveLength(2);
+    expect(critic.calls).toHaveLength(2);
+
+    // The routing point is explicit on the audit trail.
+    const revise = result.events.find((e) => e.type === 'refinement.critique.revise');
+    expect(revise.data).toMatchObject({
+      round: 1,
+      criticVerdict: 'block',
+      objections: [
+        { field: 'acceptanceCriteria', kind: 'lost_requirement' },
+        { field: 'acceptanceCriteria', kind: 'lost_requirement' },
+      ],
+    });
+    expect(result.events.map((e) => e.type)).toEqual([
+      'refinement.roles.resolved',
+      'refinement.eligibility.granted',
+      'refinement.snapshot.captured',
+      'refinement.draft.recorded',
+      'refinement.critique.revise',
+      'refinement.draft.recorded',
+      'refinement.critique.passed',
+    ]);
+
+    // The refiner got the concrete objections AND its previous draft, with the
+    // original Issue and the captured evidence still in front of it.
+    const revision = refiner.calls[1].prompt;
+    expect(revision).toContain('REVISION round');
+    expect(revision).toContain('Restore the explicit limits on interpreting mutation evidence');
+    expect(revision).toContain('global locks, live sessions.json changes');
+    expect(revision).toContain('"Run the pilot on the chain-linear and tool-request-grant suites."');
+    expect(revision).toContain('remains the authority');
+    expect(revision).toContain('restore the requirement exactly as the target Issue states it');
+    expect(revision).toContain('## Constraints');
+    expect(revision).toContain('export interface MaintenanceCandidate');
+
+    // The critic independently re-checked the REPAIRED draft before acceptance.
+    expect(draftUnderReview(critic.calls[0].prompt)).not.toContain(PROHIBITIONS);
+    expect(draftUnderReview(critic.calls[1].prompt)).toContain(PROHIBITIONS);
+    expect(draftUnderReview(critic.calls[1].prompt)).toContain(MUTATION_LIMITS);
+    expect(result.block.accepted.contract.acceptanceCriteria).toEqual(
+      repairedDraft.acceptanceCriteria,
+    );
+    expect(result.block.accepted.roundsUsed).toBe(2);
+
+    // Accepted is where the loop stops: nothing applied, nothing activated,
+    // and every port call was a read.
+    expect(result.block.state).toBe('accepted');
+    const readOnly = new Set([
+      'getBlockedBy', 'readIssue', 'readPullRequest', 'readChangedPaths',
+      'readIssueComments', 'readReviewSummary', 'readIssuePlan', 'readChainAgreement',
+      'readPredecessorEvidence',
+    ]);
+    for (const [method] of calls) expect(readOnly.has(method)).toBe(true);
+  });
+
+  test('a critic following the corrected prompt answers revise, and the correction is accepted', async () => {
+    const refiner = makeAgent([ok(fenced(omittingDraft)), ok(fenced(repairedDraft))]);
+    const critic = makeAgent([ok(fenced(incidentRevise)), ok(fenced(criticRecord()))]);
+    const { result } = await run({
+      world: incidentWorld(),
+      sourceOpts: { evidence: serve },
+      refiner,
+      critic,
+    });
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    expect(result.block.counters.rounds).toBe(2);
+    const revise = result.events.find((e) => e.type === 'refinement.critique.revise');
+    // A literal `revise` is not a routed block.
+    expect(revise.data.criticVerdict).toBeUndefined();
+    expect(refiner.calls[1].prompt).toContain('Restore the explicit prohibitions');
+  });
+
+  test('a repeated omission reaches the existing round cap and escalates no_convergence', async () => {
+    const refiner = makeAgent([ok(fenced(omittingDraft))]);
+    const critic = makeAgent([ok(fenced(incidentBlock))]);
+    const { result } = await run({
+      world: incidentWorld(),
+      sourceOpts: { evidence: serve },
+      refiner,
+      critic,
+    });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'no_convergence' });
+    expect(result.taskStatus).toBe('ready_for_human');
+    expect(result.block.counters.rounds).toBe(2);
+    // Exactly the configured budget — no extra round, no extra retry.
+    expect(refiner.calls).toHaveLength(2);
+    expect(critic.calls).toHaveLength(2);
+    expect(result.block.accepted).toBeUndefined();
+    expect(escalation(result).data).toMatchObject({
+      reason: 'no_convergence',
+      round: 2,
+      criticVerdict: 'block',
+    });
+  });
+
+  test('a lowered round cap is honoured: one round, then no_convergence', async () => {
+    const refiner = makeAgent([ok(fenced(omittingDraft))]);
+    const critic = makeAgent([ok(fenced(incidentBlock))]);
+    const { result } = await run({
+      block: makeBlock({ settings: settingsFor({ limits: { maxRefinementRoundsPerIssue: 1 } }) }),
+      world: incidentWorld(),
+      sourceOpts: { evidence: serve },
+      refiner,
+      critic,
+    });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'no_convergence' });
+    expect(refiner.calls).toHaveLength(1);
+    expect(critic.calls).toHaveLength(1);
+  });
+
+  test('a genuinely missing human decision stays a human blocker', async () => {
+    const refiner = makeAgent([ok(fenced(omittingDraft))]);
+    const critic = makeAgent([
+      ok(fenced(criticRecord({
+        verdict: 'block',
+        blockReason: 'missing_decision',
+        objections: [{
+          field: 'acceptanceCriteria',
+          kind: 'lost_requirement',
+          detail: 'The Issue never says which suites the pilot may delete from; only the operator can decide.',
+        }],
+      }))),
+    ]);
+    const { result } = await run({
+      world: incidentWorld(),
+      sourceOpts: { evidence: serve },
+      refiner,
+      critic,
+    });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'critique_blocked' });
+    expect(result.block.counters.rounds).toBe(1);
+    expect(refiner.calls).toHaveLength(1);
+    expect(result.block.accepted).toBeUndefined();
+    expect(escalation(result).data).toMatchObject({
+      reason: 'critique_blocked',
+      blockReason: 'missing_decision',
+      objections: [{ field: 'acceptanceCriteria', kind: 'lost_requirement' }],
+    });
+    expect(result.events.map((e) => e.type)).not.toContain('refinement.critique.revise');
+    // §15: the block record the operator view projects.
+    expect(result.block.criticBlock).toEqual({
+      round: 1,
+      blockReason: 'missing_decision',
+      objections: [{ field: 'acceptanceCriteria', kind: 'lost_requirement' }],
+      recordedAt: expect.any(String),
+    });
+  });
+
+  // The handoff guidance points at `admin task-status --verbose`, so that is
+  // where the named human blocker has to be readable — and the admin UI must
+  // name the same one.
+  test('admin task-status and the admin UI name the recorded blockReason', async () => {
+    const critic = makeAgent([
+      ok(fenced(criticRecord({
+        verdict: 'block',
+        blockReason: 'authority_conflict',
+        objections: [{
+          field: 'implementationNotes',
+          kind: 'contradicted',
+          detail: 'The Issue requires the pilot suites deleted; the predecessor evidence requires them kept.',
+        }],
+      }))),
+    ]);
+    const { result } = await run({ world: incidentWorld(), sourceOpts: { evidence: serve }, critic });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'critique_blocked' });
+    const task = { context: { refinement: result.block } };
+    const summary = summarizeRefinementStatus(task);
+    expect(summary.criticBlock).toEqual({
+      round: 1,
+      blockReason: 'authority_conflict',
+      objections: [{ field: 'implementationNotes', kind: 'contradicted' }],
+    });
+    const expected =
+      'critic block: blockReason=authority_conflict round=1 objections=implementationNotes:contradicted';
+    const status = renderRefinementLines(summary).join('\n');
+    expect(status).toContain('handoff=critique_blocked');
+    expect(status).toContain(expected);
+    // Literals only: the objection prose stays in the local transcript.
+    expect(status).not.toContain('pilot suites');
+    expect(formatRefinementDetail(task, '2026-08-10T01:00:00.000Z').join('\n')).toContain(expected);
+  });
+
+  test('an unnamed block renders as such, and a block-free task renders no critic line', async () => {
+    const unnamed = summarizeRefinementStatus({
+      context: {
+        refinement: {
+          state: 'escalated_human',
+          handoffReason: 'critique_blocked',
+          criticBlock: { round: 2, blockReason: null, objections: [], recordedAt: 'x' },
+        },
+      },
+    });
+    expect(renderRefinementLines(unnamed).join('\n')).toContain(
+      'critic block: blockReason=(none named) round=2 objections=(none)',
+    );
+    const { result } = await run({
+      world: incidentWorld(),
+      sourceOpts: { evidence: serve },
+      refiner: makeAgent([ok(fenced(omittingDraft))]),
+      critic: makeAgent([ok(fenced(incidentBlock))]),
+    });
+    // A routed (repairable) block records no critic block: nobody is blocked.
+    expect(result.block.criticBlock).toBeUndefined();
+    const summary = summarizeRefinementStatus({ context: { refinement: result.block } });
+    expect(summary.criticBlock).toBeNull();
+    expect(renderRefinementLines(summary).join('\n')).not.toContain('critic block:');
+  });
+
+  test('an authority conflict beside an omission stays blocked', async () => {
+    const critic = makeAgent([
+      ok(fenced(criticRecord({
+        verdict: 'block',
+        objections: [
+          INCIDENT_OBJECTIONS[0],
+          {
+            field: 'implementationNotes',
+            kind: 'contradicted',
+            detail: 'The Issue requires the pilot suites to be deleted; the predecessor evidence requires them kept.',
+          },
+        ],
+      }))),
+    ]);
+    const { result, refiner } = await run({
+      world: incidentWorld(),
+      sourceOpts: { evidence: serve },
+      critic,
+    });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'critique_blocked' });
+    expect(refiner.calls).toHaveLength(1);
+    expect(escalation(result).data.blockReason).toBeNull();
+  });
+
+  test('unavailable required evidence stops before either agent runs', async () => {
+    const { result, refiner, critic } = await run({
+      world: incidentWorld(),
+      sourceOpts: { evidence: () => ({ kind: 'missing_path' }) },
+    });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'evidence_required' });
+    expect(refiner.calls).toHaveLength(0);
+    expect(critic.calls).toHaveLength(0);
+  });
+
+  test('an uncaptured optional excerpt keeps a lost_requirement block blocked', async () => {
+    const selections = [SELECTIONS[0], SELECTIONS[1], { ...SELECTIONS[2], required: false }];
+    const refiner = makeAgent([ok(fenced(omittingDraft))]);
+    const critic = makeAgent([ok(fenced(incidentBlock))]);
+    const { result } = await run({
+      world: incidentWorld(selections),
+      sourceOpts: {
+        evidence: (request) =>
+          request.path === SELECTIONS[2].path ? { kind: 'missing_path' } : serve(request),
+      },
+      refiner,
+      critic,
+    });
+    // The preflight let the optional gap through, so the agents ran …
+    expect(critic.calls).toHaveLength(1);
+    // … but with the evidence incomplete the block is not routed as revise.
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'critique_blocked' });
+    expect(refiner.calls).toHaveLength(1);
+  });
+
+  test('a critic naming evidence_unavailable stays blocked', async () => {
+    const critic = makeAgent([
+      ok(fenced(criticRecord({ verdict: 'block', blockReason: 'evidence_unavailable', objections: [] }))),
+    ]);
+    const { result } = await run({
+      world: incidentWorld(),
+      sourceOpts: { evidence: serve },
+      critic,
+    });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'critique_blocked' });
+    expect(escalation(result).data.blockReason).toBe('evidence_unavailable');
+  });
+
+  test('the critic prompt teaches omission-is-revise and names the block reasons', async () => {
+    const { critic, refiner } = await run();
+    const prompt = critic.calls[0].prompt;
+    expect(prompt).toContain('is a repairable omission, not a missing human decision');
+    expect(prompt).toContain('A `block` must carry `blockReason`');
+    for (const reason of ['missing_decision', 'authority_conflict', 'evidence_unavailable', 'premise_invalidated', 'scope_change']) {
+      expect(prompt).toContain(`\`${reason}\``);
+    }
+    expect(prompt).not.toContain('drops a stated requirement');
+    // `blockReason` is block-only, so it is not part of the schema every
+    // verdict is told to match — a `pass`/`revise` copying that schema must
+    // not come out malformed (`block-reason-without-block`).
+    const schema = prompt.split('Result schema (every verdict):\n```json\n')[1].split('\n```')[0];
+    expect(schema).not.toContain('blockReason');
+    expect(JSON.parse(schema)).not.toHaveProperty('blockReason');
+    expect(prompt).toContain('For verdict `block` ONLY, add one more top-level field to that object');
+    expect(prompt).toContain('for `pass` and `revise` leave it out entirely');
+    expect(refiner.calls[0].prompt).toContain(
+      'Preserve every requirement, constraint, limit, prohibition, and non-goal the target Issue states',
+    );
+  });
 });
 
 describe('issue-refinement loop — malformed output (§17)', () => {
@@ -708,6 +1167,116 @@ describe('issue-refinement loop — topology proposals fail closed (§9, §12 ro
   });
 });
 
+// ---------------------------------------------------------------------------
+// §9.1 — an already-satisfied proposal never spends a human handoff (#982).
+//
+// The fixture world is the reported shape: target #500 is ALREADY blocked by
+// #10, exactly as #951 was already blocked by #950.
+// ---------------------------------------------------------------------------
+
+describe('issue-refinement loop — already-satisfied topology proposals (§9.1)', () => {
+  const dependency = (kind, relationship, disposition = 'advisory') => ({
+    kind,
+    rationale: 'chain ordering',
+    disposition,
+    relationship,
+  });
+  const runWith = (proposals, dispositions) =>
+    run({
+      refiner: makeAgent([ok(fenced(refinerRecord({ topologyProposals: proposals })))]),
+      critic: makeAgent([ok(fenced(criticRecord({ topologyDispositions: dispositions })))]),
+    });
+
+  test('the #951/#950 case: adding an existing edge does not escalate', async () => {
+    const { result } = await runWith(
+      [dependency('dependency_add', { blockedIssue: 500, blockerIssue: 10 })],
+      [{ index: 0, disposition: 'blocking' }],
+    );
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    expect(result.block.accepted.topology[0]).toMatchObject({
+      normalization: 'already_satisfied',
+      normalizationDetail: 'edge-present',
+      criticDisposition: 'blocking',
+      escalates: false,
+    });
+  });
+
+  test('removing an absent edge does not escalate', async () => {
+    const { result } = await runWith(
+      [dependency('dependency_remove', { blockedIssue: 500, blockerIssue: 4242 }, 'blocking')],
+      [{ index: 0, disposition: 'blocking' }],
+    );
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    expect(result.block.accepted.topology[0].normalization).toBe('already_satisfied');
+  });
+
+  test('a genuinely new edge still escalates under the §9 rules', async () => {
+    const { result } = await runWith(
+      [dependency('dependency_add', { blockedIssue: 500, blockerIssue: 4242 })],
+      [{ index: 0, disposition: 'blocking' }],
+    );
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'topology_change_required' });
+    const event = result.events.find((e) => e.type === 'refinement.escalated.human');
+    expect(event.data.topology[0]).toMatchObject({
+      normalization: 'effective_change',
+      normalizationDetail: 'edge-absent',
+      escalates: true,
+    });
+    expect(event.data.normalization).toEqual({
+      already_satisfied: 0,
+      effective_change: 1,
+      invalid_or_unverifiable: 0,
+    });
+  });
+
+  test('a dependency proposal that names no edge stays unverifiable and fails closed', async () => {
+    const { result } = await runWith(
+      [{ kind: 'dependency_add', rationale: 'chain ordering', disposition: 'advisory' }],
+      [{ index: 0, disposition: 'blocking' }],
+    );
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'topology_change_required' });
+    const event = result.events.find((e) => e.type === 'refinement.escalated.human');
+    expect(event.data.topology[0]).toMatchObject({
+      normalization: 'invalid_or_unverifiable',
+      normalizationDetail: 'relationship-missing',
+    });
+  });
+
+  test('duplicate no-op proposals collapse and are recorded as one decision', async () => {
+    const edge = { blockedIssue: 500, blockerIssue: 10 };
+    const { result } = await runWith(
+      [dependency('dependency_add', edge), dependency('dependency_add', edge, 'blocking')],
+      [{ index: 0, disposition: 'advisory' }],
+    );
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    const event = result.events.find((e) => e.type === 'refinement.topology.recorded');
+    expect(event.data.topology.map((t) => t.duplicateOfIndex)).toEqual([null, 0]);
+    expect(event.data.normalization.already_satisfied).toBe(2);
+  });
+
+  test('a relationship read failure never reads as satisfied: nothing is drafted at all', async () => {
+    const { result, refiner } = await run({ sourceOpts: { blockedByThrows: 'network down' } });
+    expect(result.outcome).toMatchObject({ kind: 'snapshot_failed', stage: 'blocked_by' });
+    expect(refiner.calls).toHaveLength(0);
+    expect(result.block.accepted).toBeUndefined();
+  });
+
+  test('an unparseable relationship is malformed refiner output, not a silent no-op', () => {
+    const record = refinerRecord({
+      topologyProposals: [
+        {
+          kind: 'dependency_add',
+          rationale: 'chain ordering',
+          disposition: 'advisory',
+          relationship: { blockedIssue: 500, blockerIssue: 0 },
+        },
+      ],
+    });
+    const parsed = parseRefinerResponse(fenced(record), snapshotStub(), 4096);
+    expect(parsed).toEqual({ ok: false, malformed: ['invalid-field:topologyProposals[0]'] });
+  });
+});
+
 describe('issue-refinement loop — snapshot outcomes (§12 rows 3-7, 10)', () => {
   test('a chainless Issue escalates not_chain_scoped', async () => {
     const { result } = await run({ blockedBy: [] });
@@ -745,6 +1314,240 @@ describe('issue-refinement loop — snapshot outcomes (§12 rows 3-7, 10)', () =
     expect(result.outcome).toEqual({ kind: 'refused', detail: 'state:escalated_human' });
     expect(result.events).toEqual([]);
     expect(result.artifacts).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.2 required-evidence preflight (issue #1003, §12 row 48)
+//
+// The reported #951/#950 run: the downstream Issue makes a predecessor's
+// exported selector type authoritative. With the evidence in hand the lane
+// refines normally; without it the lane must stop BEFORE either agent runs,
+// rather than spending the round cap on a draft the critic can only reject.
+// ---------------------------------------------------------------------------
+
+describe('issue-refinement loop — required-evidence preflight (§5.2, §12 row 48)', () => {
+  const SELECTOR_TYPE = [
+    'export type DisputeTurnSelection =',
+    '  | { kind: "dispatch"; subTurn: string }',
+    '  | { kind: "terminal" };',
+  ].join('\n');
+
+  function declaring(selections) {
+    const world = defaultWorld();
+    world[500].issue = targetIssue({
+      body: [
+        'Downstream body',
+        '',
+        '```refinement-evidence',
+        JSON.stringify(selections, null, 2),
+        '```',
+      ].join('\n'),
+    });
+    return world;
+  }
+
+  const serve = (content) => (request) => ({
+    kind: 'found',
+    content,
+    resolvedCommitSha: request.commitSha,
+  });
+
+  const REQUIRE_SELECTOR = [
+    { issue: 10, path: 'src/core/review-dispute-turn.ts', export: 'DisputeTurnSelection' },
+  ];
+
+  test('captured evidence refines normally and records no gate', async () => {
+    const { result, refiner, critic } = await run({
+      world: declaring(REQUIRE_SELECTOR),
+      sourceOpts: { evidence: serve(SELECTOR_TYPE) },
+    });
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    expect(result.block.evidenceGate).toBeUndefined();
+    expect(refiner.calls).toHaveLength(1);
+    expect(critic.calls).toHaveLength(1);
+    // The evidence the agents were handed is the captured contract itself.
+    expect(refiner.calls[0].prompt).toContain('export type DisputeTurnSelection');
+    expect(critic.calls[0].prompt).toContain('export type DisputeTurnSelection');
+  });
+
+  test('the #951/#950 regression: unreachable required evidence stops before either agent', async () => {
+    const { result, refiner, critic, artifactDir } = await run({
+      world: declaring(REQUIRE_SELECTOR),
+      sourceOpts: { evidence: () => ({ kind: 'missing_path' }) },
+    });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'evidence_required' });
+    expect(result.taskStatus).toBe('ready_for_human');
+    expect(result.block.state).toBe('escalated_human');
+    expect(result.block.handoffReason).toBe('evidence_required');
+    // No agent budget: neither process was started, and no round was spent.
+    expect(refiner.calls).toHaveLength(0);
+    expect(critic.calls).toHaveLength(0);
+    expect(result.block.counters.rounds).toBe(0);
+    expect(result.block.counters.malformedAttempts).toEqual({ refiner: 0, critic: 0 });
+    // Row 48 replaces row 10: the run never reached `drafting`.
+    const types = result.events.map((e) => e.type);
+    expect(types).not.toContain('refinement.snapshot.captured');
+    expect(types).toContain('refinement.escalated.human');
+    // §15: literals, counters, and the artifact NAME — never a declared path.
+    expect(result.block.evidenceGate).toMatchObject({
+      declared: 1,
+      captured: 0,
+      optionalGaps: 0,
+      artifact: 'evidence-preflight.json',
+      gaps: [
+        {
+          index: 0,
+          reason: 'missing_path',
+          requirement: 'required',
+          predecessorIssueNumber: 10,
+        },
+      ],
+    });
+    expect(JSON.stringify(result.block)).not.toContain('review-dispute-turn.ts');
+    // The full account, paths included, is local-only.
+    expect(result.artifacts).toContain('evidence-preflight.json');
+    const artifact = JSON.parse(
+      readFileSync(join(artifactDir, 'evidence-preflight.json'), 'utf8'),
+    );
+    expect(artifact.gaps).toHaveLength(1);
+    expect(artifact.evidence[0].selector.path).toBe('src/core/review-dispute-turn.ts');
+  });
+
+  test('the escalation event carries the gap literals, and the fingerprint is recorded', async () => {
+    const { result } = await run({
+      world: declaring(REQUIRE_SELECTOR),
+      sourceOpts: { evidence: () => ({ kind: 'unavailable', detail: 'type=symlink' }) },
+    });
+    const escalated = result.events.find((e) => e.type === 'refinement.escalated.human');
+    expect(escalated.data.reason).toBe('evidence_required');
+    expect(escalated.data.evidence).toEqual({
+      declared: 1,
+      captured: 0,
+      optionalGaps: 0,
+      gaps: [
+        {
+          index: 0,
+          reason: 'source_unavailable',
+          requirement: 'required',
+          predecessorIssueNumber: 10,
+        },
+      ],
+    });
+    expect(result.block.predecessorFingerprint).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('a missing evidence resolver is a required-evidence stop, not a silent proceed', async () => {
+    const { result, refiner } = await run({ world: declaring(REQUIRE_SELECTOR) });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'evidence_required' });
+    expect(result.block.evidenceGate.gaps[0].reason).toBe('resolver_unavailable');
+    expect(refiner.calls).toHaveLength(0);
+  });
+
+  test('re-running unchanged input reaches the same handoff and still spends no agent', async () => {
+    const first = await run({
+      world: declaring(REQUIRE_SELECTOR),
+      sourceOpts: { evidence: () => ({ kind: 'missing_path' }) },
+      runId: 'run-a',
+    });
+    const second = await run({
+      world: declaring(REQUIRE_SELECTOR),
+      sourceOpts: { evidence: () => ({ kind: 'missing_path' }) },
+      runId: 'run-b',
+    });
+    expect(second.result.outcome).toEqual(first.result.outcome);
+    expect(second.result.block.evidenceGate.gaps).toEqual(first.result.block.evidenceGate.gaps);
+    expect(second.result.block.predecessorFingerprint).toBe(
+      first.result.block.predecessorFingerprint,
+    );
+    expect(second.refiner.calls).toHaveLength(0);
+    expect(second.critic.calls).toHaveLength(0);
+    // And the durable half: the escalated block is refused without re-deciding.
+    const again = await run({
+      block: first.result.block,
+      world: declaring(REQUIRE_SELECTOR),
+      sourceOpts: { evidence: () => ({ kind: 'missing_path' }) },
+      runId: 'run-c',
+    });
+    expect(again.result.outcome).toEqual({ kind: 'refused', detail: 'state:escalated_human' });
+    expect(again.refiner.calls).toHaveLength(0);
+  });
+
+  test('an optional selection that cannot be captured never raises the handoff', async () => {
+    const { result, refiner } = await run({
+      world: declaring([{ ...REQUIRE_SELECTOR[0], required: false }]),
+      sourceOpts: { evidence: () => ({ kind: 'missing_path' }) },
+    });
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    expect(result.block.evidenceGate).toBeUndefined();
+    expect(refiner.calls).toHaveLength(1);
+  });
+
+  test('a required excerpt cut by its own byte cap is a gap', async () => {
+    const { result } = await run({
+      world: declaring([
+        { issue: 10, path: 'src/core/review-dispute-turn.ts', maxBytes: 8 },
+      ]),
+      sourceOpts: { evidence: serve(SELECTOR_TYPE) },
+    });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'evidence_required' });
+    expect(result.block.evidenceGate.gaps[0]).toEqual({
+      index: 0,
+      reason: 'truncated',
+      requirement: 'required',
+      predecessorIssueNumber: 10,
+    });
+  });
+
+  test('a malformed declaration fails closed as undetermined requiredness', async () => {
+    const world = defaultWorld();
+    world[500].issue = targetIssue({
+      body: ['Downstream body', '', '```refinement-evidence', 'not json', '```'].join('\n'),
+    });
+    const { result, refiner } = await run({ world });
+    expect(result.outcome).toEqual({ kind: 'escalated', reason: 'evidence_required' });
+    expect(result.block.evidenceGate.gaps).toEqual([
+      {
+        index: 0,
+        reason: 'malformed_declaration',
+        requirement: 'undetermined',
+        predecessorIssueNumber: null,
+      },
+    ]);
+    expect(refiner.calls).toHaveLength(0);
+  });
+
+  // §13 row 36 is the only way out, and it re-snapshots: evidence that became
+  // reachable — or a declaration the operator corrected — is read as it now
+  // stands, so the recovered attempt proceeds instead of stopping again.
+  test('recovery re-snapshots, and the same Issue proceeds once the evidence is reachable', async () => {
+    const stopped = await run({
+      world: declaring(REQUIRE_SELECTOR),
+      sourceOpts: { evidence: () => ({ kind: 'missing_path' }) },
+      runId: 'run-stop',
+    });
+    expect(stopped.result.outcome).toEqual({ kind: 'escalated', reason: 'evidence_required' });
+    const recovered = planRefinementRecovery({ block: stopped.result.block, now: NOW }).block;
+    expect(recovered.state).toBe('pending');
+    expect(recovered.handoffReason).toBeNull();
+    expect(recovered.evidenceGate).toBeUndefined();
+    const retried = await run({
+      block: recovered,
+      world: declaring(REQUIRE_SELECTOR),
+      sourceOpts: { evidence: serve(SELECTOR_TYPE) },
+      runId: 'run-retry',
+    });
+    expect(retried.result.outcome).toEqual({ kind: 'accepted' });
+    expect(retried.refiner.calls).toHaveLength(1);
+    expect(retried.result.block.evidenceGate).toBeUndefined();
+  });
+
+  test('an Issue that declares nothing runs exactly as before', async () => {
+    const { result, refiner } = await run();
+    expect(result.outcome).toEqual({ kind: 'accepted' });
+    expect(result.block.evidenceGate).toBeUndefined();
+    expect(result.artifacts).not.toContain('evidence-preflight.json');
+    expect(refiner.calls).toHaveLength(1);
   });
 });
 
@@ -881,6 +1684,68 @@ describe('critic response validation (§7.2, §17)', () => {
     const result = parseCriticResponse(raw);
     expect(result).toEqual({ ok: false, malformed: ['path-injection'] });
   });
+
+  // Issue #1176: the optional closed `blockReason`.
+  test('a block may name a blockReason; absent or null reads as none', () => {
+    const named = parseCriticResponse(
+      fenced(criticRecord({ verdict: 'block', blockReason: 'authority_conflict' })),
+    );
+    expect(named.ok).toBe(true);
+    expect(named.critique.blockReason).toBe('authority_conflict');
+    expect(parseCriticResponse(fenced(criticRecord({ verdict: 'block' }))).critique.blockReason)
+      .toBeNull();
+    expect(parseCriticResponse(fenced(criticRecord({ blockReason: null }))).critique.blockReason)
+      .toBeNull();
+  });
+
+  test.each([
+    ['an unknown blockReason literal', criticRecord({ verdict: 'block', blockReason: 'omission' }), 'invalid-field:blockReason'],
+    ['a blockReason on a pass', criticRecord({ blockReason: 'missing_decision' }), 'block-reason-without-block'],
+    ['a blockReason on a revise', criticRecord({ verdict: 'revise', objections: [objection], blockReason: 'scope_change' }), 'block-reason-without-block'],
+  ])('%s is malformed', (_name, record, detail) => {
+    expect(parseCriticResponse(fenced(record))).toEqual({ ok: false, malformed: [detail] });
+  });
+});
+
+describe('critic verdict routing (§7.2 repairable-block routing, #1176)', () => {
+  const lost = { field: 'acceptanceCriteria', kind: 'lost_requirement', detail: 'restore the stated limit' };
+  const critique = (overrides) => ({ verdict: 'block', objections: [lost], blockReason: null, ...overrides });
+  const captured = { status: 'captured', truncated: false };
+
+  test('pass and revise route as themselves', () => {
+    expect(routeCriticVerdict(critique({ verdict: 'pass', objections: [] }), [])).toEqual({ route: 'pass' });
+    expect(routeCriticVerdict(critique({ verdict: 'revise' }), [])).toEqual({
+      route: 'revise',
+      repairableBlock: false,
+    });
+  });
+
+  test('an unnamed block of only lost_requirement objections with complete evidence routes as revise', () => {
+    expect(routeCriticVerdict(critique({ objections: [lost, lost] }), [captured, captured])).toEqual({
+      route: 'revise',
+      repairableBlock: true,
+    });
+    // An Issue that declares no evidence is trivially complete.
+    expect(routeCriticVerdict(critique(), undefined).route).toBe('revise');
+  });
+
+  test.each([
+    ['a named blockReason', critique({ blockReason: 'missing_decision' }), [captured], 'missing_decision'],
+    ['no objections at all', critique({ objections: [] }), [captured], null],
+    ['another objection kind beside the omission', critique({ objections: [lost, { ...lost, kind: 'contradicted' }] }), [captured], null],
+    ['an omitted evidence selection', critique(), [captured, { status: 'omitted', truncated: false }], null],
+    ['a truncated evidence selection', critique(), [{ status: 'captured', truncated: true }], null],
+  ])('%s keeps the block', (_name, input, evidence, blockReason) => {
+    expect(routeCriticVerdict(input, evidence)).toEqual({ route: 'block', blockReason });
+  });
+
+  test('evidence completeness means every selection captured and uncut', () => {
+    expect(refinementEvidenceComplete(undefined)).toBe(true);
+    expect(refinementEvidenceComplete([])).toBe(true);
+    expect(refinementEvidenceComplete([captured])).toBe(true);
+    expect(refinementEvidenceComplete([{ status: 'omitted', truncated: false }])).toBe(false);
+    expect(refinementEvidenceComplete([{ status: 'captured', truncated: true }])).toBe(false);
+  });
 });
 
 describe('fenced-record extraction (§17)', () => {
@@ -900,6 +1765,103 @@ describe('fenced-record extraction (§17)', () => {
   test('readable non-object blocks are ignored', () => {
     const raw = '```json\n[1,2]\n```\n```json\n{"a":1}\n```';
     expect(extractRefinementRecord(raw)).toEqual({ ok: true, record: { a: 1 } });
+  });
+
+  // Issue #1192: the scanner replaced a regex; these pin the grammar it kept.
+  test('a fence quoted inside a JSON string does not close the block', () => {
+    const raw = 'prose\n```json\n{"note":"use ```json\\n{}\\n``` here"}\n```\ntrailing prose';
+    expect(extractRefinementRecord(raw)).toEqual({
+      ok: true,
+      record: { note: 'use ```json\n{}\n``` here' },
+    });
+  });
+
+  test('CRLF, indented closes, case-insensitive tags and a close at end of output', () => {
+    expect(extractRefinementRecord('```JSON \r\n{"a":1}\r\n  ```  \r\nafter')).toEqual({
+      ok: true,
+      record: { a: 1 },
+    });
+    expect(extractRefinementRecord('x ```json\n{"a":2}\n```')).toEqual({ ok: true, record: { a: 2 } });
+  });
+
+  test('a close fence with trailing text is not a close', () => {
+    const raw = '```json\n{"a":1}\n``` not a close\n```';
+    expect(extractRefinementRecord(raw)).toEqual({ ok: false, detail: 'unparseable-json-block' });
+  });
+
+  test('an unclosed opener is no block', () => {
+    expect(extractRefinementRecord('```json\n{"a":1}\n')).toEqual({ ok: false, detail: 'no-json-block' });
+    expect(extractRefinementRecord('```json {"a":1}\n```')).toEqual({ ok: false, detail: 'no-json-block' });
+  });
+
+  test('an oversized body is payload-too-large, not truncated', () => {
+    const big = `{"a":"${'x'.repeat(REFINEMENT_RECORD_MAX_BYTES)}"}`;
+    expect(extractRefinementRecord('```json\n' + big + '\n```')).toEqual({
+      ok: false,
+      detail: 'payload-too-large',
+    });
+    // Multi-byte characters count in UTF-8 bytes, not code units.
+    const wide = `{"a":"${'é'.repeat(REFINEMENT_RECORD_MAX_BYTES / 2)}"}`;
+    expect(extractRefinementRecord('```json\n' + wide + '\n```')).toEqual({
+      ok: false,
+      detail: 'payload-too-large',
+    });
+  });
+
+  test('matches the replaced regex on a mixed corpus', () => {
+    const pattern = () => /```[ \t]*json[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*(?=\r?\n|$)/gim;
+    const pieces = ['```', 'json', 'JSON', ' ', '\t', '\n', '\r\n', '\r', ' ', '{"a":1}', '[1]', 'x', '`'];
+    let seed = 1192;
+    const rand = (n) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    for (let round = 0; round < 3000; round += 1) {
+      let raw = '';
+      const len = 1 + rand(24);
+      for (let i = 0; i < len; i += 1) raw += pieces[rand(pieces.length)];
+      const re = pattern();
+      const records = [];
+      let expected = null;
+      let sawBlock = false;
+      for (let m = re.exec(raw); m !== null; m = re.exec(raw)) {
+        sawBlock = true;
+        let parsed;
+        try {
+          parsed = JSON.parse(m[1]);
+        } catch {
+          expected = { ok: false, detail: 'unparseable-json-block' };
+          break;
+        }
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) records.push(parsed);
+      }
+      if (expected === null) {
+        if (records.length === 0) expected = { ok: false, detail: sawBlock ? 'no-json-object' : 'no-json-block' };
+        else if (records.length > 1) expected = { ok: false, detail: 'multiple-json-objects' };
+        else expected = { ok: true, record: records[0] };
+      }
+      expect({ raw, result: extractRefinementRecord(raw) }).toEqual({ raw, result: expected });
+    }
+  });
+
+  test('repeated unclosed opening fences are scanned in linear time', () => {
+    // 16 MiB is the runner's output ceiling; the regex took minutes here.
+    const opener = '```json\n';
+    const raw = opener.repeat(Math.floor((16 * 1024 * 1024) / opener.length));
+    const started = Date.now();
+    expect(extractRefinementRecord(raw)).toEqual({ ok: false, detail: 'no-json-block' });
+    expect(extractRefinementRecord(raw + '{"a":1}')).toEqual({ ok: false, detail: 'no-json-block' });
+    const blanks = '```' + ' '.repeat(1024) + '\n';
+    expect(extractRefinementRecord(blanks.repeat(4096))).toEqual({ ok: false, detail: 'no-json-block' });
+    expect(Date.now() - started).toBeLessThan(10_000);
+  }, 30_000);
+
+  test('a valid record after many unrelated fences is still found', () => {
+    const noise = '```text\nnot json\n```\n'.repeat(10_000);
+    expect(extractRefinementRecord(noise + '```json\n{"a":1}\n```\n')).toEqual({
+      ok: true,
+      record: { a: 1 },
+    });
   });
 });
 
@@ -931,6 +1893,218 @@ describe('topology combination (§9)', () => {
 
   test('no proposals means nothing can block', () => {
     expect(combineTopologyDispositions([], []).anyBlocking).toBe(false);
+  });
+
+  test('with no graph supplied nothing can be excluded — the pre-#982 answer', () => {
+    const dependency = {
+      kind: 'dependency_add',
+      rationale: 'r',
+      disposition: 'advisory',
+      relationship: { blockedIssue: 951, blockerIssue: 950 },
+    };
+    const combined = combineTopologyDispositions([dependency], [{ index: 0, disposition: 'blocking' }]);
+    expect(combined.normalization.graphAvailable).toBe(false);
+    expect(combined.effective[0]).toMatchObject({
+      normalization: 'invalid_or_unverifiable',
+      normalizationDetail: 'graph-unavailable:not_supplied',
+      escalates: true,
+    });
+    expect(combined.anyBlocking).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §9.1 — normalization against the authoritative relationship graph (#982)
+// ---------------------------------------------------------------------------
+
+describe('topology normalization (§9.1)', () => {
+  // The reported run: #951 is ALREADY blocked by #950, and the refiner
+  // proposed adding exactly that edge.
+  const graph = { ok: true, issueNumber: 951, blockedBy: [950] };
+  const unavailable = { ok: false, reason: 'read_failed' };
+
+  const proposal = (kind, relationship, disposition = 'advisory') => ({
+    kind,
+    rationale: 'r',
+    disposition,
+    ...(relationship ? { relationship } : {}),
+  });
+  const edge = (blockedIssue, blockerIssue, previousBlockerIssue) => ({
+    blockedIssue,
+    blockerIssue,
+    ...(previousBlockerIssue === undefined ? {} : { previousBlockerIssue }),
+  });
+  const classify = (p, g = graph) => normalizeTopologyProposals([p], g).entries[0];
+
+  test('the snapshot predecessor list is the authoritative blocked-by set', () => {
+    const snapshot = {
+      target: { issueNumber: 951 },
+      predecessors: [{ issueNumber: 950 }, { issueNumber: 949 }, { issueNumber: 950 }],
+    };
+    expect(refinementRelationshipGraph(snapshot)).toEqual({
+      ok: true,
+      issueNumber: 951,
+      blockedBy: [949, 950],
+    });
+  });
+
+  test('a missing or unusable snapshot yields no graph, never an empty one', () => {
+    expect(refinementRelationshipGraph(null)).toEqual({ ok: false, reason: 'snapshot_absent' });
+    expect(refinementRelationshipGraph({ target: {}, predecessors: [] })).toEqual({
+      ok: false,
+      reason: 'snapshot_unusable',
+    });
+  });
+
+  test('dependency_add of an existing edge is already satisfied', () => {
+    expect(classify(proposal('dependency_add', edge(951, 950)))).toMatchObject({
+      normalization: 'already_satisfied',
+      detail: 'edge-present',
+    });
+  });
+
+  test('dependency_remove of an absent edge is already satisfied', () => {
+    expect(classify(proposal('dependency_remove', edge(951, 4242)))).toMatchObject({
+      normalization: 'already_satisfied',
+      detail: 'edge-absent',
+    });
+  });
+
+  test('a genuinely new add and a genuine removal are effective changes', () => {
+    expect(classify(proposal('dependency_add', edge(951, 4242))).normalization).toBe(
+      'effective_change',
+    );
+    expect(classify(proposal('dependency_remove', edge(951, 950))).normalization).toBe(
+      'effective_change',
+    );
+  });
+
+  test('a rewire is satisfied only when BOTH halves already hold', () => {
+    expect(classify(proposal('dependency_rewire', edge(951, 950, 949))).normalization).toBe(
+      'already_satisfied',
+    );
+    expect(classify(proposal('dependency_rewire', edge(951, 4242, 950))).normalization).toBe(
+      'effective_change',
+    );
+    expect(classify(proposal('dependency_rewire', edge(951, 950))).detail).toBe(
+      'rewire-previous-missing',
+    );
+  });
+
+  test('split and supersede name no edge, so they are never satisfied', () => {
+    for (const kind of ['split', 'supersede']) {
+      expect(classify(proposal(kind, null))).toMatchObject({
+        normalization: 'effective_change',
+        detail: 'kind-not-relationship',
+        key: null,
+      });
+    }
+  });
+
+  test('an uncomparable dependency proposal is unverifiable, never satisfied', () => {
+    expect(classify(proposal('dependency_add', null)).detail).toBe('relationship-missing');
+    // §5 captures the TARGET's edges only; another Issue's graph is unread.
+    expect(classify(proposal('dependency_add', edge(4242, 950))).detail).toBe(
+      'relationship-out-of-scope',
+    );
+    expect(classify(proposal('dependency_remove', edge(951, 951))).detail).toBe(
+      'relationship-self-edge',
+    );
+    for (const kind of ['dependency_add', 'dependency_remove']) {
+      expect(classify(proposal(kind, edge(951, 950))).normalization).not.toBe(
+        'invalid_or_unverifiable',
+      );
+    }
+  });
+
+  test('an unavailable graph makes every proposal unverifiable, never satisfied', () => {
+    const entry = classify(proposal('dependency_add', edge(951, 950)), unavailable);
+    expect(entry).toMatchObject({
+      normalization: 'invalid_or_unverifiable',
+      detail: 'graph-unavailable:read_failed',
+    });
+    // And it still escalates when the parties say blocking.
+    const combined = combineTopologyDispositions(
+      [proposal('dependency_add', edge(951, 950), 'blocking')],
+      [{ index: 0, disposition: 'advisory' }],
+      unavailable,
+    );
+    expect(combined.anyBlocking).toBe(true);
+  });
+
+  test('already-satisfied proposals are excluded whatever either party said', () => {
+    const combined = combineTopologyDispositions(
+      [proposal('dependency_add', edge(951, 950), 'blocking')],
+      [{ index: 0, disposition: 'blocking' }],
+      graph,
+    );
+    expect(combined.anyBlocking).toBe(false);
+    expect(combined.effective[0]).toMatchObject({
+      effective: 'blocking',
+      normalization: 'already_satisfied',
+      escalates: false,
+    });
+    expect(combined.normalization.counts.already_satisfied).toBe(1);
+  });
+
+  test('a genuine change still follows the §9 disposition rules', () => {
+    const genuine = proposal('dependency_add', edge(951, 4242));
+    expect(
+      combineTopologyDispositions([genuine], [{ index: 0, disposition: 'advisory' }], graph)
+        .anyBlocking,
+    ).toBe(false);
+    expect(
+      combineTopologyDispositions([genuine], [{ index: 0, disposition: 'blocking' }], graph)
+        .anyBlocking,
+    ).toBe(true);
+    expect(combineTopologyDispositions([genuine], [], graph).anyBlocking).toBe(true);
+  });
+
+  test('duplicate equivalent proposals collapse to one normalized proposal', () => {
+    const dup = proposal('dependency_add', edge(951, 4242));
+    const result = normalizeTopologyProposals([dup, { ...dup, rationale: 'said twice' }], graph);
+    expect(result.entries[0].duplicateOfIndex).toBeNull();
+    expect(result.entries[1].duplicateOfIndex).toBe(0);
+    expect(result.entries[0].key).toBe(result.entries[1].key);
+    // Two `split`s with different rationales are two proposals, not one.
+    const splits = normalizeTopologyProposals(
+      [proposal('split', null), proposal('split', null)],
+      graph,
+    );
+    expect(splits.entries[1].duplicateOfIndex).toBeNull();
+  });
+
+  test('a collapsed duplicate group blocks when any member does', () => {
+    const dup = proposal('dependency_add', edge(951, 4242));
+    const combined = combineTopologyDispositions(
+      [dup, { ...dup, disposition: 'blocking' }],
+      [
+        { index: 0, disposition: 'advisory' },
+        { index: 1, disposition: 'advisory' },
+      ],
+      graph,
+    );
+    expect(combined.anyBlocking).toBe(true);
+    expect(combined.effective.map((e) => e.escalates)).toEqual([true, true]);
+  });
+
+  test('duplicated no-ops still collapse to no handoff', () => {
+    const dup = proposal('dependency_add', edge(951, 950), 'blocking');
+    const combined = combineTopologyDispositions([dup, dup], [], graph);
+    expect(combined.anyBlocking).toBe(false);
+    expect(combined.normalization.counts).toEqual({
+      already_satisfied: 2,
+      effective_change: 0,
+      invalid_or_unverifiable: 0,
+    });
+  });
+
+  test('the classification vocabulary is closed', () => {
+    expect([...REFINEMENT_TOPOLOGY_NORMALIZATIONS]).toEqual([
+      'already_satisfied',
+      'effective_change',
+      'invalid_or_unverifiable',
+    ]);
   });
 });
 
@@ -998,7 +2172,8 @@ describe('supporting checks', () => {
     expect(codex.profile.cmd).toBe('codex');
     expect(codex.profile.provider).toBe('openai');
     expect(codex.profile.argv).toEqual([
-      'exec', '--sandbox', 'read-only', '--skip-git-repo-check', '-c', 'model_reasoning_effort=high',
+      'exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--ignore-user-config', '-c',
+      'model_reasoning_effort=high',
     ]);
     expect(codex.profile.model).toBeUndefined(); // CLI default: absent stays absent
     expect(codex.profile.toolPolicy).toBe('no-tools');
@@ -1074,6 +2249,116 @@ describe('supporting checks', () => {
     expect(prompt).toContain('REVISION round');
     expect(prompt).toContain('unsupported');
     expect(world[10].issue.number).toBe(10);
+  });
+
+  // #999: a still-open, reviewed `status:stack-ready` predecessor is the
+  // repository's normal stacked-branch state, not an undelivered one — both
+  // agents must be told so explicitly, in-band with the snapshot they judge.
+  const stackReadySnapshot = {
+    predecessorFingerprint: 'f'.repeat(64),
+    predecessors: [
+      {
+        issueNumber: 975,
+        issueState: 'open',
+        shape: 'open_stack_ready',
+        stackReady: true,
+        pullRequest: { number: 997, state: 'open', headRefName: 'ai/issue-975' },
+      },
+    ],
+    target: { issueNumber: 976, title: 'Downstream' },
+    manifest: {},
+  };
+
+  test('the refiner prompt explains open_stack_ready predecessor semantics', () => {
+    const prompt = buildRefinerPrompt({
+      snapshot: stackReadySnapshot,
+      nonce: 'aaaa',
+      round: 1,
+      previousContract: null,
+      objections: null,
+    });
+    expect(prompt).toContain('stacked-branch workflow');
+    expect(prompt).toContain('open_stack_ready');
+    expect(prompt).toContain('not evidence that the predecessor\'s work is missing');
+  });
+
+  test('the critic prompt explains open_stack_ready predecessor semantics and forbids blocking solely on unmerged state', () => {
+    const prompt = buildCriticPrompt({
+      snapshot: stackReadySnapshot,
+      nonce: 'bbbb',
+      contract: refinerRecord(),
+    });
+    expect(prompt).toContain('stacked-branch workflow');
+    expect(prompt).toContain('open_stack_ready');
+    expect(prompt).toContain(
+      'NOT by itself predecessor evidence contradicting the draft when that predecessor\'s snapshot `shape` is `open_stack_ready`',
+    );
+    expect(prompt).toContain('do not import concerns about unrelated Issues or defects');
+  });
+
+  // §5.1 (issue #983): both prompts embed the SAME serialization of the same
+  // frozen snapshot — evidence entries included — inside the untrusted fence,
+  // which is what makes the refiner's and the critic's evidence byte-identical
+  // rather than merely equivalent.
+  test('both prompts carry byte-identical §5.1 evidence inside the untrusted fence', () => {
+    const withEvidence = {
+      ...stackReadySnapshot,
+      evidence: [
+        {
+          index: 0,
+          selector: {
+            issueNumber: 975,
+            path: 'src/core/x.ts',
+            exportName: 'Selection',
+            lines: null,
+            maxBytes: null,
+          },
+          status: 'captured',
+          omissionReason: null,
+          detail: null,
+          source: {
+            issueNumber: 975,
+            prNumber: 997,
+            shape: 'open_stack_ready',
+            headRefName: 'ai/issue-975',
+            commitSha: 'c'.repeat(40),
+          },
+          content: 'export type Selection = { kind: "dispatch" };',
+          maxBytesApplied: 8000,
+          truncated: false,
+        },
+        {
+          index: 1,
+          selector: null,
+          status: 'omitted',
+          omissionReason: 'missing_path',
+          detail: null,
+          source: null,
+          content: null,
+          maxBytesApplied: null,
+          truncated: false,
+        },
+      ],
+    };
+    const refiner = buildRefinerPrompt({
+      snapshot: withEvidence,
+      nonce: 'cccc',
+      round: 1,
+      previousContract: null,
+      objections: null,
+    });
+    const critic = buildCriticPrompt({ snapshot: withEvidence, nonce: 'cccc', contract: refinerRecord() });
+    const fenceBody = (p) =>
+      p
+        .split('--- BEGIN UNTRUSTED SNAPSHOT DATA cccc ---')[1]
+        .split('--- END UNTRUSTED SNAPSHOT DATA cccc ---')[0];
+    expect(fenceBody(refiner)).toBe(fenceBody(critic));
+    expect(fenceBody(refiner)).toContain('"evidence"');
+    expect(fenceBody(refiner)).toContain('export type Selection');
+    for (const prompt of [refiner, critic]) {
+      expect(prompt).toContain('Declared evidence:');
+      expect(prompt).toContain('Do not guess, reconstruct, or substitute its content');
+    }
   });
 });
 
@@ -1256,6 +2541,127 @@ describe('gh snapshot source — readChangedPaths pagination', () => {
     expect(Array.isArray(result)).toBe(true);
     expect(result).toHaveLength(3000);
     expect(calls).toHaveLength(30);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// gh snapshot adapter — §5.1 evidence read (issue #983)
+// ---------------------------------------------------------------------------
+
+describe('gh snapshot source — readPredecessorEvidence', () => {
+  function sourceWithResponses(responses) {
+    const calls = [];
+    const source = createGhRefinementSnapshotSource({
+      githubRepo: 'm2dw/repo',
+      artifactRoot: '/tmp/unused-artifacts',
+      runGh: (args) => {
+        calls.push(args);
+        const next = responses.shift();
+        if (next instanceof Error) throw next;
+        return JSON.stringify(next);
+      },
+    });
+    return { source, calls };
+  }
+
+  const request = {
+    issueNumber: 950,
+    prNumber: 968,
+    headRefName: 'ai/issue-950',
+    commitSha: 'a'.repeat(40),
+    path: 'src/core/review-dispute-turn.ts',
+    maxBytes: 1024,
+  };
+
+  test('reads the file at exactly the pinned commit and echoes it as provenance', async () => {
+    const content = 'export type DisputeTurnSelection = { kind: "dispatch" };\n';
+    const { source, calls } = sourceWithResponses([
+      { type: 'file', encoding: 'base64', content: Buffer.from(content, 'utf8').toString('base64') },
+    ]);
+    const result = await source.readPredecessorEvidence(request);
+    expect(result).toEqual({ kind: 'found', content, resolvedCommitSha: 'a'.repeat(40) });
+    // The commit SHA — never the head ref name — addresses the read.
+    expect(calls).toEqual([
+      ['api', `repos/m2dw/repo/contents/src/core/review-dispute-turn.ts?ref=${'a'.repeat(40)}`],
+    ]);
+  });
+
+  test('a 1MB-plus file falls back to the blob API by object id, still pinned bytes', async () => {
+    const content = 'big file bytes\n';
+    const { source, calls } = sourceWithResponses([
+      { type: 'file', encoding: 'none', content: '', sha: 'blob1' },
+      { encoding: 'base64', content: Buffer.from(content, 'utf8').toString('base64') },
+    ]);
+    const result = await source.readPredecessorEvidence(request);
+    expect(result).toEqual({ kind: 'found', content, resolvedCommitSha: 'a'.repeat(40) });
+    expect(calls[1]).toEqual(['api', 'repos/m2dw/repo/git/blobs/blob1']);
+  });
+
+  test('a blob too large for the runner buffer is an unavailable omission, never fetched', async () => {
+    // 64 MiB of file bytes would base64-inflate past the gh runner's own
+    // 64 MiB buffer, so the adapter must decide from the Contents API `size`
+    // alone instead of starting a download that dies as a transient.
+    const size = 64 * 1024 * 1024;
+    const { source, calls } = sourceWithResponses([
+      { type: 'file', encoding: 'none', content: '', sha: 'blob1', size },
+    ]);
+    const result = await source.readPredecessorEvidence(request);
+    expect(result).toEqual({ kind: 'unavailable', detail: `oversized=${size}` });
+    expect(calls).toHaveLength(1);
+  });
+
+  test('oversize content is sliced toward the requested read bound, never returned whole', async () => {
+    const { source } = sourceWithResponses([
+      {
+        type: 'file',
+        encoding: 'base64',
+        content: Buffer.from('x'.repeat(5000), 'utf8').toString('base64'),
+      },
+    ]);
+    const result = await source.readPredecessorEvidence(request);
+    expect(result.kind).toBe('found');
+    expect(result.content).toBe('x'.repeat(1024));
+  });
+
+  test('a non-ASCII file is truncated at the UTF-8 byte cap, not at 1024 code units', async () => {
+    // 2000 three-byte characters: a code-unit slice would return 1024
+    // CHARACTERS — 3072 bytes, three times the requested read bound.
+    const { source } = sourceWithResponses([
+      {
+        type: 'file',
+        encoding: 'base64',
+        content: Buffer.from('あ'.repeat(2000), 'utf8').toString('base64'),
+      },
+    ]);
+    const result = await source.readPredecessorEvidence(request);
+    expect(result.kind).toBe('found');
+    // 1024 bytes is 341 whole characters plus one dangling lead byte, which
+    // decodes as a single replacement character: the decoded length stays at
+    // the cap or just past it, so the core's one-byte-past truncation probe
+    // still fires while the read bound holds.
+    expect(result.content).toBe('あ'.repeat(341) + '�');
+    expect(Buffer.byteLength(result.content, 'utf8')).toBe(1026);
+  });
+
+  test('a 404 is missing_path; directories and symlinks are not file evidence', async () => {
+    const notFound = sourceWithResponses([new Error('gh: Not Found (HTTP 404)')]);
+    expect(await notFound.source.readPredecessorEvidence(request)).toEqual({
+      kind: 'missing_path',
+    });
+    const directory = sourceWithResponses([[{ type: 'file', path: 'src/core/a.ts' }]]);
+    expect(await directory.source.readPredecessorEvidence(request)).toEqual({
+      kind: 'missing_path',
+    });
+    const symlink = sourceWithResponses([{ type: 'symlink', target: 'elsewhere' }]);
+    expect(await symlink.source.readPredecessorEvidence(request)).toEqual({
+      kind: 'unavailable',
+      detail: 'type=symlink',
+    });
+  });
+
+  test('a transient provider failure propagates as a throw, never as an omission shape', async () => {
+    const { source } = sourceWithResponses([new Error('gh: HTTP 500')]);
+    await expect(source.readPredecessorEvidence(request)).rejects.toThrow('HTTP 500');
   });
 });
 
@@ -1635,7 +3041,12 @@ describe('admin refinement run — CLI', () => {
     expect(calls.filter((c) => c === 'appendEvent' || c === 'transitionTask')).toHaveLength(0);
     const commits = calls.filter((c) => c.method === 'completePhaseWithEffects');
     expect(commits).toHaveLength(1);
-    expect(commits[0].effects).toBe(0);
+    // Issue #976: one append-only comment effect per committed progress
+    // milestone, in the SAME call as the milestones — never a second write a
+    // crash could land on one side of.
+    const milestones = output.events.filter((t) => t === 'refinement.progress.milestone').length;
+    expect(milestones).toBeGreaterThan(0);
+    expect(commits[0].effects).toBe(milestones);
     expect(commits[0].events).toEqual(output.events);
 
     const persisted = (await store.listEvents({ sessionId: 'addon-dev', issueNumber: 500 }))
@@ -1673,9 +3084,16 @@ describe('admin refinement run — CLI', () => {
     const outbox = new SqliteOutboxStore(dbPath);
     try {
       const rows = await outbox.listUnsent();
-      expect(rows.map((r) => r.topic)).toEqual(['gh:label:add', 'gh:comment']);
-      expect(rows[0].payload).toMatchObject({ issueNumber: 500, label: 'ai:ready-for-human' });
-      const body = rows[1].payload.body;
+      // Issue #976: the §15 progress comments lead — the boundaries the run
+      // crossed — and §13's label and handoff comment close the sequence, so an
+      // operator reads what happened before what to do about it.
+      expect(rows.slice(0, -2).every((r) => r.payload.body.includes('ai-refinement:progress'))).toBe(true);
+      const label = rows[rows.length - 2];
+      const handoff = rows[rows.length - 1];
+      expect(label.topic).toBe('gh:label:add');
+      expect(handoff.topic).toBe('gh:comment');
+      expect(label.payload).toMatchObject({ issueNumber: 500, label: 'ai:ready-for-human' });
+      const body = handoff.payload.body;
       expect(body).toContain('`critique_blocked`');
       expect(body).toContain('`escalated_human`');
       // §16: the role metadata is configuration, never the run id or a path.
@@ -1687,11 +3105,24 @@ describe('admin refinement run — CLI', () => {
     }
   });
 
-  test('an accepted run publishes nothing — only a handoff is public', async () => {
-    await capture(() => runRefinementRun(ARGS(), cliDeps()));
+  // Issue #976: an accepted run is not silent any more — it publishes the
+  // §15 progress boundaries it crossed. What it still must not publish is a
+  // label, a body write, or anything else the lane keeps to itself: only a
+  // handoff moves labels.
+  test('an accepted run publishes its progress comments and nothing else', async () => {
+    const output = await capture(() => runRefinementRun(ARGS(), cliDeps()));
     const outbox = new SqliteOutboxStore(dbPath);
     try {
-      expect(await outbox.listUnsent()).toHaveLength(0);
+      const rows = await outbox.listUnsent();
+      expect(rows.map((r) => r.topic)).toEqual(
+        rows.map(() => 'gh:comment'),
+      );
+      expect(rows).toHaveLength(
+        output.events.filter((t) => t === 'refinement.progress.milestone').length,
+      );
+      expect(rows.every((r) => r.payload.body.includes('ai-refinement:progress'))).toBe(true);
+      // Never the fingerprint that identifies the refinement, and never a path.
+      expect(rows.every((r) => !r.payload.body.includes(tmpDir))).toBe(true);
     } finally {
       outbox.close();
     }

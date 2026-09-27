@@ -50,7 +50,11 @@
  * untouched, because nothing upstream of it changes.
  */
 
-import { validateChainGraph } from "./chain-graph.js";
+import {
+  chainDiagnosticOwners,
+  describeChainOwnership,
+  validateChainGraph,
+} from "./chain-graph.js";
 import type {
   CanonicalChainGraph,
   ChainGraphDiagnostic,
@@ -262,7 +266,10 @@ export function ownedElsewhereChainAdvancedRefusal(
   const sorted = [...owners].sort(
     (a, b) => a.issueNumber - b.issueNumber || (a.chainId < b.chainId ? -1 : a.chainId > b.chainId ? 1 : 0),
   );
-  const rendered = sorted.map((o) => `#${o.issueNumber} (${o.chainId})`).join(", ");
+  // See the linear refusal: the owning chain is named with whatever identity
+  // the caller collected, because an Issue number alone is not one (#1045).
+  const rendered = sorted.map((o) => describeChainOwnership(o)).join(", ");
+  const identified = chainDiagnosticOwners(sorted);
   return refusal(
     "structural",
     false,
@@ -278,6 +285,7 @@ export function ownedElsewhereChainAdvancedRefusal(
           observedEdges: [],
           expectedEdges: [],
           chains: [...new Set(sorted.map((o) => o.chainId))].sort(),
+          ...(identified.length > 0 ? { owners: identified } : {}),
           message: `issues ${sorted.map((o) => o.issueNumber).join(", ")} already belong to another chain`,
         },
       ],

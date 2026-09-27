@@ -2,11 +2,13 @@ import { spawnSync } from "child_process";
 import { createSign } from "crypto";
 import { readFileSync } from "fs";
 import { request as httpsRequest } from "https";
-import { homedir } from "os";
 import { join } from "path";
 import { URL } from "url";
+import { resolveHomeDir } from "../../core/home-dir.js";
+import { OUTBOX_GITHUB_APP_TOKEN_EXCHANGE_DEADLINE_MS } from "../../core/outbox-transport-deadline.js";
+import { bothStreamsCommandRunner } from "../../handlers/command-runner.js";
 import type { GitHubAppAuthConfig, ProviderAuthConfig } from "../../core/session.js";
-import { defaultGhRunner, type GhRunner } from "./gh-runner.js";
+import { defaultGhRunner, ghChildOptions, type GhRunner } from "./gh-runner.js";
 
 // ---------------------------------------------------------------------------
 // GitHub App authentication
@@ -73,33 +75,65 @@ export class GitHubAuthConfigError extends Error {
   }
 }
 
-/** Default JSON POST transport over Node `https` (no global `fetch` dependency). */
-const defaultHttpPostJson: HttpPostJson = (url, opts) =>
-  new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const req = httpsRequest(
-      {
-        method: "POST",
-        hostname: u.hostname,
-        port: u.port || 443,
-        path: `${u.pathname}${u.search}`,
-        headers: { ...opts.headers, "Content-Length": Buffer.byteLength(opts.body) },
-      },
-      (res) => {
-        let data = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => {
-          data += chunk;
-        });
-        res.on("end", () => {
-          resolve({ status: res.statusCode ?? 0, statusText: res.statusMessage ?? "", body: data });
-        });
-      },
-    );
-    req.on("error", reject);
-    req.write(opts.body);
-    req.end();
-  });
+/**
+ * Default JSON POST transport over Node `https` (no global `fetch` dependency),
+ * bounded by a single wall-clock deadline (issue #1064).
+ *
+ * The deadline covers the WHOLE exchange — connect, request, and the reading of
+ * the response body — because a server that accepts the connection and then goes
+ * quiet mid-body stalls just as completely as one that never answers, and this
+ * exchange sits in front of every GitHub App outbox dispatch. On expiry the
+ * request is destroyed, which is what actually releases the socket; the promise
+ * then rejects through the existing `error` path.
+ */
+export function createHttpPostJson(timeoutMs: number): HttpPostJson {
+  return (url, opts) =>
+    new Promise((resolve, reject) => {
+      const u = new URL(url);
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        req.destroy();
+        reject(new Error(`GitHub App token exchange timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      // Every settled path clears the timer, so it never outlives the request.
+      const finish = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn();
+      };
+      const req = httpsRequest(
+        {
+          method: "POST",
+          hostname: u.hostname,
+          port: u.port || 443,
+          path: `${u.pathname}${u.search}`,
+          headers: { ...opts.headers, "Content-Length": Buffer.byteLength(opts.body) },
+        },
+        (res) => {
+          let data = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            data += chunk;
+          });
+          res.on("end", () => {
+            finish(() =>
+              resolve({ status: res.statusCode ?? 0, statusText: res.statusMessage ?? "", body: data }),
+            );
+          });
+        },
+      );
+      req.on("error", (err) => finish(() => reject(err)));
+      req.write(opts.body);
+      req.end();
+    });
+}
+
+const defaultHttpPostJson: HttpPostJson = createHttpPostJson(
+  OUTBOX_GITHUB_APP_TOKEN_EXCHANGE_DEADLINE_MS,
+);
 
 /**
  * Default synchronous JSON POST transport. Node has no synchronous HTTPS, so the
@@ -107,8 +141,23 @@ const defaultHttpPostJson: HttpPostJson = (url, opts) =>
  * `spawnSync`. Secrets (the app JWT in the Authorization header) are passed on
  * stdin — never on argv — so they cannot leak into a process listing, and only
  * the `{status, statusText, body}` envelope is read back from stdout.
+ *
+ * Bounded by `timeoutMs` (issue #1064). This is the refresh path the synchronous
+ * `gh` runner takes when a cached token has expired, so it runs INSIDE an outbox
+ * dispatch attempt with the event loop blocked: an unbounded exchange here stalls
+ * the row, every row behind it, and the claim-renewal timer all at once. The
+ * child is a plain Node process with no signal handlers, so `spawnSync`'s own
+ * `SIGTERM` is enough to end it — there is no group of helpers to sweep.
  */
-const defaultHttpPostJsonSync: HttpPostJsonSync = (url, opts) => {
+export function createHttpPostJsonSync(timeoutMs: number): HttpPostJsonSync {
+  return (url, opts) => defaultHttpPostJsonSyncImpl(url, opts, timeoutMs);
+}
+
+const defaultHttpPostJsonSyncImpl = (
+  url: string,
+  opts: { headers: Record<string, string>; body: string },
+  timeoutMs: number,
+): { status: number; statusText: string; body: string } => {
   const child = `
     const https = require("https");
     const { URL } = require("url");
@@ -148,7 +197,14 @@ const defaultHttpPostJsonSync: HttpPostJsonSync = (url, opts) => {
     input: JSON.stringify({ url, headers: opts.headers, body: opts.body }),
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
+    timeout: timeoutMs,
   });
+  if (wasKilledByDeadline(result)) {
+    // Say the deadline explicitly rather than reporting a bare non-zero
+    // subprocess exit: the two are diagnosed differently, and a token exchange
+    // that hung is a transient failure the row should retry on its own budget.
+    throw new Error(`GitHub App token exchange timed out after ${timeoutMs}ms`);
+  }
   if (result.status !== 0) {
     // stderr carries only the network error message (never the JWT/body); the
     // caller redacts regardless as defense in depth.
@@ -156,6 +212,25 @@ const defaultHttpPostJsonSync: HttpPostJsonSync = (url, opts) => {
   }
   return JSON.parse(result.stdout) as { status: number; statusText: string; body: string };
 };
+
+/**
+ * Whether `spawnSync` ended the child because its `timeout` expired. Node
+ * reports that either through `error.code === "ETIMEDOUT"` or — depending on
+ * platform and how the child died — through the delivered kill signal alone.
+ * Mirrors `wasKilledByTimeout` in providers/gitea/gitea-client.ts.
+ */
+function wasKilledByDeadline(result: {
+  error?: Error;
+  status: number | null;
+  signal: NodeJS.Signals | null;
+}): boolean {
+  const code = (result.error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ETIMEDOUT" || (result.status === null && result.signal !== null);
+}
+
+const defaultHttpPostJsonSync: HttpPostJsonSync = createHttpPostJsonSync(
+  OUTBOX_GITHUB_APP_TOKEN_EXCHANGE_DEADLINE_MS,
+);
 
 function base64url(input: Buffer | string): string {
   return Buffer.from(input).toString("base64url");
@@ -450,8 +525,8 @@ export interface GitHubAppCredentials {
 }
 
 function expandHome(p: string): string {
-  if (p === "~") return homedir();
-  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  if (p === "~") return resolveHomeDir();
+  if (p.startsWith("~/")) return join(resolveHomeDir(), p.slice(2));
   return p;
 }
 
@@ -567,17 +642,29 @@ export function ghRunnerWithToken(getToken: () => string): GhRunner {
           ),
         };
       }
-      const result = spawnSync("gh", args, {
-        cwd: opts.cwd,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
+      // Routed through the shared command runner (issue #1064) so a deadline
+      // given here gets the same cancellation the default `gh` executor has —
+      // the watchdog that force-kills a child which outlived its deadline
+      // signal, and the process-group sweep afterwards. Without it, the App
+      // path would be the one `gh` route an outbox deadline could not stop.
+      const result = bothStreamsCommandRunner.run("gh", args, {
+        ...ghChildOptions(opts),
         env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token },
-        timeout: opts.timeout,
       });
       return {
-        exitCode: result.status ?? 1,
-        stdout: result.stdout ?? "",
-        stderr: result.stderr ?? "",
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        ...(result.timedOut === undefined ? {} : { timedOut: result.timedOut }),
+        ...(result.signal === undefined ? {} : { signal: result.signal }),
+        ...(result.spawnErrorCode === undefined ? {} : { spawnErrorCode: result.spawnErrorCode }),
+        ...(result.durationMs === undefined ? {} : { durationMs: result.durationMs }),
+        ...(result.deadlineEscalated === undefined
+          ? {}
+          : { deadlineEscalated: result.deadlineEscalated }),
+        ...(result.processTreeCleanup === undefined
+          ? {}
+          : { processGroupTerminated: result.processTreeCleanup.processGroupTerminated }),
       };
     },
   };

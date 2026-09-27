@@ -1,42 +1,43 @@
+/**
+ * Behavioural coverage of the admin CLI. Since issue #1018 these cases drive the
+ * dispatcher in-process through the shared harness instead of spawning a Node
+ * process each; the real-executable contract (argv parsing, exit status, stream
+ * separation, env isolation) lives in `admin-cli-subprocess.test.js`.
+ */
+import { jest } from '@jest/globals';
 import { execFileSync } from 'child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteTaskStore } from '../dist/index.js';
 import { CLI_PROBE_INDETERMINATE_MARKER, CLI_PROBE_STUB_ENV } from '../dist/core/cli-probe.js';
+import { runAdmin } from './helpers/admin-cli.js';
+import { runUntilProbeAnswers } from './helpers/cli-probe.js';
 
-const CLI = new URL('../dist/cli/admin.js', import.meta.url).pathname;
+// These cases were synchronous before the #1018 migration, so Jest's 5s default
+// could never fire mid-body. They await now, and several still fork real git and
+// agent-CLI probes, so give the whole file the same headroom the other
+// spawn-touching suites use rather than letting a loaded runner flake.
+jest.setTimeout(30_000);
 
 let tmpDir;
 let dbPath;
 let lockDir;
 
-function run(...args) {
-  try {
-    const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
-    return { code: 0, stdout };
-  } catch (err) {
-    return { code: err.status ?? 1, stdout: err.stdout ?? '' };
-  }
+async function run(...args) {
+  return runAdmin(args);
 }
 
 // runJson appends --json so the structured stdout contract is exercised even for
 // operator-facing commands that now default to human-readable text (issue #308).
-function runJson(...args) {
+async function runJson(...args) {
   return run(...args, '--json');
 }
 
-// runFull also captures stderr, used to assert the human-mode error stream.
-function runFull(...args) {
-  try {
-    const stdout = execFileSync(process.execPath, [CLI, ...args], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    return { code: 0, stdout, stderr: '' };
-  } catch (err) {
-    return { code: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
-  }
+// runFull is retained as an alias: the harness always captures stderr, so the
+// distinction the subprocess helper needed no longer exists.
+async function runFull(...args) {
+  return run(...args);
 }
 
 function parse(result) {
@@ -54,23 +55,23 @@ afterEach(() => {
 });
 
 describe('admin CLI — help subcommand', () => {
-  test('no args exits 0 and prints human-readable help', () => {
-    const r = run();
+  test('no args exits 0 and prints human-readable help', async () => {
+    const r = await run();
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('admin');
     expect(r.stdout).toContain('help');
     expect(r.stdout).toContain('task-status');
   });
 
-  test('"help --json" still prints human-readable help (help is carved out of --json)', () => {
-    const r = run('help', '--json');
+  test('"help --json" still prints human-readable help (help is carved out of --json)', async () => {
+    const r = await run('help', '--json');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('task-status');
     expect(() => JSON.parse(r.stdout.trim())).toThrow();
   });
 
-  test('"help" subcommand exits 0 and lists all commands', () => {
-    const r = run('help');
+  test('"help" subcommand exits 0 and lists all commands', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('help');
     expect(r.stdout).toContain('task-status');
@@ -80,8 +81,8 @@ describe('admin CLI — help subcommand', () => {
     expect(r.stdout).toContain('dispatch-outbox');
   });
 
-  test('"help <subcommand>" exits 0 and shows options for that subcommand', () => {
-    const r = run('help', 'task-status');
+  test('"help <subcommand>" exits 0 and shows options for that subcommand', async () => {
+    const r = await run('help', 'task-status');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('task-status');
     expect(r.stdout).toContain('--session-id');
@@ -89,35 +90,35 @@ describe('admin CLI — help subcommand', () => {
     expect(r.stdout).toContain('--db-path');
   });
 
-  test('"help <unknown>" exits non-zero', () => {
-    const r = run('help', 'no-such-command');
+  test('"help <unknown>" exits non-zero', async () => {
+    const r = await run('help', 'no-such-command');
     expect(r.code).not.toBe(0);
   });
 });
 
 describe('admin CLI — unknown subcommand', () => {
-  test('unknown subcommand exits non-zero', () => {
-    const r = run('bogus-command');
+  test('unknown subcommand exits non-zero', async () => {
+    const r = await run('bogus-command');
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('bogus-command') });
   });
 });
 
 describe('admin CLI — task-status subcommand', () => {
-  test('missing --session-id exits non-zero', () => {
-    const r = runJson('task-status', '--db-path', dbPath);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await runJson('task-status', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('invalid --issue-number exits non-zero', () => {
-    const r = runJson('task-status', '--session-id', 'addon-dev', '--issue-number', 'abc', '--db-path', dbPath);
+  test('invalid --issue-number exits non-zero', async () => {
+    const r = await runJson('task-status', '--session-id', 'addon-dev', '--issue-number', 'abc', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('issue-number') });
   });
 
-  test('returns empty task list when no tasks exist', () => {
-    const r = runJson('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('returns empty task list when no tasks exist', async () => {
+    const r = await runJson('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, sessionId: 'addon-dev', tasks: [] });
   });
@@ -128,7 +129,7 @@ describe('admin CLI — task-status subcommand', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 20, phase: 'implementation' });
     store.close();
 
-    const r = runJson('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -143,7 +144,7 @@ describe('admin CLI — task-status subcommand', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 20, phase: 'implementation' });
     store.close();
 
-    const r = runJson('task-status', '--session-id', 'addon-dev', '--issue-number', '10', '--db-path', dbPath);
+    const r = await runJson('task-status', '--session-id', 'addon-dev', '--issue-number', '10', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -152,8 +153,8 @@ describe('admin CLI — task-status subcommand', () => {
     expect(out.tasks[0]).toMatchObject({ issueNumber: 10, phase: 'research' });
   });
 
-  test('--issue-number returns empty list when task does not exist', () => {
-    const r = runJson('task-status', '--session-id', 'addon-dev', '--issue-number', '999', '--db-path', dbPath);
+  test('--issue-number returns empty list when task does not exist', async () => {
+    const r = await runJson('task-status', '--session-id', 'addon-dev', '--issue-number', '999', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -166,7 +167,7 @@ describe('admin CLI — task-status subcommand', () => {
     await store.enqueueTask({ sessionId: 'session-b', issueNumber: 2, phase: 'implementation' });
     store.close();
 
-    const r = runJson('task-status', '--session-id', 'session-a', '--db-path', dbPath);
+    const r = await runJson('task-status', '--session-id', 'session-a', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.tasks).toHaveLength(1);
@@ -178,7 +179,7 @@ describe('admin CLI — task-status subcommand', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 5, phase: 'review', priority: 'high' });
     store.close();
 
-    const r = runJson('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
     const out = parse(r);
     const task = out.tasks[0];
     expect(task).toHaveProperty('sessionId');
@@ -192,14 +193,14 @@ describe('admin CLI — task-status subcommand', () => {
 });
 
 describe('admin CLI — list-stuck subcommand', () => {
-  test('missing --session-id exits non-zero', () => {
-    const r = runJson('list-stuck', '--db-path', dbPath);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await runJson('list-stuck', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('returns empty categories when no tasks exist', () => {
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('returns empty categories when no tasks exist', async () => {
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({
@@ -223,7 +224,7 @@ describe('admin CLI — list-stuck subcommand', () => {
     );
     store.close();
 
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.summary.failed).toBe(1);
@@ -244,7 +245,7 @@ describe('admin CLI — list-stuck subcommand', () => {
     );
     store.close();
 
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.summary.stale).toBe(1);
@@ -265,7 +266,7 @@ describe('admin CLI — list-stuck subcommand', () => {
     );
     store.close();
 
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.summary.mismatched).toBe(1);
@@ -283,7 +284,7 @@ describe('admin CLI — list-stuck subcommand', () => {
     );
     store.close();
 
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.summary.mismatched).toBe(1);
@@ -296,7 +297,7 @@ describe('admin CLI — list-stuck subcommand', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 5, phase: 'research' });
     store.close();
 
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.summary.total).toBe(0);
@@ -316,7 +317,7 @@ describe('admin CLI — list-stuck subcommand', () => {
     );
     store.close();
 
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.summary.total).toBe(0);
@@ -332,7 +333,7 @@ describe('admin CLI — list-stuck subcommand', () => {
     );
     store.close();
 
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.summary.noLease).toBe(1);
@@ -342,8 +343,8 @@ describe('admin CLI — list-stuck subcommand', () => {
     expect(out.mismatched).toHaveLength(0);
   });
 
-  test('output includes now, summary, and all four category arrays', () => {
-    const r = runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('output includes now, summary, and all four category arrays', async () => {
+    const r = await runJson('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toHaveProperty('ok', true);
@@ -356,34 +357,34 @@ describe('admin CLI — list-stuck subcommand', () => {
     expect(out).toHaveProperty('noLease');
   });
 
-  test('list-stuck appears in help output', () => {
-    const r = run('help');
+  test('list-stuck appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('list-stuck');
   });
 });
 
 describe('admin CLI — recover subcommand', () => {
-  test('missing --session-id exits non-zero', () => {
-    const r = runJson('recover', '--db-path', dbPath);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await runJson('recover', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('invalid --issue-number exits non-zero', () => {
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', 'abc', '--db-path', dbPath);
+  test('invalid --issue-number exits non-zero', async () => {
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', 'abc', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('issue-number') });
   });
 
-  test('invalid --phase exits non-zero', () => {
-    const r = runJson('recover', '--session-id', 'addon-dev', '--phase', 'bogus-phase', '--db-path', dbPath);
+  test('invalid --phase exits non-zero', async () => {
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--phase', 'bogus-phase', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('phase') });
   });
 
-  test('returns empty recovered list when no recoverable tasks exist', () => {
-    const r = runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('returns empty recovered list when no recoverable tasks exist', async () => {
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({ ok: true, sessionId: 'addon-dev', recovered: [], skipped: [] });
@@ -403,7 +404,7 @@ describe('admin CLI — recover subcommand', () => {
       );
       store.close();
 
-      const r = runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath, typo);
+      const r = await runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath, typo);
       expect(r.code).not.toBe(0);
       expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining(typo.slice(2)) });
 
@@ -415,20 +416,20 @@ describe('admin CLI — recover subcommand', () => {
     },
   );
 
-  test('--dry-ru error suggests the closest valid option', () => {
-    const r = runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath, '--dry-ru');
+  test('--dry-ru error suggests the closest valid option', async () => {
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath, '--dry-ru');
     expect(r.code).not.toBe(0);
     expect(parse(r).error).toContain('did you mean --dry-run?');
   });
 
-  test('an unknown value-style flag is rejected', () => {
-    const r = runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath, '--bogus', 'x');
+  test('an unknown value-style flag is rejected', async () => {
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath, '--bogus', 'x');
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('bogus') });
   });
 
-  test('a value flag with no following value is rejected', () => {
-    const r = runJson('recover', '--db-path', dbPath, '--session-id');
+  test('a value flag with no following value is rejected', async () => {
+    const r = await runJson('recover', '--db-path', dbPath, '--session-id');
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id requires a value') });
   });
@@ -443,7 +444,7 @@ describe('admin CLI — recover subcommand', () => {
     );
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -459,7 +460,7 @@ describe('admin CLI — recover subcommand', () => {
     await store.transitionTask({ sessionId: 'addon-dev', issueNumber: 2 }, { status: 'queued' }, { status: 'failed', lastError: 'err' });
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '1', '--db-path', dbPath);
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '1', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.recovered).toHaveLength(1);
@@ -472,7 +473,7 @@ describe('admin CLI — recover subcommand', () => {
     await store.transitionTask({ sessionId: 'addon-dev', issueNumber: 3 }, { status: 'queued' }, { status: 'failed', lastError: 'err' });
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '3', '--phase', 'review', '--db-path', dbPath);
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '3', '--phase', 'review', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.recovered).toHaveLength(1);
@@ -485,7 +486,7 @@ describe('admin CLI — recover subcommand', () => {
     await store.transitionTask({ sessionId: 'addon-dev', issueNumber: 4 }, { status: 'queued' }, { status: 'failed', lastError: 'err' });
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath);
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.dryRun).toBe(true);
@@ -499,26 +500,26 @@ describe('admin CLI — recover subcommand', () => {
     expect(task?.status).toBe('failed');
   });
 
-  test('recover appears in help output', () => {
-    const r = run('help');
+  test('recover appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('recover');
   });
 
-  test('"help recover" states that omitting --phase preserves the task\'s current phase', () => {
-    const r = run('help', 'recover');
+  test('"help recover" states that omitting --phase preserves the task\'s current phase', async () => {
+    const r = await run('help', 'recover');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("current phase");
   });
 
-  test('invalid --from value exits non-zero', () => {
-    const r = runJson('recover', '--session-id', 'addon-dev', '--from', 'failed', '--phase', 'review', '--db-path', dbPath);
+  test('invalid --from value exits non-zero', async () => {
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--from', 'failed', '--phase', 'review', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('ready_for_human') });
   });
 
-  test('--from ready_for_human without --phase exits non-zero', () => {
-    const r = runJson('recover', '--session-id', 'addon-dev', '--from', 'ready_for_human', '--db-path', dbPath);
+  test('--from ready_for_human without --phase exits non-zero', async () => {
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--from', 'ready_for_human', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('--phase') });
   });
@@ -533,7 +534,7 @@ describe('admin CLI — recover subcommand', () => {
     );
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.recovered).toHaveLength(0);
@@ -554,7 +555,7 @@ describe('admin CLI — recover subcommand', () => {
     );
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '242',
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '242',
       '--from', 'ready_for_human', '--phase', 'conflict_resolution', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
@@ -578,6 +579,103 @@ describe('admin CLI — recover subcommand', () => {
     expect(task?.lastError).toBeUndefined();
   });
 
+  // Issue #984: the PIR handoff guidance used to tell operators to dispose of
+  // the stranded refinement task row with `admin task cancel` — which leaves a
+  // terminal `cancelled` row that ordinary implementation intake
+  // (`enqueueTask`) only reactivates from `blocked`, never from `cancelled`,
+  // so the Issue could never reach implementation again. The corrected
+  // guidance instead points at this same generic `admin recover --from
+  // ready_for_human --phase implementation` surface #951's operator used by
+  // hand. This test reproduces #951's escalated-refinement shape end to end.
+  test('--from ready_for_human --phase implementation moves a PIR-escalated refinement task to queued/implementation and it is claimable (#951/#984)', async () => {
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({
+      sessionId: 'addon-dev',
+      issueNumber: 951,
+      phase: 'refinement',
+      context: {
+        refinement: {
+          state: 'escalated_human',
+          handoffReason: 'no_convergence',
+          counters: { rounds: 2, malformedAttempts: { refiner: 0, critic: 0 }, agentFailures: { refiner: 0, critic: 0 }, staleRestarts: 0 },
+        },
+      },
+    });
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 951 },
+      { status: 'queued' },
+      { status: 'ready_for_human' },
+    );
+    store.close();
+
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '951',
+      '--from', 'ready_for_human', '--phase', 'implementation', '--db-path', dbPath);
+    expect(r.code).toBe(0);
+    const out = parse(r);
+    expect(out.recovered).toHaveLength(1);
+    expect(out.recovered[0]).toMatchObject({
+      issueNumber: 951,
+      status: 'queued',
+      phase: 'implementation',
+      previousStatus: 'ready_for_human',
+      previousPhase: 'refinement',
+    });
+
+    const store2 = new SqliteTaskStore(dbPath);
+    const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 951 });
+    expect(task?.status).toBe('queued');
+    expect(task?.phase).toBe('implementation');
+    // No cancelled row anywhere: the same row that carried the escalation now
+    // carries the implementation work.
+    expect(task?.context?.refinement?.state).toBe('escalated_human');
+
+    // Claimable by the implementation phase afterward — the acceptance bar
+    // `admin task cancel` could never clear, because a cancelled row is
+    // terminal and intake cannot reactivate it.
+    const claimed = await store2.claimNextTask({
+      sessionId: 'addon-dev',
+      workerId: 'w1',
+      runId: 'run-1',
+      supportedPhases: ['implementation'],
+    });
+    store2.close();
+    expect(claimed?.issueNumber).toBe(951);
+    expect(claimed?.status).toBe('claimed');
+    expect(claimed?.phase).toBe('implementation');
+  });
+
+  // Pins the exact failure #984 fixes: following the OLD guidance
+  // (`admin task cancel` instead of `admin recover`) leaves a terminal row
+  // that ordinary implementation intake cannot reactivate, permanently
+  // stranding the Issue even though its labels look executable.
+  test('the old guidance (admin task cancel) is a dead end: a cancelled row is never reactivated by implementation intake', async () => {
+    const store = new SqliteTaskStore(dbPath);
+    await store.enqueueTask({
+      sessionId: 'addon-dev',
+      issueNumber: 951,
+      phase: 'refinement',
+      context: { refinement: { state: 'escalated_human', handoffReason: 'no_convergence' } },
+    });
+    await store.transitionTask(
+      { sessionId: 'addon-dev', issueNumber: 951 },
+      { status: 'queued' },
+      { status: 'ready_for_human' },
+    );
+
+    const cancelled = await store.cancelTask({ sessionId: 'addon-dev', issueNumber: 951 });
+    expect(cancelled.ok).toBe(true);
+    expect(cancelled.value.status).toBe('cancelled');
+
+    // The labels now look right (status:needs-implementation added by hand),
+    // so the next intake poll re-enqueues at phase implementation — and hits
+    // the terminal row instead of starting work.
+    const reenqueued = await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 951, phase: 'implementation' });
+    store.close();
+    expect(reenqueued.ok).toBe(false);
+    expect(reenqueued.code).toBe('already_exists');
+    expect(reenqueued.current.status).toBe('cancelled');
+  });
+
   test('--from ready_for_human recovers all matching tasks when --issue-number is omitted', async () => {
     const store = new SqliteTaskStore(dbPath);
     for (const n of [10, 11]) {
@@ -589,7 +687,7 @@ describe('admin CLI — recover subcommand', () => {
     await store.transitionTask({ sessionId: 'addon-dev', issueNumber: 12 }, { status: 'queued' }, { status: 'failed', lastError: 'err' });
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--from', 'ready_for_human', '--phase', 'conflict_resolution', '--db-path', dbPath);
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--from', 'ready_for_human', '--phase', 'conflict_resolution', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.recovered).toHaveLength(2);
@@ -611,7 +709,7 @@ describe('admin CLI — recover subcommand', () => {
     );
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '242',
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '242',
       '--from', 'ready_for_human', '--phase', 'conflict_resolution', '--dry-run', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
@@ -668,7 +766,7 @@ describe('admin CLI — recover subcommand', () => {
   test('--from ready_for_human --phase review rejects an unresolved implementation Tool Request handoff', async () => {
     await seedToolRequestTask(300);
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '300',
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '300',
       '--from', 'ready_for_human', '--phase', 'review', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
@@ -692,7 +790,7 @@ describe('admin CLI — recover subcommand', () => {
   test('--from ready_for_human --phase review --dry-run previews the tool_request_unresolved skip', async () => {
     await seedToolRequestTask(300);
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '300',
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '300',
       '--from', 'ready_for_human', '--phase', 'review', '--dry-run', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
@@ -719,7 +817,7 @@ describe('admin CLI — recover subcommand', () => {
       },
     });
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '301',
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '301',
       '--from', 'ready_for_human', '--phase', 'review', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
@@ -757,7 +855,7 @@ describe('admin CLI — recover subcommand', () => {
     );
     store.close();
 
-    const r = runJson('recover', '--session-id', 'addon-dev', '--issue-number', '302',
+    const r = await runJson('recover', '--session-id', 'addon-dev', '--issue-number', '302',
       '--from', 'ready_for_human', '--phase', 'review', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
@@ -779,26 +877,26 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     );
   }
 
-  test('missing --session-id exits non-zero', () => {
-    const r = runJson('recover-cap-handoff', '--db-path', dbPath);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await runJson('recover-cap-handoff', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('invalid --issue-number exits non-zero', () => {
-    const r = runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--issue-number', 'abc', '--db-path', dbPath);
+  test('invalid --issue-number exits non-zero', async () => {
+    const r = await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--issue-number', 'abc', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('issue-number') });
   });
 
-  test('invalid --phase exits non-zero', () => {
-    const r = runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--phase', 'bogus-phase', '--db-path', dbPath);
+  test('invalid --phase exits non-zero', async () => {
+    const r = await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--phase', 'bogus-phase', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('phase') });
   });
 
-  test('returns empty recovered list when no cap-handoff tasks exist', () => {
-    const r = runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('returns empty recovered list when no cap-handoff tasks exist', async () => {
+    const r = await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({ ok: true, sessionId: 'addon-dev', recovered: [], skipped: [] });
@@ -814,7 +912,7 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     );
     store.close();
 
-    const r = runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.recovered).toHaveLength(0);
@@ -825,7 +923,7 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     await enqueueCapHandoff(store, 1);
     store.close();
 
-    const r = runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -845,7 +943,7 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     await enqueueCapHandoff(store, 2, 3);
     store.close();
 
-    runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--db-path', dbPath);
+    await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--db-path', dbPath);
 
     const store2 = new SqliteTaskStore(dbPath);
     const task = await store2.getTask({ sessionId: 'addon-dev', issueNumber: 2 });
@@ -860,7 +958,7 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     await enqueueCapHandoff(store, 2);
     store.close();
 
-    const r = runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--issue-number', '1', '--db-path', dbPath);
+    const r = await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--issue-number', '1', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.recovered).toHaveLength(1);
@@ -872,7 +970,7 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     await enqueueCapHandoff(store, 3);
     store.close();
 
-    const r = runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--issue-number', '3', '--phase', 'implementation', '--db-path', dbPath);
+    const r = await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--issue-number', '3', '--phase', 'implementation', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.recovered).toHaveLength(1);
@@ -884,7 +982,7 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     await enqueueCapHandoff(store, 4);
     store.close();
 
-    const r = runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath);
+    const r = await runJson('recover-cap-handoff', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.dryRun).toBe(true);
@@ -921,7 +1019,7 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     await enqueueCapHandoff(store, 1);
     store.close();
 
-    const r = runJson(
+    const r = await runJson(
       'recover-cap-handoff', '--session-ref', 'addon',
       '--sessions-path', sessionsPath, '--db-path', dbPath,
     );
@@ -932,20 +1030,20 @@ describe('admin CLI — recover-cap-handoff subcommand', () => {
     expect(out.recovered[0].issueNumber).toBe(1);
   });
 
-  test('recover-cap-handoff appears in help output', () => {
-    const r = run('help');
+  test('recover-cap-handoff appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('recover-cap-handoff');
   });
 
-  test('"help recover-cap-handoff" documents --session-ref', () => {
-    const r = run('help', 'recover-cap-handoff');
+  test('"help recover-cap-handoff" documents --session-ref', async () => {
+    const r = await run('help', 'recover-cap-handoff');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('--session-ref');
   });
 
-  test('"help recover-cap-handoff" states that omitting --phase defaults to review', () => {
-    const r = run('help', 'recover-cap-handoff');
+  test('"help recover-cap-handoff" states that omitting --phase defaults to review', async () => {
+    const r = await run('help', 'recover-cap-handoff');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("defaults to review");
   });
@@ -971,8 +1069,8 @@ describe('admin CLI — session-init subcommand', () => {
     ...extra,
   ];
 
-  test('creates sessions.json when it does not exist', () => {
-    const r = run(...baseArgs());
+  test('creates sessions.json when it does not exist', async () => {
+    const r = await run(...baseArgs());
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -988,17 +1086,17 @@ describe('admin CLI — session-init subcommand', () => {
     });
   });
 
-  test('sessions.json file is written with a sessions array', () => {
-    run(...baseArgs());
+  test('sessions.json file is written with a sessions array', async () => {
+    await run(...baseArgs());
     const file = JSON.parse(readFileSync(sessionsPath, 'utf8'));
     expect(Array.isArray(file.sessions)).toBe(true);
     expect(file.sessions).toHaveLength(1);
     expect(file.sessions[0].sessionId).toBe('addon-dev');
   });
 
-  test('appends to an existing sessions.json', () => {
-    run(...baseArgs());
-    const r2 = run(
+  test('appends to an existing sessions.json', async () => {
+    await run(...baseArgs());
+    const r2 = await run(
       'session-init',
       '--session-id', 'workflow-dev',
       '--repo-key', 'n8n-ai-cli-loop',
@@ -1015,16 +1113,16 @@ describe('admin CLI — session-init subcommand', () => {
     expect(file.sessions.map((s) => s.sessionId)).toEqual(['addon-dev', 'workflow-dev']);
   });
 
-  test('errors when session-id already exists', () => {
-    run(...baseArgs());
-    const r2 = run(...baseArgs());
+  test('errors when session-id already exists', async () => {
+    await run(...baseArgs());
+    const r2 = await run(...baseArgs());
     expect(r2.code).not.toBe(0);
     expect(parse(r2)).toMatchObject({ ok: false, error: expect.stringContaining('addon-dev') });
   });
 
-  test('errors when repo-key already exists', () => {
-    run(...baseArgs());
-    const r2 = run(
+  test('errors when repo-key already exists', async () => {
+    await run(...baseArgs());
+    const r2 = await run(
       'session-init',
       '--session-id', 'workflow-dev',
       '--repo-key', 'thunderbird-auth-results-filter',
@@ -1042,22 +1140,22 @@ describe('admin CLI — session-init subcommand', () => {
     });
   });
 
-  test('optional --research-agent is stored in defaults', () => {
-    const r = run(...baseArgs(['--research-agent', 'gemini']));
+  test('optional --research-agent is stored in defaults', async () => {
+    const r = await run(...baseArgs(['--research-agent', 'gemini']));
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.session.defaults).toMatchObject({ researchAgent: 'gemini' });
   });
 
-  test('--verification-json stores verification commands', () => {
-    const r = run(...baseArgs(['--verification-json', '{"test":"npm test"}']));
+  test('--verification-json stores verification commands', async () => {
+    const r = await run(...baseArgs(['--verification-json', '{"test":"npm test"}']));
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.session.verification).toEqual({ test: 'npm test' });
   });
 
-  test('custom label flags override defaults', () => {
-    const r = run(...baseArgs([
+  test('custom label flags override defaults', async () => {
+    const r = await run(...baseArgs([
       '--labels-active', 'status:active',
       '--labels-blocked', 'status:blocked',
       '--labels-ready-for-human', 'status:review',
@@ -1071,8 +1169,8 @@ describe('admin CLI — session-init subcommand', () => {
     });
   });
 
-  test('missing required --session-id exits non-zero', () => {
-    const r = run(
+  test('missing required --session-id exits non-zero', async () => {
+    const r = await run(
       'session-init',
       '--repo-key', 'some-repo',
       '--repo-root', '/some/path',
@@ -1086,20 +1184,20 @@ describe('admin CLI — session-init subcommand', () => {
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('invalid --implementation-agent exits non-zero', () => {
-    const r = run(...baseArgs().map((a) => a === 'claude' ? 'invalid-agent' : a));
+  test('invalid --implementation-agent exits non-zero', async () => {
+    const r = await run(...baseArgs().map((a) => a === 'claude' ? 'invalid-agent' : a));
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false });
   });
 
-  test('invalid --verification-json exits non-zero', () => {
-    const r = run(...baseArgs(['--verification-json', 'not-json']));
+  test('invalid --verification-json exits non-zero', async () => {
+    const r = await run(...baseArgs(['--verification-json', 'not-json']));
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('verification-json') });
   });
 
-  test('session-init appears in help output', () => {
-    const r = run('help');
+  test('session-init appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('session-init');
   });
@@ -1112,27 +1210,27 @@ describe('admin CLI — context create subcommand', () => {
     sessionsPath = join(tmpDir, 'sessions.json');
   });
 
-  test('missing --execution-id exits non-zero', () => {
-    const r = run('context', 'create', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('missing --execution-id exits non-zero', async () => {
+    const r = await run('context', 'create', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('execution-id') });
   });
 
-  test('missing --session-id exits non-zero', () => {
-    const r = run('context', 'create', '--execution-id', 'exec-1', '--db-path', dbPath);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await run('context', 'create', '--execution-id', 'exec-1', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('creates context record and emits contextId', () => {
-    const r = run('context', 'create', '--execution-id', 'exec-42', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('creates context record and emits contextId', async () => {
+    const r = await run('context', 'create', '--execution-id', 'exec-42', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, contextId: 'exec-42' });
   });
 
   test('stored context resolves sessionId in subsequent CLI calls', async () => {
     // Create the context record
-    const create = run('context', 'create', '--execution-id', 'exec-ctx-1', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const create = await run('context', 'create', '--execution-id', 'exec-ctx-1', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(create.code).toBe(0);
 
     // Verify the context store resolves the sessionId
@@ -1143,15 +1241,15 @@ describe('admin CLI — context create subcommand', () => {
     expect(resolved).toBe('addon-dev');
   });
 
-  test('upsert overwrites existing context record', () => {
-    run('context', 'create', '--execution-id', 'exec-same', '--session-id', 'session-a', '--db-path', dbPath);
-    const r = run('context', 'create', '--execution-id', 'exec-same', '--session-id', 'session-b', '--db-path', dbPath);
+  test('upsert overwrites existing context record', async () => {
+    await run('context', 'create', '--execution-id', 'exec-same', '--session-id', 'session-a', '--db-path', dbPath);
+    const r = await run('context', 'create', '--execution-id', 'exec-same', '--session-id', 'session-b', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, contextId: 'exec-same' });
   });
 
-  test('unknown context action exits non-zero', () => {
-    const r = run('context', 'bogus');
+  test('unknown context action exits non-zero', async () => {
+    const r = await run('context', 'bogus');
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('bogus') });
   });
@@ -1187,7 +1285,7 @@ describe('admin CLI — context create with --session-ref', () => {
   }
 
   test('resolves an alias to the canonical sessionId and stores it', async () => {
-    const r = run('context', 'create', '--execution-id', 'exec-ref-alias',
+    const r = await run('context', 'create', '--execution-id', 'exec-ref-alias',
       '--session-ref', 'addon', '--sessions-path', sessionsPath, '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, contextId: 'exec-ref-alias' });
@@ -1195,43 +1293,43 @@ describe('admin CLI — context create with --session-ref', () => {
   });
 
   test('resolves a numeric sessionNo to the canonical sessionId', async () => {
-    const r = run('context', 'create', '--execution-id', 'exec-ref-no',
+    const r = await run('context', 'create', '--execution-id', 'exec-ref-no',
       '--session-ref', '2', '--sessions-path', sessionsPath, '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(await storedSessionId('exec-ref-no')).toBe('thunderbird-auth-results');
   });
 
   test('resolves an exact sessionId passed as --session-ref', async () => {
-    const r = run('context', 'create', '--execution-id', 'exec-ref-id',
+    const r = await run('context', 'create', '--execution-id', 'exec-ref-id',
       '--session-ref', 'thunderbird-auth-results', '--sessions-path', sessionsPath, '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(await storedSessionId('exec-ref-id')).toBe('thunderbird-auth-results');
   });
 
-  test('unknown --session-ref exits non-zero with a clear error', () => {
-    const r = run('context', 'create', '--execution-id', 'exec-ref-x',
+  test('unknown --session-ref exits non-zero with a clear error', async () => {
+    const r = await run('context', 'create', '--execution-id', 'exec-ref-x',
       '--session-ref', 'no-such-ref', '--sessions-path', sessionsPath, '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('Unknown session reference') });
   });
 
-  test('providing both --session-id and --session-ref exits non-zero', () => {
-    const r = run('context', 'create', '--execution-id', 'exec-ref-both',
+  test('providing both --session-id and --session-ref exits non-zero', async () => {
+    const r = await run('context', 'create', '--execution-id', 'exec-ref-both',
       '--session-id', 'thunderbird-auth-results', '--session-ref', 'addon',
       '--sessions-path', sessionsPath, '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('only one') });
   });
 
-  test('--session-id still works without a sessions.json (backward compatible)', () => {
-    const r = run('context', 'create', '--execution-id', 'exec-ref-compat',
+  test('--session-id still works without a sessions.json (backward compatible)', async () => {
+    const r = await run('context', 'create', '--execution-id', 'exec-ref-compat',
       '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, contextId: 'exec-ref-compat' });
   });
 
-  test('--session-ref is documented in help output', () => {
-    const r = run('help', 'context create');
+  test('--session-ref is documented in help output', async () => {
+    const r = await run('help', 'context create');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('--session-ref');
   });
@@ -1252,14 +1350,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     }
   });
 
-  function runDoctor(...args) {
-    const env = { ...process.env, PATH: `${tmpBin}:${process.env.PATH ?? ''}` };
-    try {
-      const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env });
-      return { code: 0, stdout };
-    } catch (err) {
-      return { code: err.status ?? 1, stdout: err.stdout ?? '' };
-    }
+  async function runDoctor(...args) {
+    return runAdmin(args, { env: { PATH: `${tmpBin}:${process.env.PATH ?? ''}` } });
   }
 
   function writeSession(overrides = {}) {
@@ -1278,28 +1370,28 @@ describe('admin CLI — session-doctor subcommand', () => {
     return session;
   }
 
-  test('missing --session-id exits non-zero', () => {
-    const r = runDoctor('session-doctor', '--sessions-path', sessionsPath);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await runDoctor('session-doctor', '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('unknown session-id exits non-zero', () => {
+  test('unknown session-id exits non-zero', async () => {
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'no-such-session', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'no-such-session', '--sessions-path', sessionsPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('no-such-session') });
   });
 
-  test('missing sessions file exits non-zero', () => {
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', join(tmpDir, 'nonexistent.json'));
+  test('missing sessions file exits non-zero', async () => {
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', join(tmpDir, 'nonexistent.json'));
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('not found') });
   });
 
-  test('returns ok:true with checks array and allPassed fields', () => {
+  test('returns ok:true with checks array and allPassed fields', async () => {
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({ ok: true, sessionId: 'addon-dev' });
@@ -1307,9 +1399,9 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(typeof out.allPassed).toBe('boolean');
   });
 
-  test('checks array includes all expected check names', () => {
+  test('checks array includes all expected check names', async () => {
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const names = out.checks.map((c) => c.name);
@@ -1320,9 +1412,9 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(names).toContain('claudeCli');
   });
 
-  test('each check has name, category, and ok fields', () => {
+  test('each check has name, category, and ok fields', async () => {
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     for (const check of out.checks) {
@@ -1332,9 +1424,9 @@ describe('admin CLI — session-doctor subcommand', () => {
     }
   });
 
-  test('repoRootExists check fails when repoRoot does not exist', () => {
+  test('repoRootExists check fails when repoRoot does not exist', async () => {
     writeSession({ repoRoot: join(tmpDir, 'no-such-dir') });
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'repoRootExists');
@@ -1342,19 +1434,19 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(typeof check.error).toBe('string');
   });
 
-  test('repoRootExists check passes when repoRoot exists', () => {
+  test('repoRootExists check passes when repoRoot exists', async () => {
     mkdirSync(repoRoot, { recursive: true });
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'repoRootExists');
     expect(check.ok).toBe(true);
   });
 
-  test('repoIsGit is skipped with error when repoRoot does not exist', () => {
+  test('repoIsGit is skipped with error when repoRoot does not exist', async () => {
     writeSession({ repoRoot: join(tmpDir, 'no-such-dir') });
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'repoIsGit');
@@ -1362,21 +1454,21 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(check.error).toMatch(/Skipped/);
   });
 
-  test('repoIsGit check fails when repoRoot is not a git repo', () => {
+  test('repoIsGit check fails when repoRoot is not a git repo', async () => {
     mkdirSync(repoRoot, { recursive: true });
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'repoIsGit');
     expect(check.ok).toBe(false);
   });
 
-  test('repoIsGit check passes when repoRoot is a git repository', () => {
+  test('repoIsGit check passes when repoRoot is a git repository', async () => {
     mkdirSync(repoRoot, { recursive: true });
     execFileSync('git', ['init'], { cwd: repoRoot });
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'repoIsGit');
@@ -1395,14 +1487,17 @@ describe('admin CLI — session-doctor subcommand', () => {
    * change what these assertions see. Anything named in `extra` is kept.
    */
   function doctorEnv(extra = {}) {
-    const env = { ...process.env, PATH: `${tmpBin}:${process.env.PATH ?? ''}`, ...extra };
+    // Harness env entries are overrides on top of the current environment, and
+    // `undefined` means "unset for this run" — so a key the caller did not name
+    // is cleared rather than deleted from a copied environment object.
+    const env = { PATH: `${tmpBin}:${process.env.PATH ?? ''}` };
     for (const key of [
       'CLAUDE_MODEL', 'CLAUDE_EFFORT', 'CLAUDE_MAX_BUDGET_USD',
       'CODEX_MODEL', 'CODEX_EFFORT', 'ANTIGRAVITY_BIN',
     ]) {
-      if (!(key in extra)) delete env[key];
+      if (!(key in extra)) env[key] = undefined;
     }
-    return env;
+    return { ...env, ...extra };
   }
 
   /**
@@ -1422,27 +1517,22 @@ describe('admin CLI — session-doctor subcommand', () => {
 
   const ALL_CLIS_AVAILABLE = probeStub({ claude: 'available', codex: 'available', gemini: 'available' });
 
-  function doctorChecks(session, extraEnv = {}) {
+  async function doctorChecks(session, extraEnv = {}) {
     writeSession(session);
-    const args = [CLI, 'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath];
-    let stdout;
-    try {
-      stdout = execFileSync(process.execPath, args, { encoding: 'utf8', env: doctorEnv(extraEnv) });
-    } catch (err) {
-      stdout = err.stdout ?? '';
-    }
+    const args = ['session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath];
+    const { stdout } = await runAdmin(args, { env: doctorEnv(extraEnv) });
     return Object.fromEntries(JSON.parse(stdout.trim()).checks.map((c) => [c.name, c]));
   }
 
-  test('no arbiter checks are emitted while the dispute protocol is disabled', () => {
+  test('no arbiter checks are emitted while the dispute protocol is disabled', async () => {
     for (const reviewDispute of [undefined, { enabled: false }, { arbiter: { providers: ['claude'] } }]) {
-      const checks = doctorChecks(reviewDispute === undefined ? {} : { reviewDispute });
+      const checks = await doctorChecks(reviewDispute === undefined ? {} : { reviewDispute });
       for (const name of ARBITER_CHECKS) expect(checks[name]).toBeUndefined();
     }
   });
 
-  test('a valid cross-provider candidate reports the profile it would invoke', () => {
-    const checks = doctorChecks({
+  test('a valid cross-provider candidate reports the profile it would invoke', async () => {
+    const checks = await doctorChecks({
       defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'], minConfidence: 0.8 } },
     }, ALL_CLIS_AVAILABLE);
@@ -1459,8 +1549,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterSelection.detail).toContain('sameProviderFallback: false');
   });
 
-  test('an empty candidate list fails arbiterConfig with the row-19 consequence', () => {
-    const checks = doctorChecks({
+  test('an empty candidate list fails arbiterConfig with the row-19 consequence', async () => {
+    const checks = await doctorChecks({
       defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
       reviewDispute: { enabled: true, arbiter: { providers: [] } },
     });
@@ -1470,8 +1560,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterSelection.error).toMatch(/row 19/);
   });
 
-  test('an unsupported arbiter agent id fails arbiterConfig at the config boundary', () => {
-    const checks = doctorChecks({
+  test('an unsupported arbiter agent id fails arbiterConfig at the config boundary', async () => {
+    const checks = await doctorChecks({
       reviewDispute: { enabled: true, arbiter: { providers: ['anthropic'] } },
     });
     expect(checks.arbiterConfig.ok).toBe(false);
@@ -1482,14 +1572,34 @@ describe('admin CLI — session-doctor subcommand', () => {
     }
   });
 
-  test('an agent with no arbiter invocation is reported as an unusable candidate', () => {
-    const checks = doctorChecks({
+  test('an agent with no arbiter invocation is reported as an unusable candidate', async () => {
+    const checks = await doctorChecks({
       defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
       reviewDispute: { enabled: true, arbiter: { providers: ['gemini'] } },
     });
     expect(checks.arbiterCandidates.ok).toBe(false);
     expect(checks.arbiterCandidates.error).toMatch(/gemini\[0\]: unsupported-role/);
     expect(checks.arbiterSelection.ok).toBe(false);
+    // Issue #965: the selection remedy has to be one the operator can act on.
+    // "Add a candidate from another provider" is not, when the candidate would
+    // be refused by §8.2's capability table before independence is measured —
+    // so the check names the table and where the fix actually lives.
+    expect(checks.arbiterSelection.error).toMatch(/no VERIFIED no-tools invocation for that agent/);
+    expect(checks.arbiterSelection.error).toMatch(/checked before independence is/);
+    expect(checks.arbiterSelection.error).toMatch(/defined for `claude` only/);
+  });
+
+  test('a same-provider-only refusal does not claim the capability table is the problem', async () => {
+    // The other half: `claude` DOES resolve, and is refused by §8.3 alone. An
+    // operator here is not blocked by the runner, so the capability note must
+    // not appear and send them looking for a code change.
+    const checks = await doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+    }, ALL_CLIS_AVAILABLE);
+    expect(checks.arbiterSelection.ok).toBe(false);
+    expect(checks.arbiterSelection.error).toMatch(/same-provider-not-allowed/);
+    expect(checks.arbiterSelection.error).not.toMatch(/no VERIFIED no-tools invocation/);
   });
 
   // -------------------------------------------------------------------------
@@ -1507,8 +1617,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     ['a refused fork', 'spawn-error'],
   ];
 
-  test.each(INDETERMINATE_STATUSES)('%s is reported as indeterminate, not as a missing CLI', (_label, status) => {
-    const checks = doctorChecks(
+  test.each(INDETERMINATE_STATUSES)('%s is reported as indeterminate, not as a missing CLI', async (_label, status) => {
+    const checks = await doctorChecks(
       {
         defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
         reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
@@ -1531,8 +1641,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterCandidates.error).not.toMatch(/cli-unavailable/);
   }, 30_000);
 
-  test('a missing executable is still reported as cli-unavailable', () => {
-    const checks = doctorChecks(
+  test('a missing executable is still reported as cli-unavailable', async () => {
+    const checks = await doctorChecks(
       {
         defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
         reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
@@ -1546,8 +1656,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterCandidates.transient).toBeUndefined();
   }, 30_000);
 
-  test('a CLI that ran and exited non-zero is reported as that, and is not transient', () => {
-    const checks = doctorChecks(
+  test('a CLI that ran and exited non-zero is reported as that, and is not transient', async () => {
+    const checks = await doctorChecks(
       { defaults: { implementationAgent: 'claude', reviewAgent: 'claude' } },
       probeStub({ claude: 'non-zero-exit' }),
     );
@@ -1557,8 +1667,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.claudeCli.error).not.toContain(CLI_PROBE_INDETERMINATE_MARKER);
   }, 30_000);
 
-  test('a stubbed probe is never passed off as a real availability fact', () => {
-    const checks = doctorChecks(
+  test('a stubbed probe is never passed off as a real availability fact', async () => {
+    const checks = await doctorChecks(
       { defaults: { implementationAgent: 'claude', reviewAgent: 'claude' } },
       probeStub({ claude: 'available' }),
     );
@@ -1576,21 +1686,12 @@ describe('admin CLI — session-doctor subcommand', () => {
     ['a typo\'d agent key', JSON.stringify({ claud: 'available' })],
     ['a CLI that is not stubbable', JSON.stringify({ claude: 'available', gh: 'available' })],
   ]) {
-    test(`a probe stub that is ${label} fails loudly rather than falling back to real spawns`, () => {
+    test(`a probe stub that is ${label} fails loudly rather than falling back to real spawns`, async () => {
       writeSession({ defaults: { implementationAgent: 'claude', reviewAgent: 'claude' } });
-      const args = [CLI, 'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath];
-      let code = 0;
-      let stdout = '';
-      try {
-        stdout = execFileSync(process.execPath, args, {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: doctorEnv({ [CLI_PROBE_STUB_ENV]: raw }),
-        });
-      } catch (err) {
-        code = err.status ?? 1;
-        stdout = err.stdout ?? '';
-      }
+      const { code, stdout } = await runAdmin(
+        ['session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath],
+        { env: doctorEnv({ [CLI_PROBE_STUB_ENV]: raw }) },
+      );
       expect(code).not.toBe(0);
       expect(JSON.parse(stdout.trim())).toMatchObject({
         ok: false, error: expect.stringContaining(CLI_PROBE_STUB_ENV),
@@ -1598,7 +1699,7 @@ describe('admin CLI — session-doctor subcommand', () => {
     }, 30_000);
   }
 
-  test('an unavailable candidate CLI is reported as such, not as a config problem', () => {
+  test('an unavailable candidate CLI is reported as such, not as a config problem', async () => {
     // Integration: a REAL spawn against a real PATH, kept deliberately so the
     // typed classification above is anchored to what the OS actually does.
     // A PATH without `claude` on it: the arbiter candidate cannot be invoked.
@@ -1607,7 +1708,7 @@ describe('admin CLI — session-doctor subcommand', () => {
     for (const cmd of ['gh', 'codex']) {
       writeFileSync(join(binOnlyGh, cmd), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     }
-    const checks = doctorChecks(
+    const checks = await doctorChecks(
       {
         defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
         reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
@@ -1618,8 +1719,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterCandidates.error).toMatch(/claude\[0\]: cli-unavailable/);
   });
 
-  test('a provider overlap is a selection refusal, not an unusable candidate', () => {
-    const checks = doctorChecks({
+  test('a provider overlap is a selection refusal, not an unusable candidate', async () => {
+    const checks = await doctorChecks({
       defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
     }, ALL_CLIS_AVAILABLE);
@@ -1628,12 +1729,12 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterSelection.error).toMatch(/claude\[0\]: same-provider-not-allowed/);
   });
 
-  test('explicit same-provider fallback is reported, and says why it cannot be proven here', () => {
+  test('explicit same-provider fallback is reported, and says why it cannot be proven here', async () => {
     // The regression that filed issue #897: under host contention this probe
     // timed out, the answer flipped from `same-provider-model-unknown` to
     // `cli-unavailable`, and a green branch failed review. Availability is now
     // an injected fact, so the assertion is about policy only.
-    const checks = doctorChecks({
+    const checks = await doctorChecks({
       defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'], allowSameProvider: true } },
     }, ALL_CLIS_AVAILABLE);
@@ -1643,8 +1744,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterSelection.error).toMatch(/only known once the implementation and review runs exist/);
   });
 
-  test('an invalid resolved profile is reported as a profile error', () => {
-    const checks = doctorChecks(
+  test('an invalid resolved profile is reported as a profile error', async () => {
+    const checks = await doctorChecks(
       {
         defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
         reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
@@ -1655,29 +1756,63 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.arbiterCandidates.error).toMatch(/claude\[0\]: profile-error \(effort:invalid\)/);
   });
 
-  test('the arbiter checks never re-probe a CLI the role checks already probed', () => {
+  test('the arbiter checks never re-probe a CLI the role checks already probed', async () => {
     const counter = join(tmpDir, 'claude-probes.log');
     writeFileSync(join(tmpBin, 'claude'), `#!/bin/sh\necho run >> "${counter}"\nexit 0\n`, { mode: 0o755 });
-    const checks = doctorChecks({
-      defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
-      // Claude is named twice, and is also probed as the conflict-resolution
-      // agent by the role checks — one spawn, whatever the reporting.
-      reviewDispute: { enabled: true, arbiter: { providers: ['claude', 'claude'] } },
-    });
+    // Counting spawns is the whole subject here, so this case cannot stub
+    // availability the way the selection cases above do — which leaves it
+    // exposed to the starved probe of issue #897: a `claude` the host never got
+    // round to running is (correctly) refused as a candidate, and the count is
+    // then of a run that never happened. Ask again from a clean counter, and
+    // decline to assert at all if the host never answers.
+    const { result: checks, answered } = await runUntilProbeAnswers(
+      async () => {
+        rmSync(counter, { force: true });
+        return doctorChecks({
+          defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+          // Claude is named twice, and is also probed as the conflict-resolution
+          // agent by the role checks — one spawn, whatever the reporting.
+          reviewDispute: { enabled: true, arbiter: { providers: ['claude', 'claude'] } },
+        });
+      },
+      // `claudeCli` carries the probe's own verdict; the arbiter checks are read
+      // too so the refusal they cascade into is not mistaken for an answer.
+      (result) => ['claudeCli', 'arbiterCandidates', 'arbiterSelection']
+        .map((name) => result[name]?.error ?? '')
+        .join('\n'),
+    );
+    if (!answered) return;
     expect(checks.arbiterSelection.ok).toBe(true);
     expect(readFileSync(counter, 'utf8').trim().split('\n')).toHaveLength(1);
-  });
+    // Each attempt forks real children under a 60s probe budget apiece, so the
+    // retry schedule needs headroom the file-wide 30s does not give it.
+  }, 240_000);
 
   // Issue #849 rollout regressions. The checks themselves are #839's and are
   // deliberately NOT duplicated here; what these pin is that an ENABLED session
   // gets an actionable, complete readiness answer out of them — which is the
   // thing an operator turning the protocol on is relying on.
 
-  test('an enabled, healthy session reports usable implementation and review profiles', () => {
-    const checks = doctorChecks({
-      defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
-      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
-    });
+  test('an enabled, healthy session reports usable implementation and review profiles', async () => {
+    // Deliberately unstubbed: the point of this case is that the readiness
+    // answer an operator gets is backed by REAL probes of both agent CLIs. That
+    // keeps it exposed to the starved probe of issue #897 — under concurrent
+    // verification load even an `exit 0` stub can miss its budget, and the check
+    // then reports the host's ETIMEDOUT rather than the stub's own answer. So
+    // ask again from a clean run, and decline to assert at all if the host never
+    // answered rather than failing as if the session were misconfigured.
+    const { result: checks, answered } = await runUntilProbeAnswers(
+      async () => doctorChecks({
+        defaults: { implementationAgent: 'codex', reviewAgent: 'codex' },
+        reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+      }),
+      // Both probed CLIs, plus the arbiter checks that cascade off them, so a
+      // starved probe cannot reach the assertions as a derived failure.
+      (result) => ['codexCli', 'claudeCli', ...ARBITER_CHECKS]
+        .map((name) => result[name]?.error ?? '')
+        .join('\n'),
+    );
+    if (!answered) return;
     // The role checks emit an entry only when the role is UNUSABLE, so their
     // absence is the positive signal — asserted explicitly so a future change
     // that starts failing them cannot pass this file silently.
@@ -1688,10 +1823,12 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(checks.claudeCli.ok).toBe(true);
     // …and all three arbiter checks pass, so an enabled session is ready.
     for (const name of ARBITER_CHECKS) expect(checks[name].ok).toBe(true);
-  });
+    // Each attempt forks real children under a 60s probe budget apiece, so the
+    // retry schedule needs headroom the file-wide default does not give it.
+  }, 240_000);
 
-  test('an unusable role skips the arbiter checks and says which one to fix first', () => {
-    const checks = doctorChecks({
+  test('an unusable role skips the arbiter checks and says which one to fix first', async () => {
+    const checks = await doctorChecks({
       defaults: { implementationAgent: 'not-an-agent', reviewAgent: 'codex' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
     });
@@ -1706,8 +1843,8 @@ describe('admin CLI — session-doctor subcommand', () => {
     }
   });
 
-  test('when every arbitration would escalate, the remediation names both concrete fixes', () => {
-    const checks = doctorChecks({
+  test('when every arbitration would escalate, the remediation names both concrete fixes', async () => {
+    const checks = await doctorChecks({
       defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
       reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
     }, ALL_CLIS_AVAILABLE);
@@ -1721,20 +1858,94 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(error).toMatch(/reviewDispute\.arbiter\.allowSameProvider/);
   });
 
-  test('ghRepoAccess check includes detail with githubRepo', () => {
+  // -------------------------------------------------------------------------
+  // Reviewer reconsideration capability (issue #1073, contract §8.2/§17.12)
+  // -------------------------------------------------------------------------
+
+  test('reviewerReconsiderationCapability is not emitted while the dispute protocol is disabled', async () => {
+    for (const reviewDispute of [undefined, { enabled: false }, { arbiter: { providers: ['claude'] } }]) {
+      const checks = await doctorChecks(reviewDispute === undefined ? {} : { reviewDispute });
+      expect(checks.reviewerReconsiderationCapability).toBeUndefined();
+    }
+  });
+
+  test('a claude reviewer passes reconsideration capability even when no independent arbiter is configured', async () => {
+    const checks = await doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+    }, ALL_CLIS_AVAILABLE);
+    expect(checks.reviewerReconsiderationCapability).toMatchObject({ category: 'aiCli', ok: true });
+    expect(checks.reviewerReconsiderationCapability.detail).toMatch(/claude may take the reviewer's §4\.1 reconsideration turn/);
+    // Both parties on Anthropic refuse every arbiter candidate (§8.3) — that is
+    // a real, documented limitation of THIS check, and it must not read as
+    // reconsideration being unavailable too: the two checks disagree here on
+    // purpose.
+    expect(checks.arbiterSelection.ok).toBe(false);
+  });
+
+  test('a codex reviewer fails reconsideration capability without being reported as arbitration-unavailable', async () => {
+    const checks = await doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+    }, ALL_CLIS_AVAILABLE);
+    // Structured review support (D1) is unaffected: no reviewAgentCli finding.
+    expect(checks.reviewAgentCli).toBeUndefined();
+    expect(checks.reviewerReconsiderationCapability.ok).toBe(false);
+    const error = checks.reviewerReconsiderationCapability.error;
+    expect(error).toMatch(/Unsupported reconsideration agent: codex/);
+    expect(error).toMatch(/profile_unavailable/);
+    expect(error).toMatch(/contract §15 G2/);
+    // Distinguished from the arbiter-unavailable case: fixing one is not fixing the other.
+    expect(error).toMatch(/different stop from an unavailable independent arbiter/);
+  });
+
+  // Issue #1085: with the §17.6 D2 opt-in recorded, the same check must report
+  // the turn as SUPPORTED and say under which posture — an operator who cannot
+  // tell an enabled-and-supported Codex reconsideration from a disabled one, or
+  // from the `no-tools` posture, has been given a tick and no information.
+  test('a codex reviewer with the read-bounded opt-in passes, and the detail names the posture', async () => {
+    const checks = await doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'codex' },
+      reviewDispute: {
+        enabled: true,
+        arbiter: { providers: ['claude'] },
+        reconsideration: { readBounded: true },
+      },
+    }, ALL_CLIS_AVAILABLE);
+    expect(checks.reviewerReconsiderationCapability.ok).toBe(true);
+    const detail = checks.reviewerReconsiderationCapability.detail;
+    expect(detail).toMatch(/under the `read-bounded` posture/);
+    // The limitation travels with the capability, at the surface an operator
+    // reads before trusting a verdict.
+    expect(detail).toMatch(/READS are not bounded/);
+    expect(detail).toMatch(/reviewDispute\.reconsideration\.readBounded/);
+    // It is not a claim about arbitration, which D2 did not admit.
+    expect(checks.arbiterSelection.ok).toBe(false);
+  });
+
+  test('reviewerReconsiderationCapability is skipped when the review role itself is unusable', async () => {
+    const checks = await doctorChecks({
+      defaults: { implementationAgent: 'claude', reviewAgent: 'not-an-agent' },
+      reviewDispute: { enabled: true, arbiter: { providers: ['claude'] } },
+    });
+    expect(checks.reviewerReconsiderationCapability.ok).toBe(false);
+    expect(checks.reviewerReconsiderationCapability.error).toMatch(/^Skipped: the session's default review agent is unusable/);
+  });
+
+  test('ghRepoAccess check includes detail with githubRepo', async () => {
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'ghRepoAccess');
     expect(check.detail).toBe('m2dw/some-repo');
   });
 
-  test('distinct agents each get their own check entry', () => {
+  test('distinct agents each get their own check entry', async () => {
     writeSession({
       defaults: { implementationAgent: 'claude', reviewAgent: 'codex', researchAgent: 'gemini' },
     });
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const names = out.checks.map((c) => c.name);
@@ -1743,27 +1954,27 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(names).toContain('geminiCli');
   });
 
-  test('duplicate agents across roles produce a single check entry', () => {
+  test('duplicate agents across roles produce a single check entry', async () => {
     writeSession({
       defaults: { implementationAgent: 'claude', reviewAgent: 'claude' },
     });
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const agentChecks = out.checks.filter((c) => c.name === 'claudeCli');
     expect(agentChecks).toHaveLength(1);
   });
 
-  test('allPassed is false when any check fails', () => {
+  test('allPassed is false when any check fails', async () => {
     writeSession({ repoRoot: join(tmpDir, 'no-such-dir') });
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.allPassed).toBe(false);
   });
 
-  test('session-doctor appears in help output', () => {
-    const r = run('help');
+  test('session-doctor appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('session-doctor');
   });
@@ -1781,31 +1992,53 @@ describe('admin CLI — session-doctor subcommand', () => {
     writeFileSync(join(tmpBin, 'gh'), script, { mode: 0o755 });
   }
 
-  test('ghRequiredLabels passes when all required labels are present', () => {
+  /**
+   * Both label cases assert what the `gh` stub REPORTED, so a run the host was
+   * too loaded to complete says nothing about them (issue #897): the probe comes
+   * back ETIMEDOUT and the check carries the errno instead of the stub's JSON.
+   * Every `github` check is inspected, not just this one, so the cascade
+   * ("Skipped: githubRepo is not accessible") that a starved `gh repo view`
+   * produces is recognised as the same non-answer.
+   */
+  async function runLabelsDoctor() {
+    return runUntilProbeAnswers(
+      () => runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath),
+      (run) => parse(run).checks
+        .filter((c) => c.category === 'github')
+        .map((c) => c.error ?? '')
+        .join('\n'),
+    );
+  }
+
+  test('ghRequiredLabels passes when all required labels are present', async () => {
     writeSession();
     writeGhStub(REQUIRED_LABELS);
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const { result: r, answered } = await runLabelsDoctor();
+    if (!answered) return;
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'ghRequiredLabels');
     expect(check.ok).toBe(true);
-  });
+    // Each attempt forks real children under a 60s probe budget apiece, so the
+    // retry schedule needs headroom the file-wide 30s does not give it.
+  }, 240_000);
 
-  test('ghRequiredLabels fails and lists missing labels with a create remediation', () => {
+  test('ghRequiredLabels fails and lists missing labels with a create remediation', async () => {
     writeSession();
     writeGhStub(REQUIRED_LABELS.filter((l) => l !== 'status:backlog'));
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const { result: r, answered } = await runLabelsDoctor();
+    if (!answered) return;
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'ghRequiredLabels');
     expect(check.ok).toBe(false);
     expect(check.error).toContain('status:backlog');
     expect(check.error).toContain('gh label create');
-  });
+  }, 240_000);
 
-  test('ghRequiredLabels is skipped when githubRepo is not configured', () => {
+  test('ghRequiredLabels is skipped when githubRepo is not configured', async () => {
     writeSession({ githubRepo: undefined });
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'ghRequiredLabels');
@@ -1813,23 +2046,23 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(check.error).toMatch(/Skipped/);
   });
 
-  test('artifactDirGitignored passes when artifactDir is listed in .gitignore', () => {
+  test('artifactDirGitignored passes when artifactDir is listed in .gitignore', async () => {
     mkdirSync(repoRoot, { recursive: true });
     execFileSync('git', ['init'], { cwd: repoRoot });
     writeFileSync(join(repoRoot, '.gitignore'), '.n8n-artifacts/\n', 'utf8');
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'artifactDirGitignored');
     expect(check.ok).toBe(true);
   });
 
-  test('artifactDirGitignored fails with a fix remediation when artifactDir is not ignored', () => {
+  test('artifactDirGitignored fails with a fix remediation when artifactDir is not ignored', async () => {
     mkdirSync(repoRoot, { recursive: true });
     execFileSync('git', ['init'], { cwd: repoRoot });
     writeSession();
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'artifactDirGitignored');
@@ -1837,10 +2070,10 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(check.error).toContain('.gitignore');
   });
 
-  test('sqliteDbHealth passes when the db has not been created yet', () => {
+  test('sqliteDbHealth passes when the db has not been created yet', async () => {
     writeSession();
     const dbFile = join(tmpDir, 'not-yet-created.db');
-    const r = runDoctor(
+    const r = await runDoctor(
       'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbFile,
     );
     expect(r.code).toBe(0);
@@ -1849,12 +2082,12 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(check.ok).toBe(true);
   });
 
-  test('sqliteDbHealth passes for a healthy WAL-mode database', () => {
+  test('sqliteDbHealth passes for a healthy WAL-mode database', async () => {
     writeSession();
     const dbFile = join(tmpDir, 'healthy.db');
     const store = new SqliteTaskStore(dbFile);
     store.close();
-    const r = runDoctor(
+    const r = await runDoctor(
       'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbFile,
     );
     expect(r.code).toBe(0);
@@ -1863,11 +2096,11 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(check.ok).toBe(true);
   });
 
-  test('sqliteDbHealth fails for a corrupt database file', () => {
+  test('sqliteDbHealth fails for a corrupt database file', async () => {
     writeSession();
     const dbFile = join(tmpDir, 'corrupt.db');
     writeFileSync(dbFile, 'not a real sqlite file', 'utf8');
-    const r = runDoctor(
+    const r = await runDoctor(
       'session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath, '--db-path', dbFile,
     );
     expect(r.code).toBe(0);
@@ -1876,9 +2109,9 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(check.ok).toBe(false);
   });
 
-  test('worktreeStateRoot fails when session.worktrees.root is relative', () => {
+  test('worktreeStateRoot fails when session.worktrees.root is relative', async () => {
     writeSession({ worktrees: { root: 'relative/worktrees' } });
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'worktreeStateRoot');
@@ -1886,9 +2119,9 @@ describe('admin CLI — session-doctor subcommand', () => {
     expect(check.error).toMatch(/absolute/);
   });
 
-  test('worktreeStateRoot passes for a valid absolute root', () => {
+  test('worktreeStateRoot passes for a valid absolute root', async () => {
     writeSession({ worktrees: { root: join(tmpDir, 'worktrees') } });
-    const r = runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
+    const r = await runDoctor('session-doctor', '--session-id', 'addon-dev', '--sessions-path', sessionsPath);
     expect(r.code).toBe(0);
     const out = parse(r);
     const check = out.checks.find((c) => c.name === 'worktreeStateRoot');
@@ -1901,73 +2134,73 @@ describe('admin CLI — session-doctor subcommand', () => {
 // ---------------------------------------------------------------------------
 
 describe('admin CLI — repo-lock acquire subcommand', () => {
-  function createContext(contextId, sessionId) {
+  async function createContext(contextId, sessionId) {
     return run('context', 'create', '--execution-id', contextId, '--session-id', sessionId, '--db-path', dbPath);
   }
 
-  test('missing --context-id exits non-zero', () => {
-    const r = run('repo-lock', 'acquire', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('missing --context-id exits non-zero', async () => {
+    const r = await run('repo-lock', 'acquire', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('context-id') });
   });
 
-  test('unknown context-id exits non-zero', () => {
-    const r = run('repo-lock', 'acquire', '--context-id', 'no-such-ctx', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('unknown context-id exits non-zero', async () => {
+    const r = await run('repo-lock', 'acquire', '--context-id', 'no-such-ctx', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('no-such-ctx') });
   });
 
-  test('acquires lock and emits locked:true on first call', () => {
-    createContext('ctx-100', 'my-session');
-    const r = run('repo-lock', 'acquire', '--context-id', 'ctx-100', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('acquires lock and emits locked:true on first call', async () => {
+    await createContext('ctx-100', 'my-session');
+    const r = await run('repo-lock', 'acquire', '--context-id', 'ctx-100', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, locked: true, contextId: 'ctx-100', sessionId: 'my-session' });
   });
 
-  test('returns locked:false with reason lock_held when another context holds the lock', () => {
-    createContext('ctx-100', 'my-session');
-    createContext('ctx-101', 'my-session');
+  test('returns locked:false with reason lock_held when another context holds the lock', async () => {
+    await createContext('ctx-100', 'my-session');
+    await createContext('ctx-101', 'my-session');
 
-    run('repo-lock', 'acquire', '--context-id', 'ctx-100', '--db-path', dbPath, '--lock-dir', lockDir);
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-100', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'acquire', '--context-id', 'ctx-101', '--db-path', dbPath, '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'acquire', '--context-id', 'ctx-101', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({ ok: true, locked: false, reason: 'lock_held', ownerContextId: 'ctx-100' });
     expect(out.ownerStartedAt).toBeDefined();
   });
 
-  test('different sessions do not contend', () => {
-    createContext('ctx-200', 'session-a');
-    createContext('ctx-201', 'session-b');
+  test('different sessions do not contend', async () => {
+    await createContext('ctx-200', 'session-a');
+    await createContext('ctx-201', 'session-b');
 
-    run('repo-lock', 'acquire', '--context-id', 'ctx-200', '--db-path', dbPath, '--lock-dir', lockDir);
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-200', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'acquire', '--context-id', 'ctx-201', '--db-path', dbPath, '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'acquire', '--context-id', 'ctx-201', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, locked: true, contextId: 'ctx-201', sessionId: 'session-b' });
   });
 
-  test('repo-lock acquire appears in help output', () => {
-    const r = run('help');
+  test('repo-lock acquire appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('repo-lock acquire');
   });
 });
 
 describe('admin CLI — repo-lock status subcommand', () => {
-  function createContext(contextId, sessionId) {
+  async function createContext(contextId, sessionId) {
     return run('context', 'create', '--execution-id', contextId, '--session-id', sessionId, '--db-path', dbPath);
   }
 
-  test('missing --session-id exits non-zero', () => {
-    const r = run('repo-lock', 'status', '--lock-dir', lockDir);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await run('repo-lock', 'status', '--lock-dir', lockDir);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('status with no lock: locked:false, null owner fields', () => {
-    const r = run('repo-lock', 'status', '--session-id', 'my-session', '--lock-dir', lockDir);
+  test('status with no lock: locked:false, null owner fields', async () => {
+    const r = await run('repo-lock', 'status', '--session-id', 'my-session', '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({
@@ -1983,11 +2216,11 @@ describe('admin CLI — repo-lock status subcommand', () => {
     expect(out.lockPath).toContain('my-session');
   });
 
-  test('status with active lock: locked:true with owner fields', () => {
-    createContext('ctx-s1', 'my-session');
-    run('repo-lock', 'acquire', '--context-id', 'ctx-s1', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('status with active lock: locked:true with owner fields', async () => {
+    await createContext('ctx-s1', 'my-session');
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-s1', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'status', '--session-id', 'my-session', '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'status', '--session-id', 'my-session', '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({
@@ -2003,138 +2236,138 @@ describe('admin CLI — repo-lock status subcommand', () => {
     expect(typeof out.lockPath).toBe('string');
   });
 
-  test('repo-lock status appears in help output', () => {
-    const r = run('help');
+  test('repo-lock status appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('repo-lock status');
   });
 });
 
 describe('admin CLI — repo-lock force-release subcommand', () => {
-  function createContext(contextId, sessionId) {
+  async function createContext(contextId, sessionId) {
     return run('context', 'create', '--execution-id', contextId, '--session-id', sessionId, '--db-path', dbPath);
   }
 
-  test('missing --session-id exits non-zero', () => {
-    const r = run('repo-lock', 'force-release', '--yes', '--lock-dir', lockDir);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await run('repo-lock', 'force-release', '--yes', '--lock-dir', lockDir);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('refuses without --yes', () => {
-    const r = run('repo-lock', 'force-release', '--session-id', 'my-session', '--lock-dir', lockDir);
+  test('refuses without --yes', async () => {
+    const r = await run('repo-lock', 'force-release', '--session-id', 'my-session', '--lock-dir', lockDir);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('--yes') });
   });
 
-  test('idempotent: released:false with reason no_lock when no lock exists', () => {
-    const r = run('repo-lock', 'force-release', '--session-id', 'my-session', '--yes', '--lock-dir', lockDir);
+  test('idempotent: released:false with reason no_lock when no lock exists', async () => {
+    const r = await run('repo-lock', 'force-release', '--session-id', 'my-session', '--yes', '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, released: false, reason: 'no_lock' });
   });
 
-  test('force-release with owner match: removes the lock', () => {
-    createContext('ctx-fr1', 'my-session');
-    run('repo-lock', 'acquire', '--context-id', 'ctx-fr1', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('force-release with owner match: removes the lock', async () => {
+    await createContext('ctx-fr1', 'my-session');
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-fr1', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'force-release', '--session-id', 'my-session', '--context-id', 'ctx-fr1', '--yes', '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'force-release', '--session-id', 'my-session', '--context-id', 'ctx-fr1', '--yes', '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({ ok: true, released: true, ownerContextId: 'ctx-fr1', wasStale: false });
 
     // Lock should be gone: status now reports unlocked
-    const status = parse(run('repo-lock', 'status', '--session-id', 'my-session', '--lock-dir', lockDir));
+    const status = parse(await run('repo-lock', 'status', '--session-id', 'my-session', '--lock-dir', lockDir));
     expect(status.locked).toBe(false);
   });
 
-  test('force-release with owner mismatch: refuses when --context-id does not match owner', () => {
-    createContext('ctx-fr2', 'my-session');
-    run('repo-lock', 'acquire', '--context-id', 'ctx-fr2', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('force-release with owner mismatch: refuses when --context-id does not match owner', async () => {
+    await createContext('ctx-fr2', 'my-session');
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-fr2', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'force-release', '--session-id', 'my-session', '--context-id', 'ctx-OTHER', '--yes', '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'force-release', '--session-id', 'my-session', '--context-id', 'ctx-OTHER', '--yes', '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({ ok: true, released: false, reason: 'owner_mismatch', ownerContextId: 'ctx-fr2' });
 
     // Lock should still be held
-    const status = parse(run('repo-lock', 'status', '--session-id', 'my-session', '--lock-dir', lockDir));
+    const status = parse(await run('repo-lock', 'status', '--session-id', 'my-session', '--lock-dir', lockDir));
     expect(status.locked).toBe(true);
     expect(status.contextId).toBe('ctx-fr2');
   });
 
-  test('force-release without --context-id removes any lock regardless of owner', () => {
-    createContext('ctx-fr3', 'my-session');
-    run('repo-lock', 'acquire', '--context-id', 'ctx-fr3', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('force-release without --context-id removes any lock regardless of owner', async () => {
+    await createContext('ctx-fr3', 'my-session');
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-fr3', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'force-release', '--session-id', 'my-session', '--yes', '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'force-release', '--session-id', 'my-session', '--yes', '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out).toMatchObject({ ok: true, released: true, ownerContextId: 'ctx-fr3' });
   });
 
-  test('repo-lock force-release appears in help output', () => {
-    const r = run('help');
+  test('repo-lock force-release appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('repo-lock force-release');
   });
 });
 
 describe('admin CLI — repo-lock release subcommand', () => {
-  function createContext(contextId, sessionId) {
+  async function createContext(contextId, sessionId) {
     return run('context', 'create', '--execution-id', contextId, '--session-id', sessionId, '--db-path', dbPath);
   }
 
-  test('missing --context-id exits non-zero', () => {
-    const r = run('repo-lock', 'release', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('missing --context-id exits non-zero', async () => {
+    const r = await run('repo-lock', 'release', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('context-id') });
   });
 
-  test('unknown context-id exits non-zero', () => {
-    const r = run('repo-lock', 'release', '--context-id', 'no-such-ctx', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('unknown context-id exits non-zero', async () => {
+    const r = await run('repo-lock', 'release', '--context-id', 'no-such-ctx', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('no-such-ctx') });
   });
 
-  test('releases the lock when owner matches and returns released:true', () => {
-    createContext('ctx-300', 'my-session');
-    run('repo-lock', 'acquire', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('releases the lock when owner matches and returns released:true', async () => {
+    await createContext('ctx-300', 'my-session');
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'release', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'release', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, released: true });
   });
 
-  test('returns released:false with reason not_owner when context is not the lock owner', () => {
-    createContext('ctx-300', 'my-session');
-    createContext('ctx-399', 'my-session');
-    run('repo-lock', 'acquire', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('returns released:false with reason not_owner when context is not the lock owner', async () => {
+    await createContext('ctx-300', 'my-session');
+    await createContext('ctx-399', 'my-session');
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'release', '--context-id', 'ctx-399', '--db-path', dbPath, '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'release', '--context-id', 'ctx-399', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, released: false, reason: 'not_owner' });
   });
 
-  test('returns released:false with reason no_lock when no lock exists (idempotent)', () => {
-    createContext('ctx-300', 'my-session');
-    const r = run('repo-lock', 'release', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('returns released:false with reason no_lock when no lock exists (idempotent)', async () => {
+    await createContext('ctx-300', 'my-session');
+    const r = await run('repo-lock', 'release', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, released: false, reason: 'no_lock' });
   });
 
-  test('a subsequent acquire succeeds after release', () => {
-    createContext('ctx-300', 'my-session');
-    createContext('ctx-301', 'my-session');
-    run('repo-lock', 'acquire', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
-    run('repo-lock', 'release', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
+  test('a subsequent acquire succeeds after release', async () => {
+    await createContext('ctx-300', 'my-session');
+    await createContext('ctx-301', 'my-session');
+    await run('repo-lock', 'acquire', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
+    await run('repo-lock', 'release', '--context-id', 'ctx-300', '--db-path', dbPath, '--lock-dir', lockDir);
 
-    const r = run('repo-lock', 'acquire', '--context-id', 'ctx-301', '--db-path', dbPath, '--lock-dir', lockDir);
+    const r = await run('repo-lock', 'acquire', '--context-id', 'ctx-301', '--db-path', dbPath, '--lock-dir', lockDir);
     expect(r.code).toBe(0);
     expect(parse(r)).toMatchObject({ ok: true, locked: true, contextId: 'ctx-301' });
   });
 
-  test('repo-lock release appears in help output', () => {
-    const r = run('help');
+  test('repo-lock release appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('repo-lock release');
   });
@@ -2178,26 +2411,26 @@ describe('admin CLI — task-assign subcommand', () => {
     ];
   }
 
-  test('missing --session-id exits non-zero', () => {
-    const r = run('task-assign', '--issue-number', '42', '--profile', 'codexOnly', '--sessions-path', sessionsPath, '--db-path', dbPath);
+  test('missing --session-id exits non-zero', async () => {
+    const r = await run('task-assign', '--issue-number', '42', '--profile', 'codexOnly', '--sessions-path', sessionsPath, '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('session-id') });
   });
 
-  test('missing --issue-number exits non-zero', () => {
-    const r = run('task-assign', '--session-id', 'test-session', '--profile', 'codexOnly', '--sessions-path', sessionsPath, '--db-path', dbPath);
+  test('missing --issue-number exits non-zero', async () => {
+    const r = await run('task-assign', '--session-id', 'test-session', '--profile', 'codexOnly', '--sessions-path', sessionsPath, '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('issue-number') });
   });
 
-  test('no profile or agent flags exits non-zero', () => {
-    const r = run(...baseArgs());
+  test('no profile or agent flags exits non-zero', async () => {
+    const r = await run(...baseArgs());
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('--profile') });
   });
 
-  test('invalid --implementation-agent value exits non-zero', () => {
-    const r = run(...baseArgs('--implementation-agent', 'gpt4'));
+  test('invalid --implementation-agent value exits non-zero', async () => {
+    const r = await run(...baseArgs('--implementation-agent', 'gpt4'));
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('implementation-agent') });
   });
@@ -2207,19 +2440,19 @@ describe('admin CLI — task-assign subcommand', () => {
     await store.enqueueTask({ sessionId: 'test-session', issueNumber: 42, phase: 'implementation' });
     store.close();
 
-    const r = run(...baseArgs('--profile', 'no-such-profile'));
+    const r = await run(...baseArgs('--profile', 'no-such-profile'));
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('no-such-profile') });
   });
 
-  test('unknown session exits non-zero', () => {
-    const r = run('task-assign', '--session-id', 'unknown-session', '--issue-number', '42', '--profile', 'codexOnly', '--sessions-path', sessionsPath, '--db-path', dbPath);
+  test('unknown session exits non-zero', async () => {
+    const r = await run('task-assign', '--session-id', 'unknown-session', '--issue-number', '42', '--profile', 'codexOnly', '--sessions-path', sessionsPath, '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false });
   });
 
-  test('task not found exits non-zero', () => {
-    const r = run(...baseArgs('--profile', 'codexOnly'));
+  test('task not found exits non-zero', async () => {
+    const r = await run(...baseArgs('--profile', 'codexOnly'));
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('#42') });
   });
@@ -2235,7 +2468,7 @@ describe('admin CLI — task-assign subcommand', () => {
     );
     store.close();
 
-    const r = run(...baseArgs('--profile', 'codexOnly'));
+    const r = await run(...baseArgs('--profile', 'codexOnly'));
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('claimed') });
   });
@@ -2251,7 +2484,7 @@ describe('admin CLI — task-assign subcommand', () => {
     );
     store.close();
 
-    const r = run(...baseArgs('--profile', 'codexOnly'));
+    const r = await run(...baseArgs('--profile', 'codexOnly'));
     expect(r.code).not.toBe(0);
     expect(parse(r)).toMatchObject({ ok: false, error: expect.stringContaining('running') });
   });
@@ -2266,7 +2499,7 @@ describe('admin CLI — task-assign subcommand', () => {
     );
     store.close();
 
-    const r = run(...baseArgs('--profile', 'codexOnly'));
+    const r = await run(...baseArgs('--profile', 'codexOnly'));
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -2289,7 +2522,7 @@ describe('admin CLI — task-assign subcommand', () => {
     );
     store.close();
 
-    const r = run(...baseArgs('--implementation-agent', 'codex', '--review-agent', 'codex'));
+    const r = await run(...baseArgs('--implementation-agent', 'codex', '--review-agent', 'codex'));
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -2301,7 +2534,7 @@ describe('admin CLI — task-assign subcommand', () => {
     await store.enqueueTask({ sessionId: 'test-session', issueNumber: 42, phase: 'implementation' });
     store.close();
 
-    const r = run(...baseArgs('--profile', 'code'));
+    const r = await run(...baseArgs('--profile', 'code'));
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -2322,7 +2555,7 @@ describe('admin CLI — task-assign subcommand', () => {
     });
     store.close();
 
-    const r = run(...baseArgs('--profile', 'codexOnly', '--dry-run'));
+    const r = await run(...baseArgs('--profile', 'codexOnly', '--dry-run'));
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.ok).toBe(true);
@@ -2341,7 +2574,7 @@ describe('admin CLI — task-assign subcommand', () => {
     await store.enqueueTask({ sessionId: 'test-session', issueNumber: 42, phase: 'implementation' });
     store.close();
 
-    run(...baseArgs('--profile', 'codexOnly', '--dry-run'));
+    await run(...baseArgs('--profile', 'codexOnly', '--dry-run'));
 
     const store2 = new SqliteTaskStore(dbPath);
     const events = await store2.listEvents({ sessionId: 'test-session', issueNumber: 42 });
@@ -2354,7 +2587,7 @@ describe('admin CLI — task-assign subcommand', () => {
     await store.enqueueTask({ sessionId: 'test-session', issueNumber: 42, phase: 'implementation' });
     store.close();
 
-    const r = run(...baseArgs('--profile', 'codexOnly'));
+    const r = await run(...baseArgs('--profile', 'codexOnly'));
     expect(r.code).toBe(0);
 
     const store2 = new SqliteTaskStore(dbPath);
@@ -2386,7 +2619,7 @@ describe('admin CLI — task-assign subcommand', () => {
     });
     store.close();
 
-    const r = run(...baseArgs('--profile', 'codexOnly'));
+    const r = await run(...baseArgs('--profile', 'codexOnly'));
     expect(r.code).toBe(0);
     const out = parse(r);
     expect(out.previous).toMatchObject({ implementationAgent: 'claude', reviewAgent: 'codex' });
@@ -2408,7 +2641,7 @@ describe('admin CLI — task-assign subcommand', () => {
     );
     store.close();
 
-    const r = run(...baseArgs('--profile', 'docs'));
+    const r = await run(...baseArgs('--profile', 'docs'));
     expect(r.code).toBe(0);
 
     const store2 = new SqliteTaskStore(dbPath);
@@ -2426,16 +2659,16 @@ describe('admin CLI — task-assign subcommand', () => {
     await store.enqueueTask({ sessionId: 'test-session', issueNumber: 42, phase: 'implementation' });
     store.close();
 
-    run(...baseArgs('--profile', 'codexOnly'));
+    await run(...baseArgs('--profile', 'codexOnly'));
 
     // SqliteTaskStore does not create outbox entries; command must not emit any
     // label side effects. We verify by confirming no exception and the result is ok.
-    const r = run(...baseArgs('--profile', 'docs'));
+    const r = await run(...baseArgs('--profile', 'docs'));
     expect(r.code).toBe(0);
   });
 
-  test('task-assign appears in help output', () => {
-    const r = run('help');
+  test('task-assign appears in help output', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('task-assign');
   });
@@ -2457,8 +2690,8 @@ describe('admin CLI — output contract (issue #308)', () => {
     }
   }
 
-  test('global options are documented in help', () => {
-    const r = run('help');
+  test('global options are documented in help', async () => {
+    const r = await run('help');
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('Global options');
     expect(r.stdout).toContain('--json');
@@ -2466,15 +2699,15 @@ describe('admin CLI — output contract (issue #308)', () => {
     expect(r.stdout).toContain('--verbose');
   });
 
-  test('per-command help notes the default output mode', () => {
-    const operator = run('help', 'task-status');
+  test('per-command help notes the default output mode', async () => {
+    const operator = await run('help', 'task-status');
     expect(operator.stdout).toContain('human-readable by default');
-    const machine = run('help', 'context create');
+    const machine = await run('help', 'context create');
     expect(machine.stdout).toContain('structured JSON');
   });
 
-  test('task-status prints human-readable text by default (no tasks)', () => {
-    const r = run('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('task-status prints human-readable text by default (no tasks)', async () => {
+    const r = await run('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(false);
     expect(r.stdout).toContain('No tasks found');
@@ -2486,7 +2719,7 @@ describe('admin CLI — output contract (issue #308)', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 10, phase: 'research' });
     store.close();
 
-    const r = run('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
+    const r = await run('task-status', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(false);
     expect(r.stdout).toContain('#10');
@@ -2499,7 +2732,7 @@ describe('admin CLI — output contract (issue #308)', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 10, phase: 'research' });
     store.close();
 
-    const r = run('task-status', '--session-id', 'addon-dev', '--db-path', dbPath, '--json');
+    const r = await run('task-status', '--session-id', 'addon-dev', '--db-path', dbPath, '--json');
     expect(r.code).toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(true);
     const out = JSON.parse(r.stdout.trim());
@@ -2507,29 +2740,29 @@ describe('admin CLI — output contract (issue #308)', () => {
     expect(out.tasks[0]).toMatchObject({ issueNumber: 10, phase: 'research', status: 'queued' });
   });
 
-  test('list-stuck prints human-readable text by default (none stuck)', () => {
-    const r = run('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('list-stuck prints human-readable text by default (none stuck)', async () => {
+    const r = await run('list-stuck', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(false);
     expect(r.stdout).toContain('No stuck tasks');
   });
 
-  test('recover --dry-run prints a human-readable planned action by default', () => {
-    const r = run('recover', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath);
+  test('recover --dry-run prints a human-readable planned action by default', async () => {
+    const r = await run('recover', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(false);
     expect(r.stdout).toContain('Dry run');
   });
 
-  test('recover --dry-run --json emits structured JSON', () => {
-    const r = run('recover', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath, '--json');
+  test('recover --dry-run --json emits structured JSON', async () => {
+    const r = await run('recover', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath, '--json');
     expect(r.code).toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(true);
     expect(JSON.parse(r.stdout.trim())).toMatchObject({ ok: true, dryRun: true, wouldRecover: [] });
   });
 
-  test('recover-cap-handoff --dry-run prints a human-readable planned action by default', () => {
-    const r = run('recover-cap-handoff', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath);
+  test('recover-cap-handoff --dry-run prints a human-readable planned action by default', async () => {
+    const r = await run('recover-cap-handoff', '--session-id', 'addon-dev', '--dry-run', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(false);
     expect(r.stdout).toContain('Dry run');
@@ -2540,28 +2773,28 @@ describe('admin CLI — output contract (issue #308)', () => {
     await store.enqueueTask({ sessionId: 'addon-dev', issueNumber: 10, phase: 'research' });
     store.close();
 
-    const r = run('task-status', '--session-id', 'addon-dev', '--db-path', dbPath, '--quiet');
+    const r = await run('task-status', '--session-id', 'addon-dev', '--db-path', dbPath, '--quiet');
     expect(r.code).toBe(0);
     expect(r.stdout).not.toContain('task(s) for');
     expect(r.stdout).toContain('#10');
   });
 
-  test('human-mode errors go to stderr, not stdout', () => {
-    const r = runFull('task-status', '--db-path', dbPath);
+  test('human-mode errors go to stderr, not stdout', async () => {
+    const r = await runFull('task-status', '--db-path', dbPath);
     expect(r.code).not.toBe(0);
     expect(r.stderr).toContain('session-id');
     expect(isJsonStdout(r.stdout)).toBe(false);
   });
 
-  test('JSON-mode errors stay on stdout for machine callers', () => {
-    const r = runFull('task-status', '--db-path', dbPath, '--json');
+  test('JSON-mode errors stay on stdout for machine callers', async () => {
+    const r = await runFull('task-status', '--db-path', dbPath, '--json');
     expect(r.code).not.toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(true);
     expect(JSON.parse(r.stdout.trim())).toMatchObject({ ok: false });
   });
 
-  test('machine commands (context create) still default to JSON', () => {
-    const r = run('context', 'create', '--execution-id', 'exec-1', '--session-id', 'addon-dev', '--db-path', dbPath);
+  test('machine commands (context create) still default to JSON', async () => {
+    const r = await run('context', 'create', '--execution-id', 'exec-1', '--session-id', 'addon-dev', '--db-path', dbPath);
     expect(r.code).toBe(0);
     expect(isJsonStdout(r.stdout)).toBe(true);
     expect(JSON.parse(r.stdout.trim())).toMatchObject({ ok: true, contextId: 'exec-1' });

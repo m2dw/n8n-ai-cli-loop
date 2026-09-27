@@ -9,6 +9,11 @@
  * `admin task-status`. These tests pin the two effects that close that gap, the
  * bound and the redaction on their public text, and the run-independent keys
  * that keep a phase retry from publishing the handoff twice.
+ *
+ * Issue #981 adds the third effect of the same handoff: the session's configured
+ * messenger notification, which the lane owed every other `ready_for_human`
+ * transition and did not send for this one. It shares the handoff's identity — and
+ * therefore its idempotency and its §16 bound — but it is not a work-item write.
  */
 import { execFileSync } from 'child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
@@ -260,7 +265,12 @@ describe('renderRefinementHandoffComment — §16 fields', () => {
     expect(body).toContain(REFINEMENT_HANDOFF_NEXT_ACTIONS.agent_unavailable);
     // §13 item 2, stated for the reader who has to decide what to relabel.
     expect(body).toContain('deliberately left in place');
-    expect(body).toContain('admin task cancel');
+    // issue #984: the guidance must point at the command that actually moves
+    // the row into implementation, and must never send an operator to
+    // `admin task cancel`, whose terminal row implementation intake cannot
+    // reactivate.
+    expect(body).toContain('admin recover --session-id <session-id> --issue-number 697 --from ready_for_human --phase implementation');
+    expect(body).not.toContain('admin task cancel');
     // §16: never a run id, never raw output, never an artifact path.
     expect(body).not.toContain('run-secret-1');
     expect(body).not.toContain('.n8n-artifacts');
@@ -278,6 +288,45 @@ describe('renderRefinementHandoffComment — §16 fields', () => {
     // A shared "see the docs" sentence for every reason would make the comment
     // useless exactly when it matters, so each reason names its own next step.
     expect(seen.size).toBe(REFINEMENT_HANDOFF_REASONS.length);
+  });
+
+  // §5.2 (issue #1003): the comment is the operator's first sight of a stop
+  // that happened before either agent ran, so it has to say what to fix — and
+  // it cannot name the declared path, which is repository content §5 keeps out
+  // of public Issues.
+  test('the required-evidence handoff names an actionable next step without a path', () => {
+    const publication = publishableRefinementHandoff(
+      697,
+      block({
+        handoffReason: 'evidence_required',
+        evidenceGate: {
+          declared: 1,
+          captured: 0,
+          optionalGaps: 0,
+          gaps: [
+            {
+              index: 0,
+              reason: 'missing_path',
+              requirement: 'required',
+              predecessorIssueNumber: 10,
+            },
+          ],
+          artifact: 'evidence-preflight.json',
+          recordedAt: '2026-08-10T00:00:00.000Z',
+        },
+      }),
+    );
+    // The publication TYPE is the redaction boundary: the gate record is not
+    // one of its fields, so nothing about it can reach the comment.
+    expect(publication.reason).toBe('evidence_required');
+    expect(JSON.stringify(publication)).not.toContain('evidence-preflight.json');
+    const body = renderRefinementHandoffComment(publication);
+    expect(body).toContain('| Handoff reason | `evidence_required` |');
+    expect(body).toContain('neither agent was run');
+    expect(body).toContain('"required": false');
+    expect(body).not.toContain('src/');
+    // The marker was never touched: this handoff is raised long before §11.
+    expect(publication.markerRetained).toBe(true);
   });
 
   test('a post-step-5 handoff warns that the marker may already be gone', () => {
@@ -414,6 +463,351 @@ describe('enqueueRefinementHandoffEffects', () => {
     const rows = await pending();
     expect(rows.map((r) => r.topic).sort()).toEqual(['workitem:comment', 'workitem:transition']);
     expect(rows.every((r) => r.payload.owner === 'private' && r.payload.repo === 'work')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The messenger notification (issue #981)
+//
+// #936 made the Issue right and left the notifier silent: the refinement lane
+// skips the phase runner's generic completion builders, `enqueueSlackNotificationEffect`
+// among them, so a PIR escalation was the one `ready_for_human` transition in the
+// system that produced no notification at all — and it is the transition with a
+// human waiting on the other end of it.
+// ---------------------------------------------------------------------------
+
+describe('enqueueRefinementHandoffEffects — configured notifier', () => {
+  const NOTIFIED_SESSION = {
+    ...SESSION,
+    notifications: { slack: { enabled: true, webhookUrlEnv: 'REFINEMENT_WEBHOOK_URL' } },
+  };
+
+  async function notifications() {
+    return (await pending()).filter((r) => r.topic === 'slack:notification');
+  }
+
+  test('a terminal handoff notifies the configured messenger beside its two work-item effects', async () => {
+    await enqueueHandoff({ refinement: block() }, NOTIFIED_SESSION);
+
+    const rows = await pending();
+    expect(rows.map((r) => r.topic).sort()).toEqual([
+      'gh:comment',
+      'gh:label:add',
+      'slack:notification',
+    ]);
+    const [notification] = await notifications();
+    // The whole payload, not a subset: what is absent matters as much as what is
+    // present, and `toEqual` is what pins the absence.
+    expect(notification.payload).toEqual({
+      topic: 'slack:notification',
+      owner: 'm2dw',
+      repo: 'some-repo',
+      // The env var NAME. The webhook URL is resolved at dispatch and never
+      // persisted, exactly as for every other lane's notification (issue #465).
+      webhookUrlEnv: 'REFINEMENT_WEBHOOK_URL',
+      sessionId: 'addon-dev',
+      issueNumber: 697,
+      // What identifies the handoff as Issue refinement rather than one of the
+      // implementation lane's own stops.
+      phase: 'refinement',
+      transition: 'ready_for_human',
+      // A closed-set §13 literal — never agent output or provider error text.
+      reason: 'agent_unavailable',
+      issueUrl: 'https://github.com/m2dw/some-repo/issues/697',
+    });
+  });
+
+  // One Issue per reason so the whole closed set lands in one outbox: every §13
+  // reason is a handoff, so every §13 reason must reach the notifier — a set that
+  // grows by one and quietly notifies for all but the new member is the failure
+  // this pins.
+  test('every terminal reason reaches the notifier with its own literal', async () => {
+    const reasons = [...REFINEMENT_HANDOFF_REASONS];
+    for (const [index, reason] of reasons.entries()) {
+      await enqueueHandoff({ refinement: block({ handoffReason: reason }) }, NOTIFIED_SESSION, 1000 + index);
+    }
+    const rows = await notifications();
+    expect(rows).toHaveLength(reasons.length);
+    expect(rows.map((r) => r.payload.reason)).toEqual(reasons);
+    expect(rows.every((r) => r.payload.phase === 'refinement')).toBe(true);
+    expect(rows.every((r) => r.payload.transition === 'ready_for_human')).toBe(true);
+  });
+
+  test('a session with no notifications configured completes its handoff and notifies nobody', async () => {
+    await enqueueHandoff({ refinement: block() });
+    const rows = await pending();
+    expect(rows.map((r) => r.topic).sort()).toEqual(['gh:comment', 'gh:label:add']);
+  });
+
+  test('a session with notifications disabled notifies nobody', async () => {
+    await enqueueHandoff({ refinement: block() }, {
+      ...SESSION,
+      notifications: { slack: { enabled: false, webhookUrlEnv: 'REFINEMENT_WEBHOOK_URL' } },
+    });
+    expect(await notifications()).toHaveLength(0);
+    expect(await pending()).toHaveLength(2);
+  });
+
+  // A notifications block with the switch on but no env var name is a half-written
+  // config; enqueuing it would dead-letter at dispatch with nowhere to POST.
+  test('an enabled notifier with no webhook env var name enqueues nothing', async () => {
+    await enqueueHandoff({ refinement: block() }, {
+      ...SESSION,
+      notifications: { slack: { enabled: true, webhookUrlEnv: '' } },
+    });
+    expect(await notifications()).toHaveLength(0);
+  });
+
+  test('publishes no notification for a non-terminal completion', async () => {
+    await enqueueHandoff({ refinement: block({ state: 'accepted', handoffReason: null }) }, NOTIFIED_SESSION);
+    await enqueueHandoff({ refinement: block({ state: 'activated', handoffReason: null }) }, NOTIFIED_SESSION);
+    await enqueueHandoff({}, NOTIFIED_SESSION);
+    expect(await pending()).toHaveLength(0);
+  });
+
+  test('a re-derived completion enqueues one notification, not one per attempt', async () => {
+    await enqueueHandoff({ refinement: block() }, NOTIFIED_SESSION);
+    await enqueueHandoff({ refinement: block({ updatedAt: '2026-08-18T11:22:33.000Z' }) }, NOTIFIED_SESSION);
+    await enqueueHandoff({ refinement: block({ updatedAt: '2026-08-19T01:02:03.000Z' }) }, NOTIFIED_SESSION);
+
+    const rows = await notifications();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].idempotencyKey).toBe(
+      refinementHandoffIdempotencyKey({
+        sessionId: 'addon-dev',
+        issueNumber: 697,
+        reason: 'agent_unavailable',
+        effect: 'notification',
+      }),
+    );
+    // Transition identity, not run identity: a lost CAS re-derives the same key.
+    expect(rows[0].idempotencyKey).not.toContain('run-');
+  });
+
+  // The whole point of keying on the §13 recovery ordinal rather than on the
+  // Issue and the reason: `admin refinement recover` returns the lane to
+  // `pending`, and the attempt it starts is a new handoff a human must hear about
+  // even when it stops for the very same reason (issue #980).
+  test('a recovered lane that escalates again notifies again', async () => {
+    await enqueueHandoff({ refinement: block() }, NOTIFIED_SESSION);
+    await enqueueHandoff({ refinement: block({ recoveries: 1 }) }, NOTIFIED_SESSION);
+
+    const rows = await notifications();
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((r) => r.idempotencyKey)).size).toBe(2);
+    expect(rows.map((r) => r.payload.reason)).toEqual(['agent_unavailable', 'agent_unavailable']);
+  });
+
+  test('a later handoff stopping for a different reason notifies again', async () => {
+    await enqueueHandoff({ refinement: block() }, NOTIFIED_SESSION);
+    await enqueueHandoff({ refinement: block({ handoffReason: 'no_convergence' }) }, NOTIFIED_SESSION);
+    expect((await notifications()).map((r) => r.payload.reason).sort()).toEqual([
+      'agent_unavailable',
+      'no_convergence',
+    ]);
+  });
+
+  // §16: the notification is a public surface with a private channel, not an
+  // exemption. The block below carries every kind of thing that must not leave —
+  // a run id, an artifact path, a repo path, raw agent prose — and none of it is
+  // reachable from the payload's closed set of fields.
+  test('carries no local path, artifact path, run id, or raw agent output', async () => {
+    await enqueueHandoff(
+      {
+        refinement: block({
+          markerLabel: '/tmp/some-repo/.n8n-artifacts/status:needs-refinement',
+          lastAgentOutput: 'the critic said the repository at /tmp/some-repo is a mess',
+          execution: {
+            runId: 'run-secret-1',
+            refiner: {
+              agentId: '/tmp/some-repo/bin/claude',
+              provider: 'anthropic',
+              model: 'claude-opus',
+              invocations: 3,
+            },
+            critic: null,
+          },
+        }),
+        artifactDir: '/tmp/some-repo/.n8n-artifacts/697',
+        prUrl: 'https://github.com/m2dw/some-repo/pull/11',
+      },
+      NOTIFIED_SESSION,
+    );
+
+    const [notification] = await notifications();
+    const serialized = JSON.stringify(notification.payload);
+    expect(serialized).not.toContain('/tmp/some-repo');
+    expect(serialized).not.toContain('.n8n-artifacts');
+    expect(serialized).not.toContain('run-secret-1');
+    expect(serialized).not.toContain('is a mess');
+    // Not the webhook URL either — only the name of the env var holding it.
+    expect(serialized).not.toContain('hooks.slack.com');
+    // …and the fields that DO survive are the ones §16 permits.
+    expect(notification.payload.reason).toBe('agent_unavailable');
+    expect(notification.payload.issueUrl).toBe('https://github.com/m2dw/some-repo/issues/697');
+  });
+
+  // The link follows the WORK ITEM, not the session's GitHub fields: a Gitea
+  // session's Issue 697 is on its own instance, and `github.com/<githubRepo>`
+  // would send the operator to a different Issue (issue #981 review).
+  test('links the Gitea Issue for a gitea-issues work-item provider', async () => {
+    await enqueueHandoff({ refinement: block() }, {
+      ...NOTIFIED_SESSION,
+      workItemProvider: {
+        provider: 'gitea-issues',
+        auth: { mode: 'token', tokenEnv: 'GITEA_TOKEN' },
+        gitea: { baseUrl: 'https://git.example/', owner: 'private', repo: 'work' },
+      },
+    });
+
+    const [notification] = await notifications();
+    expect(notification.payload.issueUrl).toBe('https://git.example/private/work/issues/697');
+    expect(notification.payload.reason).toBe('agent_unavailable');
+    // Only the LINK follows the work item. `owner`/`repo` are not rewritten: a
+    // notification is not a work-item write, and the dispatcher's session filter
+    // keys on these two fields.
+    expect(notification.payload.owner).toBe('m2dw');
+    expect(notification.payload.repo).toBe('some-repo');
+    expect(notification.topic).toBe('slack:notification');
+  });
+
+  // No link beats a wrong or unsafe one. A `baseUrl` embedding credentials is
+  // rejected at session validation, so reaching here means something bypassed it
+  // — and the notification must not be the thing that posts it into a channel.
+  test('omits the link rather than inventing one when the Gitea coordinates cannot build it', async () => {
+    const cases = [
+      undefined,
+      { baseUrl: 'https://user:token@git.example', owner: 'private', repo: 'work' },
+      { baseUrl: 'not a url', owner: 'private', repo: 'work' },
+      { baseUrl: 'https://git.example', owner: '', repo: 'work' },
+    ];
+    for (const [index, gitea] of cases.entries()) {
+      await enqueueHandoff(
+        { refinement: block() },
+        {
+          ...NOTIFIED_SESSION,
+          workItemProvider: {
+            provider: 'gitea-issues',
+            auth: { mode: 'token', tokenEnv: 'GITEA_TOKEN' },
+            ...(gitea ? { gitea } : {}),
+          },
+        },
+        2000 + index,
+      );
+    }
+
+    const rows = await notifications();
+    expect(rows).toHaveLength(cases.length);
+    for (const row of rows) {
+      expect(row.payload.issueUrl).toBeUndefined();
+      expect(JSON.stringify(row.payload)).not.toContain('token@');
+      // The rest of the notification is provider-independent and still goes out.
+      expect(row.payload.reason).toBe('agent_unavailable');
+    }
+  });
+
+  test('the key parses back as this handoff\'s notification effect', () => {
+    const key = refinementHandoffIdempotencyKey({
+      sessionId: 'addon-dev',
+      issueNumber: 697,
+      reason: 'agent_unavailable',
+      effect: 'notification',
+      recoveries: 2,
+    });
+    expect(refinementHandoffEffectFromKey(key)).toEqual({
+      sessionId: 'addon-dev',
+      issueNumber: 697,
+      reason: 'agent_unavailable',
+      effect: 'notification',
+      recoveries: 2,
+    });
+  });
+});
+
+describe('handoff notification — delivery', () => {
+  const NOTIFIED_NO_LABEL_SESSION = {
+    ...SESSION,
+    labels: { active: 'ai:active' },
+    notifications: { slack: { enabled: true, webhookUrlEnv: 'REFINEMENT_WEBHOOK_URL' } },
+  };
+
+  /** A `gh` fake that answers the comment-history GET and swallows the POST. */
+  function ghRunner() {
+    return {
+      run(args) {
+        const method = args[args.indexOf('--method') + 1];
+        if (method === 'GET') return { exitCode: 0, stdout: '[]', stderr: '' };
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    };
+  }
+
+  async function drain(fetchImpl, env) {
+    const store = new SqliteOutboxStore(dbPath);
+    try {
+      return await dispatchOutbox(store, ghRunner(), { cwd: tmpDir, fetchImpl, env });
+    } finally {
+      store.close();
+    }
+  }
+
+  test('one POST reaches the webhook, naming the Issue and the refinement phase', async () => {
+    await enqueueHandoff({ refinement: block() }, NOTIFIED_NO_LABEL_SESSION);
+
+    const calls = [];
+    const fetchImpl = async (url, opts) => {
+      calls.push({ url, opts });
+      return { ok: true, status: 200, text: async () => '' };
+    };
+    const result = await drain(fetchImpl, { REFINEMENT_WEBHOOK_URL: 'https://hooks.slack.com/fake' });
+
+    expect(result.failed).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('https://hooks.slack.com/fake');
+    const { text } = JSON.parse(calls[0].opts.body);
+    expect(text).toContain('Ready for human');
+    expect(text).toContain('issue #697');
+    expect(text).toContain('refinement');
+    expect(text).toContain('agent_unavailable');
+    expect(text).toContain('https://github.com/m2dw/some-repo/issues/697');
+    expect(text).not.toContain('/tmp/');
+  });
+
+  test('a second drain re-posts nothing: the row is sent, not re-derived', async () => {
+    await enqueueHandoff({ refinement: block() }, NOTIFIED_NO_LABEL_SESSION);
+
+    const calls = [];
+    const fetchImpl = async (url, opts) => {
+      calls.push({ url, opts });
+      return { ok: true, status: 200, text: async () => '' };
+    };
+    const env = { REFINEMENT_WEBHOOK_URL: 'https://hooks.slack.com/fake' };
+    await drain(fetchImpl, env);
+    // The completion re-derives its effects (a lost CAS, an operator re-run) and
+    // the outbox dedupes them against the sent row rather than notifying twice.
+    await enqueueHandoff({ refinement: block() }, NOTIFIED_NO_LABEL_SESSION);
+    await drain(fetchImpl, env);
+
+    expect(calls).toHaveLength(1);
+  });
+
+  // §13: the handoff already committed. A messenger that is down retries on its
+  // own budget and can never reach back into the transition.
+  test('an undeliverable notification stays a retryable outbox row', async () => {
+    await enqueueHandoff({ refinement: block() }, NOTIFIED_NO_LABEL_SESSION);
+
+    const result = await drain(
+      async () => ({ ok: false, status: 500, text: async () => 'slack is down' }),
+      { REFINEMENT_WEBHOOK_URL: 'https://hooks.slack.com/fake' },
+    );
+
+    expect(result.failed).toBe(1);
+    const [row] = (await pending()).filter((r) => r.topic === 'slack:notification');
+    expect(row).toBeDefined();
+    expect(row.attemptCount).toBe(1);
+    expect(row.deadLetterAt).toBeUndefined();
+    // The comment — the §13 half that does not depend on a messenger — went out.
+    expect((await pending()).some((r) => r.topic === 'gh:comment')).toBe(false);
   });
 });
 
@@ -921,6 +1315,9 @@ describe('recordRefinementHandoffCommentUndeliverable — §12 row 46', () => {
       issueNumber: 42,
       reason: 'agent_unavailable',
       effect: 'comment',
+      // Issue #980: a block that has never taken §13 recovery keys exactly as
+      // it always did, and parses back with the ordinal at zero.
+      recoveries: 0,
     });
   });
 

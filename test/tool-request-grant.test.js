@@ -138,6 +138,12 @@ describe('tool-request-grant — status', () => {
     expect(grantStatus(g, '2026-06-20T01:00:00.000Z')).toBe('expired');
   });
 
+  test('expired at exactly expiresAt (boundary; issue #1112 survivor 10)', () => {
+    const g = baseGrant({ ttlMs: 1000 });
+    expect(grantStatus(g, g.expiresAt)).toBe('expired');
+    expect(grantStatus(g, new Date(Date.parse(g.expiresAt) - 1).toISOString())).toBe('active');
+  });
+
   test('exhausted once uses reaches maxUses', () => {
     const g = { ...baseGrant(), uses: 1, maxUses: 1 };
     expect(grantStatus(g, NOW)).toBe('exhausted');

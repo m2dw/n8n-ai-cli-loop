@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { isIndeterminateProbeError } from './helpers/cli-probe.js';
 import {
   CHILD_ARTIFACT_FILE_NAME,
   CHILD_WORKFLOW_ID,
@@ -47,6 +48,96 @@ function run(args, env = {}) {
   } catch (err) {
     return { code: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
   }
+}
+
+/**
+ * Is this deploy failure a statement about the HOST rather than about the
+ * deploy? The fake `n8n` below is a handful of `/bin/sh` lines, so nothing but a
+ * thrashing machine — a full parallel Jest run forking thousands of children —
+ * can spend a step's whole command budget and have it killed (`ETIMEDOUT`).
+ * Issue #897 draws exactly this line for CLI probes, and its errno test is
+ * reused here rather than restated.
+ */
+function isHostStarvedDeploy(payload) {
+  const failure = payload.failure;
+  if (failure === undefined || failure === null) return false;
+  return isIndeterminateProbeError(
+    [failure.reason, failure.detail].filter((text) => typeof text === 'string').join(' '),
+  );
+}
+
+/**
+ * Run a deploy that is expected to succeed, asking again when the host starved a
+ * step, with the deploy's own failure detail asserted first: `expect(payload.ok)
+ * .toBe(true)` alone reports nothing but `false`, which names neither the step
+ * that failed nor why.
+ *
+ * Re-running is safe: a deploy releases both locks whatever its outcome, and a
+ * second one re-generates and re-imports the same artifacts. `answered` is false
+ * only when every attempt was starved — the caller then declines to assert
+ * rather than report a host that could not run a child as a deployment bug.
+ *
+ * `beforeAttempt` runs before each attempt, for a caller that compares the fake
+ * n8n's call log: a starved attempt appends its partial argv to the same log, so
+ * only a log cleared per attempt holds the calls of the deploy being asserted.
+ *
+ * `extraArgs` are appended after `--yes`, so a case whose deploy carries another
+ * flag (`--publish`) gets the same starvation tolerance rather than a second,
+ * drifting copy of this loop.
+ */
+function runSuccessfulDeploy(attempts = 2, beforeAttempt = undefined, extraArgs = []) {
+  let result;
+  let payload;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (beforeAttempt !== undefined) beforeAttempt();
+    result = run([...args('--yes', ...extraArgs), '--json'], deployEnv());
+    payload = JSON.parse(result.stdout.trim());
+    if (!isHostStarvedDeploy(payload)) {
+      expect(payload.failure ?? null).toBeNull();
+      return { result, payload, answered: true };
+    }
+    // Loud on purpose: a case that stops asserting has to be visible in the run
+    // it happened in, not discovered later as coverage that quietly went away.
+    console.warn(
+      `n8n deploy starved on attempt ${attempt}/${attempts} — the host did not run a step in time: ` +
+        JSON.stringify(payload.failure),
+    );
+  }
+  return { result, payload, answered: false };
+}
+
+/**
+ * Run a deploy that is expected to FAIL for the reason the case is about, asking
+ * again when the host starved a step instead.
+ *
+ * {@link runSuccessfulDeploy} gives that tolerance to the deploys that must
+ * succeed; a case whose subject is *which* step stopped the deploy needs it for
+ * the same reason and cannot use that helper, which asserts there was no
+ * failure. A starved step fails EARLY — `import-child` reporting `ETIMEDOUT`
+ * from a `/bin/sh` stub that never got a slot — so on a thrashing host the run
+ * never reaches the verification the case is about, and the case would report
+ * "the deploy stopped at the wrong step" about a machine, not about the deploy.
+ *
+ * Re-running is safe here for the reasons it is safe there: a deploy releases
+ * both locks whatever its outcome, and the fake n8n's listing is a file the case
+ * wrote before the first attempt, so every attempt fails the same way.
+ * `answered` is false only when every attempt was starved.
+ */
+function runFailingDeploy(extraArgs = [], attempts = 2) {
+  let result;
+  let payload;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    result = run([...args('--yes', ...extraArgs), '--json'], deployEnv());
+    payload = JSON.parse(result.stdout.trim());
+    if (!isHostStarvedDeploy(payload)) return { result, payload, answered: true };
+    // Loud on purpose: a case that stops asserting has to be visible in the run
+    // it happened in, not discovered later as coverage that quietly went away.
+    console.warn(
+      `n8n deploy starved on attempt ${attempt}/${attempts} — the host did not run a step in time: ` +
+        JSON.stringify(payload.failure),
+    );
+  }
+  return { result, payload, answered: false };
 }
 
 /** argv of each fake-n8n invocation, in call order. */
@@ -313,8 +404,12 @@ describe('apply (--yes)', () => {
     const trackedTemplate = join(REPO_ROOT, 'docs', 'n8n-thin-parent-workflow.json');
     const templateMtime = statSync(trackedTemplate).mtimeMs;
 
-    const result = run([...args('--yes'), '--json'], deployEnv());
-    const payload = JSON.parse(result.stdout.trim());
+    // The call-count assertion below reads the fake n8n's log, and a starved
+    // attempt appends its partial argv to the same log, so each attempt starts
+    // from an empty one — as in the repeat-import case below.
+    const clearLog = () => rmSync(logPath, { force: true });
+    const { result, payload, answered } = runSuccessfulDeploy(2, clearLog);
+    if (!answered) return;
     expect(payload.ok).toBe(true);
     expect(payload.applied).toBe(true);
     expect(payload.published).toBe(false);
@@ -350,19 +445,28 @@ describe('apply (--yes)', () => {
       CHILD_WORKFLOW_ID,
     );
     expect(statSync(trackedTemplate).mtimeMs).toBe(templateMtime);
-  }, 60_000);
+    // One deploy, retryable once, against a 120 s per-command budget, as in
+    // the verification-failure cases below.
+  }, 300_000);
 
   test('a second deploy repeats the same two imports rather than creating duplicates', () => {
-    run([...args('--yes'), '--json'], deployEnv());
+    // Both deploys are compared by their call log, so each attempt starts from
+    // an empty one: a starved attempt still logs the steps it got through, and
+    // those calls belong to no deploy this test is asserting about.
+    const clearLog = () => rmSync(logPath, { force: true });
+    const first = runSuccessfulDeploy(2, clearLog);
+    if (!first.answered) return;
     const firstCalls = fakeN8nCalls();
-    rmSync(logPath, { force: true });
-    const result = run([...args('--yes'), '--json'], deployEnv());
-    const payload = JSON.parse(result.stdout.trim());
+    const second = runSuccessfulDeploy(2, clearLog);
+    if (!second.answered) return;
+    const payload = second.payload;
     expect(payload.ok).toBe(true);
     expect(fakeN8nCalls()).toEqual(firstCalls);
     expect(payload.verification.matched.parent).toEqual({ id: PARENT_ID, name: PARENT_NAME });
     expect(payload.verification.matched.child).toEqual({ id: CHILD_WORKFLOW_ID, name: CHILD_WORKFLOW_NAME });
-  }, 60_000);
+    // Two full deploys, each retryable once, against a 120 s per-command budget,
+    // matching the lock-release case below.
+  }, 600_000);
 
   test('--publish activates the parent after verification passes', () => {
     const result = run([...args('--yes', '--publish'), '--json'], deployEnv());
@@ -431,15 +535,22 @@ describe('apply (--yes)', () => {
   test('a verification failure fails the command before publishing', () => {
     // n8n reports only the child: the parent import did not land.
     writeListOutput([`${CHILD_WORKFLOW_ID}|${CHILD_WORKFLOW_NAME}`]);
-    const result = run([...args('--yes', '--publish'), '--json'], deployEnv());
+    // The claim is that the deploy got as far as verification and stopped there,
+    // so a host that starved an earlier step has to be asked again rather than
+    // reported as a deploy that failed at the wrong step.
+    const { result, payload, answered } = runFailingDeploy(['--publish']);
+    if (!answered) return;
     expect(result.code).toBe(1);
-    const payload = JSON.parse(result.stdout.trim());
     expect(payload.ok).toBe(false);
     expect(payload.published).toBe(false);
     expect(payload.failure.step).toBe('verify-workflows');
     expect(payload.steps.find((step) => step.id === 'publish-parent').outcome).toBe('skipped');
+    // Read across every attempt: no attempt of a deploy that never verifies may
+    // publish, so a retry cannot make this true either.
     expect(fakeN8nCalls().some((call) => call[0] === 'update:workflow')).toBe(false);
-  }, 60_000);
+    // One deploy, retryable once, against a 120 s per-command budget, as in the
+    // repeat-import case above.
+  }, 300_000);
 
   test('a duplicate workflow under a second ID fails verification', () => {
     writeListOutput([
@@ -447,16 +558,23 @@ describe('apply (--yes)', () => {
       `${PARENT_ID}|${PARENT_NAME}`,
       `stale-duplicate|${PARENT_NAME}`,
     ]);
-    const result = run([...args('--yes'), '--json'], deployEnv());
+    // Same subject as the case above — a failure reported by verification, not
+    // by whichever step the host happened to starve.
+    const { result, payload, answered } = runFailingDeploy();
+    if (!answered) return;
     expect(result.code).toBe(1);
-    const payload = JSON.parse(result.stdout.trim());
     expect(payload.ok).toBe(false);
+    expect(payload.failure.step).toBe('verify-workflows');
     expect(payload.failure.detail).toContain('stale-duplicate');
-  }, 60_000);
+  }, 300_000);
 
   test('human output reports each step and the unpublished parent', () => {
     const result = run([...args('--yes')], deployEnv());
-    expect(result.code).toBe(0);
+    // Asserted through the whole result rather than `result.code` alone: this is
+    // the human renderer, so a non-zero exit prints no JSON to read the failing
+    // step out of, and a bare `expected 0, received 1` says nothing about which
+    // step stopped the deploy.
+    expect(result).toMatchObject({ code: 0 });
     expect(result.stdout).toContain('ok      generate');
     expect(result.stdout).toContain('ok      import-child');
     expect(result.stdout).toContain('Parent workflow imported but not published');
@@ -468,9 +586,14 @@ describe('apply (--yes)', () => {
     // the whole record — so without the restore this plain re-deploy would stop
     // the schedule trigger of a session that was running.
     writeActiveListOutput([`${PARENT_ID}|${PARENT_NAME}`]);
-    const result = run([...args('--yes'), '--json'], deployEnv());
+    // The claim is about the LAST call the deploy made, so a starved attempt's
+    // partial argv must not be left in the log the assertion reads — as in the
+    // --publish case below. The active listing is a file written above and is
+    // answered identically on every attempt.
+    const clearLog = () => rmSync(logPath, { force: true });
+    const { result, payload, answered } = runSuccessfulDeploy(2, clearLog);
+    if (!answered) return;
     expect(result.code).toBe(0);
-    const payload = JSON.parse(result.stdout.trim());
     expect(payload.ok).toBe(true);
     expect(payload.parentWasActive).toBe(true);
     expect(payload.parentActiveRestored).toBe(true);
@@ -479,7 +602,8 @@ describe('apply (--yes)', () => {
     expect(payload.publishRequested).toBe(false);
     const calls = fakeN8nCalls();
     expect(calls[calls.length - 1]).toEqual(['update:workflow', `--id=${PARENT_ID}`, '--active=true']);
-  }, 60_000);
+    // One deploy, retryable once, against a 120 s per-command budget.
+  }, 300_000);
 
   test('human output says the parent stayed active', () => {
     writeActiveListOutput([`${PARENT_ID}|${PARENT_NAME}`]);
@@ -507,8 +631,11 @@ describe('apply (--yes)', () => {
 
   test('--publish activates outright, without probing the prior state', () => {
     writeActiveListOutput([`${PARENT_ID}|${PARENT_NAME}`]);
-    const result = run([...args('--yes', '--publish'), '--json'], deployEnv());
-    const payload = JSON.parse(result.stdout.trim());
+    // The claim is about which calls the deploy did NOT make, so a starved
+    // attempt's partial argv must not be left in the log the assertion reads.
+    const clearLog = () => rmSync(logPath, { force: true });
+    const { payload, answered } = runSuccessfulDeploy(2, clearLog, ['--publish']);
+    if (!answered) return;
     expect(payload.ok).toBe(true);
     expect(payload.published).toBe(true);
     expect(payload.parentWasActive).toBeUndefined();
@@ -516,7 +643,9 @@ describe('apply (--yes)', () => {
     expect(fakeN8nCalls().some((call) => call[1] === '--active=true' && call[0] === 'list:workflow')).toBe(
       false,
     );
-  }, 60_000);
+    // One deploy, retryable once, against the same 120 s per-command budget as
+    // the repeat-import case above.
+  }, 300_000);
 
   test('a missing n8n binary is reported with a usable hint', () => {
     const result = run(
@@ -583,12 +712,17 @@ describe('the per-parent deployment lock', () => {
   }, 60_000);
 
   test('the lock is released when the deploy finishes, so the next one runs', () => {
-    const first = run([...args('--yes'), '--json'], deployEnv());
-    expect(JSON.parse(first.stdout.trim()).ok).toBe(true);
+    const first = runSuccessfulDeploy();
+    if (!first.answered) return;
+    expect(first.payload.ok).toBe(true);
     expect(existsSync(deployLockPath())).toBe(false);
-    const second = run([...args('--yes'), '--json'], deployEnv());
-    expect(JSON.parse(second.stdout.trim()).ok).toBe(true);
-  }, 90_000);
+    const second = runSuccessfulDeploy();
+    if (!second.answered) return;
+    expect(second.payload.ok).toBe(true);
+    // Two full deploys, each retryable once, against a 120 s per-command budget:
+    // the cap is generous because a starved attempt spends that budget before it
+    // reports, and Jest cannot interrupt this synchronous body anyway.
+  }, 600_000);
 
   test('the lock is released after a failed deploy too', () => {
     // n8n reports only the child, so verification fails after both imports.
@@ -647,13 +781,18 @@ describe('the shared-child deployment lock', () => {
   }, 60_000);
 
   test('both locks are released when the deploy finishes, so the next one runs', () => {
-    const first = run([...args('--yes'), '--json'], deployEnv());
-    expect(JSON.parse(first.stdout.trim()).ok).toBe(true);
+    const first = runSuccessfulDeploy();
+    if (!first.answered) return;
+    expect(first.payload.ok).toBe(true);
     expect(existsSync(childLockPath())).toBe(false);
     expect(existsSync(deployLockPath())).toBe(false);
-    const second = run([...args('--yes'), '--json'], deployEnv());
-    expect(JSON.parse(second.stdout.trim()).ok).toBe(true);
-  }, 90_000);
+    const second = runSuccessfulDeploy();
+    if (!second.answered) return;
+    expect(second.payload.ok).toBe(true);
+    // Two full deploys, each retryable once, against a 120 s per-command budget:
+    // the cap is generous because a starved attempt spends that budget before it
+    // reports, and Jest cannot interrupt this synchronous body anyway.
+  }, 600_000);
 
   test('the child lock is released after a failed deploy too', () => {
     // n8n reports only the child, so verification fails after both imports —

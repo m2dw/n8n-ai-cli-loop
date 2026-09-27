@@ -61,15 +61,27 @@ import { leaseExpiry } from "../core/transitions.js";
 import { resolveQuotaRetryDelayMs } from "../core/quota-classifier.js";
 import type { OutboxEffect } from "../core/task-store.js";
 import { OutboxEffectCollector } from "../core/phase-runner.js";
-import { enqueueRefinementHandoffEffects } from "../core/outbox-effects.js";
+import {
+  enqueueRefinementHandoffEffects,
+  enqueueRefinementProgressCommentEffects,
+} from "../core/outbox-effects.js";
+import { withRecordedRefinementHandoffLabel } from "../core/issue-refinement-publication.js";
 import type {
   RefinementChainAgreement,
   RefinementChangedPathListing,
   RefinementChangedPathRead,
   RefinementCommentRead,
+  RefinementEvidenceFileLookup,
+  RefinementEvidenceFileRequest,
   RefinementSnapshotSource,
 } from "../core/issue-refinement-snapshot.js";
 import type { RefinementLoopContextBlock } from "../core/issue-refinement-loop.js";
+import type { RefinementProgressMilestone } from "../core/issue-refinement-progress.js";
+import {
+  prepareRefinementProgressCommit,
+  refinementProgressEvent,
+} from "../core/issue-refinement-progress.js";
+import { refinementProgressCommentUnpublishableEvent } from "../core/issue-refinement-progress-publication.js";
 import type {
   RefinementApplyContextBlock,
   RefinementApplyPort,
@@ -100,6 +112,16 @@ import { die, emit } from "./cli-io.js";
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_TIMEOUT_MS = 60 * 60 * 1000;
 const GH_MAX_BUFFER = 64 * 1024 * 1024;
+/**
+ * §5.1 blob-fallback ceiling: the blob API is an all-or-nothing read (no
+ * ranged retrieval), and its JSON payload inflates the file's bytes by 4/3
+ * (base64) and again by 62/60 (each embedded newline per 60-character line
+ * escapes to two characters). A file whose Contents-API `size` exceeds this
+ * bound would overflow GH_MAX_BUFFER mid-download — turning a bounded
+ * declared selection into a capture failure — so the adapter records it as
+ * an `unavailable` omission without asking for the bytes at all.
+ */
+const GH_BLOB_EVIDENCE_MAX_BYTES = Math.floor(((GH_MAX_BUFFER - 64 * 1024) * 3 * 60) / (4 * 62));
 /** Bound on the local `issue-plan` artifact handed into the snapshot (§5). */
 const MAX_ISSUE_PLAN_BYTES = 256 * 1024;
 /** REST page size for the PR file listing (the endpoint's own maximum). */
@@ -324,6 +346,76 @@ export function createGhRefinementSnapshotSource(
       return readFileSync(path, "utf8");
     },
 
+    // §5.1 (issue #983): one file at one explicit commit, still a `gh` READ.
+    // The contents API with `?ref=<sha>` addresses the exact commit the core
+    // pinned — never a branch name, which could move between the identity
+    // check and this read — so the echoed `resolvedCommitSha` is the request's
+    // by construction. A 404 is a fact about the commit (`missing_path`); a
+    // shape this adapter cannot read as file bytes (directory listing,
+    // symlink, submodule, unexpected encoding) is `unavailable`; everything
+    // else propagates as the transient failure it is.
+    readPredecessorEvidence: async (
+      request: RefinementEvidenceFileRequest,
+    ): Promise<RefinementEvidenceFileLookup> => {
+      const encodedPath = request.path.split("/").map(encodeURIComponent).join("/");
+      let raw: unknown;
+      try {
+        raw = ghJson(runGh, [
+          "api",
+          `repos/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(request.commitSha)}`,
+        ]);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/\b404\b|Not Found/i.test(message)) return { kind: "missing_path" };
+        throw err;
+      }
+      // A directory listing: the selection named something that is not a file
+      // at that commit.
+      if (Array.isArray(raw)) return { kind: "missing_path" };
+      const rec = asRecord(raw);
+      const type = str(rec["type"]);
+      if (type !== "file") return { kind: "unavailable", detail: `type=${type || "unknown"}` };
+      let encoded = str(rec["content"]);
+      let encoding = str(rec["encoding"]);
+      if (encoding === "none" || encoded.length === 0) {
+        // A 1–100 MB file: the contents API returns metadata only, and the
+        // blob API serves the bytes by the entry's own object id — still
+        // pinned content, because a blob id names exact bytes. Decided on the
+        // metadata alone: a blob too large for the runner buffer is an
+        // omission the same way an unreadable content form is, never a
+        // download attempt that fails as a transient mid-capture.
+        const size = rec["size"];
+        if (typeof size === "number" && size > GH_BLOB_EVIDENCE_MAX_BYTES) {
+          return { kind: "unavailable", detail: `oversized=${size}` };
+        }
+        const blobSha = str(rec["sha"]);
+        if (blobSha.length === 0) return { kind: "unavailable", detail: "no_content" };
+        const blob = asRecord(ghJson(runGh, ["api", `repos/${repo}/git/blobs/${blobSha}`]));
+        encoded = str(blob["content"]);
+        encoding = str(blob["encoding"]);
+      }
+      if (encoding !== "base64") {
+        return { kind: "unavailable", detail: `encoding=${encoding || "unknown"}` };
+      }
+      const bytes = Buffer.from(encoded, "base64");
+      return {
+        kind: "found",
+        // Truncated in UTF-8 BYTES — the unit `maxBytes` is documented in —
+        // never code units, which would let a non-ASCII file through at up to
+        // 4x the bound. A cut landing inside a multi-byte sequence decodes its
+        // dangling tail as U+FFFD, which keeps the decoded byte length at or
+        // slightly above the cap: the core's truncation probe (it requests one
+        // byte past its scan bound) still sees past the bound, and its own
+        // code-point-boundary re-bound cuts BEFORE the replacement character,
+        // so the mangled tail never reaches a capture.
+        content:
+          bytes.byteLength > request.maxBytes
+            ? bytes.subarray(0, request.maxBytes).toString("utf8")
+            : bytes.toString("utf8"),
+        resolvedCommitSha: request.commitSha,
+      };
+    },
+
     ...(chainAgreement
       ? {
           readChainAgreement: async (
@@ -490,8 +582,45 @@ async function refinementHandoffEffects(
   now: string,
 ): Promise<OutboxEffect[]> {
   const collector = new OutboxEffectCollector();
-  await enqueueRefinementHandoffEffects(collector, session, { issueNumber }, context, now);
-  return collector.effects;
+  // The two rows go through the collector; the cancellations the publication
+  // needs come back as a return value and ride in the same set (issue #980
+  // review) — a handoff raised after a §13 recovery retires that recovery's
+  // still-undelivered label removal, which would otherwise retry and strip the
+  // label this add is putting back.
+  const supersessions = await enqueueRefinementHandoffEffects(
+    collector, session, { issueNumber }, context, now,
+  );
+  return [...collector.effects, ...supersessions];
+}
+
+/**
+ * The append-only progress comments for the milestones this command is about to
+ * commit (issue #976), plus the audit events for any milestone that could not be
+ * rendered into one.
+ *
+ * `admin refinement run` commits the same #975 milestones a phase-runner tick
+ * commits, so it must leave the same public trace: an Issue refined by hand and
+ * an Issue refined by an unattended tick tell a reader the same story. Both ride
+ * in the SAME `completePhaseWithEffects` call as the milestones themselves, so a
+ * commit refused by the CAS publishes nothing.
+ */
+async function refinementProgressEffects(
+  session: ResolvedSession,
+  issueNumber: number,
+  milestones: readonly RefinementProgressMilestone[] | undefined,
+  now: string,
+): Promise<{ effects: OutboxEffect[]; events: { type: string; data: Record<string, unknown> }[] }> {
+  const collector = new OutboxEffectCollector();
+  const refusals = await enqueueRefinementProgressCommentEffects(
+    collector, session, { issueNumber }, milestones, now,
+  );
+  return {
+    effects: collector.effects,
+    events: refusals.map((refusal) => {
+      const event = refinementProgressCommentUnpublishableEvent(refusal);
+      return { type: event.type, data: event.data };
+    }),
+  };
 }
 
 /**
@@ -712,22 +841,68 @@ export async function runRefinementRun(
           : null;
       const createdAt = new Date(deps.now ? deps.now() : Date.now()).toISOString();
       const applyNotBefore = applyRetryDelayMs !== null ? leaseExpiry(createdAt, applyRetryDelayMs) : null;
+      // Issue #975: the same progress projection the phase runner commits, over
+      // the same transition this command is about to make — so an operator-run
+      // application records the boundaries it crosses (and, through the ledger
+      // it returns, does not duplicate the ones the runner already recorded).
+      const applyContext: Record<string, unknown> = {
+        ...(task.context ?? {}),
+        refinement: result.block,
+      };
+      const applyProgress = prepareRefinementProgressCommit({
+        issueNumber: args.issueNumber,
+        context: applyContext,
+        events: result.events,
+        result:
+          result.outcome.kind === "escalated"
+            ? "blocked"
+            : applyNotBefore !== null
+              ? "delayed"
+              : "success",
+        notBefore: applyNotBefore,
+        now: createdAt,
+      });
       const patch = {
-        context: { ...(task.context ?? {}), refinement: result.block },
+        // Issue #980 review: a commit that publishes a handoff records the
+        // ready-for-human label it adds, in the same transaction, so the §13
+        // recovery that undoes it removes the label the add actually used even
+        // if session config has been renamed since. A no-op on every other
+        // outcome — the gate is the publication's, not this call site's.
+        context: withRecordedRefinementHandoffLabel(
+          args.issueNumber,
+          applyProgress?.context ?? applyContext,
+          session.labels["readyForHuman"] as string | undefined,
+        ),
         ...(result.taskStatus ? { status: result.taskStatus } : {}),
         ...(activated ? { status: plan.targetStatus, phase: plan.targetPhase } : {}),
         ...(applyNotBefore !== null ? { notBefore: applyNotBefore } : {}),
       };
-      const [event, ...extraEvents] = result.events.map(
+      // Issue #976: one append-only comment per committed milestone, built here
+      // so it commits with the milestone rather than after it.
+      const applyProgressPublication = await refinementProgressEffects(
+        session.outboxSession, args.issueNumber, applyProgress?.milestones, createdAt,
+      );
+      const applyEvents = [
+        ...result.events,
+        ...(applyProgress?.milestones ?? []).map(refinementProgressEvent),
+        ...applyProgressPublication.events,
+      ];
+      const [event, ...extraEvents] = applyEvents.map(
         (e): TaskEvent => ({ task: key, type: e.type, runId, data: e.data, createdAt }),
       );
       // §13 items 3–4 (issue #936): an escalation raised here is the same
       // handoff the phase runner publishes, so it carries the same two effects,
       // in the same transaction as the block that escalated. Every other apply
       // outcome contributes nothing — the gate is the builder's.
-      const applyEffects = await refinementHandoffEffects(
-        session.outboxSession, args.issueNumber, patch.context, createdAt,
-      );
+      // Progress comments first, then the handoff pair: the Issue then reads in
+      // the order the lane moved — the boundary that was crossed, then (for a
+      // terminal one) the notice that says what an operator does about it.
+      const applyEffects = [
+        ...applyProgressPublication.effects,
+        ...(await refinementHandoffEffects(
+          session.outboxSession, args.issueNumber, patch.context, createdAt,
+        )),
+      ];
       const committed = event
         ? await store.completePhaseWithEffects(
             { key, expected: { revision: task.revision }, patch, event, extraEvents },
@@ -757,7 +932,7 @@ export async function runRefinementRun(
         notBefore: applyNotBefore,
         counters: result.block.counters,
         apply: result.block.apply ?? null,
-        events: result.events.map((e) => e.type),
+        events: applyEvents.map((e) => e.type),
         artifactDir,
         artifacts: result.artifacts,
       });
@@ -815,24 +990,72 @@ export async function runRefinementRun(
           ? REFINEMENT_RETRY_DELAY_MS
           : null;
     let notBefore: string | null = null;
+    // What this run actually committed to the event log — the audit events plus
+    // any progress milestone projected from them (issue #975). Reported rather
+    // than re-derived so the command's own output and the transaction it made
+    // cannot disagree.
+    let committedEvents: string[] = result.events.map((e) => e.type);
 
     if (result.outcome.kind !== "refused") {
       const createdAt = new Date(deps.now ? deps.now() : Date.now()).toISOString();
       notBefore = retryDelayMs !== null ? leaseExpiry(createdAt, retryDelayMs) : null;
+      // Issue #975, as on the application branch: the milestones and the
+      // ledger that suppresses their replay commit with the block itself.
+      // `notBefore` is this command's own committed retry deadline, which is
+      // what a `retry_scheduled` milestone must state.
+      const loopContext: Record<string, unknown> = {
+        ...(task.context ?? {}),
+        refinement: result.block,
+      };
+      const loopProgress = prepareRefinementProgressCommit({
+        issueNumber: args.issueNumber,
+        context: loopContext,
+        events: result.events,
+        result:
+          result.outcome.kind === "escalated"
+            ? "blocked"
+            : notBefore !== null
+              ? "delayed"
+              : "success",
+        notBefore,
+        now: createdAt,
+      });
       const patch = {
-        context: { ...(task.context ?? {}), refinement: result.block },
+        // As on the application branch (issue #980 review): the label a handoff
+        // adds is recorded on the block it escalates, so §13's recovery removes
+        // that label rather than whatever `labels.readyForHuman` holds later.
+        context: withRecordedRefinementHandoffLabel(
+          args.issueNumber,
+          loopProgress?.context ?? loopContext,
+          session.labels["readyForHuman"] as string | undefined,
+        ),
         ...(taskStatus ? { status: taskStatus } : {}),
         ...(notBefore !== null ? { notBefore } : {}),
       };
-      const [event, ...extraEvents] = result.events.map(
+      // Issue #976, as on the application branch: the milestone's public comment
+      // is part of the same commit as the milestone.
+      const loopProgressPublication = await refinementProgressEffects(
+        session.outboxSession, args.issueNumber, loopProgress?.milestones, createdAt,
+      );
+      const loopEvents = [
+        ...result.events,
+        ...(loopProgress?.milestones ?? []).map(refinementProgressEvent),
+        ...loopProgressPublication.events,
+      ];
+      committedEvents = loopEvents.map((e) => e.type);
+      const [event, ...extraEvents] = loopEvents.map(
         (e): TaskEvent => ({ task: key, type: e.type, runId, data: e.data, createdAt }),
       );
       // §13 items 3–4 (issue #936): the ready-for-human label and the one
       // handoff comment, committed with the escalation rather than left to the
-      // operator to notice. An accepted/held/retrying run enqueues nothing.
-      const loopEffects = await refinementHandoffEffects(
-        session.outboxSession, args.issueNumber, patch.context, createdAt,
-      );
+      // operator to notice. Only an escalation adds them — every other outcome's
+      // public half is the progress comments above and nothing else.
+      const loopEffects = [
+        ...loopProgressPublication.effects,
+        ...(await refinementHandoffEffects(
+          session.outboxSession, args.issueNumber, patch.context, createdAt,
+        )),
+      ];
       const committed = event
         ? await store.completePhaseWithEffects(
             { key, expected: { revision: task.revision }, patch, event, extraEvents },
@@ -865,7 +1088,7 @@ export async function runRefinementRun(
       counters: result.block.counters,
       roles: result.block.execution ?? null,
       rounds: result.block.counters.rounds,
-      events: result.events.map((e) => e.type),
+      events: committedEvents,
       artifactDir,
       artifacts: result.artifacts,
     });

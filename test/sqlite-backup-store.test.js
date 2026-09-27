@@ -341,6 +341,216 @@ describe('restoreBackup', () => {
     stillLive.close();
   });
 
+  test('refuses to complete when a per-lineage dispute/reconsideration artifactDir is gone, even though the scalars are intact (issue #955 review)', async () => {
+    // Two lineages, answered by two different fix/reviewer runs. The scalar
+    // keys name only the LAST run of each kind; the earlier — still live —
+    // lineage is reachable only through its nested per-lineage entry.
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const firstFixDir = join(artifactRoot, 'runs', 'fix-run-1');
+    const lastFixDir = join(artifactRoot, 'runs', 'fix-run-2');
+    const lastReviewerDir = join(artifactRoot, 'runs', 'reviewer-run-2');
+    for (const dir of [firstFixDir, lastFixDir, lastReviewerDir]) mkdirSync(dir, { recursive: true });
+
+    await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'review', now: '2026-01-01T00:00:00.000Z' });
+    const raw = new Database(dbPath);
+    raw.prepare(`UPDATE tasks SET context = ? WHERE session_id = 's1' AND issue_number = 1`).run(
+      JSON.stringify({
+        disputeArtifactDir: lastFixDir,
+        reconsiderationArtifactDir: lastReviewerDir,
+        reviewDisputeRebuttals: {
+          lineages: {
+            'lineage-a': { version: 1, artifactDir: firstFixDir, agentId: 'claude' },
+            'lineage-b': { version: 1, artifactDir: lastFixDir, agentId: 'claude' },
+          },
+        },
+        reviewDisputeReconsiderations: {
+          lineages: { 'lineage-b': { version: 1, artifactDir: lastReviewerDir, agentId: 'claude' } },
+        },
+      }),
+    );
+    raw.close();
+    const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');
+    store.close();
+
+    // Only the earlier lineage's directory is gone: every scalar still resolves.
+    rmSync(firstFixDir, { recursive: true, force: true });
+
+    const result = await restoreBackup(dbPath, backupResult.entry.id, backupDir, '2026-01-01T00:10:00.000Z', {
+      artifactRoot,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/reviewDisputeRebuttals\.lineages\.lineage-a\.artifactDir/);
+
+    // The live DB must be untouched — restore failed before the rename.
+    const stillLive = new SqliteTaskStore(dbPath);
+    const tasks = await stillLive.listSessionTasks('s1');
+    expect(tasks.map((t) => t.issueNumber)).toEqual([1]);
+    stillLive.close();
+  });
+
+  test('refuses to complete when a per-lineage reconsideration artifactDir is gone (issue #955 review)', async () => {
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const firstReviewerDir = join(artifactRoot, 'runs', 'reviewer-run-1');
+    const lastReviewerDir = join(artifactRoot, 'runs', 'reviewer-run-2');
+    for (const dir of [firstReviewerDir, lastReviewerDir]) mkdirSync(dir, { recursive: true });
+
+    await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'review', now: '2026-01-01T00:00:00.000Z' });
+    const raw = new Database(dbPath);
+    raw.prepare(`UPDATE tasks SET context = ? WHERE session_id = 's1' AND issue_number = 1`).run(
+      JSON.stringify({
+        reconsiderationArtifactDir: lastReviewerDir,
+        reviewDisputeReconsiderations: {
+          lineages: {
+            'lineage-a': { version: 1, artifactDir: firstReviewerDir, agentId: 'claude' },
+            'lineage-b': { version: 2, artifactDir: lastReviewerDir, agentId: 'claude' },
+          },
+        },
+      }),
+    );
+    raw.close();
+    const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');
+    store.close();
+
+    rmSync(firstReviewerDir, { recursive: true, force: true });
+
+    const result = await restoreBackup(dbPath, backupResult.entry.id, backupDir, '2026-01-01T00:10:00.000Z', {
+      artifactRoot,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/reviewDisputeReconsiderations\.lineages\.lineage-a\.artifactDir/);
+  });
+
+  test('restores when every per-lineage artifactDir still exists, and ignores unreadable lineage entries (issue #955 review)', async () => {
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const fixDir = join(artifactRoot, 'runs', 'fix-run-1');
+    const reviewerDir = join(artifactRoot, 'runs', 'reviewer-run-1');
+    for (const dir of [fixDir, reviewerDir]) mkdirSync(dir, { recursive: true });
+
+    await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'review', now: '2026-01-01T00:00:00.000Z' });
+    const raw = new Database(dbPath);
+    raw.prepare(`UPDATE tasks SET context = ? WHERE session_id = 's1' AND issue_number = 1`).run(
+      JSON.stringify({
+        reviewDisputeRebuttals: {
+          lineages: {
+            'lineage-a': { version: 1, artifactDir: fixDir, agentId: 'claude' },
+            // Malformed entries are dropped by the record's own parser, so no
+            // turn will ever read a record out of them — a restore must not
+            // fail over bookkeeping nothing can use.
+            'lineage-bad': { version: 0, artifactDir: join(artifactRoot, 'runs', 'never-created') },
+            'lineage-worse': { version: 1, artifactDir: '' },
+          },
+        },
+        reviewDisputeReconsiderations: {
+          lineages: { 'lineage-a': { version: 1, artifactDir: reviewerDir, agentId: 'claude' } },
+        },
+      }),
+    );
+    raw.close();
+    const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');
+    store.close();
+
+    const result = await restoreBackup(dbPath, backupResult.entry.id, backupDir, '2026-01-01T00:10:00.000Z', {
+      artifactRoot,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test('refuses to complete when a per-lineage arbitration artifactDir is gone (issue #975 review)', async () => {
+    // The §8.1 verdict record lives in the run that MINTED it, and the §7.1
+    // evidence turn an `insufficient_evidence` verdict opens re-presents it one
+    // or more phase runs later — no scalar key survives to name that directory.
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const arbitrationDir = join(artifactRoot, 'runs', 'arbitration-run-1');
+    mkdirSync(arbitrationDir, { recursive: true });
+
+    await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'review', now: '2026-01-01T00:00:00.000Z' });
+    const raw = new Database(dbPath);
+    raw.prepare(`UPDATE tasks SET context = ? WHERE session_id = 's1' AND issue_number = 1`).run(
+      JSON.stringify({
+        reviewDisputeArbitrations: {
+          lineages: { 'lineage-a': { version: 1, artifactDir: arbitrationDir, agentId: 'claude' } },
+        },
+      }),
+    );
+    raw.close();
+    const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');
+    store.close();
+
+    rmSync(arbitrationDir, { recursive: true, force: true });
+
+    const result = await restoreBackup(dbPath, backupResult.entry.id, backupDir, '2026-01-01T00:10:00.000Z', {
+      artifactRoot,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/reviewDisputeArbitrations\.lineages\.lineage-a\.artifactDir/);
+  });
+
+  test('refuses to complete when a party evidence-collection artifactDir is gone (issue #975 review)', async () => {
+    // The re-presented arbitration resolves a party's admitted attachments from
+    // that party's own run directory; without it the sub-turn fails closed into
+    // a human handoff, so a restore must not accept a snapshot missing it.
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const implementerDir = join(artifactRoot, 'runs', 'evidence-run-implementer');
+    const reviewerDir = join(artifactRoot, 'runs', 'evidence-run-reviewer');
+    for (const dir of [implementerDir, reviewerDir]) mkdirSync(dir, { recursive: true });
+
+    await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'review', now: '2026-01-01T00:00:00.000Z' });
+    const raw = new Database(dbPath);
+    raw.prepare(`UPDATE tasks SET context = ? WHERE session_id = 's1' AND issue_number = 1`).run(
+      JSON.stringify({
+        reviewDisputeEvidenceCollections: {
+          implementer: { artifactDir: implementerDir, agentId: 'claude' },
+          reviewer: { artifactDir: reviewerDir, agentId: 'claude' },
+        },
+      }),
+    );
+    raw.close();
+    const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');
+    store.close();
+
+    rmSync(implementerDir, { recursive: true, force: true });
+
+    const result = await restoreBackup(dbPath, backupResult.entry.id, backupDir, '2026-01-01T00:10:00.000Z', {
+      artifactRoot,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/reviewDisputeEvidenceCollections\.implementer\.artifactDir/);
+  });
+
+  test('restores when the arbitration and evidence-collection directories exist, ignoring unreadable entries (issue #975 review)', async () => {
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const arbitrationDir = join(artifactRoot, 'runs', 'arbitration-run-1');
+    const reviewerDir = join(artifactRoot, 'runs', 'evidence-run-reviewer');
+    for (const dir of [arbitrationDir, reviewerDir]) mkdirSync(dir, { recursive: true });
+
+    await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'review', now: '2026-01-01T00:00:00.000Z' });
+    const raw = new Database(dbPath);
+    raw.prepare(`UPDATE tasks SET context = ? WHERE session_id = 's1' AND issue_number = 1`).run(
+      JSON.stringify({
+        reviewDisputeArbitrations: {
+          lineages: {
+            'lineage-a': { version: 1, artifactDir: arbitrationDir, agentId: 'claude' },
+            'lineage-bad': { version: 0, artifactDir: join(artifactRoot, 'runs', 'never-created') },
+          },
+        },
+        reviewDisputeEvidenceCollections: {
+          // Only the reviewer has run so far; an entry that never recorded a
+          // directory names nothing and must not fail the restore.
+          implementer: { agentId: 'claude' },
+          reviewer: { artifactDir: reviewerDir, agentId: 'claude' },
+        },
+      }),
+    );
+    raw.close();
+    const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');
+    store.close();
+
+    const result = await restoreBackup(dbPath, backupResult.entry.id, backupDir, '2026-01-01T00:10:00.000Z', {
+      artifactRoot,
+    });
+    expect(result.ok).toBe(true);
+  });
+
   test('preserves the live file it replaced via a hard link, not a rename, so dbPath is never briefly absent (issue #611 review)', async () => {
     await store.enqueueTask({ sessionId: 's1', issueNumber: 1, phase: 'implementation', now: '2026-01-01T00:00:00.000Z' });
     const backupResult = await createBackup(dbPath, backupDir, '2026-01-01T00:05:00.000Z');

@@ -185,13 +185,90 @@ A prepare failure does **not** produce a `tool_request` handoff. It surfaces as 
 clear stopped state so the operator can inspect the artifact and fix the command
 or infrastructure before retrying.
 
+#### Stop-reason classification (normative, #1060)
+
+A failed prepare run is classified into exactly one **stop reason**, and only one
+of them is something the configured command chose:
+
+| `stopReason` | Meaning | Signals it is read from |
+|---|---|---|
+| `command-failed` | The command ran to completion and exited non-zero. | A numeric exit status. |
+| `timeout` | `timeoutMs` expired and the runner killed the command. | An `ETIMEDOUT` errno, a watchdog escalation, or — when the measured elapsed time shows the deadline actually **elapsed** — a `SIGTERM` kill with no exit status. |
+| `signal` | The command was terminated by a signal before it could exit (OOM killer, operator, supervisor). | A terminating signal with no exit status. |
+| `spawn-error` | The command never ran: missing or unexecutable binary, or a host that could not fork. | A spawn-level errno (`ENOENT`, `EACCES`, `ENOBUFS`, …). |
+| `refused` | Safe mode refused the command before anything was spawned (§2.2 `allowLifecycleScripts`). | No spawn occurred. |
+
+Classification order is most-determinate first: `timeout` precedes `signal` and
+`spawn-error`, because a deadline kill *is* all three at the OS level and the
+deadline is the fact the operator needs. `command-failed` is the fallback, so an
+unrecognised shape stays the plain command failure it already was.
+
+Normative rules:
+
+- **A killed process is never reported as a non-zero exit.** For any stop reason
+  other than `command-failed`, the recorded exit code is the runner's stand-in
+  for a status the process never produced and must not be presented as something
+  the command said.
+- **Captured output is never presented as the cause of a stop the command did not
+  choose.** A timed-out `npm ci` prints deprecation warnings on its way to the
+  deadline; those bytes are partial output, not the failure, and must be labelled
+  as such.
+- **One classified sentence reaches every surface.** `task.lastError`, `admin
+  status`, and the public failure comment all render the same stop-reason clause,
+  which carries no local paths and no command output.
+- **A configured deadline is evidence of nothing on its own.** A run is reported
+  as a `timeout` only when the deadline is known to have *elapsed* — an
+  `ETIMEDOUT` errno, a watchdog escalation, or a measured elapsed time that
+  reaches `timeoutMs`. Environment preparation always configures a deadline, so
+  a command that terminates itself, or that an operator or supervisor kills a
+  second into a five-minute budget, is a `signal` termination and must be
+  reported as one.
+- **A timed-out process tree is terminated.** The command is spawned into its
+  own process group and the whole group is signalled, because the synchronous
+  child APIs kill only the direct child — leaving a package manager's fetch pool
+  running and its cache locks held for the next attempt. What the sweep reached
+  is recorded, and a sweep that could not confirm termination is recorded as such
+  rather than as a success.
+- **The deadline is enforced even against a command that ignores it.** A
+  deadline on a synchronous child API only sends `SIGTERM` and then keeps
+  waiting, so a command that traps or ignores that signal would outlive its own
+  budget indefinitely. An external watchdog, armed before the spawn and disarmed
+  after it, force-kills the process group once the deadline plus a grace period
+  has passed; that escalation is recorded as `deadlineEscalated` and reported in
+  the stop summary, because a command that had to be taken down is a different
+  observation from one that stopped when asked.
+- **Raising `timeoutMs` is not a classification.** A timeout is reported as a
+  timeout regardless of the configured budget.
+
 ### 2.7 Metadata artifacts
 
 The runner records the following in local artifacts (`<artifactRoot>/runs/<runId>/`):
 
-- `environment-prepare-result.json` — records outcome (`run` | `skip` | `failed`),
-  the stamp key used, timestamp, exit code, and bounded stdout/stderr when the
-  command ran.
+- `environment-prepare-result.json` — records outcome (`run` | `skip` | `failed` |
+  `refused`), the stamp key used, timestamp, exit code, and bounded
+  stdout/stderr when the command ran.
+
+On a `failed` outcome it additionally records the classified stop reason and the
+process-termination facts behind it: `stopReason`, `stopSummary`, `timedOut`,
+`deadlineEscalated`, `signal`, `spawnErrorCode`, a bounded `spawnError`, the
+`timeoutMs` in force, the measured `durationMs`, and the `processTreeCleanup`
+record for the surviving descendants. Within that record,
+`processGroupTerminated` is claimed only on evidence — the group was gone by the
+end of the grace period, its `SIGKILL` was accepted, or the process table shows
+no live member left in it — and a group that still has live members after every
+signal to it was refused is recorded as `false` with the refusing errno in
+`processGroupSignalError`, which the stop summary renders as an explicitly
+unsuccessful cleanup. The errno alone is not that evidence: a group signal
+reports the same refusal for a group that is not ours to signal and for one whose
+last member is an unreaped zombie.
+
+It also records a bounded `runnerContext` block — configured command, `cwd`,
+timing, the child's pid, the runner's own pid and parent pid, Node/platform/arch,
+CPU count, load average, and free/total memory — so that a command which
+completes when run directly but stalls under runner execution can be
+investigated from the artifact rather than by re-running it. Environment
+variables appear there by **name only**, never by value: package-manager
+environment variables are exactly where a registry token lives.
 
 Artifact paths are local-only and must never be posted verbatim to public comments.
 Redaction rules that apply to `repoRoot` and `artifactRoot` apply equally to
@@ -223,6 +300,27 @@ multi-command aggregation, continuation routing, and evidence rules
 are fixed by
 [docs/verification-execution-contract.md](verification-execution-contract.md)
 (#918), which consumes this section without restating it.
+
+**Extended by #1037.** Task-scoped, operator-owned correction of
+verification requirements after intake — the amendment layer, its
+revision model, and its evidence rules — is fixed by
+[docs/verification-amendment-contract.md](verification-amendment-contract.md)
+(#1037). It adds a task-local operator overlay over
+`session.verification`; it never edits `sessions.json`, and it weakens
+no rule in §3.1–§3.3: an agent may propose verification and may still
+never author, amend, remove, skip, or reorder it.
+
+**Extended by #1095.** Project-owned verification configuration — where a
+repository may record its own verification metadata, and what a project
+adapter may say about a check — is fixed by
+[docs/project-verification-contract.md](project-verification-contract.md)
+(#1095). It weakens no rule in §3.1–§3.3: **the project verification file
+is non-authorizing**, so it may carry no command, path, budget,
+environment value, grant or verdict, it may only name checks the
+operator already authorized, and every statement it can make moves
+verification toward running more of it. Command bytes stay
+`session.verification`'s alone, and the runner never synthesizes a
+command from adapter output.
 
 ### 3.1 Session configuration
 

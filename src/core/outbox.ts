@@ -153,7 +153,11 @@ export interface SlackNotificationPayload {
   transition?: "ready_for_human" | "failed";
   /** Short human-readable reason or last error (sanitized, no local paths). */
   reason?: string;
-  /** Public GitHub issue URL — safe to include in Slack messages. */
+  /**
+   * Public browser URL of the work item — safe to include in Slack messages.
+   * GitHub for a `github-issues` session; the configured instance's Issue URL
+   * for a session whose work items live on another supported tracker (#981).
+   */
   issueUrl?: string;
   /** Public GitHub PR URL if available — safe to include in Slack messages. */
   prUrl?: string;
@@ -320,7 +324,7 @@ export interface OutboxStore {
    * makes the caller fall back to per-effect writes, where a partially written
    * set is treated as non-retryable instead.
    */
-  enqueueEffects?(effects: OutboxEffect[]): Promise<void>;
+  enqueueEffects?(effects: readonly OutboxEffect[]): Promise<void>;
 
   /**
    * Return entries that have not been sent and have not been dead-lettered yet,
@@ -695,4 +699,43 @@ export function isOutboxClaimActive(claimedAt: string | undefined, nowIso: strin
   if (!claimedAt) return false;
   const staleBefore = new Date(new Date(nowIso).getTime() - OUTBOX_CLAIM_STALE_MS).toISOString();
   return claimedAt > staleBefore;
+}
+
+/**
+ * Cancel every unsent row carrying `idempotencyKey`, using only the store's
+ * public lookup/cancel pair (issue #980 review).
+ *
+ * The portable expression of the `cancelPending` effect
+ * (`OutboxEffectCancelPending` in core/task-store.ts), for the one path that
+ * cannot commit that effect inside a transaction: a phase whose task store and
+ * outbox store sit on DIFFERENT backends and whose outbox store offers no
+ * `enqueueEffects` batch. A store on the same backend applies the effect in the
+ * transaction itself and never reaches this.
+ *
+ * Best-effort by construction, and deliberately so. `cancelEntry` refuses a row
+ * a dispatch attempt currently holds, and this has no transaction to serialize
+ * against, so the guarantee here is weaker than the in-transaction write's:
+ * every unsent, unclaimed row with that key stops, an in-flight one is left to
+ * its attempt. Returns how many rows were actually cancelled so a caller that
+ * wants to report the difference can.
+ *
+ * For the same reason it cannot honour `refuseWhileClaimed` (issue #980 review):
+ * refusing means "commit nothing", and by the time this runs the transition it
+ * belongs to has already been written on another backend. Leaving the in-flight
+ * row alone is the closest this path gets — an effect that needs the refusal has
+ * to be committed through the task store's own transaction instead.
+ */
+export async function cancelPendingOutboxEntriesByKey(
+  store: Pick<OutboxStore, "listUnsent" | "cancelEntry">,
+  idempotencyKey: string,
+  now?: string,
+): Promise<number> {
+  const rows = await store.listUnsent();
+  let cancelled = 0;
+  for (const row of rows) {
+    if (row.idempotencyKey !== idempotencyKey) continue;
+    const outcome = await store.cancelEntry(row.id, now);
+    if (outcome.cancelled) cancelled += 1;
+  }
+  return cancelled;
 }

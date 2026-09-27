@@ -78,7 +78,8 @@ Everything else in the `COMMANDS` array (`src/cli/admin.ts:139-685`) that
 lacks an `entrypoint` field is dispatched in-process by `main()`: `help`,
 `ui`, `status`, `task-status`, `list-stuck`, `recover`, `recover-cap-handoff`,
 `task clear-delay`, `task-assign`, `human-review-return`,
-`github-app-review-return`, `review-verification resolve`, `tool-request
+`github-app-review-return`, `review-verification resolve`,
+`review-verification refresh`, `tool-request
 list`, `tool-request resolve`, `tool-request run`, `context create`,
 `session-doctor`, `context-mode status`, `repo-lock acquire`, `repo-lock
 release`, `repo-lock status`, `repo-lock force-release`,
@@ -144,7 +145,7 @@ There are two shapes:
   | `context-mode` | `status` |
   | `issue-plan` | `preview` \| `ai-preview` \| `evaluate-history` |
   | `issue-discuss` | `preview` \| `post` |
-  | `review-verification` | `resolve` |
+  | `review-verification` | `resolve` \| `refresh` |
 
 The compound command's *name* as registered/documented (`CommandInfo.name`,
 e.g. `"tool-request list"`, `"task clear-delay"`) is the resource and action

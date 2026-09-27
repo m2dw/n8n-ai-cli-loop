@@ -977,10 +977,70 @@ should assume:
   #722 (V6) included — are scheduled. The unified engine, policy
   schema, continuation wiring, and operator surfaces themselves remain
   with those tracker-assigned implementation issues.
+- **Correcting a verification requirement after intake** — the
+  operator-owned amendment layer over §5.1's set resolution and over
+  the Issue-derived review gate.
+  **Delivered (#1037)**: `docs/verification-amendment-contract.md` —
+  the task-scoped verification amendment and revision contract: four
+  named ownership layers with one precedence order, a revisioned
+  operator overlay with stable command identity and a plan digest
+  distinct from this contract's `setFingerprint`, a closed
+  admissible-state table that fails closed on `claimed`/`running`,
+  evidence invalidation that preserves every record, and a default
+  continuation back to review. It supplies one more operator-owned
+  input to §5.1 and consumes §8.2 rule 3's identity binding unchanged;
+  it adds no lane, classification, cycle outcome, or continuation row
+  here, never touches a `"verification.pinned"` entry, and changes
+  nothing in §10's eligibility or E1–E7 evidence gate.
+- **Staging the set — running less than the whole set on a normal loop,
+  and running the whole set once per Issue before it becomes a stacking
+  base** — §5.1 resolves one set for every cycle in every lane, and this
+  contract defines no notion of a verification *stage*.
+  **Delivered (#1094)**: `docs/staged-verification-contract.md` — the
+  staged verification lifecycle and ownership contract: a `loop` stage
+  (impact-related plus always-required plus this Issue's
+  prior-final-failure regressions plus every check an earlier loop left
+  unproven, with unknown impact falling back to the full required set) and a `final` stage that runs the entire
+  required set per Issue after AI review approval and before the
+  stack-ready grant, a narrowing-only project selection port that is
+  never authorization and never evidence, a closed stage-outcome set
+  over pass, code failure, timeout, interruption, unknown and
+  infrastructure, runner-owned mandatory retention, and a 13-row
+  transition table whose single granting cell requires a complete,
+  passed, head-bound final bundle. It sits *above* §5.1 as a membership
+  filter and consumes this document's lanes, classifications, cycle
+  outcomes and continuation rules unchanged; it adds no lane, no
+  classification, no cycle outcome, no phase-runner vocabulary, and no
+  change to §10's eligibility or E1–E7 evidence gate.
+  **Delivered (#1096)**: `docs/verification-evidence-validity-contract.md`
+  — the verification evidence validity, pinned regressions and recovery
+  contract, the chain's third and last design Issue. It extends §8.2
+  rule 3's identity binding from two fields to a closed seven-component
+  identity in which an unresolvable component is `unknown` and matches
+  nothing — including another `unknown` — so a bundle whose world cannot
+  be pinned down is never reused and never grants. It restates this
+  document's classification posture as attribution rules and adds no
+  classifier: stop reasons come from the shipped typed facts —
+  `timedOut`, `deadlineEscalated`, `spawnErrorCode`, `spawnError`,
+  `signal`, the exit code — and never from parsing output, so a
+  whole-command timeout is attributed to the **check** and to no case,
+  and §6.3's ban on laundering a code failure into infrastructure is
+  restated as running in both directions. Its one bound — a consecutive,
+  per-Issue, per-stage budget on `interrupted`, `unknown` and
+  `infrastructure` stage terminations, which #1094's rows 4, 5, 11 and
+  13 otherwise leave uncounted — is deliberately confined to outcomes
+  that consume no agent resource, so it is not a retry of a code failure
+  and §6.3 stands. It adds no lane, no classification, no cycle outcome,
+  no set-resolution input, no phase-runner vocabulary, and no change to
+  §10's eligibility or E1–E7 evidence gate.
 - **Evidence reuse to skip the review lane's re-execution** — rejected
   this cycle: the review worktree re-runs the session-configured set
   even when an implementation-lane bundle binds to the same head SHA.
-  Revisiting this is a change to this document first.
+  Revisiting this is a change to this document first. #1094 §4.4 does
+  not reopen it: a final stage may be satisfied without re-execution
+  only by a **same-lane**, same-head, same-plan complete **final-stage**
+  bundle, and neither an implementation-lane bundle nor a `loop` bundle
+  of any lane ever satisfies a review-lane final stage.
 - **Flake detection, rerun-to-green, or quarantine** — no automatic
   retry of code failures exists here (§6.3), and none is planned by
   this contract.

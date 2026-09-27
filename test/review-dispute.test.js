@@ -404,7 +404,36 @@ describe('protocol limits (§6.1)', () => {
         allowSameProvider: false,
         minConfidence: DEFAULT_ARBITER_MIN_CONFIDENCE,
       });
+      // Issue #1085: §17.6's D2 opt-in is a SECOND switch, so the stricter
+      // posture is what an absent, empty, or protocol-enabled config resolves to.
+      expect(resolved.settings.reconsideration).toEqual({ readBounded: false });
     }
+  });
+
+  test('the §17.6 D2 reconsideration opt-in is default-off and refuses a non-boolean', () => {
+    // Enabling the protocol must never enable the weaker execution posture with
+    // it: the two are separate decisions and only one of them has a table an
+    // operator had to accept (contract §17.6, §17.16).
+    expect(resolveReviewDisputeSettings({ enabled: true }).settings.reconsideration).toEqual({
+      readBounded: false,
+    });
+    expect(
+      resolveReviewDisputeSettings({ enabled: true, reconsideration: {} }).settings.reconsideration,
+    ).toEqual({ readBounded: false });
+    expect(
+      resolveReviewDisputeSettings({ enabled: true, reconsideration: { readBounded: false } }).settings
+        .reconsideration,
+    ).toEqual({ readBounded: false });
+    expect(
+      resolveReviewDisputeSettings({ enabled: true, reconsideration: { readBounded: true } }).settings
+        .reconsideration,
+    ).toEqual({ readBounded: true });
+    // Coercing `"true"` would record a decision the operator did not make; the
+    // load fails instead, naming the path.
+    const refused = resolveReviewDisputeSettings({ reconsideration: { readBounded: 'true' } });
+    expect(refused.ok).toBe(false);
+    expect(refused.errors.map((e) => e.path)).toEqual(['reviewDispute.reconsideration.readBounded']);
+    expect(refused.errors[0].code).toBe('not-a-boolean');
   });
 
   test('the four positive-only limits reject 0 at session load', () => {

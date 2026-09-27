@@ -46,8 +46,17 @@ describe(`${DOC_PATH} — status and scope`, () => {
     expect(doc).toMatch(/src\/core\/chatops-operation-dispatch\.ts/);
   });
 
-  test('states that no operation is registered by this issue', () => {
-    expect(doc).toMatch(/No operation is registered yet/i);
+  // Was "no operation is registered yet" until issue #1031 registered the two
+  // mapped Tool Request operations. What must stay stated is the pair of facts
+  // an adapter author needs: which ids are registered, and that everything else
+  // is still a definite `unknown-operation` refusal rather than a gap.
+  test('names the registered operations and keeps the catalog closed', () => {
+    expect(doc).toMatch(/tool-request\.run/);
+    expect(doc).toMatch(/tool-request\.resolve/);
+    expect(doc).toMatch(/registered both in/);
+    expect(doc).toMatch(/src\/core\/chatops-operations\.ts/);
+    expect(doc).toMatch(/catalog is closed at those two/i);
+    expect(doc).toMatch(/unknown-operation/);
   });
 
   test('supersedes the callable-dispatch portion of the earlier attempts', () => {

@@ -19,7 +19,8 @@
  * stale refinement — both agent schemas, the
  * critic-independence rule and its role-resolution failure path, the bounded
  * -refinement constants, the applicable/advisory split with its topology
- * fail-closed rule, the managed-region rules, the activation ordering with its
+ * fail-closed rule and the §9.1 normalization that subtracts already-satisfied
+ * proposals from it, the managed-region rules, the activation ordering with its
  * verify-before-persist commit point, its
  * remove-before-add label replacement and its park-and-reactivate handover into
  * the implementation lane, the undeliverable-handoff-comment exception, every
@@ -163,9 +164,21 @@ describe('docs/issue-refinement-contract.md — canonical vocabulary', () => {
       'agent_unavailable',
       'marker_precondition_failed',
       'execution_marker_conflict',
+      'evidence_required',
     ]) {
       expect(doc).toContain(`\`${reason}\``);
     }
+  });
+
+  // §5.2 (issue #1003): the only handoff raised before either agent is
+  // invoked, and the reason it is a stop rather than a warning.
+  test('the required-evidence reason is a pre-agent handoff, and says why', () => {
+    expect(doc).toMatch(
+      /`evidence_required` \(§5\.2\) is raised \*\*before\*\* either agent is invoked,\s+on an Issue whose eligibility and roles both resolved/,
+    );
+    expect(doc).toMatch(
+      /running the agents on an\s+under-specified contract would spend the round cap reaching this same human/,
+    );
   });
 
   // The conflicting-marker shape that reaches an existing task cannot reuse the
@@ -623,6 +636,179 @@ describe('docs/issue-refinement-contract.md — predecessor inputs and snapshots
 });
 
 // ---------------------------------------------------------------------------
+// §5.1 declared predecessor contract evidence (issue #983)
+// ---------------------------------------------------------------------------
+
+describe('docs/issue-refinement-contract.md — declared predecessor contract evidence', () => {
+  test('has the §5.1 subsection and its operator-visible declaration block', () => {
+    expect(doc).toMatch(/### 5\.1 Declared predecessor contract evidence/);
+    expect(doc).toMatch(
+      /exactly one\s+fenced code block with info string `refinement-evidence`/,
+    );
+    expect(doc).toMatch(/The schema is closed/);
+  });
+
+  // The declaration lives in operator-owned text: the lane's own managed
+  // region is elided before parsing, so the lane cannot declare evidence to
+  // itself.
+  test('parses the declaration from operator-owned text only', () => {
+    expect(doc).toMatch(
+      /the managed region of §10 is elided before parsing, so\s+the lane cannot declare evidence to itself/,
+    );
+  });
+
+  test('resolves only from the authoritative predecessor branch, by exact commit', () => {
+    expect(doc).toMatch(/\*\*Evidence resolves ONLY from the authoritative predecessor branch\.\*\*/);
+    expect(doc).toMatch(
+      /the head commit SHA of the stack-ready PR for the\s+`open_stack_ready` shape, the merge commit SHA for `merged` — never at a\s+branch name/,
+    );
+    expect(doc).toMatch(/refused as\s+an `identity_mismatch` omission/);
+  });
+
+  test('exposes only the selection, under the deny floor', () => {
+    expect(doc).toMatch(/\*\*Only the selection is exposed\.\*\*/);
+    expect(doc).toMatch(/never a partial slice presented as exact/);
+    expect(doc).toMatch(/refused as\s+`denied_path`/);
+  });
+
+  test('delivers byte-identical evidence to both agents inside the fence', () => {
+    expect(doc).toMatch(/\*\*Both agents receive byte-identical evidence\.\*\*/);
+    expect(doc).toMatch(/no refiner-only or critic-only view/);
+    expect(doc).toMatch(
+      /The agents still hold no repository or network access; the\s+runner performed the read/,
+    );
+  });
+
+  // The capture records failures; deciding whether they stop the refinement is
+  // issue #1003's preflight, and no agent is invoked on a failure's behalf.
+  test('records capture failures with closed reasons for the #1003 preflight', () => {
+    expect(doc).toMatch(/\*\*A selection that cannot be captured is recorded, not guessed\.\*\*/);
+    expect(doc).toMatch(/decided at capture without\s+invoking any agent/);
+    expect(doc).toMatch(/the `evidence_required` preflight of\s+issue #1003/);
+    for (const reason of [
+      'malformed_declaration',
+      'invalid_selection',
+      'denied_path',
+      'selection_capped',
+      'unknown_predecessor',
+      'resolver_unavailable',
+      'source_unavailable',
+      'missing_path',
+      'identity_mismatch',
+      'export_not_found',
+      'line_range_out_of_bounds',
+    ]) {
+      expect(doc).toContain(`\`${reason}\``);
+    }
+  });
+
+  test('hashes declared evidence in §6 and keeps undeclared fingerprints stable', () => {
+    const section = RAW.split('## 6.')[1].split('## 7.')[0].replace(/\s+/g, ' ');
+    expect(section).toMatch(/\*\*Hashed — the §5\.1 declared evidence\*\*, when any entry exists/);
+    expect(section).toMatch(
+      /A snapshot whose body declares no evidence hashes exactly the pre-evidence serialization/,
+    );
+    // §5.2: requiredness is a declared input, so §6's one-to-one rule covers it.
+    expect(section).toMatch(
+      /Requiredness is hashed for the reason every other selector field is/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §5.2 required-evidence preflight (issue #1003)
+// ---------------------------------------------------------------------------
+
+describe('docs/issue-refinement-contract.md — required-evidence preflight', () => {
+  const section = RAW.split('### 5.2 Required-evidence preflight')[1].split('## 6.')[0];
+  const flat = section.replace(/\s+/g, ' ');
+
+  test('stops before either agent runs, on the frozen capture alone', () => {
+    expect(RAW).toMatch(/### 5\.2 Required-evidence preflight/);
+    expect(flat).toMatch(
+      /\*\*Required evidence that could not be captured stops the refinement before either agent is invoked\.\*\*/,
+    );
+    expect(flat).toMatch(
+      /it runs on the frozen capture alone, in state `eligible`, after the snapshot exists and before the first refiner turn \(§12, row 48\)/,
+    );
+  });
+
+  // The #951/#950 loop is the whole reason the stop exists: without it the
+  // pair spends the round cap converging on evidence neither of them holds.
+  test('names the convergence failure it exists to prevent', () => {
+    expect(flat).toMatch(/the refiner has only inference to draft from/);
+    expect(flat).toMatch(
+      /re-running produces the identical rejection because nothing about the evidence changed/,
+    );
+  });
+
+  test('requiredness defaults to required and only the literal false opts out', () => {
+    expect(flat).toMatch(
+      /A selection is required unless its declaration entry says `"required": false`/,
+    );
+    expect(flat).toMatch(/only the JSON literal `false` opts out/);
+    expect(flat).toMatch(
+      /a default of "optional" would admit exactly the #951 failure under a declaration that looks like it prevented it/,
+    );
+  });
+
+  test('a truncated required capture is a gap, and the vocabulary says so', () => {
+    expect(flat).toMatch(
+      /a required entry captured with `truncated: true` is in the snapshot and still is not the contract/,
+    );
+    expect(flat).toMatch(
+      /The closed gap vocabulary is therefore the §5\.1 omission vocabulary plus `truncated`/,
+    );
+  });
+
+  test('unknown requiredness fails closed, recorded as undetermined', () => {
+    expect(flat).toMatch(/\*\*Unknown requiredness fails closed\.\*\*/);
+    expect(flat).toMatch(
+      /recorded as `undetermined` rather than as `required` so the audit record still says whether the operator asked for the stop or the lane defaulted to it/,
+    );
+  });
+
+  test('optional absence never stops the lane, and an undeclared body is unaffected', () => {
+    expect(flat).toMatch(/\*\*Optional absence is not a gap\.\*\*/);
+    expect(flat).toMatch(/never stops the lane/);
+    expect(flat).toMatch(/\*\*Nothing declared is nothing to require\.\*\*/);
+    expect(flat).toMatch(
+      /the refinement lane behaves exactly as it did before this section existed/,
+    );
+  });
+
+  test('travels the ordinary durable handoff path, spending no round and no agent', () => {
+    expect(flat).toMatch(
+      /raises the `evidence_required` handoff of §13 through the same durable ready-for-human path every other reason uses/,
+    );
+    expect(flat).toMatch(
+      /No round is spent, no malformed-attempt or agent-failure counter moves, and neither agent process is started/,
+    );
+  });
+
+  // §5 excludes predecessor diffs from public Issues; a declared path on the
+  // block would be one refactor away from the same leak.
+  test('persists literals only, and keeps the declared paths in the local artifact', () => {
+    expect(flat).toMatch(/\*\*What is persisted is literals\.\*\*/);
+    expect(flat).toMatch(
+      /The declared paths are not persisted to the block and never appear in a comment/,
+    );
+    expect(flat).toMatch(
+      /`evidence-preflight\.json` beside the run's `snapshot\.json`/,
+    );
+  });
+
+  test('is deterministic, so retry is idempotent and recovery re-snapshots', () => {
+    expect(flat).toMatch(
+      /an attempt re-run against unchanged inputs reaches the same handoff by the same route and still invokes no agent/,
+    );
+    expect(flat).toMatch(
+      /the recovered attempt captures a \*\*fresh\*\* snapshot/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Fingerprint and staleness
 // ---------------------------------------------------------------------------
 
@@ -897,6 +1083,57 @@ describe('docs/issue-refinement-contract.md — refiner and critic schemas', () 
     expect(doc).toMatch(/`block` goes straight to human handoff/);
   });
 
+  // Issue #1176: a dropped requirement the Issue already states is repairable
+  // by the refiner, so it is `revise`; `block` is reserved for human blockers
+  // and names which one.
+  test('an omission of an already-stated requirement is revise, not block', () => {
+    expect(doc).toMatch(
+      /\*\*A draft that drops, weakens, or reinterprets a requirement the original Issue already states is a repairable omission, not a missing human decision\*\*/,
+    );
+    expect(doc).not.toMatch(/drops a requirement the original Issue stated/);
+    expect(doc).toMatch(
+      /\*\*Critic block reasons\*\* \(closed set, exactly five; §7\.2\): `missing_decision`, `authority_conflict`, `evidence_unavailable`, `premise_invalidated`, `scope_change`/,
+    );
+    expect(doc).toMatch(
+      /The critic names why in `blockReason`, a closed set of exactly five: `missing_decision`/,
+    );
+    for (const reason of [
+      'missing_decision',
+      'authority_conflict',
+      'evidence_unavailable',
+      'premise_invalidated',
+      'scope_change',
+    ]) {
+      expect(doc).toContain(`\`${reason}\` (`);
+    }
+  });
+
+  test('routes only the narrow repairable-block shape through the bounded revise rows', () => {
+    expect(doc).toMatch(/\*\*Repairable-block routing \(issue #1176\)\.\*\*/);
+    expect(doc).toMatch(
+      /only when \*\*all\*\* of these hold: it names no `blockReason`; it carries at least one objection and every objection is `lost_requirement`; and the snapshot's declared evidence \(§5\.1\) is complete/,
+    );
+    expect(doc).toMatch(/Every other `block` stays a `block` \(row 19\)/);
+    expect(doc).toMatch(/a named `blockReason` is honoured verbatim/);
+    expect(doc).toMatch(
+      /The routing spends no extra round, adds no retry, and changes no cap/,
+    );
+    expect(doc).toMatch(/the revised draft is critiqued again before it can be accepted/);
+    expect(doc).toMatch(/record `criticVerdict: "block"` when the round was routed this way/);
+  });
+
+  // Issue #1176 review: `blockReason` is block-only in the displayed schema,
+  // and the operator can read it where the handoff guidance points.
+  test('blockReason is shown as block-only and persisted for the operator view', () => {
+    expect(doc).toMatch(/\/\/ verdict `block` ONLY — omitted entirely on `pass` and `revise`/);
+    expect(doc).toMatch(
+      /The critic prompt therefore shows it apart from the every-verdict schema, as a field added for `block` only/,
+    );
+    expect(doc).toMatch(
+      /the \*\*critic block record\*\* when the critic raised the `critique_blocked` handoff \(§12 row 19; issue #1176\)/,
+    );
+  });
+
   test('the critic evaluates and never authors replacement prose', () => {
     expect(doc).toMatch(/The critic evaluates; it never authors replacement prose/);
     expect(doc).toMatch(
@@ -1084,6 +1321,101 @@ describe('docs/issue-refinement-contract.md — applicable and advisory changes'
       /With \*\*any\*\* proposal `blocking`, the run fails closed: nothing is applied, the Issue is not activated, `status:needs-refinement` stays/,
     );
     expect(doc).toMatch(/escalates with reason `topology_change_required`/);
+  });
+
+  // Issue #982: §9 answered "is this blocking?" without ever asking "does this
+  // change anything?", so a proposal the relationship graph already satisfied
+  // spent a human handoff — and parked every downstream Issue of a serial
+  // chain behind an operator decision that did not exist.
+  describe('§9.1 normalization against the authoritative graph', () => {
+    test('compares proposals against the relationships captured for the snapshot', () => {
+      expect(doc).toMatch(/### 9\.1 Normalization against the authoritative graph/);
+      expect(doc).toMatch(
+        /The comparison set is the direct GitHub Issue Relationships captured for this refinement's §5 snapshot\*\*, reused rather than re-read/,
+      );
+      expect(doc).toMatch(
+        /the snapshot's predecessor list \*\*is\*\* the target's current `blocked by` set/,
+      );
+      expect(doc).toMatch(
+        /Nothing else is consulted — not the Issue body, not labels, not the proposal's own rationale/,
+      );
+    });
+
+    test('classifies every proposal into exactly one of three literals', () => {
+      expect(doc).toMatch(
+        /`dependency_add\(A, B\)` when A is already blocked by B; `dependency_remove\(A, B\)` when that edge is already absent/,
+      );
+      expect(doc).toMatch(
+        /\*\*`effective_change`\*\* — applying it would alter the graph\. Every `split` and `supersede` is here by construction/,
+      );
+      expect(doc).toMatch(
+        /\*\*`invalid_or_unverifiable`\*\* — it cannot be safely compared/,
+      );
+    });
+
+    test('excludes already-satisfied proposals whatever either party said', () => {
+      expect(doc).toMatch(
+        /\*\*`already_satisfied` proposals are excluded from `topology_change_required`,\*\* whatever either party said about them/,
+      );
+      expect(doc).toMatch(
+        /A critic disposition cannot turn a no-op into a blocking topology change/,
+      );
+    });
+
+    test('leaves the §9 rules untouched for everything else', () => {
+      expect(doc).toMatch(
+        /`effective_change` and `invalid_or_unverifiable` proposals follow the disposition rules and the handoff rules above unchanged/,
+      );
+      expect(doc).toMatch(
+        /Normalization only ever subtracts no-ops; it never promotes a proposal to `advisory` and never applies one/,
+      );
+    });
+
+    test('collapses duplicate proposals into one decision that fails closed', () => {
+      expect(doc).toMatch(
+        /\*\*Duplicate equivalent proposals in the same draft collapse to one normalized proposal\*\* — same kind, same edge, one decision/,
+      );
+      expect(doc).toMatch(
+        /it blocks when \*\*any\*\* of its members does, so repeating a proposal cannot dilute a `blocking` judgement/,
+      );
+    });
+
+    test('never reads a relationship read failure as already satisfied', () => {
+      expect(doc).toMatch(/\*\*A relationship read failure is never "already satisfied\."\*\*/);
+      expect(doc).toMatch(
+        /if a graph is unavailable for any other reason, every proposal is `invalid_or_unverifiable` and the §9 rules decide it/,
+      );
+      expect(doc).toMatch(/Absence of evidence is never evidence of an existing edge/);
+    });
+
+    test('records the normalization as private audit metadata only', () => {
+      expect(doc).toMatch(
+        /are recorded as \*\*private\*\* audit metadata \(§15\)/,
+      );
+      expect(doc).toMatch(
+        /None of it is published \(§16\), and no raw agent output rides along with it/,
+      );
+      // §15 has to carry it too, or the "recorded" claim points nowhere.
+      expect(doc).toMatch(
+        /the recorded advisory proposals \*\*with their §9\.1 normalization literals\*\*/,
+      );
+    });
+
+    test('the refiner schema requires the edge to be named for the dependency kinds', () => {
+      expect(RAW).toMatch(/"relationship": \{ +\/\/ required for the dependency_\* kinds \(§9\.1\)/);
+      expect(RAW).toMatch(/"previousBlockerIssue": 949 +\/\/ dependency_rewire only/);
+      expect(doc).toMatch(
+        /Every `dependency_add`, `dependency_remove`, and `dependency_rewire` proposal must carry `relationship`, naming the edge by Issue number/,
+      );
+      // Omission is unverifiable (fails closed), not malformed; a present but
+      // unparseable one is malformed like any other field.
+      expect(doc).toMatch(
+        /A proposal that omits it is not malformed — it is \*\*unverifiable\*\*, which fails closed exactly like a blocking one/,
+      );
+      expect(doc).toMatch(
+        /A `relationship` that is present but does not parse \(a non-integer, a non-positive Issue number, an unknown key\) is malformed \(§17\)/,
+      );
+    });
   });
 });
 
@@ -1514,9 +1846,9 @@ describe('docs/issue-refinement-contract.md — transition table', () => {
     );
   });
 
-  test('has 47 rows numbered contiguously from 1', () => {
-    expect(rows).toHaveLength(47);
-    expect(rows.map((r) => r.num)).toEqual(Array.from({ length: 47 }, (_, i) => i + 1));
+  test('has 48 rows numbered contiguously from 1', () => {
+    expect(rows).toHaveLength(48);
+    expect(rows.map((r) => r.num)).toEqual(Array.from({ length: 48 }, (_, i) => i + 1));
   });
 
   // Rows are appended, never renumbered, because this document and its
@@ -1537,6 +1869,25 @@ describe('docs/issue-refinement-contract.md — transition table', () => {
     expect(doc).toMatch(
       /Row 47 was appended for the same reason once more: it is the second admission refusal of §4 condition 1, and it sits beside row 2 rather than replacing it because the two failures are repaired by opposite label edits/,
     );
+    expect(doc).toMatch(
+      /Row 48 was appended last: it is the §5\.2 required-evidence preflight, and it sits beside row 10 rather than inside it because the two are opposite outcomes of the same `snapshot\.captured` event/,
+    );
+  });
+
+  // §5.2 (issue #1003). Rows 10 and 48 answer the same event, so their guards
+  // have to exclude each other explicitly — otherwise a snapshot with a gap
+  // would satisfy both and the round-set would start anyway.
+  test('rows 10 and 48 split the captured snapshot on the evidence gate', () => {
+    const proceed = rows.find((r) => r.num === 10);
+    expect(proceed.guard).toMatch(/§5\.2 raises no evidence gap/);
+    expect(proceed.next).toBe('drafting');
+    const stop = rows.find((r) => r.num === 48);
+    expect(stop.state).toBe('eligible');
+    expect(stop.guard).toMatch(/at least one §5\.2 gap/);
+    expect(stop.guard).toMatch(/omitted or truncated/);
+    expect(stop.next).toBe('escalated_human');
+    expect(stop.effect).toMatch(/handoff \(`evidence_required`\)/);
+    expect(stop.effect).toMatch(/no round spent, and neither agent is invoked/);
   });
 
   const EXPECTED = [
@@ -1587,6 +1938,7 @@ describe('docs/issue-refinement-contract.md — transition table', () => {
     [45, 'applying', 'activation.reconciled', 'activated'],
     [46, 'escalated_human', 'handoff.comment.dead_lettered', 'escalated_human'],
     [47, 'pending', 'intake.scanned', 'pending'],
+    [48, 'eligible', 'snapshot.captured', 'escalated_human'],
   ];
 
   test.each(EXPECTED)('row %i: %s + %s -> %s', (num, state, event, next) => {
@@ -1930,6 +2282,43 @@ describe('docs/issue-refinement-contract.md — human handoff', () => {
     );
   });
 
+  // Issue #981: the GitHub half of a handoff was published from #936 on, but the
+  // lane skips the phase runner's generic completion builders, so the configured
+  // messenger heard nothing — a stopped lane an operator could discover only by
+  // opening the Issue. §13 has to say the notification is part of a handoff, and
+  // that it is a session-configured effect rather than a named provider.
+  test('a handoff also reaches the session-configured notifier', () => {
+    expect(doc).toMatch(
+      /\*\*A handoff also reaches the session's configured notifier\.\*\*/,
+    );
+    expect(doc).toMatch(
+      /A handoff is \*also\* an\s+ordinary `ready_for_human` transition, and every other lane's ready-for-human\s+transition already sends the provider-neutral notification the session\s+configures/,
+    );
+    // Same transaction as the transition and items 3–4, so the notification
+    // cannot be lost by a completion that commits.
+    expect(doc).toMatch(
+      /It is enqueued as a further effect in the same durable transaction as\s+the transition and items 3–4/,
+    );
+    // Which messenger is configuration, not contract: no Slack-shaped path here.
+    expect(doc).toMatch(
+      /which messenger\s+receives it is session configuration this contract does not name, a session that\s+configures none sends none, and the handoff completes identically either way/,
+    );
+    // §16 bounds it as it bounds the comment, with the session id as the one
+    // recorded difference — a private channel, not the public Issue.
+    expect(doc).toMatch(
+      /What it may carry is bounded by §16 almost exactly as the comment is — the\s+repository, the Issue number and its public URL, the phase \(`refinement`\), the\s+transition, the handoff reason literal, and the session id every notification\s+already carries; never an artifact or repository path, agent output, provider\s+error text, a snapshot excerpt, or a run identifier/,
+    );
+    // A failed webhook is the outbox's problem, never the transition's.
+    expect(doc).toMatch(
+      /a notification that cannot be delivered retries and dead-letters on its\s+own budget and can no more undo the handoff than an undeliverable comment can,\s+and no handoff waits on one/,
+    );
+    // Transition identity, not run identity and not "an Issue was escalated
+    // once": a recovered lane that escalates again is a new handoff.
+    expect(doc).toMatch(
+      /Its idempotency is the handoff's own identity —\s+session, Issue, reason, and the recovery ordinal below — so a completion\s+re-derived after a lost CAS notifies once, while a lane recovered and escalated\s+again is a new handoff and notifies again/,
+    );
+  });
+
   // §13 and §16 require one comment per handoff; the comment topic itself can
   // dead-letter, which is exactly the failure that raised the handoff. The
   // contract has to say which of the two requirements yields.
@@ -1981,7 +2370,7 @@ describe('docs/issue-refinement-contract.md — human handoff', () => {
       /What keeps the Issue out of implementation in that window is the shared task row rather than the label — it survives at `ready_for_human`, phase `refinement`, so the next intake scan refuses the implementation enqueue as a duplicate/,
     );
     expect(doc).toMatch(
-      /cancel the row and let the hand-applied status stand \(the skip path, whose label step is already done for them\), or restore the label shape and run the recovery command/,
+      /move the row into implementation and let the hand-applied status stand \(the skip path, whose label step is already done for them\), or restore the label shape and run the recovery command/,
     );
   });
 
@@ -1999,13 +2388,19 @@ describe('docs/issue-refinement-contract.md — human handoff', () => {
       /\*\*Remove `status:needs-refinement` first, then add `status:needs-implementation`\*\* — the same removal-before-addition ordering §11 step 5 gives the automatic path/,
     );
     expect(doc).toMatch(
-      /\*\*Dispose of the stranded refinement task row\*\* with `admin task cancel`/,
+      /\*\*Move the stranded refinement task row into implementation\*\* with `admin recover --session-id <session-id> --issue-number <n> --from ready_for_human --phase implementation`/,
     );
     expect(doc).toMatch(
-      /the next intake scan finds it and refuses the implementation enqueue as a duplicate/,
+      /this command requeues it in place to `queued` at phase `implementation`, so the next intake scan finds an already-active row rather than admitting a duplicate/,
     );
     expect(doc).toMatch(
-      /the refinement state of the cancelled row stays `escalated_human`/,
+      /\*\*Never `admin task cancel` for this step\*\* \(issue #984\)\. Cancellation is terminal, and ordinary implementation intake/,
+    );
+    expect(doc).toMatch(
+      /a `cancelled` row returns `already_exists` forever/,
+    );
+    expect(doc).toMatch(
+      /the refinement state of the requeued row stays `escalated_human`/,
     );
   });
 
@@ -2049,6 +2444,66 @@ describe('docs/issue-refinement-contract.md — human handoff', () => {
     );
     expect(doc).toMatch(
       /an Issue that carries an executable status there is precisely what row 2 refuses to admit/,
+    );
+  });
+
+  // Issue #980 review: the handoff's label ADD may still be pending behind a
+  // backoff when recovery runs, so a removal alone can dispatch first and be
+  // undone by the add's own retry.
+  test('recovery retires the handoff label add rather than only compensating for it', () => {
+    expect(doc).toMatch(
+      /\*\*The handoff's own label addition is retired in that same transaction\*\*, not merely compensated for/,
+    );
+    expect(doc).toMatch(
+      /the removal above can dispatch first and that retry then re-applies "a human is needed here" to a row recovery has already returned to `queued`/,
+    );
+    expect(doc).toMatch(
+      /"the label will not be added" and "the task is queued again" are one fact/,
+    );
+    expect(doc).toMatch(/An addition already delivered is left alone; the removal is what retracts it/);
+    // The comment is a record of the attempt, not a claim about the row's state.
+    expect(doc).toMatch(/The handoff \*\*comment\*\* is not retired/);
+  });
+
+  // Issue #980 review: retiring the add stops its retry but cannot abort a
+  // request already on the wire, so the recovery defers instead of racing it.
+  test('a recovery that would race the addition\'s own dispatch is refused in full', () => {
+    expect(doc).toMatch(
+      /\*\*A recovery that would race the addition's own dispatch is refused, not\s+applied\.\*\*/,
+    );
+    expect(doc).toMatch(/it cannot abort a request\s+already on the wire/);
+    expect(doc).toMatch(/commits nothing at\s+all: no reset, no event, no removal/);
+    // …and only the operator command, which is simply re-run.
+    expect(doc).toMatch(
+      /the\s+mirror-image retirement performed by a handoff raised after a recovery is\s+never refused/,
+    );
+  });
+
+  // Issue #980 review: `labels.readyForHuman` is renameable session config, and
+  // the removal compensates for one specific addition.
+  test('the removal names the label the handoff recorded, not the configured one', () => {
+    expect(doc).toMatch(
+      /\*\*The removal names the label the handoff actually added\*\*, which the handoff\s+records on its own block/,
+    );
+    expect(doc).toMatch(
+      /naming the currently configured\s+label after a rename would take off a label the Issue never carried/,
+    );
+    expect(doc).toMatch(
+      /A block written before that record\s+existed has no label to name and falls back to the configured one/,
+    );
+  });
+
+  // Issue #980 review: the same divergence pointing the other way — a delayed
+  // recovery removal retrying after the next handoff's addition landed.
+  test('a handoff raised after a recovery retires that recovery\'s removal', () => {
+    expect(doc).toMatch(
+      /\*\*A handoff raised after a recovery retires that recovery's removal\*\*, the\s+mirror image of the retirement above/,
+    );
+    expect(doc).toMatch(
+      /the removal's retry would strip the marker off a task that is\s+`ready_for_human` again/,
+    );
+    expect(doc).toMatch(
+      /The handoff cancels it in the transaction that\s+publishes the new addition/,
     );
   });
 
@@ -2166,6 +2621,45 @@ describe('docs/issue-refinement-contract.md — persistence and audit', () => {
     expect(doc).toMatch(/`<artifactRoot>\/issue-refinement\/issue-<n>\/<runId>\/`/);
   });
 
+  // Issue #980: §13's reset clears every §8 counter, so the one number that
+  // discriminates the retried attempt from the one before it cannot live among
+  // them — without it, the retry's handoff dedupes against the first attempt's
+  // already-posted comment.
+  test('the recovery count survives the §13 reset and is not one of the §8 counters', () => {
+    expect(doc).toMatch(
+      /One field survives the §13 reset that clears all of the above: the \*\*recovery\s+count\*\*/,
+    );
+    expect(doc).toMatch(/deliberately not one of the §8 counters/);
+    expect(doc).toMatch(
+      /A row that has never been recovered records nothing here and keys exactly\s+as it always did/,
+    );
+  });
+
+  // Issue #980 review: the label the handoff added is persisted beside the
+  // reason, so the §13 removal can name it after a config rename.
+  test('the handoff label is persisted beside the reason and cleared with it', () => {
+    expect(doc).toMatch(/reason when escalated together with the \*\*ready-for-human label that handoff\s+added\*\*/);
+    expect(doc).toMatch(/The recorded \*\*handoff label\*\* is written for the same kind of reason/);
+    expect(doc).toMatch(
+      /It is cleared by the reset alongside the\s+reason it belongs to, and a block written without it falls back to the\s+configured label/,
+    );
+  });
+
+  // §5.2 (issue #1003): the gate record is the operator's account of a handoff
+  // raised before either agent ran, and it is literals — a declared path on the
+  // block would be one refactor away from a public Issue comment.
+  test('the §5.2 evidence gate is persisted as literals, with the paths in the artifact', () => {
+    expect(doc).toMatch(
+      /the §5\.2 evidence gate record when the required-evidence preflight\s+raised the handoff/,
+    );
+    expect(doc).toMatch(
+      /and the local artifact's file name, never a declared path/,
+    );
+    expect(doc).toMatch(
+      /the\s+§5\.2 `evidence-preflight\.json` record when the required-evidence preflight\s+stopped the attempt/,
+    );
+  });
+
   test('writes raw transcripts before parsing and never publishes artifact paths', () => {
     expect(doc).toMatch(/the raw refiner and critic transcripts written before parsing/);
     expect(doc).toMatch(
@@ -2203,6 +2697,153 @@ describe('docs/issue-refinement-contract.md — persistence and audit', () => {
     }
   });
 
+  // Issue #975: the progress milestones are a PROJECTION over the audit events
+  // above, and the doc has to say so — a reader who takes them for a second
+  // state machine will try to drive the lane from them.
+  test('states the progress milestones as a bounded projection, not a second state machine', () => {
+    expect(doc).toMatch(
+      /\*\*Progress milestones\*\* are a stable, versioned PROJECTION over those audit events — not a second state machine/,
+    );
+    expect(doc).toMatch(/persisted as `refinement\.progress\.milestone` task events/);
+    for (const kind of [
+      'started',
+      'refiner_completed',
+      'critic_completed',
+      'retry_scheduled',
+      'accepted',
+      'activated',
+      'human_handoff',
+      'failed',
+    ]) {
+      expect(doc).toContain(`\`${kind}\``);
+    }
+    expect(doc).toMatch(/exactly eight `kind` literals/);
+    expect(doc).toMatch(/no artifact reference, no absolute path, no unbounded prose/);
+  });
+
+  test('excludes polls, holds, and internal churn from the milestone stream', () => {
+    expect(doc).toMatch(/\*\*Milestones are emitted at boundaries, never at ticks\.\*\*/);
+    expect(doc).toMatch(
+      /Worker polling and claim attempts, idle runs, predecessor-not-ready and other eligibility holds, unchanged retry checks, duplicate intake/,
+    );
+  });
+
+  test('derives the milestone id and keeps its suppression on the block', () => {
+    expect(doc).toMatch(/\*\*`milestoneId` is derived, not minted\.\*\*/);
+    expect(doc).toMatch(/depends on no wall-clock time and no randomness/);
+    expect(doc).toMatch(/`task\.context\.refinement\.progressMilestones`/);
+    expect(doc).toMatch(
+      /an in-memory set would forget exactly the restart it exists to survive/,
+    );
+  });
+
+  test('commits milestones with the transition and states the authoritative retry deadline', () => {
+    expect(doc).toMatch(/\*\*Milestones commit with the transition they describe\.\*\*/);
+    expect(doc).toMatch(/no GitHub-backed source of truth/);
+    expect(doc).toMatch(
+      /no milestone may be committed for a transition that loses the task claim or fails its authoritative task-state commit/,
+    );
+    expect(doc).toMatch(
+      /The `retry_scheduled` deadline is the task `notBefore` the committing layer ACTUALLY wrote, never a handler-side estimate/,
+    );
+  });
+
+  // Issue #977: the operator surfaces. A reader who takes admin status for a
+  // third projection — or who lets it read a comment back — reintroduces exactly
+  // the second state machine §15 exists to prevent.
+  describe('the operator view (issue #977)', () => {
+    test('names one normalized model shared by admin status and the admin UI', () => {
+      expect(doc).toMatch(
+        /\*\*The operator view is one normalized model, not three renderings\.\*\*/,
+      );
+      expect(doc).toMatch(
+        /`admin task-status` — human output and `--json` alike — and the admin UI derive refinement progress from exactly two authoritative inputs: the task row \(its status, phase, and `notBefore`\) and the persisted `refinement\.progress\.milestone` events/,
+      );
+      expect(doc).toMatch(
+        /They share a single projection, so they cannot disagree about a round, a deadline, or whether a human has to act/,
+      );
+    });
+
+    test('enumerates the fields and the closed six dispositions', () => {
+      for (const field of [
+        'the phase and refinement sub-state',
+        'the round and attempt',
+        'the current role',
+        'the refiner and critic agent identities',
+        'the last milestone kind and the instant it occurred',
+        'the machine-readable `nextAction`',
+        'the authoritative retry deadline',
+        'the bounded failure class or handoff reason',
+        'whether human action is required',
+      ]) {
+        expect(doc).toContain(field);
+      }
+      expect(doc).toMatch(
+        /one execution disposition drawn from a closed six: `running`, `queued`, `delayed`, `activated`, `failed`, and `awaiting_human`/,
+      );
+    });
+
+    test('makes the task row decide the disposition, with two named exceptions', () => {
+      expect(doc).toMatch(
+        /The disposition is decided by the task ROW in its own order, and the last milestone is consulted only where the row genuinely cannot answer/,
+      );
+      expect(doc).toMatch(
+        /a task an operator recovered after a hard failure is running again while its milestone log still ends at `failed`, and reporting it dead would be the one mistake this view must never make/,
+      );
+    });
+
+    test('reports a reactivated implementation row from the row, not the retained state', () => {
+      expect(doc).toMatch(
+        /Both exceptions are read from the park the row is STILL in, never from a terminal state a row that has moved on happens to keep carrying/,
+      );
+      expect(doc).toMatch(
+        /§12 row 33 reactivates the parked row to `queued` at phase `implementation` while the block keeps `state: "activated"` for good, and that reactivated row is reported as the ordinary queued implementation task it now is/,
+      );
+    });
+
+    test('forbids scraping the projection back into workflow state', () => {
+      expect(doc).toMatch(/\*\*Operator output never scrapes the projection back\.\*\*/);
+      expect(doc).toMatch(
+        /Neither surface reads a GitHub comment, infers state from outbox delivery, or reconstructs the fine-grained `refinement\.\*` audit events into a second progress state machine/,
+      );
+      expect(doc).toMatch(/Status and UI commands perform no GitHub mutation at all/);
+    });
+
+    test('requires the machine-exact retry deadline in JSON', () => {
+      expect(doc).toMatch(/\*\*The retry deadline is machine-exact\.\*\*/);
+      expect(doc).toMatch(
+        /`--json` carries stable field names and absolute ISO-8601 UTC timestamps, including the exact persisted `retryNotBefore` — the committed task `notBefore`, byte for byte, never a re-derived or reformatted copy/,
+      );
+      expect(doc).toMatch(/Human-readable output may additionally render an instant in local time/);
+    });
+
+    test('fails the operator view closed on unknown persisted milestone data', () => {
+      expect(doc).toMatch(/\*\*The operator view fails closed too\.\*\*/);
+      expect(doc).toMatch(
+        /A persisted milestone whose `schemaVersion` this build does not implement, or whose `kind` falls outside the closed eight, is refused and COUNTED — never coerced into a plausible-looking boundary/,
+      );
+      expect(doc).toMatch(
+        /Where a refused record is newer than the newest readable one, that readable one stops informing the disposition, which falls back to the authoritative task row/,
+      );
+      expect(doc).toMatch(
+        /Committed milestones whose public comment could not be projected \(`refinement\.progress\.comment\.unpublishable`\) are surfaced as a count/,
+      );
+    });
+
+    test('§18 records the admin surfaces as extended, never replaced', () => {
+      expect(doc).toMatch(/\*\*Admin status and the admin UI\.\*\* Extended, never replaced\./);
+      expect(doc).toMatch(
+        /`admin task-status` keeps its existing defaults, its `--json` field shape, and its closed\/completed task filtering unchanged/,
+      );
+      expect(doc).toMatch(
+        /The admin UI renders that same model through the same shared projection rather than interpreting milestones itself, and adds one read-only action for a refinement task/,
+      );
+      expect(doc).toMatch(
+        /Neither surface gains a GitHub mutation, and neither reads a GitHub comment back as workflow state/,
+      );
+    });
+  });
+
   // Issue #967: the hold is now decided in two places. One event name for one
   // fact, or every surface that counts holds counts them twice.
   test('the intake hold shares the handler event name and records why it is free', () => {
@@ -2219,14 +2860,23 @@ describe('docs/issue-refinement-contract.md — persistence and audit', () => {
     );
   });
 
-  // Both facts happen outside the §12 state machine, so without their own
-  // events neither would be recorded anywhere.
-  test('the two out-of-lane events are explained rather than left dangling', () => {
+  // All three facts happen outside the §12 state machine, so without their own
+  // events none of them would be recorded anywhere.
+  test('the out-of-lane events are explained rather than left dangling', () => {
     expect(doc).toMatch(
       /`refinement\.execution\.suspended` records the pre-execution marker guard of §3\.1 stopping an already-existing executable task — that task carries no refinement state, so no §12 row could record it/,
     );
     expect(doc).toMatch(
       /`refinement\.handoff\.comment\.undeliverable` records a handoff whose public comment could not be delivered \(§12, row 46\)/,
+    );
+    // Issue #976: a milestone that cannot be PROJECTED into a comment never
+    // reaches the outbox, so — unlike a delivery failure — no row exists to
+    // carry the diagnostic, and only the task event log can.
+    expect(doc).toMatch(
+      /`refinement\.progress\.comment\.unpublishable` records a committed progress\s+milestone whose public comment could not be projected at all \(§16\)/,
+    );
+    expect(doc).toMatch(
+      /That is not a delivery failure: no outbox row was ever\s+created, so no pending or dead-lettered row exists to find it in, and the event\s+is written in the same transaction as the milestone it belongs to/,
     );
   });
 
@@ -2278,6 +2928,101 @@ describe('docs/issue-refinement-contract.md — public comment policy', () => {
     expect(doc).toMatch(
       /with the single exception §13 defines: when the handoff's own comment effect dead-letters the handoff stands with no comment at all \(§12, row 46\), and no replacement is attempted\. One or none, never two/,
     );
+  });
+
+  // Issue #981: the handoff notification leaves the lane through a messenger
+  // rather than a comment, so §16 has to say the never-published list reaches it
+  // too — otherwise the one public surface §16 does not name is the one with no
+  // stated redaction rule.
+  test('the never-published list binds the handoff notification too', () => {
+    expect(doc).toMatch(
+      /It binds the handoff \*\*notification\*\* of §13 too, with one recorded difference: a\s+notification is delivered to the operator's own configured messenger rather than\s+posted on the Issue, so it carries the session id every notification already\s+carries and no comment ever may/,
+    );
+    expect(doc).toMatch(
+      /Everything else on the never-published list —\s+local and artifact paths, run and task identifiers, raw agent output, agent\s+reasoning, provider error text, snapshot excerpts, repository file contents — is\s+as forbidden there as it is here, and what remains is the repository, the Issue\s+number and its public URL, the phase, the transition, the handoff reason\s+literal, and the NAME of the environment variable holding the delivery\s+credential — never the credential itself, which is resolved at dispatch and\s+never persisted/,
+    );
+  });
+
+  // Issue #976: the progress milestones §15 already persists are published as
+  // append-only comments, so §16 has to admit them explicitly — a policy that
+  // still read "one or none, never two" would forbid the thing the lane now
+  // does on every boundary.
+  describe('progress comments (issue #976)', () => {
+    test('names the progress comments as the exception to one-or-none', () => {
+      expect(doc).toMatch(
+        /Beside those two, the lane posts the §15\s+progress comments specified at the end of this section — one per committed\s+progress milestone, append-only/,
+      );
+      expect(doc).toMatch(
+        /each committed milestone leaves at most one\s+comment, so a refinement that runs to completion leaves an ordered trail from\s+`started` through `activated`/,
+      );
+    });
+
+    test('is append-only and never a mutable status comment', () => {
+      expect(doc).toMatch(
+        /They are strictly append-only — the lane never\s+edits one mutable status comment, and never revises a comment it has posted/,
+      );
+    });
+
+    test('posts nothing for polls, holds, and unchanged retry checks', () => {
+      expect(doc).toMatch(
+        /worker polls,\s+claim attempts, idle runs, predecessor and eligibility holds, unchanged retry\s+checks, and duplicate intake produce no comment at all/,
+      );
+    });
+
+    test('bounds the progress comment field-by-field', () => {
+      expect(doc).toMatch(/A progress comment contains at most:/);
+      expect(doc).toMatch(/the milestone kind literal, and the refinement state at that boundary/);
+      expect(doc).toMatch(/the round, the role, and the attempt, where the milestone carries them/);
+      expect(doc).toMatch(/the machine-readable `nextAction` and its short fixed phrase/);
+      expect(doc).toMatch(
+        /the authoritative retry deadline, for a `retry_scheduled` milestone/,
+      );
+      expect(doc).toMatch(/whether human action is required/);
+    });
+
+    // The milestone CARRIES both fingerprints, so their absence from the
+    // comment has to be stated rather than left to the renderer's discretion.
+    test('omits absent fields and never publishes the fingerprints', () => {
+      expect(doc).toMatch(
+        /An optional field the milestone does not carry is omitted, never rendered as\s+`undefined`, `null`, or filled in with guessed prose/,
+      );
+      expect(doc).toMatch(
+        /`sourceFingerprint` and `predecessorFingerprint` are deliberately NOT published\s+even though the milestone carries both/,
+      );
+    });
+
+    test('keys delivery on the milestone id and the projection version, never on a run', () => {
+      expect(doc).toMatch(
+        /keyed on the milestone's deterministic `milestoneId` together with\s+the comment projection's fixed name and version — never on a run id, a\s+timestamp, or the wording/,
+      );
+      expect(doc).toMatch(
+        /the body opens with an idempotency marker derived\s+from that key, so a dispatcher that posted the comment and then lost its claim\s+recognises its own delivery/,
+      );
+    });
+
+    test('commits the comment effect with the milestone, and the retry comment once', () => {
+      expect(doc).toMatch(
+        /committed in the SAME\s+transaction as the milestone it publishes: a committed milestone is never left\s+without its intended effect, and a transition that loses the task claim\s+publishes neither/,
+      );
+      expect(doc).toMatch(
+        /a `retry_scheduled` comment is posted once, by\s+the transition that commits the delay, and not by each scheduler pass that\s+observes it/,
+      );
+    });
+
+    test('fails closed on a milestone it cannot render', () => {
+      expect(doc).toMatch(
+        /an unknown `schemaVersion`, an\s+unrecognised `kind`, or a `retry_scheduled` with no committed deadline —\s+publishes nothing and records `refinement\.progress\.comment\.unpublishable` \(§15\)/,
+      );
+      expect(doc).toMatch(
+        /Nothing outside the known boundaries is guessed\s+into a public comment/,
+      );
+    });
+
+    test('is a projection, never workflow state', () => {
+      expect(doc).toMatch(
+        /Progress comments are never read back as workflow state: SQLite task state and\s+the `refinement\.progress\.milestone` events remain authoritative/,
+      );
+    });
   });
 
   test('publishes source predecessor references and agent/model/effort metadata', () => {
@@ -2396,6 +3141,7 @@ describe('docs/issue-refinement-contract.md — fail-closed malformed output', (
     expect(doc).toMatch(/output that is not exactly one fenced JSON object/);
     expect(doc).toMatch(/a `pass` verdict carrying objections/);
     expect(doc).toMatch(/a `revise` verdict carrying no objection/);
+    expect(doc).toMatch(/a `blockReason` on a verdict other than `block`/);
     expect(doc).toMatch(/any output containing the managed-region markers/);
     expect(doc).toMatch(/any output containing an absolute or repository-external filesystem path/);
   });

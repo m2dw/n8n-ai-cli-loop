@@ -13,6 +13,15 @@ import {
 import { agentForPhase, readResolvedAssignment } from "../core/assignment.js";
 import { classifyQuotaExhaustion, resolveRetryDelayOverrideMsForCategory, describeFailureCategory } from "../core/quota-classifier.js";
 import { extractAgentFailureDiagnostic } from "../core/agent-diagnostics.js";
+import type { ResolvedSession } from "../core/session.js";
+import { AGENT_RUNTIME_AUDIT_ARTIFACT_FILENAME, serializeAgentRuntimeAuditRecord } from "../core/agent-runtime-audit.js";
+import {
+  legacyRuntimeSettingSource,
+  resolveAgentPhaseRuntime,
+  runtimeCmdSource,
+  withAgentRuntimeAudit,
+} from "./agent-runtime.js";
+import type { AgentPhaseRuntime, LegacyRuntimeSource } from "./agent-runtime.js";
 export type { CommandRunner, CommandRunResult } from "./command-runner.js";
 
 // ---------------------------------------------------------------------------
@@ -298,35 +307,66 @@ export interface ResolvedContentDraftProfile {
   cmd: string;
   /** Sanitized argv — excludes prompt content (passed as positional arg and stdin). */
   argv: string[];
-  cmdSource: "env" | "cli-default";
-  modelSource: "cli-default" | "session-config";
-  /** Configured Antigravity model name, present only when modelSource is "session-config". */
+  /** Binary path source (issue #912) — the diagnostics boundary reads this. */
+  cmdSource: "env" | "cli-default" | "catalog-builtin" | "catalog-overlay";
+  modelSource: LegacyRuntimeSource | "cli-default";
+  /** Resolved Antigravity model name, absent when the CLI's own default applies. */
   model?: string;
+  /** The catalog profile behind the concrete values above (§13.2). */
+  profileName?: string;
+  requestedQuality?: string;
+  effectiveQuality?: string;
 }
 
-function contentDraftCommand(
+/**
+ * Resolve the content-draft runtime through the boundary's `content_draft`
+ * lane (issue #912). The model is a profile setting now —
+ * `session.contentPipeline`'s Antigravity model is no longer read by this
+ * lane (set `model` on a `google` profile in `agent-profiles.json`);
+ * `ANTIGRAVITY_BIN` keeps its break-glass meaning as the boundary's validated
+ * §8.1 layer-1 override, and every built-in `google` profile now carries
+ * `printTimeout: 15m`, so the lane passes `--print-timeout` instead of
+ * running under `agy`'s own five-minute print-mode default.
+ */
+function contentDraftRuntime(
+  task: AiTask,
+  session: ResolvedSession,
   agentId: string | undefined,
-  model: string | undefined,
-): { cmd: string; args: string[]; resolvedProfile: ResolvedContentDraftProfile } | { error: string } {
+  sessionsPath: string | undefined,
+):
+  | { runtime: AgentPhaseRuntime; cmd: string; args: string[]; resolvedProfile: ResolvedContentDraftProfile }
+  | { error: string } {
   const agent = agentId ?? "gemini";
-  if (agent === "gemini") {
-    const envBin = process.env["ANTIGRAVITY_BIN"];
-    const bin = envBin ?? "agy";
-    const cmdSource: ResolvedContentDraftProfile["cmdSource"] = envBin ? "env" : "cli-default";
-    const modelSource: ResolvedContentDraftProfile["modelSource"] = model ? "session-config" : "cli-default";
-    const argv: string[] = model ? ["--model", model, "--print"] : ["--print"];
-    const resolvedProfile: ResolvedContentDraftProfile = {
-      phase: "content_draft",
-      agentId: agent,
-      cmd: bin,
-      argv,
-      cmdSource,
-      modelSource,
-      ...(model ? { model } : {}),
-    };
-    return { cmd: bin, args: argv, resolvedProfile };
+  if (agent !== "gemini") {
+    return { error: `Unsupported content draft agent: ${agent}. Supported: gemini` };
   }
-  return { error: `Unsupported content draft agent: ${agent}. Supported: gemini` };
+  const resolution = resolveAgentPhaseRuntime({
+    task,
+    session,
+    phase: "content_draft",
+    lane: "content_draft",
+    agentId: agent,
+    sessionsPath,
+  });
+  if ("error" in resolution) return resolution;
+  const runtime = resolution.runtime;
+  const resolved = runtime.resolved;
+  const resolvedProfile: ResolvedContentDraftProfile = {
+    phase: "content_draft",
+    agentId: agent,
+    cmd: runtime.command,
+    argv: [...runtime.argv],
+    cmdSource: runtimeCmdSource(resolved),
+    modelSource:
+      resolved.model.value === undefined
+        ? "cli-default"
+        : legacyRuntimeSettingSource(resolved.model, resolved, runtime.quality),
+    ...(resolved.model.value !== undefined ? { model: resolved.model.value } : {}),
+    profileName: resolved.profileName,
+    requestedQuality: runtime.quality.requested.quality,
+    effectiveQuality: runtime.quality.quality,
+  };
+  return { runtime, cmd: runtime.command, args: [...runtime.argv], resolvedProfile };
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +393,12 @@ export function createContentDraftHandler(
   context: PhaseHandlerContext,
   runner: CommandRunner = defaultCommandRunner,
 ): PhaseHandler {
-  return async (task: AiTask): Promise<PhaseHandlerResult> => {
+  const runContentDraftPhase = async (
+    task: AiTask,
+    // Records the runtime whose §13 audit pieces the outer wrapper folds into
+    // the returned result on every path (issue #912).
+    setAgentRuntime: (runtime: AgentPhaseRuntime) => void,
+  ): Promise<PhaseHandlerResult> => {
     const { session, runId } = context;
     const artifactDir = runArtifactDir(session.artifactRoot, runId);
 
@@ -388,10 +433,10 @@ export function createContentDraftHandler(
       };
     }
 
-    // Determine agent and command.
+    // Determine agent and command — resolved through the runtime boundary's
+    // `content_draft` lane (issue #912).
     const agentId = agentForPhase(task, session, "research");
-    const antigravityModel = session.research?.antigravity?.model;
-    const cmdSpec = contentDraftCommand(agentId, antigravityModel);
+    const cmdSpec = contentDraftRuntime(task, session, agentId, context.sessionsPath);
     if ("error" in cmdSpec) {
       writeAssignmentFailureArtifact(artifactDir, {
         phase: "content_draft",
@@ -420,6 +465,9 @@ export function createContentDraftHandler(
       };
     }
     const resolvedProfile = cmdSpec.resolvedProfile;
+    // Hand the resolution to the outer wrapper so its §13 audit pieces ride
+    // the returned result on every path (issue #912).
+    setAgentRuntime(cmdSpec.runtime);
 
     // Build prompt — bounded issue fields + validated research brief.
     const prompt = buildPrompt(task, researchResult.content);
@@ -451,6 +499,16 @@ export function createContentDraftHandler(
         error: "content_draft_setup_failed",
       };
     }
+
+    // §13.4: the run artifact carries the same record the context trail and
+    // the `agent.runtime.resolved` event persist (issue #912), written before
+    // the agent is invoked so an interrupted run still records the billable
+    // resolution.
+    writeFileSync(
+      join(artifactDir, AGENT_RUNTIME_AUDIT_ARTIFACT_FILENAME),
+      serializeAgentRuntimeAuditRecord(cmdSpec.runtime.record),
+      "utf8",
+    );
 
     // Write prompt artifact (local only — never forwarded to GitHub).
     writeFileSync(join(artifactDir, "content-draft-prompt.md"), prompt, "utf8");
@@ -588,5 +646,13 @@ export function createContentDraftHandler(
         outcome,
       },
     };
+  };
+
+  return async (task: AiTask): Promise<PhaseHandlerResult> => {
+    let agentRuntime: AgentPhaseRuntime | undefined;
+    const result = await runContentDraftPhase(task, (runtime) => {
+      agentRuntime = runtime;
+    });
+    return withAgentRuntimeAudit(result, agentRuntime);
   };
 }

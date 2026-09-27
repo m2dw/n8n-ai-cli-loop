@@ -1,10 +1,10 @@
 import Database from "better-sqlite3";
-import { homedir } from "os";
 import { mkdirSync } from "fs";
 import { join } from "path";
+import { resolveHomeDir } from "../core/home-dir.js";
 import type { IssueActivationStore, IssueAutomationSuspension } from "../core/issue-activation.js";
 
-const DEFAULT_DB_PATH = join(homedir(), ".config", "n8n-ai-cli-loop", "dev_loop.db");
+const DEFAULT_DB_PATH = join(resolveHomeDir(), ".config", "n8n-ai-cli-loop", "dev_loop.db");
 
 /**
  * How long a connection waits for another process's lock before giving up.

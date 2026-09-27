@@ -11,8 +11,9 @@ contracts (§8).
 
 This "implemented" status is component-level, not end-to-end: see
 [feature-status.md](feature-status.md) for ChatOps's overall availability,
-which stays `foundation-only` until comment ingestion, dispatch, and result
-publication are connected.
+which is `config-gated` on `session.chatOps.enabled` (default off) now that
+comment ingestion, dispatch, and result publication are connected end to end
+by `src/cli/chatops-scan.ts` (issue #1024).
 
 Issue #696 / PR #776 attempted to specify the entire ChatOps surface —
 grammar, identity, durable replay, provider behavior, dispatch, and

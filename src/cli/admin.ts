@@ -77,36 +77,52 @@ import {
 } from "../core/outbox-effects.js";
 import { OutboxEffectCollector } from "../core/phase-runner.js";
 import { sanitizeBody, boundedExcerpt } from "../core/text-sanitize.js";
-import { redactCommand, hasUnresolvedToolRequest } from "../core/tool-request.js";
-import {
-  createToolRequestGrant,
-  grantMatches,
-  grantStatus,
-  normalizeCommand,
-  GRANT_DEFAULT_MAX_USES,
-  GRANT_DEFAULT_TTL_MS,
-} from "../core/tool-request-grant.js";
-import type { ToolRequestGrant, GrantCandidate } from "../core/tool-request-grant.js";
-import {
-  parseRepoChangeAction,
-  parsePorcelainStatus,
-  classifyChangedFiles,
-  planRepoChange,
-  summarizeClassification,
-} from "../core/tool-request-changes.js";
+import { hasUnresolvedToolRequest } from "../core/tool-request.js";
+import { GRANT_DEFAULT_MAX_USES, GRANT_DEFAULT_TTL_MS } from "../core/tool-request-grant.js";
+import { parseRepoChangeAction } from "../core/tool-request-changes.js";
 import type { RepoChangeAction } from "../core/tool-request-changes.js";
-// Issue #722: the direct-review continuation decision for a resolved
-// implementation Tool Request. All of the policy is pure and lives in core; this
-// module only collects the trusted, runner-owned evidence and commits the
-// selected transition (see the guided-run no-op path below).
+// Issue #1029: the guided run is a callable `{ request, context } →
+// OperationResult` core (docs/operation-dispatch-port-contract.md §11.2). Every
+// business rule it used to hold — one-shot grants, exact-command matching,
+// dirty-worktree handling, the dispositions, artifact recording, continuation
+// routing — now lives there; this module keeps only the shell around it: argv
+// parsing, session resolution, store construction, rendering, and exit codes.
 import {
-  buildToolRequestContinuationRecord,
-  collectPendingImplementationMarkers,
-  decideToolRequestContinuation,
-  resolveConfiguredVerification,
-} from "../core/tool-request-continuation.js";
-import { checkReviewAdmission, resolveDependencyReviewBase } from "../handlers/review-admission.js";
-import { bothStreamsCommandRunner, defaultCommandRunner, type CommandRunResult } from "../handlers/command-runner.js";
+  GUIDED_RUN_DISPOSITIONS,
+  readStoredToolRequest,
+  runToolRequestRun,
+} from "../core/tool-request-run.js";
+import type {
+  GuidedRunDisposition,
+  ToolRequestRunContext,
+  ToolRequestRunRequest,
+  ToolRequestRunTaskPort,
+} from "../core/tool-request-run.js";
+// Issue #1030: the operator resolution is a callable core for the same reason,
+// and by the same split — `src/core/tool-request-resolve.ts` owns the guards,
+// the resolution record, the transition and the publication; this module keeps
+// argv, session resolution, rendering and exit codes.
+import {
+  parseToolRequestResolveParams,
+  runToolRequestResolve,
+} from "../core/tool-request-resolve.js";
+import type {
+  ToolRequestResolveContext,
+  ToolRequestResolveRequest,
+  ToolRequestResolveTaskPort,
+} from "../core/tool-request-resolve.js";
+import type { OutboxStore } from "../core/outbox.js";
+// `probe`/`remoteHasBranch`/`sleepSync` used to be defined in this file. They
+// moved to the shared spawn module in issue #1031: they are the git seam the two
+// Tool Request operation cores take by injection, and the ChatOps composition
+// root now builds those same contexts, which it could not do from an entrypoint
+// module. Same functions, same behavior, one definition.
+import {
+  defaultCommandRunner,
+  probe,
+  remoteHasBranch,
+  sleepSync,
+} from "../handlers/command-runner.js";
 import { listWorktrees, removeWorktree, canonicalizePath, IssueWorktreeLock, issueLockScope, DEFAULT_WORKTREE_LOCK_DIR } from "../handlers/worktree.js";
 import {
   resolveWorktreeRoot,
@@ -119,7 +135,60 @@ import {
 import { assessWorktreeRecovery } from "../core/worktree-recovery.js";
 import type { WorktreeRecoveryAssessment } from "../core/worktree-recovery.js";
 import { boundVerificationOutput } from "../handlers/verification.js";
+import {
+  extractIssueVerificationCommands,
+  extractIssueVerificationSections,
+} from "../handlers/issue-verification-extractor.js";
+import {
+  deriveRequirementCommandId,
+  validateVerificationAmendmentState,
+  VERIFICATION_AMENDMENTS_CONTEXT_KEY,
+} from "../core/verification-amendment.js";
+import type {
+  VerificationAmendmentContinuation,
+  VerificationAmendmentOperation,
+} from "../core/verification-amendment.js";
+import { resolveEffectiveVerificationPlan } from "../core/verification-plan.js";
+import type { EffectiveVerificationPlan } from "../core/verification-plan.js";
+// The §13.2 equivalence the requirement gate itself applies; the resolve path
+// decides which slot a displayed command addresses under the same rule.
+import { matchesConfiguredVerificationCommand } from "../core/tool-request-continuation.js";
+// Issue #1166: the operator's declared full-suite requirement alias, read for
+// the read-only plan view so it reports what the lanes gate on.
+import { fullSuiteRequirementDeclaration } from "../core/test-stage-routing.js";
+import { refreshIssueVerification } from "../core/verification-refresh.js";
+import type {
+  IssueVerificationRefreshOutcome,
+  VerificationRefreshIssueSource,
+} from "../core/verification-refresh.js";
+import {
+  amendTaskVerification,
+  describeTaskVerificationPlan,
+  resetTaskVerification,
+} from "../core/verification-amend.js";
+import {
+  describeStagedVerificationStatus,
+  hasStagedVerificationSurface,
+  type StageBundleView,
+  type StagedVerificationStatusView,
+} from "../core/staged-verification-status.js";
+import type { StagedVerificationConfig } from "../core/staged-verification-config.js";
+import type {
+  TaskVerificationAmendOutcome,
+  TaskVerificationPlanView,
+  TaskVerificationResetDiff,
+  TaskVerificationResetOutcome,
+} from "../core/verification-amend.js";
+import {
+  normalizeCommitSha,
+  readVerificationEvidenceBindingBlock,
+  VERIFICATION_EVIDENCE_BINDING_CONTEXT_KEY,
+} from "../core/verification-evidence.js";
 import { runArtifactDir } from "../handlers/artifact-dir.js";
+import {
+  toolRequestResolveOperationContext,
+  toolRequestRunOperationContext,
+} from "../handlers/tool-request-operation-context.js";
 import { makeOutboxKey, categorizeOutboxEntry, isOutboxClaimActive } from "../core/outbox.js";
 import type { OutboxEntry, OutboxDeliveryStatus } from "../core/outbox.js";
 import {
@@ -130,7 +199,17 @@ import {
   type OutboxScanCursorAfterIds,
   type OutboxScanCursorRewindPlan,
 } from "../core/outbox-scan-cursor.js";
-import { branchName, extractPrNumber, resolvePrContext } from "../handlers/pr-helpers.js";
+import { adoptExistingPrForHead, branchName, extractPrNumber, resolvePrContext } from "../handlers/pr-helpers.js";
+import type { PrReconciliationRefusal } from "../core/pr-reconciliation.js";
+import {
+  assessMergedPrProviderSupport,
+  reconcileMergedPrTask,
+} from "../core/merged-pr-reconciliation.js";
+import type {
+  MergedPrReconciliationOutcome,
+  MergedPrReconciliationRefusal,
+  MergedPrTaskReconciliationResult,
+} from "../core/merged-pr-reconciliation.js";
 import { fileURLToPath, pathToFileURL } from "url";
 // Issue #822: `admin n8n deploy`. All ordering, verification, and publish
 // policy is pure and lives in core/n8n-deploy.ts; this module only resolves the
@@ -158,9 +237,11 @@ import {
   emit,
   die,
   report,
+  writeOut,
   setOutputMode,
   extractOutputFlags,
   resolveOutputMode,
+  CliExit,
 } from "./cli-io.js";
 import type { OutputMode } from "./cli-io.js";
 import {
@@ -177,6 +258,10 @@ import { resolveReviewDisputeSettings, isTerminalLineageState } from "../core/re
 // block, shared with any other surface that needs it.
 import { renderRefinementLines, summarizeRefinementStatus } from "../core/issue-refinement-status.js";
 import type { RefinementTaskStatus } from "../core/issue-refinement-status.js";
+// Issue #977: the §15 progress milestones live in the task EVENT log, so the
+// operator view of "where is this Issue now" needs the key that says whether a
+// task is in the lane at all before it pays for that read.
+import { REFINEMENT_CONTEXT_KEY } from "../core/issue-refinement.js";
 // Issue #848: the operator surface of the review-dispute protocol. The
 // projection is shared with the admin UI so the two cannot disagree; the
 // transition/commit path is #840's, reused rather than reimplemented, so an
@@ -192,6 +277,12 @@ import {
 } from "../core/review-dispute-commit.js";
 import { disputeReopenArgv, summarizeDisputeStatus } from "../core/review-dispute-status.js";
 import type { DisputeTaskStatus } from "../core/review-dispute-status.js";
+import { formatEvidenceParty } from "../core/review-dispute-evidence-state.js";
+// Issue #1073: the same capability answer the reviewer's own reconsideration
+// turn reads (contract §17.12/§8.2) — doctor reports it rather than inferring
+// support from CLI availability alone, since a Codex reviewer's binary is
+// available while its reconsideration turn is not.
+import { reconsiderationAgentSupport } from "../handlers/review-reconsideration.js";
 // Issue #849: the read-only, event-derived operator report. Pure aggregation
 // lives in core; this file only resolves the session's tasks and renders.
 import { aggregateDisputeMetrics } from "../core/review-dispute-metrics.js";
@@ -205,11 +296,10 @@ import {
 import type { ArbiterCliAvailability } from "../core/review-arbiter-profile.js";
 import {
   CLI_PROBE_STUB_ENV,
-  classifyProbeFailure,
+  TRANSIENT_SPAWN_ERROR_CODES,
+  TRANSIENT_SPAWN_RETRY_BACKOFF_MS,
   describeProbeOutcome,
-  isRetryableProbeFailure,
   parseCliProbeStub,
-  probeSucceeded,
 } from "../core/cli-probe.js";
 import type { CliProbeOutcome } from "../core/cli-probe.js";
 import type { EcosystemPreset } from "../core/presets.js";
@@ -227,14 +317,28 @@ import { parseIssuePlanArgs, runIssuePlanPreview } from "./issue-plan.js";
 import { parseIssuePlanAiArgs, runIssuePlanAiPreview } from "./issue-plan-ai.js";
 import { parseEvaluateHistoryArgs, runEvaluateHistory } from "./issue-plan-history.js";
 import { parseRefinementRunArgs, runRefinementRun } from "./issue-refinement-loop.js";
+import {
+  parseRefinementRecoverArgs,
+  runRefinementRecover,
+} from "./issue-refinement-recover.js";
 import { runIssueActivate, runIssueSuspend } from "./issue-activation.js";
 import { runChainList, runChainShow, runChainValidate } from "./chain-inspect.js";
+import {
+  runAgentProfileList,
+  runAgentProfileRefresh,
+  runAgentProfileShow,
+  runAgentProfileValidate,
+} from "./agent-profile.js";
 import { runChainSync } from "./chain-sync.js";
 import { runChainAppend, runChainNew, runChainPrepend } from "./chain-edit.js";
 import { runChainFork, runChainMerge } from "./chain-advanced.js";
 import { prReviewReaderFromGhRunner } from "./pr-review-reader.js";
 import type { PrReviewReader } from "./pr-review-reader.js";
-import { defaultGhRunner } from "../providers/github/gh-runner.js";
+import { defaultGhRunner, ghRunnerFromCommandRunner } from "../providers/github/gh-runner.js";
+// The gh-backed live work-item read the §10 refresh uses (issue #1041). Reused
+// from the refinement lane rather than re-derived: one `gh issue view` shape,
+// so a refresh and a refinement snapshot can never read an Issue differently.
+import { createGhRefinementReads, runGhViaRunner } from "./github-intake.js";
 import { resolveGhRunner } from "../providers/github/github-app-auth.js";
 import type { GhRunnerAuthDeps } from "../providers/github/github-app-auth.js";
 import { resolveSessionRepoHost } from "../providers/repo-host-factory.js";
@@ -300,6 +404,7 @@ export const COMMANDS: CommandInfo[] = [
       { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
       { flag: "--issue-number <n>", description: "Restrict the view to one issue (optional). An explicit issue is always shown, even when done or with no task." },
       { flag: "--all", description: "Include closed/completed (done) tasks (default: hidden)." },
+      { flag: "--discover-pr", description: "With --issue-number, and only when that task's context has no persisted PR URL: live-query the repo host for a matching open PR on the expected head branch and report it separately as `discoveredPr`, without recording it in task context (issue #1002). Opt-in; default off." },
       { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve the repo/worktree roots and --session-ref (optional)." },
       { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
       { flag: "--lock-dir <path>", description: "Directory holding the per-session repo lock (optional)." },
@@ -441,7 +546,7 @@ export const COMMANDS: CommandInfo[] = [
   {
     name: "dispute status",
     description:
-      "Show the persisted review-dispute state for one task (issue #848, docs/review-dispute-contract.md): every structured lineage with its version, severity, repository-relative affected boundary, current state and terminal outcome, the rebuttal/reconsideration/arbitration-pass/malformed-arbiter/evidence-round counters, humanGate and reopenRequested flags, the task-level pendingReReview and resolvedWithoutChanges flags, the §7.1 routing intent recorded by the last transition event, and the one supported next action — or an explicit statement that no automated action is authorized, with the exact stop reason. Read-only. Reads persisted task context and bounded task events only; arbiter reasoning, confidence, and evidence content are not persisted state and are never shown. A task with no reviewDispute block reports that and exits cleanly.",
+      "Show the persisted review-dispute state for one task (issue #848, docs/review-dispute-contract.md): every structured lineage with its version, severity, repository-relative affected boundary, current state and terminal outcome, the rebuttal/reconsideration/arbitration-pass/malformed-arbiter/evidence-round counters, humanGate and reopenRequested flags, the task-level pendingReReview and resolvedWithoutChanges flags, the §7.1 routing intent recorded by the last transition event, the last reviewer reconsideration run with the tool policy it actually enforced (`no-tools` or `read-bounded`, contract §17.6 D2), and the one supported next action — or an explicit statement that no automated action is authorized, with the exact stop reason. Read-only. Reads persisted task context and bounded task events only; arbiter reasoning, confidence, and evidence content are not persisted state and are never shown. A task with no reviewDispute block reports that and exits cleanly.",
     options: [
       { flag: "--session-id <id>", description: "Canonical session ID (required unless --session-ref is given)." },
       { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
@@ -520,6 +625,20 @@ export const COMMANDS: CommandInfo[] = [
     ],
   },
   {
+    name: "task reconcile-merged",
+    description:
+      "Reconcile tasks whose exact recorded pull request was merged outside the loop (issue #1048, docs/merged-pr-reconciliation-contract.md). Reads the live PR state for the task's recorded prUrl — never a branch guess, never a search for merged PRs — and completes the ones the contract makes eligible: queued/blocked/ready_for_human become done, failed/cancelled keep their status and record the merge. Lifecycle metadata only: it writes the task row, one task event, and one bounded work-item comment, and never deletes a worktree or a branch, never touches a label, and never edits the work item. Preview by default (every read, no write); pass --yes to apply. Omit --issue-number to scan every non-`done` task in the session. Refuses, without writing, on: an active claim or live Issue lock, an expired claim that `admin recover` owns, unusable claim metadata, an unresolved Tool Request, a missing or mismatched PR identity, a PR that is open or closed-unmerged, a malformed reconciliation history, a provider read failure, or a task that changed mid-run. There is no --force. GitHub repo hosts only: Gitea reports PR state as open/closed, so a merged PR is indistinguishable from a closed-unmerged one. Disk-space workflow: run `admin worktree cleanup` first, use this command only if more space must be reclaimed, then run the unchanged `worktree cleanup` again (a reconciled task is `done`, which cleanup already prunes).",
+    options: [
+      { flag: "--session-id <id>", description: "Canonical session ID (required unless --session-ref is given)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--issue-number <n>", description: "Reconcile only this issue's task (optional; omit to scan every non-`done` task in the session)." },
+      { flag: "--yes", description: "Actually apply the reconciliation (without it, the command only previews). Confirms task-state mutation only; it never overrides a refusal." },
+      { flag: "--worktree-lock-dir <path>", description: "Directory holding the per-issue worktree locks, read to detect an in-flight run (optional)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref and the session's repo host (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
     name: "issue suspend",
     description:
       "Suspend automation for one or more Issues by removing their currently-present execution labels — the status:*/agent:* labels core/github-intake.ts reads to pick up an Issue — while preserving every other label (issue #787). Resolves the execution-label vocabulary from session/flow configuration, never a hard-coded agent or phase. Records exactly which labels were removed so a later `admin issue activate` restores only what THIS operation suspended. Repeated calls are idempotent; a partial per-Issue failure never blocks the rest of the batch. Preview by default; pass --yes to apply.",
@@ -543,6 +662,52 @@ export const COMMANDS: CommandInfo[] = [
       { flag: "--yes", description: "Actually restore the labels (without it, the command only previews)." },
       { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
       { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "agent-profile list",
+    description:
+      "Show the effective agent runtime profile catalog (issue #913, docs/agent-runtime-profiles-contract.md §11.4): the `agent-profiles.json` overlay merged over the built-in catalog, per provider — its capability descriptors, every declared runtime profile with each setting's concrete value, all four quality bindings with the profile they name, and which agents resolve through that provider. Every value is labelled built-in or overridden, so an overlay's effect is visible without diffing a file against a compiled-in constant. Works with no catalog file present, in which case the built-in defaults are what is shown. Read-only; runs no agent and spawns nothing.",
+    options: [
+      { flag: "--session-id <id>", description: "Read `session.agentRuntime.profilesPath` from this session when resolving which catalog file applies (optional; omit to use AGENT_PROFILES_FILE or the default location beside sessions.json)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, which also fixes the default catalog location (agent-profiles.json beside it) and resolves --session-ref (optional)." },
+    ],
+  },
+  {
+    name: "agent-profile show",
+    description:
+      "Show what one agent would actually run (issue #913). Resolves the agent's provider through the same fail-closed runtime registry a phase uses, then reports all four quality levels: the profile each level binds (and the other levels sharing it), and the concrete model, reasoning effort, budget, binary, and provider options the §8.1 precedence ladder resolves for it — each value labelled with the layer that supplied it (an env break-glass override, an operator pin, the overlay file, or the built-in catalog). An unset value is reported as an absence with its reason, never as a model named \"default\". Answers \"which model and effort will this agent use at this quality?\" without spending a token. Addresses a catalog and a session, never one task: a task-level quality or profile pin is not consulted. Exits non-zero when a level cannot resolve, reporting the refusal reason against that level while still showing the ones that do. Read-only; never prints an environment variable's name-value pairs beyond the settings themselves, and never a credential.",
+    options: [
+      { flag: "<agent>", description: "Agent id to resolve: claude | codex | gemini (required positional argument)." },
+      { flag: "--quality <level>", description: "Which of light | normal | strong | maximum to mark as selected (optional; defaults to the session's agentRuntime.defaultQuality, else normal). All four levels are reported either way." },
+      { flag: "--session-id <id>", description: "Apply this session's `agentRuntime` selection: its catalog path, its default quality, and its per-agent profile pin (optional)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, which also fixes the default catalog location and resolves --session-ref (optional)." },
+    ],
+  },
+  {
+    name: "agent-profile validate",
+    description:
+      "Validate the effective (or a candidate) agent runtime profile catalog before adopting it (issue #913). Runs the same load-time gate a phase run does — schema version, closed schema, forbidden keys, every quality binding naming a declared profile, every profile conforming to its provider's capability descriptor — and then the resolution-time gate for every agent at every quality level under this environment and this session's pins, so an invalid break-glass override or a pin naming an undeclared profile is reported here instead of failing a phase mid-run. Findings carry the contract's own refusal reason (catalog-invalid, unknown-profile, unsupported-value, invalid-override, ...). A catalog provider that no runtime adapter serves is a warning, not an error. Exits non-zero when any error-severity finding is reported. Read-only.",
+    options: [
+      { flag: "--file <path>", description: "Validate this candidate catalog file instead of the configured one, merged over the built-in catalog exactly as the loader would merge it (optional)." },
+      { flag: "--probe", description: "Also run each provider's declared version probe against the binary that resolved, and report available | unavailable | indeterminate. Informational only: capability discovery never invalidates a profile and never feeds the catalog (§11.3). Off by default, because it spawns each provider CLI." },
+      { flag: "--session-id <id>", description: "Validate against this session's `agentRuntime` selection: its catalog path, its default quality, and its per-agent profile pins (optional)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, which also fixes the default catalog location and resolves --session-ref (optional)." },
+    ],
+  },
+  {
+    name: "agent-profile refresh",
+    description:
+      "Compare the configured agent-profiles.json overlay against this release's recommended (built-in) catalog and the installed provider CLIs, and propose the safe cleanup (issue #914, docs/agent-runtime-profiles-contract.md §11.6). Detects removed/no-longer-recommended models, effort tiers the release does not declare, overrides identical to the recommendation (redundant), and overrides shadowing a different recommendation (stale). Uses a provider's bounded non-interactive model listing when one exists (today: the Antigravity CLI's `models` subcommand) and falls back to the bundled recommended catalog otherwise, reporting the source either way; it never assumes the newest model is the preferred choice and never proposes a discovered name as a value. Previews by default; --yes applies. Applying removes ONLY tool-managed values — overrides identical to the recommendation, whose removal provably changes no resolved setting (the current and proposed effective catalogs must produce the same digest) — records the refresh provenance (timestamp, comparison source, recommended catalog version) in the file, and backs the previous file up beside it first. Operator-created profiles, custom bindings, and any value that differs from the recommendation are preserved and reported as findings; there is no force/replace mode. With no catalog file present nothing is written and the built-in defaults continue to apply. Rollback: restore the printed backup over the catalog path.",
+    options: [
+      { flag: "--yes", description: "Actually apply the previewed changes (without it, the command only previews). Writes a timestamped backup of the previous file before replacing it." },
+      { flag: "--offline", description: "Skip every provider CLI probe (version and model listing); the bundled recommended catalog is the only comparison source, and the output says so. For hosts without the CLIs installed or without network access." },
+      { flag: "--session-id <id>", description: "Read `session.agentRuntime.profilesPath` from this session when resolving which catalog file applies (optional)." },
+      { flag: "--session-ref <ref>", description: "Short session reference (sessionId, sessionNo, or alias) resolved to the canonical sessionId. Mutually exclusive with --session-id." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, which also fixes the default catalog location (agent-profiles.json beside it) and resolves --session-ref (optional)." },
     ],
   },
   {
@@ -720,9 +885,109 @@ export const COMMANDS: CommandInfo[] = [
       { flag: "--exit-code <n>", description: "Exit code from running the command (required). 0 = success; non-zero routes to implementation fix mode." },
       { flag: "--output <text>", description: "Command output (stdout+stderr). Mutually exclusive with --output-file." },
       { flag: "--output-file <path>", description: "Read command output from a local file. Mutually exclusive with --output." },
+      { flag: "--head-sha <sha>", description: "Reviewed branch HEAD the command was run against (full 40/64-hex commit SHA). Required only when the escalation predates evidence binding (issue #1040) and recorded no reviewed HEAD; otherwise the recorded value is authoritative and a differing --head-sha is refused." },
       { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
       { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
       { flag: "--dry-run", description: "Preview the action without writing to the database or outbox." },
+    ],
+  },
+  {
+    name: "review-verification refresh",
+    description:
+      "Re-read the live Issue and import ONLY its verification section into an existing task as a new task-scoped verification revision (docs/verification-amendment-contract.md §10). " +
+      "The intake-time title, goal, body, implementation instructions, and every other task field are left untouched — a refresh never refreshes the task body. " +
+      "Previews by default and applies nothing without --yes. Proposed retirements are reported but withheld unless --allow-retire is passed, and a replacement is never proposed: correcting a requirement's bytes in place stays an explicit operator amendment. " +
+      "A provider without a work-item body adapter, a missing Issue, a body with no supported verification section, and a diff the §10 matcher cannot map each refuse the whole refresh without writing anything.",
+    options: [
+      { flag: "--session-id <id>", description: "Session ID (required)." },
+      { flag: "--issue-number <n>", description: "Issue number whose task to refresh (required)." },
+      { flag: "--reason <text>", description: "Why this refresh is being applied (required, non-empty). Recorded on the revision and on every operation it applies." },
+      { flag: "--allow-retire", description: "Also apply the proposed retirements for requirements the live Issue no longer names. Without it they are previewed and withheld." },
+      { flag: "--expect-issue-digest <digest>", description: "Refuse unless the live Issue body still hashes to this digest — the concurrent-edit guard between a preview and the apply that follows it." },
+      { flag: "--expect-plan-digest <digest>", description: "Refuse unless the task's effective verification plan still hashes to this digest — the concurrent-AMENDMENT guard. A refresh diffs the live Issue against the task's own plan, so a plan another revision moved changes the difference applied even when the Issue body did not." },
+      { flag: "--request-key <token>", description: "Stable idempotency handle for this invocation. Omit it to derive one from the invocation's own content; supply a distinct token to ask for a deliberate repeat." },
+      { flag: "--yes", description: "Apply the previewed difference. Without it nothing is written." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "task-verification show",
+    description:
+      "Show one task's EFFECTIVE verification plan (docs/verification-amendment-contract.md §6/§11): the ordered execution and requirement slots with their stable command identity, origin (session default, Issue requirement, or task amendment), state (active/retired), the revisions that touched them, each requirement's evidence status, and the plan digest. " +
+      "Read-only: it resolves the plan, reports session-default drift, and writes nothing — not even the drift re-anchor, which belongs to the applying commands. " +
+      "For a session with stagedVerification enabled, or a task that retains stage state, it also shows the stage view (docs/staged-verification-operations.md): progress (review approved vs pending final verification vs completed final evidence), the last loop and final bundles with selected/required checks, verdicts and durations, evidence invalidation reasons, the regression set with pin reasons, and the recovery counters. " +
+      "A stored plan digest that reconciles against neither the live inputs nor the recorded session baseline is refused rather than shown, and never repaired.",
+    options: [
+      { flag: "--session-id <id>", description: "Session ID (required)." },
+      { flag: "--issue-number <n>", description: "Issue number whose task to show (required)." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "task-verification amend",
+    description:
+      "Amend one task's verification plan as a single append-only revision (docs/verification-amendment-contract.md §5/§11): add, replace, retire, restore, or annotate a command, with a mandatory operator-authored reason. " +
+      "Previews by default and applies nothing without --yes; a preview and an apply both report the old and new plan digests and the resulting plan. " +
+      "Operations compose in the order they are typed and the whole revision is refused if any one of them is invalid — nothing partial is ever applied. " +
+      "Claimed/running tasks, terminal tasks, a stale plan, and a #915 pinned entry each refuse without writing anything. Editing sessions.json, the task row, or SQLite by hand is not the supported flow and is detected: a hand-edited chain that neither the live inputs nor the recorded session baseline explains fails closed.",
+    options: [
+      { flag: "--session-id <id>", description: "Session ID (required)." },
+      { flag: "--issue-number <n>", description: "Issue number whose task to amend (required)." },
+      { flag: "--reason <text>", description: "Why this revision is being made (required, non-empty). Recorded on the revision and on every operation that carries no --op-reason of its own." },
+      { flag: "--replace <commandId>", description: "Replace the bytes of an existing slot, keeping its identity and position. Requires a following --command. Repeatable." },
+      { flag: "--add-execution <name>", description: "Add a task-local execution-layer command under this name. Requires a following --command. Repeatable." },
+      { flag: "--add-requirement", description: "Add a task-local requirement-layer command. Requires a following --command. Repeatable." },
+      { flag: "--retire <commandId>", description: "Retire a slot: it stops being executed and is reported `retired`, which is never a passing result. Never deleted; reversible with --restore. Repeatable." },
+      { flag: "--restore <commandId>", description: "Return a retired slot to active at its original position with its original bytes. Repeatable." },
+      { flag: "--annotate <commandId>", description: "Record a reason against a slot without changing its bytes, state, or position. Repeatable." },
+      { flag: "--command <bytes>", description: "The command bytes for the operation flag it follows (--replace / --add-execution / --add-requirement). Stored, digested, and executed verbatim apart from end trimming." },
+      { flag: "--op-reason <text>", description: "Operation-level reason, binding to the operation flag it follows and overriding --reason for that operation alone. Repeatable; a leading, doubled, or empty one is refused." },
+      { flag: "--continue <mode>", description: "review | implementation | none. The route an applied revision takes; omitted, the §9.2 default applies — review for a review-lane park (ready_for_human/blocked + review), none everywhere else. review/implementation re-queue the task {queued, <mode>} in the same transaction that persists the amended plan, clearing the stale missing-command state; none records the revision and routes nothing. Rejected when the task's row parks the task outside review (no continuation unparks one)." },
+      { flag: "--expect-plan-digest <digest>", description: "Refuse unless the effective plan still hashes to this digest — the concurrent-amendment guard between a preview and the apply that follows it." },
+      { flag: "--request-key <token>", description: "Stable idempotency handle for this invocation. Omit it to derive one from the invocation's own content; supply a distinct token to ask for a deliberate repeat of the same operations." },
+      { flag: "--yes", description: "Apply the previewed revision. Without it nothing is written." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "task-verification refresh-from-issue",
+    description:
+      "Re-read the live Issue and import ONLY its verification section into an existing task as a new task-scoped verification revision (docs/verification-amendment-contract.md §10). The resource-oriented spelling of `review-verification refresh`: same flags, same outcomes, same exit codes. " +
+      "The intake-time title, goal, body, implementation instructions, and every other task field are left untouched. " +
+      "Previews by default and applies nothing without --yes. Proposed retirements are reported but withheld unless --allow-retire is passed, and a replacement is never proposed: correcting a requirement's bytes in place stays an explicit `task-verification amend`.",
+    options: [
+      { flag: "--session-id <id>", description: "Session ID (required)." },
+      { flag: "--issue-number <n>", description: "Issue number whose task to refresh (required)." },
+      { flag: "--reason <text>", description: "Why this refresh is being applied (required, non-empty). Recorded on the revision and on every operation it applies." },
+      { flag: "--allow-retire", description: "Also apply the proposed retirements for requirements the live Issue no longer names. Without it they are previewed and withheld." },
+      { flag: "--expect-issue-digest <digest>", description: "Refuse unless the live Issue body still hashes to this digest — the concurrent-edit guard between a preview and the apply that follows it." },
+      { flag: "--expect-plan-digest <digest>", description: "Refuse unless the task's effective verification plan still hashes to this digest — the concurrent-AMENDMENT guard. A refresh diffs the live Issue against the task's own plan, so a plan another revision moved changes the difference applied even when the Issue body did not." },
+      { flag: "--request-key <token>", description: "Stable idempotency handle for this invocation. Omit it to derive one from the invocation's own content; supply a distinct token to ask for a deliberate repeat." },
+      { flag: "--yes", description: "Apply the previewed difference. Without it nothing is written." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+    ],
+  },
+  {
+    name: "task-verification reset",
+    description:
+      "Return one task's verification plan to its unamended baseline — the session defaults plus the Issue-derived requirements — as one ordinary append-only revision (docs/verification-amendment-contract.md §5.3 rule 6). " +
+      "Retired slots are restored, replaced slots are reverted to the bytes they entered the plan with, and task-local additions are retired. Nothing is deleted and no recorded revision is rewritten: a reset is a reversal, and reversals are revisions. " +
+      "Previews by default and applies nothing without --yes. Retiring a task-local addition removes a check the task currently runs, so it is withheld unless --allow-retire is passed. " +
+      "A plan that already matches its baseline reports no change, records no revision, and exits zero.",
+    options: [
+      { flag: "--session-id <id>", description: "Session ID (required)." },
+      { flag: "--issue-number <n>", description: "Issue number whose task to reset (required)." },
+      { flag: "--reason <text>", description: "Why the amendments are being reverted (required, non-empty). Recorded on the revision and on every operation it applies." },
+      { flag: "--allow-retire", description: "Also retire the task-local additions the amendments created. Without it they are previewed and withheld." },
+      { flag: "--expect-plan-digest <digest>", description: "Refuse unless the effective plan still hashes to this digest — the concurrent-amendment guard between a preview and the apply that follows it." },
+      { flag: "--request-key <token>", description: "Stable idempotency handle for this invocation; the preview names the one to pass back. Supply it so an apply whose response was lost is recognized as a replay of the revision it already recorded — a reset derives its operations from the plan, so a key derived from them cannot survive the reset's own success." },
+      { flag: "--yes", description: "Apply the previewed reset. Without it nothing is written." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
     ],
   },
   {
@@ -1122,6 +1387,19 @@ export const COMMANDS: CommandInfo[] = [
     ],
   },
   {
+    name: "refinement recover",
+    description: "Recover an Issue whose refinement stopped at a ready_for_human handoff (issue #980, docs/issue-refinement-contract.md §13, §12 row 36). The only supported transition out of ready_for_human / phase refinement / escalated_human: it clears the handoff reason, the rejected draft, the predecessor snapshot and fingerprint, and the round/malformed/agent-failure/stale counters, drops the previous attempt's execution metadata and the task's delay/lease/owner/last error, and re-queues the row at phase refinement with the refinement state back at pending — so the next run captures a fresh snapshot and starts with the refiner. context.assignment, the applied-refinement record §10 needs to trust an existing managed region, and the status:needs-refinement marker are preserved. Previews by default and mutates nothing; --yes applies the reset, its refinement.recovery.applied event, and the ready-for-human label removal in one guarded transaction. Refuses any other status, phase, or refinement state, a claimed task, and any Issue whose labels are not the admissible shape (status:needs-refinement present, no executable status:* label). Holds the same per-issue worktree lock the phase runner uses.",
+    options: [
+      { flag: "--session-ref <ref>", description: "Session holding the task: sessionId, sessionNo, or alias (required, or use --session-id)." },
+      { flag: "--session-id <id>", description: "Canonical session ID, as an alternative to --session-ref." },
+      { flag: "--issue-number <n>", description: "Issue number whose escalated refinement task to recover (required, exactly one)." },
+      { flag: "--yes", description: "Apply the recovery. Without it nothing is written: the command previews the task, its handoff reason, the observed labels, and the planned reset." },
+      { flag: "--sessions-path <path>", description: "Path to sessions.json, used to resolve --session-ref (optional)." },
+      { flag: "--db-path <path>", description: "Path to SQLite database (optional)." },
+      { flag: "--lock-dir <path>", description: "Directory for lock files (optional; defaults to ~/.local/state/n8n-ai-cli-loop/locks — the command holds the same per-issue worktree lock the phase runner uses)." },
+    ],
+  },
+  {
     name: "n8n deploy",
     description: "Generate the deployment artifacts for one session and import the shared child plus that session's parent workflow into a local n8n (issue #822). Previews by default and imports nothing; --yes applies. Imports the child before the parent (the parent references the child by its stable ID), verifies the imported IDs/names with `n8n list:workflow` and the parent's Config sessionId and child reference, and refuses to publish when verification fails. A parent that was already active is re-activated after the import, so a re-deploy never silently deactivates a running workflow; an apply holds a lock scoped to that parent workflow, so two concurrent deploys of the same session cannot lose each other's activation. Local/same-host n8n CLI v1 only — no REST API or remote Docker deployment. Local filesystem paths are redacted from the output.",
     options: [
@@ -1218,9 +1496,9 @@ function runHelp(argv: string[]): void {
     if (!cmd) {
       die(`Unknown command: ${target}. Run "admin help" to see available commands.`);
     }
-    process.stdout.write(formatHelpOne(cmd));
+    writeOut(formatHelpOne(cmd));
   } else {
-    process.stdout.write(formatHelpAll());
+    writeOut(formatHelpAll());
   }
 }
 
@@ -1349,14 +1627,33 @@ async function runTaskStatus(argv: string[]): Promise<void> {
     // that actually carries a protocol block. A session that never enabled the
     // protocol therefore does exactly the queries it did before, and a listing of
     // many legacy tasks costs nothing extra.
+    //
+    // Issue #977 needs the same read for a refinement task: the §15 progress
+    // milestones are persisted as task events, so the operator view of "where is
+    // this Issue now" cannot be answered from the context block alone. The two
+    // lanes share ONE event read per task — a task carrying both blocks must not
+    // pay for the log twice — and a task carrying neither still does exactly the
+    // queries it did before.
     const disputeSummaries = new Map<number, DisputeTaskStatus | null>();
+    const refinementSummaries = new Map<number, RefinementTaskStatus | null>();
+    // One clock read for the whole listing: whether a committed delay is still
+    // in force is a comparison against a single instant, and taking it per task
+    // would let two rows in one report be classified against different "now"s.
+    const now = new Date().toISOString();
     for (const t of tasks) {
-      if (t.context?.[REVIEW_DISPUTE_CONTEXT_KEY] === undefined) {
+      const hasDispute = t.context?.[REVIEW_DISPUTE_CONTEXT_KEY] !== undefined;
+      const hasRefinement = t.context?.[REFINEMENT_CONTEXT_KEY] !== undefined;
+      if (!hasDispute && !hasRefinement) {
         disputeSummaries.set(t.issueNumber, null);
+        refinementSummaries.set(t.issueNumber, summarizeRefinementStatus(t));
         continue;
       }
       const events = await store.listEvents({ sessionId: t.sessionId, issueNumber: t.issueNumber });
-      disputeSummaries.set(t.issueNumber, summarizeDisputeStatus(t, events));
+      disputeSummaries.set(t.issueNumber, hasDispute ? summarizeDisputeStatus(t, events) : null);
+      refinementSummaries.set(
+        t.issueNumber,
+        summarizeRefinementStatus(t, hasRefinement ? events : undefined, now),
+      );
     }
     const result = {
       ok: true,
@@ -1379,9 +1676,9 @@ async function runTaskStatus(argv: string[]): Promise<void> {
           ? (t.context["missingVerificationCommands"] as unknown[]).filter((c): c is string => typeof c === "string")
           : null,
         reviewDispute: disputeSummaries.get(t.issueNumber) ?? null,
-        // Issue #867: read straight off the task context — no extra query, so a
-        // session that never enabled the lane pays nothing for this field.
-        refinement: summarizeRefinementStatus(t),
+        // Issue #867/#977: the §15 block plus, for a refinement task, the
+        // normalized progress view derived from its persisted milestone events.
+        refinement: refinementSummaries.get(t.issueNumber) ?? null,
         createdAt: t.createdAt,
         updatedAt: t.updatedAt,
       })),
@@ -2026,6 +2323,61 @@ function renderDisputeLines(summary: DisputeTaskStatus, indent = ""): string[] {
         `evidenceRounds=${c.evidenceRoundsUsed}` +
         (l.humanGate ? " humanGate" : "") +
         (l.reopenRequested ? " reopenRequested" : ""),
+    );
+    // §7.1's bounded evidence round, when this lineage has one (#956). Printed
+    // only where it exists, so nothing changes for the tasks — almost all of
+    // them — that never entered a round: counts and party states, never a
+    // reference, a digest, or an artifact name.
+    const evidence = summary.evidenceCollection.find((e) => e.lineageId === l.lineageId);
+    if (evidence) {
+      lines.push(
+        `${indent}      evidence round ${evidence.round}: ` +
+          evidence.parties.map(formatEvidenceParty).join(" ") +
+          `  recorded=${evidence.attachmentsRecorded}` +
+          (evidence.complete ? " complete" : "") +
+          (evidence.recorded ? " rowApplied" : ""),
+      );
+    }
+    // THIS lineage's own reviewer run and the posture it enforced (issue #1085
+    // review, P2). Printed beside the lineage rather than only as the task's
+    // last run, because a task that disputed two findings takes two reviewer
+    // runs and the single-valued summary below then describes only the newer
+    // one — leaving the older lineage's posture, which §17.6 D2 requires to
+    // stay distinguishable, unstated. `(unrecorded)` for an entry that carries
+    // none; never a supplied default.
+    const rc = summary.reconsiderationsByLineage.find((e) => e.lineageId === l.lineageId);
+    if (rc) {
+      lines.push(
+        `${indent}      reconsideration: v${rc.version} agent=${rc.agentId ?? "?"} ` +
+          `toolPolicy=${rc.toolPolicy ?? "(unrecorded)"}`,
+      );
+    }
+  }
+  // The posture the last §4.1 reviewer run enforced (issue #1085). Printed only
+  // where a reviewer run is on record, so nothing changes for a task that has
+  // taken none — and `toolPolicy` is printed exactly as recorded, including
+  // `(unrecorded)` for a run whose summary predates the field: an operator must
+  // never read a supplied default as an enforced boundary.
+  const lr = summary.lastReconsideration;
+  if (lr) {
+    lines.push(
+      `${indent}  last reconsideration: ${lr.lineageId ?? "(unknown lineage)"} v${lr.version} ` +
+        `agent=${lr.agentId ?? "?"} toolPolicy=${lr.toolPolicy ?? "(unrecorded)"}` +
+        (lr.timedOut ? " timedOut" : "") +
+        (lr.failure ? ` failure=${lr.failure}` : ""),
+    );
+  }
+  // The D2 caveat, once, if ANY run on record took the weaker posture — the last
+  // one or an earlier lineage's. Keyed on the per-lineage record as well as the
+  // summary so a task whose newest run was `no-tools` still carries the warning
+  // for the lineage that was actually decided read-bounded.
+  if (
+    lr?.toolPolicy === "read-bounded"
+    || summary.reconsiderationsByLineage.some((e) => e.toolPolicy === "read-bounded")
+  ) {
+    lines.push(
+      `${indent}    read-bounded (contract §17.6 D2): writes, network and operator agent config were refused, ` +
+        `but reads outside the bundle were NOT bounded.`,
     );
   }
   const r = summary.routing;
@@ -3380,6 +3732,415 @@ async function runTaskReconcileClosed(argv: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Subcommand: task reconcile-merged (issue #1048)
+//
+// The operator surface over docs/merged-pr-reconciliation-contract.md: a task
+// whose recorded pull request an operator merged by hand is still carrying a
+// live lifecycle status, so nothing ever finishes it. This command previews and
+// (with --yes) applies the contract's §7 decision for one Issue or for a whole
+// session, delegating every decision to `core/merged-pr-reconciliation.ts` —
+// no provider read, no eligibility rule, and no transition is re-implemented
+// here. This layer only addresses tasks, renders, and maps outcomes to an exit
+// status.
+//
+// Deliberately NOT a cleanup feature (§14). It never removes a worktree, never
+// deletes a branch, never touches a file: it writes lifecycle metadata only.
+// The disk-space workflow is two-stage and one-directional — run the ordinary
+// `worktree cleanup`, and only if more space must be reclaimed, preview and
+// apply this command, then run the unchanged `worktree cleanup` again (a
+// reconciled task is `done`, which cleanup already classifies as a prune
+// candidate). There is no `--include-merged` on cleanup and no `--force` here:
+// §12.7 gives no flag that overrides a refusal.
+// ---------------------------------------------------------------------------
+
+/**
+ * Statuses a §7 evaluation can act on. `done` is row 11 — an informative no-op
+ * that consumes no provider call — so a bulk scan skips it rather than emitting
+ * one line per historical task. Asking about a specific `done` task with
+ * `--issue-number` still reports its `noop-done` outcome.
+ */
+const MERGED_RECONCILE_SCAN_STATUSES: TaskStatus[] = [
+  "queued",
+  "claimed",
+  "running",
+  "blocked",
+  "ready_for_human",
+  "failed",
+  "cancelled",
+];
+
+/**
+ * The refusals that mean "this run could not complete", as opposed to "this
+ * task is not eligible". Only these (plus an unresolvable single-Issue target
+ * and the §12.4 command-level provider refusal) produce a non-zero exit status:
+ * a session scan normally finds many tasks whose recorded PR is simply still
+ * open, and failing the command for that would make it unusable from n8n.
+ */
+const MERGED_RECONCILE_FAILURE_REFUSALS = new Set<MergedPrReconciliationRefusal>([
+  "pr-lookup-failed",
+  "store-refused",
+  "stale-state",
+]);
+
+/**
+ * One row of the stable machine payload. Every key is always present (null when
+ * unknown) so a consumer never has to branch on shape, and no field carries a
+ * local path: every message AND the reported PR identity pass through
+ * `sanitizeBody` with the session redaction paths first. The identity needs that
+ * as much as the messages do — `context.prUrl` is arbitrary task context, so a
+ * malformed row can hold an absolute local path rather than a URL.
+ */
+interface ReconcileMergedRow {
+  issueNumber: number;
+  /** Task status/phase as observed BEFORE this row was acted on. */
+  taskStatus: TaskStatus | null;
+  taskPhase: TaskPhase | null;
+  /**
+   * The recorded PR identity (§4) — never inferred from the Issue number —
+   * redacted for reporting. The unredacted value is what the core compares
+   * against the provider, so redaction here cannot affect any decision.
+   */
+  prUrl: string | null;
+  prNumber: number | null;
+  /** The §3 outcome, plus `task-not-found` for an unresolvable `--issue-number`. */
+  outcome: MergedPrReconciliationOutcome | "task-not-found";
+  /** True for the two writing outcomes — what an apply would change / changed. */
+  eligible: boolean;
+  /** True only when this invocation actually wrote (apply mode). */
+  applied: boolean;
+  /** Refusal code, or the `active` reason; null when neither applies. */
+  reason: string | null;
+  /** The live provider `state` for the recorded PR, when one was read. */
+  providerState: string | null;
+  /** Sanitized human explanation; null when the outcome needs none. */
+  message: string | null;
+}
+
+interface TaskReconcileMergedArgs {
+  sessionId: string;
+  issueNumber: number | undefined;
+  sessionsPath: string;
+  dbPath: string | undefined;
+  worktreeLockDir: string | undefined;
+  yes: boolean;
+}
+
+function parseTaskReconcileMergedArgs(argv: string[]): TaskReconcileMergedArgs | { error: string } {
+  const opts = parseCommonOptions(argv, {
+    session: "required",
+    issueNumber: "optional",
+    // No `--force`: §12.7 defines no flag that overrides a refusal, so an
+    // operator who types one gets the unknown-option error rather than a
+    // silently ignored token.
+    booleanFlags: ["yes"],
+    valueFlags: ["worktree-lock-dir"],
+  });
+  if ("error" in opts) return { error: opts.error };
+  return {
+    sessionId: opts.sessionId,
+    issueNumber: opts.issueNumber,
+    sessionsPath: opts.sessionsPath,
+    dbPath: opts.dbPath,
+    worktreeLockDir: opts.args["worktree-lock-dir"],
+    yes: opts.flags.has("yes"),
+  };
+}
+
+/** The §14 sequence, printed with every human-readable run so it is never folklore. */
+const MERGED_RECONCILE_WORKFLOW_NOTE =
+  "Disk-space workflow, in order: 1) run `admin worktree cleanup`; " +
+  "2) only if more space must still be reclaimed, preview and then apply this command; " +
+  "3) run `admin worktree cleanup` again. This command never deletes a worktree or a branch.";
+
+function describeReconcileMergedRow(row: ReconcileMergedRow, dryRun: boolean): string {
+  const where =
+    row.taskStatus === null ? "" : ` — ${row.taskStatus}/${row.taskPhase ?? "?"}`;
+  const pr =
+    row.prNumber === null
+      ? ""
+      : `, PR #${row.prNumber}${row.providerState ? ` ${row.providerState}` : ""}` +
+        (row.prUrl ? ` (${row.prUrl})` : "");
+  const detail = row.message ? `: ${row.message}` : "";
+  switch (row.outcome) {
+    case "reconciled":
+      return dryRun ? `would reconcile${where}${pr}` : `reconciled -> done${where}${pr}`;
+    case "recorded-terminal":
+      return dryRun
+        ? `would record merge, status preserved${where}${pr}`
+        : `merge recorded, status preserved${where}${pr}`;
+    case "already-reconciled":
+      return `already reconciled${where}${pr}`;
+    case "noop-done":
+      return `no-op, task already done${where}`;
+    case "active":
+      return `active (${row.reason ?? "unknown"})${where}${pr}${detail}`;
+    case "task-not-found":
+      return `no task found${detail}`;
+    case "refused":
+    default: {
+      const failed =
+        row.reason !== null &&
+        MERGED_RECONCILE_FAILURE_REFUSALS.has(row.reason as MergedPrReconciliationRefusal);
+      const label = failed ? "failed" : "not eligible";
+      return `${label} (${row.reason ?? "unknown"})${where}${pr}${detail}`;
+    }
+  }
+}
+
+function renderTaskReconcileMerged(
+  payload: {
+    ok: boolean;
+    sessionId: string;
+    dryRun: boolean;
+    scanned: number;
+    reconciled: number;
+    recordedTerminal: number;
+    results: ReconcileMergedRow[];
+    reasonCode?: string;
+    error?: string;
+  },
+  _mode: OutputMode,
+): string {
+  if (payload.error !== undefined) return payload.error;
+  const { sessionId, dryRun, scanned, reconciled, recordedTerminal, results } = payload;
+  const lines = [
+    `Reconcile externally merged PRs for session ${sessionId}: scanned ${scanned}, ` +
+      (dryRun
+        ? `would reconcile ${reconciled}, would record ${recordedTerminal} (preview).`
+        : `reconciled ${reconciled}, recorded ${recordedTerminal}.`),
+  ];
+  for (const row of results) {
+    lines.push(`  #${row.issueNumber}: ${describeReconcileMergedRow(row, dryRun)}`);
+  }
+  if (dryRun) lines.push("Run with --yes to apply.");
+  lines.push(MERGED_RECONCILE_WORKFLOW_NOTE);
+  return lines.join("\n");
+}
+
+async function runTaskReconcileMerged(argv: string[]): Promise<void> {
+  const parsed = parseTaskReconcileMergedArgs(argv);
+  if ("error" in parsed) die(parsed.error);
+  const { sessionId, issueNumber, sessionsPath, dbPath, worktreeLockDir, yes } = parsed;
+
+  let registry: JsonSessionRegistry;
+  try {
+    registry = new JsonSessionRegistry(sessionsPath);
+  } catch (err) {
+    die(`Failed to load sessions file (${sessionsPath}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const session = await registry.getSessionById(sessionId);
+  if (!session) {
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
+  }
+
+  const mode = yes ? "apply" : "preview";
+  const base = { sessionId, issueNumber: issueNumber ?? null, mode, dryRun: !yes };
+
+  // §12.4 — decided from the session's configured repo host BEFORE the store is
+  // opened and before any task is read. Resolving the provider first would make
+  // an unsupported host fail as a setup error (or, for gitea, as a missing
+  // token) instead of the contract's own refusal.
+  const repoHostKind = session.repoHostProvider?.provider ?? "github";
+  const support = assessMergedPrProviderSupport(repoHostKind);
+  if (!support.supported) {
+    const result = {
+      ok: false,
+      ...base,
+      scanned: 0,
+      reconciled: 0,
+      recordedTerminal: 0,
+      alreadyReconciled: 0,
+      noopDone: 0,
+      active: 0,
+      refused: 0,
+      notFound: 0,
+      results: [] as ReconcileMergedRow[],
+      reasonCode: "unsupported_provider",
+      repoHost: repoHostKind,
+      error: `task reconcile-merged cannot run for session "${sessionId}": ${support.message}`,
+    };
+    report(result, (m) => renderTaskReconcileMerged(result, m));
+    process.exitCode = 1;
+    return;
+  }
+
+  let sessionRepoHost: SessionRepoHost;
+  try {
+    sessionRepoHost = await resolveSessionRepoHost(session.repoHostProvider, {
+      githubRepo: session.githubRepo,
+      cwd: session.repoRoot,
+      ghRunnerFallback: defaultGhRunner,
+    });
+  } catch (err) {
+    die(
+      `Failed to resolve the repo-host provider for session "${sessionId}": ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const redactionPaths = sessionRedactionPaths(session);
+  const clean = (text: string): string => sanitizeBody(text, redactionPaths);
+  // The recorded PR identity is task context, so it is arbitrary text: a
+  // malformed row can carry an absolute local path (and one with no extractable
+  // PR number never reaches the provider, so nothing else would ever reject it).
+  // Reporting it verbatim would put that path in both the JSON payload and the
+  // human render, past the redaction every message already gets — so the
+  // reported identity is redacted the same way. The DECISION still uses the raw
+  // recorded value, which the core re-reads from the store itself.
+  const cleanPrUrl = (value: string | null | undefined): string | null =>
+    value === undefined || value === null ? null : clean(value);
+  const issueLock = new IssueWorktreeLock(worktreeLockDir);
+  const store = new SqliteTaskStore(dbPath);
+  try {
+    const rows: ReconcileMergedRow[] = [];
+    let candidates: AiTask[];
+    if (issueNumber !== undefined) {
+      const task = await store.getTask({ sessionId, issueNumber });
+      candidates = task ? [task] : [];
+      if (!task) {
+        rows.push({
+          issueNumber,
+          taskStatus: null,
+          taskPhase: null,
+          prUrl: null,
+          prNumber: null,
+          outcome: "task-not-found",
+          eligible: false,
+          applied: false,
+          reason: null,
+          providerState: null,
+          message: `no task exists for issue #${issueNumber} in session "${sessionId}"`,
+        });
+      }
+    } else {
+      const all = await store.listSessionTasks(sessionId);
+      candidates = all
+        .filter((t) => MERGED_RECONCILE_SCAN_STATUSES.includes(t.status))
+        .sort((a, b) => a.issueNumber - b.issueNumber);
+    }
+
+    for (const task of candidates) {
+      // The identity shown in the report comes from the task row this layer
+      // already read; the DECISION still re-reads the row inside the core, which
+      // is what §11.3/§11.4 require (a preview is not a promise, and the write
+      // CAS-es on the core's own read).
+      const ctx = resolvePrContext(task);
+      const recordedPrNumber = ctx.prUrl === undefined ? undefined : extractPrNumber(ctx.prUrl);
+      const now = new Date().toISOString();
+      const result: MergedPrTaskReconciliationResult = await reconcileMergedPrTask(
+        {
+          sessionId,
+          issueNumber: task.issueNumber,
+          mode,
+          runId: `admin-task-reconcile-merged-${now}-${task.issueNumber}`,
+          now,
+        },
+        {
+          store,
+          repoHost: {
+            kind: sessionRepoHost.kind,
+            getPullRequest: (selector) => sessionRepoHost.provider.getPullRequest(selector),
+          },
+          issueLock,
+          session,
+        },
+      );
+
+      const row: ReconcileMergedRow = {
+        issueNumber: task.issueNumber,
+        taskStatus: task.status,
+        taskPhase: task.phase,
+        prUrl: cleanPrUrl(ctx.prUrl),
+        prNumber: recordedPrNumber ?? null,
+        outcome: "refused",
+        eligible: false,
+        applied: false,
+        reason: null,
+        providerState: null,
+        message: null,
+      };
+      switch (result.outcome) {
+        case "unsupported-provider":
+          // Unreachable: the same assessment already ran above, before the store
+          // was opened. Surfaced rather than swallowed if the core ever widens.
+          row.outcome = "refused";
+          row.reason = "unsupported-provider";
+          row.message = clean(result.message);
+          break;
+        case "task-not-found":
+          row.outcome = "task-not-found";
+          row.message = clean(result.message);
+          break;
+        case "noop-done":
+          row.outcome = "noop-done";
+          break;
+        case "already-reconciled":
+          row.outcome = "already-reconciled";
+          row.prUrl = cleanPrUrl(result.prUrl);
+          row.prNumber = result.prNumber;
+          row.message = `PR #${result.prNumber} is already recorded in this task's reconciliation history`;
+          break;
+        case "active":
+          row.outcome = "active";
+          row.reason = result.reason;
+          row.message = clean(result.message);
+          break;
+        case "refused":
+          row.outcome = "refused";
+          row.reason = result.refusal;
+          row.providerState = result.providerState ?? null;
+          row.message = clean(result.message);
+          break;
+        case "reconciled":
+        case "recorded-terminal":
+          row.outcome = result.outcome;
+          row.eligible = true;
+          row.applied = result.applied;
+          row.prUrl = cleanPrUrl(result.record.prUrl);
+          row.prNumber = result.record.prNumber;
+          row.providerState =
+            typeof result.record.providerState === "string" ? result.record.providerState : null;
+          row.message =
+            result.outcome === "reconciled"
+              ? `merged PR #${result.record.prNumber} ${result.applied ? "reconciled" : "would reconcile"}: ` +
+                `${task.status} -> done`
+              : `external merge of PR #${result.record.prNumber} ` +
+                `${result.applied ? "recorded" : "would be recorded"}; terminal status ${task.status} preserved`;
+          break;
+      }
+      rows.push(row);
+    }
+
+    const count = (predicate: (row: ReconcileMergedRow) => boolean): number =>
+      rows.filter(predicate).length;
+    const hasFailures = rows.some(
+      (row) =>
+        row.outcome === "task-not-found" ||
+        (row.outcome === "refused" &&
+          row.reason !== null &&
+          MERGED_RECONCILE_FAILURE_REFUSALS.has(row.reason as MergedPrReconciliationRefusal)),
+    );
+    const result = {
+      ok: !hasFailures,
+      ...base,
+      scanned: rows.length,
+      reconciled: count((row) => row.outcome === "reconciled"),
+      recordedTerminal: count((row) => row.outcome === "recorded-terminal"),
+      alreadyReconciled: count((row) => row.outcome === "already-reconciled"),
+      noopDone: count((row) => row.outcome === "noop-done"),
+      active: count((row) => row.outcome === "active"),
+      refused: count((row) => row.outcome === "refused"),
+      notFound: count((row) => row.outcome === "task-not-found"),
+      results: rows,
+    };
+    report(result, (m) => renderTaskReconcileMerged(result, m));
+    if (hasFailures) process.exitCode = 1;
+  } finally {
+    store.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Subcommand: context create
 // ---------------------------------------------------------------------------
 
@@ -3971,357 +4732,6 @@ function describeArbiterRejections(rejections: readonly ArbiterCandidateRejectio
     .join("; ");
 }
 
-/** Block the calling thread; `probe` is synchronous, so a promise is no use here. */
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-/**
- * Run a command and classify what happened (issue #897).
- *
- * Returns the full {@link CliProbeOutcome} rather than a bare boolean: the
- * `ok`/`output` pair every pre-#897 caller reads is still there, but a caller
- * that must not confuse "the binary is missing" with "this host could not fork
- * right now" can read `status`/`transient`/`code` instead. Reducing the
- * distinction away too early is what let a loaded machine be reported as an
- * uninstalled CLI.
- */
-function probe(cmd: string, args: string[], cwd?: string): CliProbeOutcome {
-  // Attempt 0 is the normal path; the retries exist only for a host that could
-  // not fork, and are spaced so the contended resource has a chance to free up.
-  const backoffMs = [100, 300];
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      const stdout = execFileSync(cmd, args, {
-        cwd,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        // Generous enough to tolerate a loaded host: these calls include network
-        // ops (fetch/pull/ls-remote) whose latency is outside our control, and a
-        // spurious timeout here is misread as "could not fetch origin" even
-        // though the command actually completed.
-        timeout: 60_000,
-      }) as string;
-      return probeSucceeded(stdout);
-    } catch (err: unknown) {
-      const outcome = classifyProbeFailure(err);
-      if (attempt < backoffMs.length && isRetryableProbeFailure(outcome)) {
-        sleepSync(backoffMs[attempt]);
-        continue;
-      }
-      return outcome;
-    }
-  }
-}
-
-/**
- * Determine whether origin has `branch`, distinguishing a positively-absent
- * branch from an ambiguous lookup failure (issue #316 review). `git ls-remote
- * --exit-code` exits 2 only when the lookup succeeded but matched no ref; any
- * other non-zero status (network, auth, timeout) is ambiguous and must NOT be
- * read as "branch absent" — doing so could create a base-derived branch that
- * misses the existing PR head's changes.
- */
-function remoteHasBranch(repoRoot: string, branch: string): "yes" | "no" | "unknown" {
-  // With no `origin` remote configured the branch is definitively local-only: the
-  // remote cannot hold it, so this is a determinate "no", not the ambiguous
-  // "unknown" reserved for a configured remote whose lookup failed (network/auth).
-  // Conflating the two would steer a genuinely local-only stale branch away from
-  // cleanup and toward recreate.
-  try {
-    execFileSync("git", ["remote", "get-url", "origin"], {
-      cwd: repoRoot,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch {
-    return "no";
-  }
-  try {
-    execFileSync("git", ["ls-remote", "--exit-code", "--heads", "origin", branch], {
-      cwd: repoRoot,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 60_000,
-    });
-    return "yes";
-  } catch (err: unknown) {
-    return (err as { status?: number }).status === 2 ? "no" : "unknown";
-  }
-}
-
-/**
- * Resolve the work branch a Tool Request's side effects must land on (issue
- * #316). Tool Request recovery follows the same branch discipline as
- * implementation work: dependency/Tool Request changes belong on the issue's
- * branch, never the session base branch (e.g. `main`). Prefer the PR head branch
- * recorded on the task (set once an open PR exists for the issue); otherwise fall
- * back to the conventional `ai/issue-<n>` branch — the initial-implementation
- * case where no PR exists yet.
- */
-function resolveToolRequestWorkBranch(task: AiTask, issueNumber: number): string {
-  const { branch } = resolvePrContext(task);
-  return branch && branch.trim().length > 0 ? branch.trim() : branchName(issueNumber);
-}
-
-/**
- * The dependency start point a Tool Request work branch must be built on when it
- * has to be created from scratch (issue #316 review). In dependency-start-point
- * mode the implementation handler creates `ai/issue-<n>` from the blocker PR head
- * and then DELETES that temporary branch when it hands off a Tool Request — so a
- * later grant finds the branch nowhere and would otherwise create it from the
- * session base, missing the blocker's changes. The handler records `dependencyBase`
- * on the task so the grant can rebuild the branch on the blocker head instead.
- * Returns the blocker PR head ref name, or undefined when the issue is not
- * dependency-started.
- */
-function resolveToolRequestDependencyHead(task: AiTask): string | undefined {
-  const dep = task.context["dependencyBase"];
-  if (dep && typeof dep === "object" && !Array.isArray(dep)) {
-    const head = (dep as Record<string, unknown>)["baseHeadRefName"];
-    if (typeof head === "string" && head.trim().length > 0) return head.trim();
-  }
-  return undefined;
-}
-
-/**
- * Move the checkout onto `workBranch` so a granted Tool Request command runs on
- * the issue branch, never the base branch (issue #316). Assumes a clean tree —
- * the caller's preflight has already verified it.
- *
- *   - already on the work branch         → nothing to do (`created: false`).
- *   - the branch exists locally          → check it out (`created: false`).
- *   - it exists on origin (PR branch)    → fetch + check it out (`created: false`).
- *   - it exists nowhere                  → safely update the base, then create the
- *                                          branch from it (`created: true`).
- *
- * `created` lets a clean no-op grant tidy up a branch it had to invent. Fails
- * closed (returns an error) rather than running the command on the wrong branch.
- * Origin is only consulted when one is configured, so a checkout without a remote
- * still creates the branch from the local base.
- *
- * `depStartPoint`, when set, is the blocker PR head a dependency-started issue
- * branch must be built on (issue #316 review). When the branch exists nowhere and
- * a dependency start point is given, the branch is created from the fetched blocker
- * head instead of the session base — and we fail closed rather than fall back to
- * the base, since a base-derived branch would miss the blocker's changes.
- *
- * `fromRecordedPr` marks a `workBranch` that came from the task's recorded PR head
- * rather than the conventional `ai/issue-<n>` name (issue #316 review). When the
- * branch exists nowhere we only create it from the base for the conventional
- * no-PR case: a recorded PR head that is missing both locally and on origin (the
- * head was deleted, lives in a fork, or is otherwise unavailable) must NOT be
- * rebuilt from the base, which would run the grant on a branch lacking the PR's
- * current changes. Fail closed instead.
- *
- * `resumeSafe` (on success) reports whether a resolved — not freshly created —
- * branch is a *known* resume point: the recorded PR head, or a branch that exists
- * on origin (pushed). It is false for an arbitrary pre-existing local conventional
- * branch, which on a clean no-op grant is most likely a stale leftover from a
- * prior failed run rather than intentional work. The no-op-grant caller uses this
- * to avoid silently adopting such a leftover as the requeue resume point — letting
- * the implementation run's new-branch preflight fail loudly instead (issue #316
- * review). Always false when `created` is true (the caller checks `created` first).
- */
-function moveToToolRequestBranch(
-  repoRoot: string,
-  workBranch: string,
-  baseBranch: string,
-  depStartPoint?: string,
-  fromRecordedPr = false,
-): { ok: true; created: boolean; resumeSafe: boolean } | { ok: false; error: string } {
-  const current = probe("git", ["rev-parse", "--abbrev-ref", "HEAD"], repoRoot);
-  const hasOrigin = probe("git", ["remote", "get-url", "origin"], repoRoot).ok;
-
-  // Fast-forward the checked-out work branch from origin so the granted command
-  // runs against current files, mirroring fix-mode branch setup (issue #316
-  // review). The local branch may be behind the open PR head after another
-  // operator or worker pushed updates. Fail closed if the branch diverged rather
-  // than run the grant on stale state. A grant-created branch never pushed has no
-  // origin counterpart, so only pull when origin actually has the branch.
-  // `onOrigin` lets the caller tell a pushed/PR branch (a known resume point)
-  // from an arbitrary local-only branch (issue #316 review).
-  const fastForwardFromOrigin = (): { ok: true; onOrigin: boolean } | { ok: false; error: string } => {
-    if (!hasOrigin) return { ok: true, onOrigin: false };
-    const remoteHas = remoteHasBranch(repoRoot, workBranch);
-    if (remoteHas === "unknown") {
-      // A transient ls-remote failure must NOT be read as "origin lacks this
-      // branch": collapsing unknown→false would skip the pull and run the grant
-      // on a stale local PR branch even though origin/<workBranch> may have
-      // advanced. Fail closed so the operator reconciles instead (issue #316
-      // review).
-      return {
-        ok: false,
-        error:
-          `could not determine whether origin has '${workBranch}' (lookup failed); refusing to run the ` +
-          `granted command on a possibly-stale '${workBranch}' without reconciling with origin`,
-      };
-    }
-    if (remoteHas === "no") {
-      // A recorded PR head that origin positively lacks is a stale local copy of
-      // a deleted/unavailable PR branch (issue #316 review). Running the grant on
-      // it would apply Tool Request side effects to a branch that is no longer the
-      // PR head — the same hazard the no-PR fail-closed check below guards, which
-      // is otherwise bypassed because the branch happens to still exist locally.
-      // Fail closed so the operator restores the PR head before granting.
-      if (fromRecordedPr) {
-        return {
-          ok: false,
-          error:
-            `the recorded PR head branch '${workBranch}' exists locally but not on origin (the head was ` +
-            `deleted or is otherwise unavailable); refusing to run the granted command on a stale local ` +
-            `copy that is no longer the PR head. Restore the PR head branch (or its origin ref) before granting`,
-        };
-      }
-      return { ok: true, onOrigin: false };
-    }
-    const pull = probe("git", ["pull", "origin", workBranch, "--ff-only"], repoRoot);
-    if (!pull.ok) {
-      return { ok: false, error: `git pull origin ${workBranch} --ff-only failed: ${pull.output}` };
-    }
-    // `git pull --ff-only` succeeds as a no-op when the local branch is *ahead* of
-    // origin (origin is already an ancestor), leaving unpushed local commits in
-    // place. Returning onOrigin:true here would let a clean/no-op grant treat such
-    // a branch as a known resume point, record it as `toolRequestResumeBranch`, and
-    // bypass the manual-done pushed-branch guard — resuming the next run from commits
-    // that exist only in this checkout (issue #316 review). Fail closed so the
-    // operator pushes or drops the local-only commits before the branch is adopted.
-    // Compare the local branch against the just-fetched origin tip via FETCH_HEAD,
-    // not the remote-tracking ref origin/<workBranch>: a fresh/single-branch clone
-    // that pulls `origin <workBranch>` updates only FETCH_HEAD and never creates
-    // refs/remotes/origin/<workBranch>, so `rev-list origin/<workBranch>..` would
-    // fail and refuse a valid local PR branch (issue #316 review). The
-    // `git pull origin <workBranch> --ff-only` above wrote FETCH_HEAD to the
-    // fetched tip.
-    const ahead = probe("git", ["rev-list", "--count", `FETCH_HEAD..${workBranch}`], repoRoot);
-    if (!ahead.ok) {
-      return {
-        ok: false,
-        error: `git rev-list --count FETCH_HEAD..${workBranch} (origin/${workBranch} tip) failed: ${ahead.output}`,
-      };
-    }
-    if (ahead.output.trim() !== "0") {
-      return {
-        ok: false,
-        error:
-          `local '${workBranch}' is ahead of origin/${workBranch} by ${ahead.output.trim()} commit(s); refusing ` +
-          `to run the granted command on a branch with unpushed commits. Push or drop the local-only commits on ` +
-          `'${workBranch}' before granting`,
-      };
-    }
-    return { ok: true, onOrigin: true };
-  };
-
-  // Already on the work branch: still reconcile with origin. Skipping the
-  // fast-forward here (the prior early return) would run the grant against a
-  // stale PR branch when origin/<workBranch> has advanced (issue #316 review).
-  if (current.ok && current.output === workBranch) {
-    const ff = fastForwardFromOrigin();
-    if (!ff.ok) return ff;
-    return { ok: true, created: false, resumeSafe: ff.onOrigin || fromRecordedPr };
-  }
-
-  const localExists = probe("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${workBranch}`], repoRoot).ok;
-  if (localExists) {
-    const co = probe("git", ["checkout", workBranch], repoRoot);
-    if (!co.ok) return { ok: false, error: `git checkout ${workBranch} failed: ${co.output}` };
-    const ff = fastForwardFromOrigin();
-    if (!ff.ok) return ff;
-    return { ok: true, created: false, resumeSafe: ff.onOrigin || fromRecordedPr };
-  }
-
-  // Not local — does origin have it (an existing PR branch)? Only consult origin
-  // when one is configured. Positively prove the branch's presence/absence first
-  // (issue #316 review): a transient fetch failure must NOT be treated the same as
-  // "branch does not exist", or a granted command for an existing PR head could be
-  // run on a base-derived branch missing the PR's current changes. Only fall
-  // through to base-branch creation when origin genuinely lacks the branch.
-  if (hasOrigin) {
-    const remote = remoteHasBranch(repoRoot, workBranch);
-    if (remote === "unknown") {
-      return {
-        ok: false,
-        error:
-          `could not determine whether origin has '${workBranch}' (lookup failed); refusing to create a ` +
-          `base-derived branch that could miss existing PR changes`,
-      };
-    }
-    if (remote === "yes") {
-      const fetched = probe("git", ["fetch", "origin", workBranch], repoRoot);
-      if (!fetched.ok) {
-        return { ok: false, error: `git fetch origin ${workBranch} failed: ${fetched.output}` };
-      }
-      const co = probe("git", ["checkout", "-B", workBranch, "FETCH_HEAD"], repoRoot);
-      if (!co.ok) return { ok: false, error: `git checkout ${workBranch} (from origin) failed: ${co.output}` };
-      // Resolved from origin — a pushed/PR branch is a known, safe resume point.
-      return { ok: true, created: false, resumeSafe: true };
-    }
-    // remote === "no": origin positively lacks the branch — safe to create it
-    // from the base branch below.
-  }
-
-  // The branch exists nowhere. A recorded PR head must be resolved before the
-  // dependency start point (issue #316 review): when the task carries both a
-  // recorded PR head and a `dependencyBase`, rebuilding the PR head from the
-  // blocker head here would run the grant on a branch missing the PR's current
-  // commits — the same fail-closed case as below. The recorded PR head wins, so
-  // we fail closed rather than recreate it from the dependency start point.
-  if (fromRecordedPr) {
-    return {
-      ok: false,
-      error:
-        `the recorded PR head branch '${workBranch}' exists neither locally nor on origin; refusing to ` +
-        `recreate it from the base branch '${baseBranch}', which would miss the PR's current changes. ` +
-        `Restore the PR head branch (or its origin ref) before granting`,
-    };
-  }
-
-  // In dependency-start-point mode the branch must be built on the blocker PR
-  // head, not the session base (issue #316 review): the implementation handler
-  // deleted the temporary `ai/issue-<n>` branch at handoff, so creating it from
-  // the base here would miss the blocker's changes and the requeued dependency
-  // implementation would later collide with this branch or recreate from the
-  // blocker and lose the granted side effects. Fetch the blocker head and branch
-  // from it; fail closed rather than fall back to the base.
-  if (depStartPoint) {
-    if (!hasOrigin) {
-      return {
-        ok: false,
-        error:
-          `'${workBranch}' must be created from the dependency start point '${depStartPoint}' (the blocker PR ` +
-          `head), but this checkout has no 'origin' remote to fetch it from; refusing to create the branch ` +
-          `from the base branch '${baseBranch}', which would miss the blocker's changes`,
-      };
-    }
-    const fetched = probe("git", ["fetch", "origin", depStartPoint], repoRoot);
-    if (!fetched.ok) {
-      return {
-        ok: false,
-        error:
-          `git fetch origin ${depStartPoint} (dependency start point for '${workBranch}') failed: ${fetched.output}; ` +
-          `refusing to create the branch from the base branch '${baseBranch}', which would miss the blocker's changes`,
-      };
-    }
-    const create = probe("git", ["checkout", "-b", workBranch, "FETCH_HEAD"], repoRoot);
-    if (!create.ok) {
-      return { ok: false, error: `git checkout -b ${workBranch} FETCH_HEAD (dependency start point) failed: ${create.output}` };
-    }
-    return { ok: true, created: true, resumeSafe: false };
-  }
-
-  // Not dependency-started: create it from the configured base branch after
-  // updating the base safely (fetch/ff-only pull when a remote exists).
-  const coBase = probe("git", ["checkout", baseBranch], repoRoot);
-  if (!coBase.ok) return { ok: false, error: `git checkout ${baseBranch} failed: ${coBase.output}` };
-  if (hasOrigin) {
-    const pull = probe("git", ["pull", "--ff-only"], repoRoot);
-    if (!pull.ok) return { ok: false, error: `git pull --ff-only on ${baseBranch} failed: ${pull.output}` };
-  }
-  const create = probe("git", ["checkout", "-b", workBranch, baseBranch], repoRoot);
-  if (!create.ok) return { ok: false, error: `git checkout -b ${workBranch} ${baseBranch} failed: ${create.output}` };
-  return { ok: true, created: true, resumeSafe: false };
-}
-
 function runSessionDoctor(argv: string[]): void {
   const parsed = parseSessionDoctorArgs(argv);
   if ("error" in parsed) die(parsed.error);
@@ -4705,6 +5115,69 @@ function runSessionDoctor(argv: string[]): void {
     const skip = (name: string, why: string): void => {
       checks.push({ name, category: "aiCli", ok: false, error: `Skipped: ${why}` });
     };
+
+    // ---- Reviewer reconsideration capability (issues #1073, #1085) ----
+    //
+    // Independent of the arbiter's own configuration: whether the reviewer can
+    // take the §4.1 reconsideration turn is a property of `reviewAgent` and this
+    // session's §17.6 D2 opt-in (contract §8.2, §17.5 B2, §17.16), so it is
+    // reported before arbiter resolution and never folded into it.
+    // `reviewAgentCli`'s absence above already means this reviewer can run the
+    // structured review turn (D1, §17.11) — that is NOT evidence it can also
+    // reconsider a disputed finding it raised: a Codex reviewer passes the first
+    // and, without the opt-in, fails the second. Reported only when `reviewAgent`
+    // itself resolves, the same guard the arbiter checks below use.
+    //
+    // The opt-in is read from the RAW session object rather than from the
+    // resolved settings below, because this check is emitted even when the rest
+    // of the reviewDispute configuration does not resolve — and an unreadable or
+    // non-boolean value reads as absent here, which is the same fail-closed
+    // direction `resolveReviewDisputeSettings` takes before refusing it outright.
+    const disputeReconsideration = (disputeRaw as Record<string, unknown>)["reconsideration"];
+    const readBoundedOptIn =
+      typeof disputeReconsideration === "object"
+      && disputeReconsideration !== null
+      && !Array.isArray(disputeReconsideration)
+      && (disputeReconsideration as Record<string, unknown>)["readBounded"] === true;
+    const reviewRoleOk =
+      !!reviewAgent
+      && VALID_AGENTS.includes(reviewAgent as AgentId)
+      && REVIEW_SUPPORTED.includes(reviewAgent as AgentId);
+    if (!reviewRoleOk) {
+      skip("reviewerReconsiderationCapability", "the session's default review agent is unusable (see reviewAgentCli above)");
+    } else {
+      const support = reconsiderationAgentSupport(reviewAgent, { readBounded: readBoundedOptIn });
+      checks.push({
+        name: "reviewerReconsiderationCapability",
+        category: "aiCli",
+        ok: support.supported,
+        ...(support.supported
+          ? {
+              detail:
+                `${reviewAgent} may take the reviewer's §4.1 reconsideration turn under the `
+                + `\`${support.toolPolicy ?? "no-tools"}\` posture (contract §8.2, §17.16): ${support.reason}`
+                + (support.toolPolicy === "read-bounded"
+                  ? " Every lineage this reviewer decides records that posture permanently; to roll it back, set "
+                    + "reviewDispute.reconsideration.readBounded to false, which restores the fail-closed park "
+                    + "without touching any recorded lineage."
+                  : ""),
+            }
+          : {
+              error:
+                `${support.reason} A finding this reviewer raises can still be disputed and rebutted; only the `
+                + "reconsideration turn itself is affected, and it fails closed as `profile_unavailable` and parks "
+                + "the task at `ready_for_human` (contract §15 G2; docs/review-dispute-operations.md §8, §10.1) "
+                + "rather than running. That is a different stop from an unavailable independent arbiter "
+                + "(`arbiterSelection` below, contract §7 row 19): configuring an arbiter does not change this "
+                + "answer, and this answer does not mean arbitration is unavailable for a different reviewer."
+                + (support.optIn === undefined
+                  ? ""
+                  : ` The one setting that would change this answer is \`${support.optIn}: true\`, and what it `
+                    + "admits is the weaker read-bounded posture, not the §8.2 one."),
+            }),
+      });
+    }
+
     const resolvedDispute = resolveReviewDisputeSettings(disputeRaw as ReviewDisputeConfig);
     if (!resolvedDispute.ok) {
       checks.push({
@@ -4851,6 +5324,21 @@ function runSessionDoctor(argv: string[]): void {
               + (evaluation.rejections.some((r) => r.reason === "same-provider-model-unknown")
                 ? " Note: a session-level check cannot prove a same-provider candidate differs by model, because"
                   + " the parties' resolved models are only known once the implementation and review runs exist."
+                : "")
+              // Issue #965: without this, the two remedies above read as things
+              // an operator can do, and for the commonest configuration neither
+              // is. §8.2 makes this runner the enforcement point of the arbiter's
+              // no-tool boundary, so a candidate it has no verified read-only
+              // invocation for is refused before independence is even measured —
+              // and it has one for `claude` alone. Naming that turns "add another
+              // provider" (which will be refused the same way) into the real
+              // answer: this needs a runner change, or the session accepts row 19.
+              + (evaluation.rejections.some((r) => r.reason === "unsupported-role")
+                ? " Note: `unsupported-role` means this runner has no VERIFIED no-tools invocation for that agent"
+                  + " (contract §8.2), which is checked before independence is. Today that invocation is defined"
+                  + " for `claude` only, so a session whose parties are both Anthropic has no acceptable candidate"
+                  + " at all and every arbitration escalates through row 19 until a verified invocation for"
+                  + " another CLI is added to this runner."
                 : ""),
           });
         }
@@ -5515,13 +6003,21 @@ interface StatusArgs {
   lockDir: string | undefined;
   worktreeLockDir: string | undefined;
   all: boolean;
+  /**
+   * Live-query the repo host for a matching open PR when a single issue's task
+   * context lacks a persisted `prUrl` (issue #1002). Opt-in and restricted to an
+   * explicit `--issue-number`: unlike every other field on `StatusEntry`, this
+   * one reaches an external service, so it must never fire as a side effect of a
+   * routine bulk `status` call.
+   */
+  discoverPr: boolean;
 }
 
 function parseStatusArgs(argv: string[]): StatusArgs | { error: string } {
   const opts = parseCommonOptions(argv, {
     session: "required",
     issueNumber: "optional",
-    booleanFlags: ["all"],
+    booleanFlags: ["all", "discover-pr"],
     valueFlags: ["lock-dir", "worktree-lock-dir"],
   });
   if ("error" in opts) return { error: opts.error };
@@ -5533,6 +6029,7 @@ function parseStatusArgs(argv: string[]): StatusArgs | { error: string } {
     lockDir: opts.args["lock-dir"],
     worktreeLockDir: opts.args["worktree-lock-dir"],
     all: opts.flags.has("all"),
+    discoverPr: opts.flags.has("discover-pr"),
   };
 }
 
@@ -5647,11 +6144,113 @@ interface StatusEntry {
   } | null;
   branch: StatusBranch;
   pr: { url: string | null; exists: boolean };
+  /**
+   * Result of a live repo-host lookup for a PR matching the expected head branch,
+   * run only when `--discover-pr` was requested AND `pr.exists` is false — i.e.
+   * task context carries no persisted PR identity (issue #1002). `undefined` when
+   * discovery was not attempted (the default), so this never appears for a task
+   * with complete persisted PR context and existing consumers of `pr` are
+   * unaffected.
+   */
+  discoveredPr?: StatusPrDiscovery;
   worktree: StatusWorktree;
   /** True when the canonical checkout has uncommitted changes; null when git could not be queried. */
   canonicalDirty: boolean | null;
   issueLock: StatusLock;
   suggestedAction: string;
+}
+
+/**
+ * Outcome of the live PR-discovery lookup (issue #1002). Deliberately separate
+ * from `pr` (which reflects ONLY persisted task context): an operator must be
+ * able to tell "no PR is recorded" apart from "no PR is recorded, and the repo
+ * host confirms none is live either" or "...and one IS live but not recorded".
+ *
+ * `found` mirrors the same fail-closed reconciliation #998 uses to adopt a PR at
+ * implementation time (repository, open state, exact head, configured base, and
+ * uniqueness all validated) — this command only ever reports it, never records
+ * it. `not-found` covers every refusal reason (`no-match`, `ambiguous`,
+ * `head-mismatch`, `not-open`, `cross-repository`, `repository-mismatch`,
+ * `base-mismatch`, `unusable-url`, and a raw `lookup-failed`), so a closed,
+ * wrong-base, forked, or ambiguous PR is surfaced with an actionable reason
+ * rather than silently treated as absent. `error` covers a failure to even
+ * resolve the session or repo-host provider needed to ask.
+ */
+type StatusPrDiscovery =
+  | { attempted: true; outcome: "found"; url: string; headRefName: string; number?: number; recommendation: string }
+  | { attempted: true; outcome: "not-found"; reason: PrReconciliationRefusal | "lookup-failed"; message: string }
+  | { attempted: true; outcome: "error"; message: string };
+
+/**
+ * Live-query the repo host for an open PR on the expected head branch of an
+ * issue whose task context has no persisted `prUrl` (issue #1002 — the
+ * `admin status --issue-number 975` gap where PR #997 existed but was invisible
+ * to the operator). Read-only: this never writes task context, labels, or the
+ * PR itself — see {@link adoptExistingPrForHead}, which this reuses for the SAME
+ * fail-closed reconciliation #998 applies at implementation time, so a status
+ * "found" and an implementation-time adoption never disagree.
+ */
+async function discoverLivePrForStatus(
+  sessionId: string,
+  sessionsPath: string,
+  issueNumber: number,
+  head: string,
+): Promise<StatusPrDiscovery> {
+  let session: ResolvedSession | undefined;
+  try {
+    session = await new JsonSessionRegistry(sessionsPath).getSessionById(sessionId);
+  } catch (err) {
+    return {
+      attempted: true,
+      outcome: "error",
+      message: `failed to resolve session '${sessionId}' for PR discovery: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (!session) {
+    return {
+      attempted: true,
+      outcome: "error",
+      message: `session '${sessionId}' could not be resolved for PR discovery`,
+    };
+  }
+
+  let sessionRepoHost: SessionRepoHost;
+  try {
+    sessionRepoHost = await resolveSessionRepoHost(session.repoHostProvider, {
+      githubRepo: session.githubRepo,
+      cwd: session.repoRoot,
+      ghRunnerFallback: defaultGhRunner,
+    });
+  } catch (err) {
+    return {
+      attempted: true,
+      outcome: "error",
+      message: `failed to resolve the repo-host provider for PR discovery: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const base = session.baseBranch ?? "main";
+  const adoption = adoptExistingPrForHead(sessionRepoHost.provider, {
+    issueNumber,
+    head,
+    base,
+    repo: sessionRepoHost.repoSlug,
+  });
+
+  if (adoption.kind === "adopted") {
+    return {
+      attempted: true,
+      outcome: "found",
+      url: adoption.url,
+      headRefName: adoption.headRefName,
+      ...(adoption.number !== undefined ? { number: adoption.number } : {}),
+      recommendation:
+        `This PR is not recorded in issue #${issueNumber}'s task context. Do not edit task context directly — if the ` +
+        `task's current state supports it, retry the implementation phase (e.g. \`admin recover --session-id ${sessionId} ` +
+        `--issue-number ${issueNumber}\`) so the run adopts this PR automatically via the same reconciliation issue #998 added.`,
+    };
+  }
+  return { attempted: true, outcome: "not-found", reason: adoption.reason, message: adoption.error };
 }
 
 function lockSummary(result: {
@@ -6116,6 +6715,16 @@ function renderStatus(payload: StatusPayload, mode: OutputMode): string {
     const local = e.branch.localExists ? "yes" : "no";
     lines.push(`      branch ${e.branch.name}: local=${local} remote=${remote}`);
     lines.push(`      pr: ${e.pr.url ?? "none"}`);
+    if (e.discoveredPr) {
+      const d = e.discoveredPr;
+      if (d.outcome === "found") {
+        lines.push(`      pr discovery: LIVE PR FOUND (not persisted in task context): ${d.url}`);
+        lines.push(`        ${d.recommendation}`);
+      } else {
+        const label = d.outcome === "error" ? "error" : d.reason;
+        lines.push(`      pr discovery: no live PR adopted (${label}): ${d.message}`);
+      }
+    }
     let wtState: string;
     if (!e.worktree.exists) {
       wtState = "missing";
@@ -6166,7 +6775,7 @@ async function runStatus(argv: string[]): Promise<void> {
   const parsed = parseStatusArgs(argv);
   if ("error" in parsed) die(parsed.error);
 
-  const { sessionId, issueNumber, sessionsPath, dbPath, lockDir, worktreeLockDir, all } = parsed;
+  const { sessionId, issueNumber, sessionsPath, dbPath, lockDir, worktreeLockDir, all, discoverPr } = parsed;
   const sessionInfo = loadSessionInfo(sessionId, sessionsPath);
   if ("error" in sessionInfo) die(sessionInfo.error);
 
@@ -6244,6 +6853,18 @@ async function runStatus(argv: string[]): Promise<void> {
     }
   } finally {
     store.close();
+  }
+
+  // Live PR discovery (issue #1002): opt-in and restricted to a single explicit
+  // issue, and only attempted when persisted task context carries no `prUrl` —
+  // a task with complete persisted PR context is left byte-for-byte unchanged.
+  if (discoverPr && issueNumber !== undefined && entries.length === 1 && !entries[0].pr.exists) {
+    entries[0].discoveredPr = await discoverLivePrForStatus(
+      sessionId,
+      sessionsPath,
+      issueNumber,
+      entries[0].branch.name,
+    );
   }
 
   // Surface the session-level pause (issue #531) in the default status view so
@@ -9246,7 +9867,13 @@ export async function runHumanReviewReturn(
 //     required command succeeds does this requeue to review and post a single
 //     public comment. The next review run reads the evidence and treats every
 //     recorded command as "passed", so the same missing-command escalation
-//     does not repeat.
+//     does not repeat. Since issue #1040 the stored entry is BOUND to the
+//     plan revision/digest, the §5.1 slot identity, and the reviewed branch
+//     HEAD the escalating review recorded (or, only for a legacy escalation
+//     that recorded none, an explicit --head-sha): a later review admits it
+//     only while those identities still hold, so a plan correction or a new
+//     commit makes the evidence inadmissible (fail closed) instead of
+//     producing a stale pass.
 //
 //   - Exit non-zero (failure): routes directly to implementation fix mode with
 //     the failure output as feedback. Does not mark review as passed and does
@@ -9268,6 +9895,8 @@ interface ReviewVerificationResolveArgs {
   exitCode: number;
   output: string | undefined;
   outputFile: string | undefined;
+  /** Issue #1040: operator-attested reviewed HEAD for a legacy escalation. */
+  headSha: string | undefined;
   sessionsPath: string;
   dbPath: string | undefined;
   dryRun: boolean;
@@ -9283,6 +9912,7 @@ function parseReviewVerificationResolveArgs(argv: string[]): ReviewVerificationR
       "exit-code",
       "output",
       "output-file",
+      "head-sha",
       "sessions-path",
       "db-path",
     ],
@@ -9310,6 +9940,14 @@ function parseReviewVerificationResolveArgs(argv: string[]): ReviewVerificationR
     return { error: "Only one of --output or --output-file may be provided" };
   }
 
+  let headSha: string | undefined;
+  if (args["head-sha"] !== undefined) {
+    headSha = normalizeCommitSha(args["head-sha"]);
+    if (headSha === undefined) {
+      return { error: `--head-sha must be a full commit SHA (40 or 64 hex characters), got: ${args["head-sha"]}` };
+    }
+  }
+
   return {
     sessionId: args["session-id"],
     issueNumber: n,
@@ -9317,6 +9955,7 @@ function parseReviewVerificationResolveArgs(argv: string[]): ReviewVerificationR
     exitCode: ec,
     output: args["output"],
     outputFile: args["output-file"],
+    headSha,
     sessionsPath: args["sessions-path"] ?? DEFAULT_SESSIONS_PATH,
     dbPath: args["db-path"],
     dryRun,
@@ -9327,7 +9966,7 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
   const parsed = parseReviewVerificationResolveArgs(argv);
   if ("error" in parsed) die(parsed.error);
 
-  const { sessionId, issueNumber, command, exitCode, output, outputFile, sessionsPath, dbPath, dryRun } = parsed;
+  const { sessionId, issueNumber, command, exitCode, output, outputFile, headSha, sessionsPath, dbPath, dryRun } = parsed;
 
   let registry: JsonSessionRegistry;
   try {
@@ -9398,6 +10037,150 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
             ? ` Missing commands: ${missingCmds.join(", ")}.`
             : " No missing commands are recorded for this task."),
       );
+    }
+
+    // Issue #1040: the block the escalation recorded, binding each displayed
+    // command to the §5.1 slot identity the review actually gated on. Read here
+    // rather than at its first use below because the §13.1 refusal needs the
+    // same binding: it is the only place a displayed command's STABLE slot id
+    // survives (issue #1044 review, P2).
+    const bindingBlock = readVerificationEvidenceBindingBlock(ctx[VERIFICATION_EVIDENCE_BINDING_CONTEXT_KEY]);
+
+    // §13.1 (issue #1044): the recorded missing list predates any amendment
+    // applied since the escalation, so a command it still names may address a
+    // slot the effective plan no longer carries — replaced, retired, or
+    // orphaned by a session-key removal. Recording evidence against it would
+    // attest a requirement that is gone, and for a replaced slot it would read
+    // as a pass of bytes nobody ran. Refuse, naming the revision that moved it,
+    // rather than storing orphan evidence. Only an AMENDED task can reach this
+    // check: without a chain the effective requirement layer is exactly the
+    // shipped extraction, and the behavior is unchanged.
+    const amendmentChain = ctx[VERIFICATION_AMENDMENTS_CONTEXT_KEY];
+    // Resolved once and kept: §13.1 below refuses on it, and the evidence
+    // binding is re-verified against it before anything is recorded (issue
+    // #1044 review, P2). Left `undefined` on an unamended task, where the
+    // effective requirement layer is exactly the shipped extraction and the
+    // escalation's block cannot have gone stale under an amendment.
+    let amendedEffectivePlan: EffectiveVerificationPlan | undefined;
+    if (amendmentChain !== undefined) {
+      const amendedPlan = resolveEffectiveVerificationPlan({
+        sessionVerification: session.verification,
+        issueRequirements: typeof ctx.body === "string" ? extractIssueVerificationCommands(ctx.body) : [],
+        amendments: amendmentChain,
+      });
+      if (amendedPlan.status === "invalid") {
+        die(
+          `Cannot resolve the effective verification plan for task #${issueNumber}: the task carries ` +
+            `verification amendments that do not form a readable record ` +
+            `(${amendedPlan.reason}: ${amendedPlan.detail}). Recording evidence would attest a plan nobody ` +
+            `can resolve. Inspect the amendment record with \`admin task-verification show\` first.`,
+        );
+      }
+      amendedEffectivePlan = amendedPlan.plan;
+      const trimmedForPlan = command.trim();
+      // Issue #1044 review (P2): decided under the requirement gate's OWN
+      // admission rule rather than on raw bytes. `buildIssueVerificationStatus`
+      // credits an evidence entry to a requirement when
+      // `matchesConfiguredVerificationCommand` holds with the EVIDENCE bytes on
+      // the left, so an escalation displaying `bash -lc 'npm test'` still
+      // addresses a slot an amendment replaced with `npm test`: the next review
+      // would admit that evidence, and refusing to record it would send the
+      // operator to requeue a review that has nothing to fix.
+      //
+      // The direction is the gate's, deliberately not a symmetric widening: the
+      // reverse pairing (bare bytes offered against a wrapped requirement) is
+      // NOT admitted there, so accepting it here would store evidence the next
+      // review rejects forever — the deadlock this refusal exists to avoid.
+      //
+      // Slot IDENTITY is not what this test decides; it is verified where the
+      // evidence is actually stamped, below: the binding is re-resolved against
+      // this same plan and must land on the escalation's `commandId`, and an
+      // amended task whose escalation carries no usable binding block refuses
+      // outright rather than deriving one.
+      const stillRequired = amendedPlan.plan.requirement.some(
+        (slot) => slot.state === "active" && matchesConfiguredVerificationCommand(trimmedForPlan, slot.command),
+      );
+      if (!stillRequired) {
+        const stored = validateVerificationAmendmentState(amendmentChain);
+        // The identity of the slot these bytes address is RECOVERED, never
+        // re-derived from them (issue #1044 review, P2). A slot a `replace`
+        // already moved keeps the `req:<hash>` identity derived from its
+        // ORIGINAL bytes while the escalation displays — and the missing list
+        // records — the replacement bytes. Hashing those again mints an
+        // identity no revision ever names, so the reverse search below would
+        // find nothing and the refusal would omit the very revision §13.1
+        // requires it to name. Three sources, most authoritative first:
+        //
+        //  1. the escalation's own binding block, which recorded the identity
+        //     the gating review resolved for exactly these displayed bytes;
+        //  2. the effective slot the plan still carries under that identity,
+        //     matched on either its current or its origin bytes (this is the
+        //     replaced-then-retired case, where the slot survives);
+        //  3. the chain's `replace` operations, which record the identity the
+        //     bytes were installed under even when no slot survives at all
+        //     (a session-key removal orphaned it, §6.4 rule 4).
+        //
+        // Deriving from the displayed bytes stays the last resort: for an
+        // unreplaced slot it is the correct identity, and for anything else it
+        // is only ever the id the message prints.
+        const recordedBindingId =
+          bindingBlock?.commandIds?.[trimmedForPlan] ?? bindingBlock?.commandIds?.[command];
+        const boundSlot = amendedPlan.plan.requirement.find(
+          (slot) =>
+            slot.command.trim() === trimmedForPlan || slot.originCommand.trim() === trimmedForPlan,
+        );
+        let replacedIntoId: string | undefined;
+        if (recordedBindingId === undefined && boundSlot === undefined && stored.valid && stored.state) {
+          for (const revision of [...stored.state.revisions].reverse()) {
+            for (const operation of [...revision.operations].reverse()) {
+              if (operation.kind === "replace" && operation.command.trim() === trimmedForPlan) {
+                replacedIntoId = operation.commandId;
+                break;
+              }
+            }
+            if (replacedIntoId !== undefined) break;
+          }
+        }
+        const orphanedId =
+          recordedBindingId
+          ?? boundSlot?.commandId
+          ?? replacedIntoId
+          ?? deriveRequirementCommandId(trimmedForPlan);
+        // Only an operation that actually MOVED the slot can name the revision
+        // this refusal is about (issue #1044 review, P2): `replace` changed its
+        // bytes and `retire` made it inactive, while `annotate` only recorded a
+        // note against it and `restore` put it back. Accepting every operation
+        // carrying the id would let a later annotation win the reverse search
+        // and send the operator to an audit record that changed nothing — and an
+        // orphan the search cannot explain at all (a session-key removal, §6.4
+        // rule 4) is better reported without a revision than with the wrong one.
+        const naming =
+          stored.valid && stored.state
+            ? [...stored.state.revisions]
+                .reverse()
+                .find((revision) =>
+                  revision.operations.some(
+                    (operation) =>
+                      (operation.kind === "replace" || operation.kind === "retire") &&
+                      operation.commandId === orphanedId,
+                  ),
+                )
+            : undefined;
+        die(
+          `Command \`${command}\` is no longer an active requirement of task #${issueNumber}'s effective ` +
+            `verification plan: a verification amendment replaced, retired, or orphaned its slot ` +
+            `(${orphanedId})` +
+            (naming !== undefined
+              ? `, most recently revision ${naming.revisionOrdinal} (${naming.revisionId}): ` +
+                // §11 rule 7: the operator's reason is free text and can name a
+                // local path, so it is redacted like every other reported string.
+                sanitizeBody(naming.reason, sessionRedactionPaths(session))
+              : "") +
+            `. Recording evidence for it would attest a requirement the plan does not carry. ` +
+            `Inspect the plan with \`admin task-verification show\`, then resolve the command the ` +
+            `amended plan actually requires (requeue the review to refresh the missing-command list).`,
+        );
+      }
     }
 
     if (exitCode !== 0) {
@@ -9489,6 +10272,143 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
       return;
     }
 
+    // Issue #1040: bind the passing evidence to the plan revision, the §5.1
+    // slot identity, and the reviewed commit it attests, so a later review
+    // admits it only for exactly what it tested. The review escalation
+    // records the binding block (`verificationEvidenceBinding`); a legacy
+    // escalation lacks it, in which case the reviewed HEAD must be supplied
+    // explicitly via --head-sha and the remaining identities are derived from
+    // the task's own durable inputs — or the resolve refuses rather than
+    // recording evidence a bound review could never admit. A recorded HEAD is
+    // authoritative: --head-sha may restate it but never replace it, because
+    // an override would stamp the evidence with a commit the escalating
+    // review never examined and let the next review admit it as a clean pass.
+    // (`bindingBlock` is read above, where §13.1's refusal also consults it.)
+    if (headSha !== undefined && bindingBlock?.headSha !== undefined && headSha !== bindingBlock.headSha) {
+      die(
+        `--head-sha ${headSha} does not match the reviewed HEAD this escalation recorded (${bindingBlock.headSha}). ` +
+          `The recorded value is authoritative — evidence bound to a different commit could pass a review that never ` +
+          `examined it. Omit --head-sha (the recorded value is used), or pass the recorded value.`,
+      );
+    }
+    const boundHeadSha = bindingBlock?.headSha ?? headSha;
+    if (boundHeadSha === undefined) {
+      die(
+        `Cannot bind manual verification evidence to a reviewed commit: the escalation recorded no reviewed HEAD ` +
+          `(it predates the evidence-binding contract, issue #1040) and no --head-sha was supplied. ` +
+          `Pass --head-sha <sha> naming the commit the command was run against, or requeue the review once so the ` +
+          `next escalation records it.`,
+      );
+    }
+    const trimmedCommand = command.trim();
+    // Issue #1043 review (P2): bytes carried by more than one active
+    // requirement slot are excluded from the byte-keyed map and listed as
+    // ambiguous — a single evidence entry binds ONE §5.1 identity, so binding
+    // here would clear whichever slot the map happened to keep while the
+    // other rejects the evidence forever. Refuse with the repair instead.
+    if (
+      bindingBlock?.ambiguousCommands !== undefined &&
+      (bindingBlock.ambiguousCommands.includes(trimmedCommand) ||
+        bindingBlock.ambiguousCommands.includes(command))
+    ) {
+      die(
+        `Cannot bind manual verification evidence for \`${command}\`: more than one active requirement slot in the ` +
+          `effective verification plan carries exactly these command bytes, so a single evidence entry cannot name ` +
+          `which slot it attests. Disambiguate the requirement first with \`admin task-verification amend\` ` +
+          `(retire or replace one of the duplicate slots), requeue the review, then re-run this resolve.`,
+      );
+    }
+    let boundCommandId = bindingBlock?.commandIds?.[trimmedCommand] ?? bindingBlock?.commandIds?.[command];
+    let boundPlanDigest = bindingBlock?.planDigest;
+    let boundPlanRevisionOrdinal = bindingBlock?.planRevisionOrdinal;
+    if (boundCommandId === undefined || boundPlanDigest === undefined || boundPlanRevisionOrdinal === undefined) {
+      if (ctx[VERIFICATION_AMENDMENTS_CONTEXT_KEY] !== undefined) {
+        // Under an amendment chain a slot's identity can differ from its raw
+        // command bytes (a replaced slot keeps its original commandId), so
+        // deriving the identity here would guess — exactly what the binding
+        // contract forbids. Fail closed; a fresh review escalation records
+        // the authoritative block.
+        die(
+          `Cannot bind manual verification evidence for \`${command}\`: the task carries verification amendments ` +
+            `but the escalation recorded no usable evidence-binding block. Requeue the review so the escalation ` +
+            `records the effective plan's identities, then re-run this resolve.`,
+        );
+      }
+      const planResult = resolveEffectiveVerificationPlan({
+        sessionVerification: session.verification,
+        issueRequirements: typeof ctx.body === "string" ? extractIssueVerificationCommands(ctx.body) : [],
+      });
+      if (planResult.status === "invalid") {
+        die(
+          `Cannot resolve the effective verification plan to bind evidence (${planResult.reason}): ${planResult.detail}`,
+        );
+      }
+      boundCommandId ??= deriveRequirementCommandId(trimmedCommand);
+      boundPlanDigest ??= planResult.plan.planDigest;
+      boundPlanRevisionOrdinal ??= planResult.plan.appliedThroughOrdinal;
+    }
+    // Issue #1044 review (P2): the block above is the ESCALATION's, resolved
+    // before any amendment applied since. §13.1 only proved the displayed bytes
+    // still name an ACTIVE requirement — it says nothing about which slot
+    // carries them now, nor about the plan they belong to. An amendment that
+    // leaves those bytes required can still have moved the slot under them (a
+    // retire plus a re-add, a restore that re-materializes the identity), and
+    // stamping the escalation's identity would bind evidence to a slot the
+    // amended plan no longer evaluates: the next review rejects it
+    // `identity_mismatch` forever while still reporting the command as missing,
+    // which is the manual-evidence deadlock the binding rule exists to avoid.
+    // So under an amendment chain the binding is verified against the CURRENT
+    // effective plan and its provenance rebuilt from it. The recorded HEAD is
+    // untouched — the evidence attests a commit, and no amendment changes which.
+    if (amendedEffectivePlan !== undefined) {
+      // Candidates are the slots this evidence would be CREDITED to by the
+      // requirement gate — the same `matchesConfiguredVerificationCommand`
+      // direction §13.1 used above, so a slot an amendment unwrapped out of
+      // `bash -lc '<cmd>'` is still the slot these bytes address (issue #1044
+      // review, P2).
+      const currentSlots = amendedEffectivePlan.requirement.filter(
+        (slot) => slot.state === "active" && matchesConfiguredVerificationCommand(trimmedCommand, slot.command),
+      );
+      // Matching under the equivalence rule can also admit a pair the rule
+      // itself cannot tell apart — a bare command and its own `bash -lc`
+      // wrapper, the §13.2 ambiguity. That is the same refusal as byte-equal
+      // duplicates and for the same reason: the review resolves a requirement's
+      // expected identity through a BYTE-keyed map, so whichever slot the map
+      // does not keep would reject this entry forever. The escalation's
+      // recorded identity is deliberately not used to pick between them.
+      if (currentSlots.length > 1) {
+        // The §1043-P2 refusal, decided on the plan as it stands rather than on
+        // the escalation's `ambiguousCommands`: an amendment applied since can
+        // have created the duplicate the escalation never saw.
+        die(
+          `Cannot bind manual verification evidence for \`${command}\`: more than one active requirement slot in the ` +
+            `effective verification plan is satisfied by these command bytes, so a single evidence entry cannot name ` +
+            `which slot it attests. Disambiguate the requirement first with \`admin task-verification amend\` ` +
+            `(retire or replace one of the duplicate slots), requeue the review, then re-run this resolve.`,
+        );
+      }
+      const currentSlot = currentSlots[0];
+      if (currentSlot === undefined || currentSlot.commandId !== boundCommandId) {
+        die(
+          `Cannot bind manual verification evidence for \`${command}\`: a verification amendment moved the ` +
+            `requirement slot these bytes address since the review escalation recorded its binding ` +
+            `(escalation: ${boundCommandId ?? "none"}, effective plan: ${currentSlot?.commandId ?? "none"}). ` +
+            `Evidence stamped with the escalation's identity would be rejected by the next review as bound to a ` +
+            `slot the amended plan no longer evaluates. Requeue the review so a fresh escalation records the ` +
+            `effective plan's identities, then re-run this resolve.`,
+        );
+      }
+      // Provenance follows the plan the evidence is actually recorded under.
+      boundPlanDigest = amendedEffectivePlan.planDigest;
+      boundPlanRevisionOrdinal = amendedEffectivePlan.appliedThroughOrdinal;
+    }
+    const evidenceBinding = {
+      headSha: boundHeadSha,
+      commandId: boundCommandId,
+      planDigest: boundPlanDigest,
+      planRevisionOrdinal: boundPlanRevisionOrdinal,
+    };
+
     // Exit 0: store passing evidence. Merge with any existing evidence,
     // replacing an entry for the same command.
     const existingEvidence = Array.isArray(ctx.manualVerificationEvidence) ? ctx.manualVerificationEvidence : [];
@@ -9497,7 +10417,14 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
         (e: unknown) =>
           !(typeof e === "object" && e !== null && (e as Record<string, unknown>)["command"] === command),
       ),
-      { command, exitCode: 0, output: sanitizedOutput, recordedAt: now, source: "operator_input" },
+      {
+        command,
+        exitCode: 0,
+        output: sanitizedOutput,
+        recordedAt: now,
+        source: "operator_input",
+        ...evidenceBinding,
+      },
     ];
 
     const remainingMissingCmds = missingCmds.filter((c) => c !== command);
@@ -9524,6 +10451,7 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
               remainingCommands: remainingMissingCmds,
               remainingCount: remainingMissingCmds.length,
             }),
+        binding: evidenceBinding,
         evidenceCount: updatedEvidence.length,
         outputChars: sanitizedOutput.length,
         prUrl: prUrl ?? null,
@@ -9585,6 +10513,7 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
           previousStatus: task.status,
           previousPhase: task.phase,
           action: "recorded",
+          binding: evidenceBinding,
           evidenceCount: updatedEvidence.length,
           remainingCommands: remainingMissingCmds,
         },
@@ -9602,6 +10531,7 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
         status: recordResult.value.status,
         phase: recordResult.value.phase,
         action: "recorded",
+        binding: evidenceBinding,
         remainingCommands: remainingMissingCmds,
         remainingCount: remainingMissingCmds.length,
         evidenceCount: updatedEvidence.length,
@@ -9734,6 +10664,7 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
         previousStatus: task.status,
         previousPhase: task.phase,
         action: "requeue_review",
+        binding: evidenceBinding,
         evidenceCount: updatedEvidence.length,
       },
       createdAt: now,
@@ -9750,6 +10681,7 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
       status: result.value.status,
       phase: result.value.phase,
       action: "requeue_review",
+      binding: evidenceBinding,
       evidenceCount: updatedEvidence.length,
       outputChars: sanitizedOutput.length,
       prUrl: prUrl ?? null,
@@ -9759,6 +10691,1374 @@ export async function runReviewVerificationResolve(argv: string[]): Promise<void
     store.close();
     outboxStore.close();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: review-verification refresh (issue #1041)
+//
+// docs/verification-amendment-contract.md §10 / §15 slice A6: re-read the live
+// Issue, project ONLY its verification section through the shipped extractor,
+// diff that against the task's effective requirement layer, and record the
+// difference as one task-scoped `issue-refresh` revision.
+//
+// Preview by default (§11 rule 1); `--yes` applies. `--reason` is mandatory on
+// an applying invocation and becomes the reason of every operation it records
+// (§5.2 rule 1). Retirements are proposed, never applied, without
+// `--allow-retire` (§10 rule 4), and no `replace` is ever emitted (§10 rule 3)
+// — correcting a requirement's bytes in place stays an explicit operator
+// judgment. `--expect-issue-digest` is the concurrent-edit guard between a
+// preview and the apply that follows it.
+//
+// What it never touches: `context.body`, the title, labels, the phase, the
+// dependencies, or any implementation-scope field (§10 rule 1). The intake
+// snapshot stays pinned; the amendment layer is what makes the corrected
+// requirement effective.
+// ---------------------------------------------------------------------------
+
+interface ReviewVerificationRefreshArgs {
+  sessionId: string;
+  issueNumber: number;
+  reason: string;
+  allowRetire: boolean;
+  yes: boolean;
+  requestKey: string | undefined;
+  expectIssueDigest: string | undefined;
+  /** The concurrent-amendment guard (issue #1044 review): the base plan digest. */
+  expectPlanDigest: string | undefined;
+  sessionsPath: string;
+  dbPath: string | undefined;
+}
+
+function parseReviewVerificationRefreshArgs(
+  argv: string[],
+): ReviewVerificationRefreshArgs | { error: string } {
+  // §11 rule 2: the shared tokenizer, never a hand-rolled scan, so unknown and
+  // abbreviated flags (`--ye`, `--allow-retir`, `--reaso`) inherit the
+  // fail-closed bar instead of reimplementing it.
+  const tokenized = tokenizeArgs(argv, {
+    booleanFlags: ["yes", "allow-retire"],
+    valueFlags: [
+      "session-id",
+      "issue-number",
+      "reason",
+      "request-key",
+      "expect-issue-digest",
+      "expect-plan-digest",
+      "sessions-path",
+      "db-path",
+    ],
+  });
+  if ("error" in tokenized) return { error: tokenized.error };
+  const { args, flags } = tokenized;
+
+  if (!args["session-id"]) return { error: "--session-id is required" };
+  if (args["issue-number"] === undefined) return { error: "--issue-number is required" };
+  const n = Number(args["issue-number"]);
+  if (!Number.isInteger(n) || n <= 0) {
+    return { error: `--issue-number must be a positive integer, got: ${args["issue-number"]}` };
+  }
+  if (args["reason"] === undefined || args["reason"].trim() === "") {
+    return { error: "--reason is required and must not be empty or whitespace-only" };
+  }
+
+  return {
+    sessionId: args["session-id"],
+    issueNumber: n,
+    reason: args["reason"],
+    allowRetire: flags.has("allow-retire"),
+    yes: flags.has("yes"),
+    requestKey: args["request-key"],
+    expectIssueDigest: args["expect-issue-digest"],
+    expectPlanDigest: args["expect-plan-digest"],
+    sessionsPath: args["sessions-path"] ?? DEFAULT_SESSIONS_PATH,
+    dbPath: args["db-path"],
+  };
+}
+
+/** Exit-code mapping (§11 rule 5): only operational refusals exit non-zero. */
+function reviewVerificationRefreshFailed(outcome: IssueVerificationRefreshOutcome): boolean {
+  return outcome.status === "refused" || outcome.status === "stale" || outcome.status === "maintenance_locked";
+}
+
+function renderReviewVerificationRefresh(payload: Record<string, unknown>): string {
+  const lines: string[] = [];
+  const text = (key: string): string => (payload[key] === undefined ? "" : String(payload[key]));
+  const list = (key: string): string[] => (Array.isArray(payload[key]) ? (payload[key] as string[]) : []);
+  const outcome = text("outcome");
+  lines.push(`${text("command")} — issue #${text("issueNumber")} (session ${text("sessionId")})`);
+  if (payload.issueBodyDigest !== undefined) {
+    lines.push(`  live Issue body digest: ${text("issueBodyDigest")}`);
+  }
+  if (outcome === "refused" || outcome === "stale" || outcome === "maintenance_locked") {
+    lines.push(`  REFUSED (${text("reasonCode") || outcome}): ${text("error")}`.trimEnd());
+    lines.push(`  Nothing was written; no revision ordinal was consumed.`);
+    return lines.join("\n");
+  }
+  if (outcome === "replay") {
+    lines.push(
+      `  Replay: the request key already names revision ${text("revisionId")} ` +
+        `(ordinal ${text("revisionOrdinal")}). Nothing was written.`,
+    );
+    return lines.join("\n");
+  }
+  const section = (title: string, entries: readonly string[]): void => {
+    lines.push(`  ${title}: ${entries.length}`);
+    for (const entry of entries) lines.push(`    - ${entry}`);
+  };
+  section("unchanged", list("unchanged"));
+  section("restore", list("restores"));
+  section("add", list("adds"));
+  // §10 rule 3: stated explicitly rather than omitted — a refresh never
+  // proposes a replacement, and the preview should say so.
+  section("replace (never proposed by a refresh)", list("replacements"));
+  section(
+    payload.allowRetire === true ? "retire" : "retire (withheld — pass --allow-retire to apply)",
+    list("retirements"),
+  );
+  if (outcome === "no_change") {
+    // The plan this refresh actually diffed the Issue against, reported in the
+    // same words the amend/reset renderer uses for the same outcome (issue #1044
+    // review, P1). A `no_change` names no revision, so without this line the
+    // only plan digest a reader — or a caller carrying the preview into an
+    // apply — could pin is one read from somewhere else, before this invocation
+    // resolved the plan. That plan may already have moved.
+    lines.push(`  plan digest: ${text("planDigest")} (unchanged)`);
+    lines.push(
+      list("withheldRetirements").length > 0
+        ? `  Nothing to apply: the only difference is a retirement, which is withheld without --allow-retire. No revision was recorded.`
+        : `  No difference to apply. No revision was recorded.`,
+    );
+    return lines.join("\n");
+  }
+  lines.push(`  plan digest: ${text("basePlanDigest")} -> ${text("planDigest")}`);
+  lines.push(`  revision: ${text("revisionId")} (request key ${text("requestKey")})`);
+  lines.push(taskVerificationContinuationLine(payload));
+  if (outcome === "preview") {
+    // Both guards, because a refresh's difference is a function of two inputs:
+    // the live Issue AND the task's own plan. Naming only the Issue digest would
+    // leave a concurrent `amend` free to change what the apply applies (issue
+    // #1044 review).
+    lines.push(
+      `  Preview only. Re-run with --yes --expect-issue-digest ${text("issueBodyDigest")}` +
+        ` --expect-plan-digest ${text("basePlanDigest")} to apply exactly this.`,
+    );
+  } else {
+    lines.push(`  Applied as revision ordinal ${text("revisionOrdinal")}.`);
+  }
+  return lines.join("\n");
+}
+
+export async function runReviewVerificationRefresh(
+  argv: string[],
+  // `commandName` is how `task-verification refresh-from-issue` (issue #1042)
+  // reports itself through this exact runner: the two spellings are one
+  // command, so they must not become two implementations.
+  deps?: { source?: VerificationRefreshIssueSource; commandName?: string },
+): Promise<void> {
+  const parsed = parseReviewVerificationRefreshArgs(argv);
+  if ("error" in parsed) die(parsed.error);
+  const {
+    sessionId,
+    issueNumber,
+    reason,
+    allowRetire,
+    yes,
+    requestKey,
+    expectIssueDigest,
+    expectPlanDigest,
+    sessionsPath,
+    dbPath,
+  } = parsed;
+
+  let registry: JsonSessionRegistry;
+  try {
+    registry = new JsonSessionRegistry(sessionsPath);
+  } catch (err) {
+    die(`Failed to load sessions file (${sessionsPath}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const session = await registry.getSessionById(sessionId);
+  if (!session) {
+    die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
+  }
+
+  // The provider gate reads the CONFIGURED kind before any adapter is built, so
+  // an unsupported provider refuses with its own message rather than with an
+  // auth or transport failure from a host it should never have contacted.
+  const workItemKind = session.workItemProvider?.provider ?? "github-issues";
+  let source: VerificationRefreshIssueSource | undefined = deps?.source;
+  if (!source && workItemKind === "github-issues") {
+    try {
+      const runner = await resolveGhRunner(
+        session.workItemProvider?.auth ?? { mode: "gh" },
+        ghRunnerFromCommandRunner(defaultCommandRunner),
+      );
+      source = createGhRefinementReads({
+        githubRepo: session.githubRepo,
+        runGh: runGhViaRunner(runner, session.repoRoot),
+      });
+    } catch (err) {
+      die(
+        `Failed to resolve GitHub work-item provider auth: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  const redactionPaths = sessionRedactionPaths(session);
+  const clean = (text: string): string => sanitizeBody(text, redactionPaths);
+
+  const store = new SqliteTaskStore(dbPath);
+  try {
+    const now = new Date().toISOString();
+    const outcome = await refreshIssueVerification(
+      { store, source, extract: extractIssueVerificationSections },
+      {
+        key: { sessionId, issueNumber },
+        sessionVerification: session.verification,
+        actorId: "admin",
+        reason,
+        allowRetire,
+        apply: yes,
+        requestKey,
+        expectedIssueBodyDigest: expectIssueDigest,
+        expectedPlanDigest: expectPlanDigest,
+        providerKind: workItemKind,
+        session,
+        runId: `admin-review-verification-refresh-${now}`,
+        now,
+      },
+    );
+
+    const payload = reviewVerificationRefreshPayload(outcome, {
+      sessionId,
+      issueNumber,
+      allowRetire,
+      clean,
+      command: deps?.commandName ?? "review-verification refresh",
+    });
+    report(payload, () => renderReviewVerificationRefresh(payload));
+    if (reviewVerificationRefreshFailed(outcome)) process.exitCode = 1;
+  } finally {
+    store.close();
+  }
+}
+
+/**
+ * The reported payload. Every human-facing string — refusal detail and command
+ * bytes alike — goes through the session redaction the shipped
+ * `review-verification resolve` output uses (§11 rule 7): a verification
+ * command is Issue text and can carry a local path.
+ */
+function reviewVerificationRefreshPayload(
+  outcome: IssueVerificationRefreshOutcome,
+  ctx: {
+    sessionId: string;
+    issueNumber: number;
+    allowRetire: boolean;
+    clean: (text: string) => string;
+    command: string;
+  },
+): Record<string, unknown> {
+  const base = {
+    command: ctx.command,
+    sessionId: ctx.sessionId,
+    issueNumber: ctx.issueNumber,
+    allowRetire: ctx.allowRetire,
+    outcome: outcome.status,
+  };
+  if (outcome.status === "refused") {
+    return {
+      ok: false,
+      ...base,
+      reasonCode: outcome.reason,
+      ...(outcome.issueBodyDigest !== undefined ? { issueBodyDigest: outcome.issueBodyDigest } : {}),
+      error: ctx.clean(outcome.detail),
+    };
+  }
+  if (outcome.status === "stale") {
+    return {
+      ok: false,
+      ...base,
+      reasonCode: "stale",
+      observedTaskRevision: outcome.observedTaskRevision,
+      currentTaskRevision: outcome.currentTaskRevision ?? null,
+      observedPlanDigest: outcome.observedPlanDigest,
+      currentPlanDigest: outcome.currentPlanDigest ?? null,
+      error:
+        `the task moved while this refresh was being prepared; nothing was written. ` +
+        `Re-run the preview and apply again.`,
+    };
+  }
+  if (outcome.status === "maintenance_locked") {
+    return {
+      ok: false,
+      ...base,
+      reasonCode: "maintenance_locked",
+      error: "the task store is under maintenance; nothing was written. Retry shortly.",
+    };
+  }
+  if (outcome.status === "replay") {
+    return {
+      ok: true,
+      ...base,
+      revisionId: outcome.revision.revisionId,
+      revisionOrdinal: outcome.revision.revisionOrdinal,
+      requestKey: outcome.revision.requestKey,
+      planDigest: outcome.revision.planDigest,
+      applied: false,
+    };
+  }
+
+  const diff = outcome.status === "no_change" ? outcome.diff : outcome.report.diff;
+  const shared = {
+    ...base,
+    issueBodyDigest: outcome.status === "no_change" ? outcome.issueBodyDigest : outcome.report.issueBodyDigest,
+    liveCommands: (outcome.status === "no_change" ? outcome.liveCommands : outcome.report.liveCommands).map(ctx.clean),
+    unchanged: diff.unchanged.map((entry) => `${entry.commandId} ${ctx.clean(entry.planCommand)}`),
+    restores: diff.restores.map(
+      (entry) =>
+        `${entry.commandId} ${ctx.clean(entry.reinstatedCommand)}` +
+        (entry.reinstatedBytesDiffer ? ` (reinstated bytes differ from the live text \`${ctx.clean(entry.liveCommand)}\`)` : ""),
+    ),
+    adds: diff.adds.map((entry) => `${entry.commandId} ${ctx.clean(entry.command)}`),
+    // §10 rule 3: a refresh never emits a `replace`. Reported as an empty set
+    // rather than omitted, so the preview answers the question explicitly.
+    replacements: [] as string[],
+    retirements: diff.proposedRetirements.map((entry) => `${entry.commandId} ${ctx.clean(entry.command)}`),
+    withheldRetirements: (outcome.status === "no_change"
+      ? outcome.withheldRetirements
+      : outcome.report.withheldRetirements
+    ).map((entry) => entry.commandId),
+    defaultContinuation:
+      outcome.status === "no_change" ? outcome.defaultContinuation : outcome.report.defaultContinuation,
+  };
+
+  if (outcome.status === "no_change") {
+    return { ok: true, ...shared, planDigest: outcome.planDigest, applied: false };
+  }
+  const refreshReport = outcome.report;
+  return {
+    ok: true,
+    ...shared,
+    operations: refreshReport.operations.map((operation) => operation.kind),
+    basePlanDigest: refreshReport.basePlanDigest,
+    planDigest: refreshReport.planDigest,
+    continuation: refreshReport.continuation,
+    requestKey: refreshReport.requestKey,
+    revisionId: refreshReport.revisionId,
+    applied: outcome.status === "applied",
+    ...(outcome.status === "applied"
+      ? {
+          revisionOrdinal: outcome.revision.revisionOrdinal,
+          // §9.2 (issue #1043): the explicit routing outcome of the apply.
+          taskStatus: outcome.task.status,
+          taskPhase: outcome.task.phase,
+          requeued:
+            refreshReport.continuation === "none"
+              ? null
+              : { status: outcome.task.status, phase: outcome.task.phase },
+        }
+      : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand family: task-verification (issue #1042)
+//
+// The operator surface of docs/verification-amendment-contract.md §11 (§15
+// slice A4), spelled as the resource it addresses: one TASK's verification
+// plan.
+//
+//   admin task-verification show               — the effective plan, read-only
+//   admin task-verification amend              — one operator-typed revision
+//   admin task-verification refresh-from-issue — the §10 live-Issue import
+//   admin task-verification reset              — back to the unamended plan
+//
+// `review-verification resolve` stays exactly where it is: it records EVIDENCE
+// for a command, and these commands change which commands there are. Neither is
+// a spelling of the other. `review-verification refresh` (issue #1041) also
+// stays, with `refresh-from-issue` as its resource-oriented entry to the same
+// runner — same flags, same outcomes, same exit codes.
+//
+// Every mutation previews by default and applies only under `--yes` (§11 rule
+// 1), takes a mandatory `--reason` (§11 rule 3), refuses on a claimed/running
+// or terminal task and on a stale plan (§7), reports both plan digests, and
+// goes through the shared tokenizer so an unknown or abbreviated flag fails
+// closed (§11 rule 2). None of them opens `sessions.json` for writing (§4 rule
+// 3), and none re-implements plan resolution: the effective plan, the digest,
+// the composition, and the write all come from the shipped core modules.
+// ---------------------------------------------------------------------------
+
+interface TaskVerificationTarget {
+  sessionId: string;
+  issueNumber: number;
+  sessionsPath: string;
+  dbPath: string | undefined;
+}
+
+/** The identity every `task-verification` action takes: a session and an Issue. */
+function taskVerificationTarget(args: Record<string, string>): TaskVerificationTarget | { error: string } {
+  if (!args["session-id"]) return { error: "--session-id is required" };
+  if (args["issue-number"] === undefined) return { error: "--issue-number is required" };
+  const n = Number(args["issue-number"]);
+  if (!Number.isInteger(n) || n <= 0) {
+    return { error: `--issue-number must be a positive integer, got: ${args["issue-number"]}` };
+  }
+  return {
+    sessionId: args["session-id"],
+    issueNumber: n,
+    sessionsPath: args["sessions-path"] ?? DEFAULT_SESSIONS_PATH,
+    dbPath: args["db-path"],
+  };
+}
+
+/**
+ * Resolve the session and its redaction closure. `session.verification` is the
+ * LIVE execution layer every one of these commands resolves against (§6.1 step
+ * 1); it is read and never written (§4 rule 3, §17).
+ */
+async function loadTaskVerificationSession(
+  target: TaskVerificationTarget,
+): Promise<{
+  session: ResolvedSession;
+  verification: Record<string, string> | undefined;
+  clean: (text: string) => string;
+}> {
+  let registry: JsonSessionRegistry;
+  try {
+    registry = new JsonSessionRegistry(target.sessionsPath);
+  } catch (err) {
+    die(
+      `Failed to load sessions file (${target.sessionsPath}): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const session = await registry.getSessionById(target.sessionId);
+  if (!session) {
+    die(describeUnresolvedSessionId(registry, target.sessionId, target.sessionsPath));
+  }
+  const redactionPaths = sessionRedactionPaths(session);
+  return {
+    // The full resolved session rides along (issue #1043 review): an applying
+    // amend/reset whose continuation routes needs it to enqueue the
+    // stack-ready removal and lane-label swap atomically with the re-queue.
+    session,
+    verification: session.verification,
+    // §11 rule 7: every human-facing string — command bytes and operator prose
+    // alike — goes through the same bounding and sanitization the shipped
+    // `review-verification resolve` output uses. A verification command is
+    // Issue text and can carry a local path.
+    clean: (text: string): string => sanitizeBody(text, redactionPaths),
+  };
+}
+
+/** One plan slot as the preview and the applied report list it. */
+function taskVerificationSlotLine(
+  slot: { commandId: string; state: string; command: string; origin: string; amended: boolean },
+  clean: (text: string) => string,
+): string {
+  return (
+    `${slot.commandId} [${slot.state}] ${clean(slot.command)} ` +
+    `(${slot.origin}${slot.amended ? ", amended" : ""})`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// task-verification show
+// ---------------------------------------------------------------------------
+
+function parseTaskVerificationShowArgs(argv: string[]): TaskVerificationTarget | { error: string } {
+  const tokenized = tokenizeArgs(argv, {
+    valueFlags: ["session-id", "issue-number", "sessions-path", "db-path"],
+  });
+  if ("error" in tokenized) return { error: tokenized.error };
+  return taskVerificationTarget(tokenized.args);
+}
+
+/**
+ * The #1094 §10 rule 6 stage view as it rides the `show` payload (issue #1107).
+ *
+ * Additive: present only for an opted-in session or a task that retains stage
+ * state, so every other `show --json` payload is byte-identical to before.
+ * Every field is an id, a name, a verdict, a count, a duration, a digest, a SHA
+ * or a fixed code; the free-text fields still go through `clean`.
+ */
+function taskVerificationStagedPayload(
+  view: TaskVerificationPlanView,
+  stagedVerification: StagedVerificationConfig | undefined,
+  clean: (text: string) => string,
+): StagedVerificationStatusView | undefined {
+  if (!hasStagedVerificationSurface(stagedVerification, view.taskContext)) return undefined;
+  const status = describeStagedVerificationStatus({
+    stagedVerification,
+    context: view.taskContext,
+    plan: view.plan,
+  });
+  const cleanBundle = (bundle: StageBundleView): StageBundleView => ({
+    ...bundle,
+    checks: bundle.checks.map((check) => (check.name !== undefined ? { ...check, name: clean(check.name) } : check)),
+    invalidations: bundle.invalidations.map(clean),
+  });
+  return {
+    ...status,
+    ...(status.stateDetail !== undefined ? { stateDetail: clean(status.stateDetail) } : {}),
+    loop: status.loop.map(cleanBundle),
+    ...(status.lastFinal !== undefined ? { lastFinal: cleanBundle(status.lastFinal) } : {}),
+  };
+}
+
+function stageBundleLines(title: string, bundle: StageBundleView): string[] {
+  // Issue #1155: a stage covers the entire required set, so "without the test
+  // suite" is the only scope that is not the full set — the suite is Stage 1's.
+  const scope = bundle.full ? "full set" : "without the test suite";
+  const required = bundle.required !== undefined ? `/${bundle.required} required` : "";
+  const duration = bundle.durationMs !== undefined ? `, ${bundle.durationMs}ms` : "";
+  const row = bundle.row !== undefined
+    ? ` — row ${bundle.row} routes ${bundle.routedDisposition}; runner ${bundle.disposition ?? "unrecorded"}` +
+      `${bundle.granting === true ? " (granting)" : ""}`
+    : "";
+  const lines = [
+    `    ${title} ${bundle.stageRunKey}: ${bundle.outcome}, ${bundle.complete ? "complete" : "INCOMPLETE"}, ` +
+      `${bundle.selected}${required} selected (${scope})${duration}${row}`,
+    `      passed ${bundle.counts.passed}, failed ${bundle.counts.failed}, timed-out ${bundle.counts.timedOut}, ` +
+      `not-run ${bundle.counts.notRun}, unknown ${bundle.counts.unknown}; head ${bundle.headSha ?? "unknown"}, ` +
+      `plan ${bundle.planDigest}`,
+  ];
+  for (const check of bundle.checks) {
+    const label = check.name !== undefined ? `${check.checkId} (${check.name})` : check.checkId;
+    const extra = [
+      check.notRunKind !== undefined ? check.notRunKind : undefined,
+      check.exitCode !== undefined ? `exit ${check.exitCode}` : undefined,
+      check.durationMs !== undefined ? `${check.durationMs}ms` : undefined,
+    ].filter((part): part is string => part !== undefined);
+    lines.push(`      - ${label}: ${check.verdict}${extra.length > 0 ? ` (${extra.join(", ")})` : ""}`);
+  }
+  if (bundle.notSelected !== undefined && bundle.notSelected.length > 0) {
+    lines.push(`      not selected (not known to pass): ${bundle.notSelected.join(", ")}`);
+  }
+  if (bundle.invalidations.length > 0) {
+    lines.push(`      invalidated by: ${bundle.invalidations.join(", ")}`);
+  }
+  // Issue #1154: the test-file half — Stage 1 for a loop bundle, Stage 2 for a final one.
+  const tests = bundle.testFiles;
+  if (tests !== undefined) {
+    const counts = tests.outcomeCounts;
+    lines.push(
+      `      tests (${bundle.stage === "loop" ? "Stage 1" : "Stage 2"}): ${tests.result}, selection ${tests.selection}` +
+        (tests.selectionReason !== undefined ? ` (${tests.selectionReason})` : "") +
+        (tests.mode !== undefined ? `, mode ${tests.mode}` : "") +
+        (tests.trust !== undefined && tests.trust !== "trusted" ? `, outcomes untrusted (${tests.trust})` : "") +
+        (counts !== undefined
+          ? `; passed ${counts.passed}, failed ${counts.failed}, skipped ${counts.skipped}, not-run ${counts.notRun}`
+          : ""),
+    );
+    for (const selected of tests.selectedFiles ?? []) {
+      lines.push(`        - ${selected.file} (${selected.reasons.join(", ")})`);
+    }
+    if ((tests.unresolvedRetained ?? []).length > 0) {
+      lines.push(`        unresolved retained: ${(tests.unresolvedRetained ?? []).join(", ")}`);
+    }
+    if (tests.failedFiles.length > 0) lines.push(`        failed: ${tests.failedFiles.join(", ")}`);
+  }
+  return lines;
+}
+
+function renderTaskVerificationStaged(staged: StagedVerificationStatusView): string[] {
+  const lines = [
+    `  staged verification: ${staged.enabled ? "enabled" : "DISABLED (retained state shown)"} — ` +
+      `${staged.progress}: ${staged.meaning}`,
+  ];
+  if (staged.state === "unreadable") {
+    lines.push(`    stage state UNREADABLE: ${staged.stateDetail ?? ""} — nothing is credited`);
+  }
+  if (staged.requiredChecks !== undefined) {
+    lines.push(`    required checks (what a final stage runs): ${staged.requiredChecks}`);
+  }
+  if (staged.pendingApprovalHeadSha !== undefined) {
+    lines.push(`    pending final verification of approved head ${staged.pendingApprovalHeadSha}`);
+  }
+  if (staged.openRun !== undefined) {
+    lines.push(`    open run ${staged.openRun.stageRunKey} allocated at ${staged.openRun.allocatedAt} (no bundle)`);
+  }
+  for (const bundle of staged.loop) lines.push(...stageBundleLines("last loop", bundle));
+  if (staged.lastFinal !== undefined) lines.push(...stageBundleLines("last final", staged.lastFinal));
+  if (staged.lastFinalRecord !== undefined) {
+    const record = staged.lastFinalRecord;
+    lines.push(
+      `    last final record: ${record.status}` +
+        (record.reason !== undefined ? ` (${record.reason})` : "") +
+        (record.reused === true ? ", satisfied by reuse" : "") +
+        (record.bindingRefusals !== undefined ? `; binding refused: ${record.bindingRefusals.join(", ")}` : ""),
+    );
+  }
+  if (staged.issueBase !== undefined) {
+    lines.push(`    Issue base: ${staged.issueBase.sha} (${staged.issueBase.source})`);
+  }
+  lines.push(
+    `    retained test files: ${staged.retainedTestFiles.length}` +
+      (staged.retainedTestFilesOverflowed ? " (OVERFLOWED — Stage 1 selection is unavailable)" : ""),
+  );
+  for (const retained of staged.retainedTestFiles) lines.push(`      - ${retained.file} (added by ${retained.addedBy})`);
+  const recovery = staged.recovery;
+  lines.push(
+    `    recovery: final streak ${recovery.finalStreak}/${recovery.maxStageRecoveryAttempts}, ` +
+      (recovery.loopUnreadable === true
+        ? "loop streak UNREADABLE"
+        : `loop streak ${recovery.loopStreak ?? 0}/${recovery.maxStageRecoveryAttempts}` +
+          (recovery.loopLastOutcome !== undefined ? ` (last ${recovery.loopLastOutcome})` : "")),
+  );
+  return lines;
+}
+
+function taskVerificationShowPayload(
+  view: TaskVerificationPlanView,
+  ctx: {
+    target: TaskVerificationTarget;
+    clean: (text: string) => string;
+    stagedVerification?: StagedVerificationConfig;
+  },
+): Record<string, unknown> {
+  const { clean } = ctx;
+  const staged = taskVerificationStagedPayload(view, ctx.stagedVerification, clean);
+  const statusOf = new Map(view.requirementStatus.map((entry) => [entry.commandId, entry] as const));
+  const ordinals = (slot: { amendments: readonly { revisionOrdinal: number }[] }): number[] => [
+    ...new Set(slot.amendments.map((record) => record.revisionOrdinal)),
+  ];
+  return {
+    ok: true,
+    sessionId: ctx.target.sessionId,
+    issueNumber: ctx.target.issueNumber,
+    outcome: "ok",
+    taskStatus: view.taskStatus,
+    taskPhase: view.taskPhase,
+    reconciliation: view.reconciliation,
+    planDigest: view.plan.planDigest,
+    appliedThroughOrdinal: view.plan.appliedThroughOrdinal,
+    amendable: view.amendable,
+    ...(view.amendmentRefusal !== undefined
+      ? { amendmentRefusal: { reason: view.amendmentRefusal.reason, detail: clean(view.amendmentRefusal.detail) } }
+      : {}),
+    defaultContinuation: view.defaultContinuation,
+    execution: view.plan.execution.map((slot) => ({
+      commandId: slot.commandId,
+      ...(slot.name !== undefined ? { name: slot.name } : {}),
+      state: slot.state,
+      command: clean(slot.command),
+      origin: slot.origin,
+      amended: slot.amended,
+      revisionOrdinals: ordinals(slot),
+    })),
+    requirement: view.plan.requirement.map((slot) => ({
+      commandId: slot.commandId,
+      state: slot.state,
+      command: clean(slot.command),
+      origin: slot.origin,
+      amended: slot.amended,
+      revisionOrdinals: ordinals(slot),
+      // §6.2 rule 3 / §8.4 rule 1: `retired` is a state of its own and is
+      // never reported as a pass.
+      status: statusOf.get(slot.commandId)?.status ?? "not_run",
+      ...(statusOf.get(slot.commandId)?.satisfiedBy !== undefined
+        ? { satisfiedBy: statusOf.get(slot.commandId)?.satisfiedBy }
+        : {}),
+    })),
+    revisions: view.revisions.map((revision) => ({
+      revisionId: revision.revisionId,
+      revisionOrdinal: revision.revisionOrdinal,
+      source: revision.source,
+      actorId: revision.actor.id,
+      reason: clean(revision.reason),
+      operations: revision.operations.map((operation) => operation.kind),
+      basePlanDigest: revision.basePlanDigest,
+      planDigest: revision.planDigest,
+      continuation: revision.continuation,
+      createdAt: revision.createdAt,
+    })),
+    ...(view.checkpoint !== undefined
+      ? {
+          checkpoint: {
+            planDigest: view.checkpoint.planDigest,
+            sessionBaselineDigest: view.checkpoint.sessionBaselineDigest,
+            appliedThroughOrdinal: view.checkpoint.appliedThroughOrdinal,
+            updatedAt: view.checkpoint.updatedAt,
+            updatedBy: view.checkpoint.updatedBy,
+          },
+        }
+      : {}),
+    ...(view.drift !== undefined ? { drift: view.drift } : {}),
+    notes: view.plan.notes.map((note) =>
+      note.kind === "masked_session_entry"
+        ? `masked session entry ${note.commandId} (a task-local add claims it)`
+        : note.kind === "orphaned_slot"
+          ? `orphaned slot ${note.commandId} — its session key is gone; its operations are inert`
+          : note.kind === "duplicate_command"
+            ? `duplicate command collapsed into ${note.commandId} (${note.occurrences} occurrences)`
+            : note.kind === "colliding_add"
+              ? `colliding add of ${note.commandId} in revision ${note.revisionId} materialized no second slot`
+              : `ambiguous equivalence between ${note.commandIds[0]} and ${note.commandIds[1]}`,
+    ),
+    ...(staged !== undefined ? { stagedVerification: staged } : {}),
+  };
+}
+
+function renderTaskVerificationShow(payload: Record<string, unknown>): string {
+  const text = (key: string): string => (payload[key] === undefined ? "" : String(payload[key]));
+  const rows = (key: string): Record<string, unknown>[] =>
+    Array.isArray(payload[key]) ? (payload[key] as Record<string, unknown>[]) : [];
+  const lines: string[] = [];
+  lines.push(`task-verification show — issue #${text("issueNumber")} (session ${text("sessionId")})`);
+  lines.push(
+    `  task: ${text("taskStatus")} / ${text("taskPhase")} — ` +
+      (payload.amendable === true
+        ? "amendable"
+        : `NOT amendable: ${String((payload.amendmentRefusal as Record<string, unknown> | undefined)?.detail ?? "")}`),
+  );
+  lines.push(
+    `  plan digest: ${text("planDigest")} (through revision ordinal ${text("appliedThroughOrdinal")}, ${text("reconciliation")})`,
+  );
+  const section = (title: string, entries: Record<string, unknown>[], render: (row: Record<string, unknown>) => string): void => {
+    lines.push(`  ${title}: ${entries.length}`);
+    for (const entry of entries) lines.push(`    - ${render(entry)}`);
+  };
+  // The payload strings are already redacted, so the renderer only arranges
+  // them — it never reaches back to the plan for bytes of its own.
+  const slotText = (row: Record<string, unknown>): string =>
+    `${String(row.commandId)} [${String(row.state)}] ${String(row.command)} ` +
+    `(${String(row.origin)}${row.amended === true ? ", amended" : ""})`;
+  section("execution", rows("execution"), (row) => {
+    const ordinals = Array.isArray(row.revisionOrdinals) ? (row.revisionOrdinals as number[]) : [];
+    return slotText(row) + (ordinals.length > 0 ? ` revisions ${ordinals.join(", ")}` : "");
+  });
+  section("requirement", rows("requirement"), (row) => `${slotText(row)} — ${String(row.status)}`);
+  section("revisions", rows("revisions"), (row) => {
+    const kinds = Array.isArray(row.operations) ? (row.operations as string[]) : [];
+    return (
+      `${String(row.revisionOrdinal)} ${String(row.revisionId)} ${String(row.source)} ` +
+      `by ${String(row.actorId)} at ${String(row.createdAt)}: ${kinds.join(", ")} — ${String(row.reason)}`
+    );
+  });
+  const notes = Array.isArray(payload.notes) ? (payload.notes as string[]) : [];
+  if (notes.length > 0) {
+    lines.push(`  notes: ${notes.length}`);
+    for (const note of notes) lines.push(`    - ${note}`);
+  }
+  if (payload.drift !== undefined) {
+    const drift = payload.drift as Record<string, unknown>;
+    lines.push(
+      `  DRIFT: the session defaults moved since the recorded checkpoint ` +
+        `(${String(drift.previousPlanDigest)} -> ${String(drift.planDigest)}). ` +
+        `The live plan above is what resolves; the next applying command re-anchors the checkpoint.`,
+    );
+  }
+  lines.push(`  continuation default for this row: ${text("defaultContinuation")}`);
+  if (payload.stagedVerification !== undefined) {
+    lines.push(...renderTaskVerificationStaged(payload.stagedVerification as StagedVerificationStatusView));
+  }
+  return lines.join("\n");
+}
+
+export async function runTaskVerificationShow(argv: string[]): Promise<void> {
+  const parsed = parseTaskVerificationShowArgs(argv);
+  if ("error" in parsed) die(parsed.error);
+  const { session, verification, clean } = await loadTaskVerificationSession(parsed);
+
+  const store = new SqliteTaskStore(parsed.dbPath);
+  // Issue #1166: report the requirement status the lanes gate on, so a
+  // requirement the bound suite discharges by the operator's declaration is not
+  // shown here as one no configured command covers.
+  const fullSuite = fullSuiteRequirementDeclaration(session);
+  try {
+    const outcome = await describeTaskVerificationPlan(
+      { store, extract: extractIssueVerificationSections },
+      {
+        key: { sessionId: parsed.sessionId, issueNumber: parsed.issueNumber },
+        ...(verification !== undefined ? { sessionVerification: verification } : {}),
+        ...(fullSuite !== undefined ? { fullSuite } : {}),
+      },
+    );
+    if (outcome.status === "refused") {
+      // A read that cannot produce a plan refuses rather than showing a
+      // plausible-looking one (§11 rule 6); nothing is repaired.
+      const payload = {
+        ok: false,
+        sessionId: parsed.sessionId,
+        issueNumber: parsed.issueNumber,
+        outcome: "refused",
+        reasonCode: outcome.reason,
+        error: clean(outcome.detail),
+      };
+      report(payload, () =>
+        `task-verification show — issue #${parsed.issueNumber} (session ${parsed.sessionId})\n` +
+        `  REFUSED (${outcome.reason}): ${clean(outcome.detail)}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const payload = taskVerificationShowPayload(outcome.view, {
+      target: parsed,
+      clean,
+      ...(session.stagedVerification !== undefined ? { stagedVerification: session.stagedVerification } : {}),
+    });
+    report(payload, () => renderTaskVerificationShow(payload));
+  } finally {
+    store.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// task-verification amend
+// ---------------------------------------------------------------------------
+
+/** One operation clause, open from its operation flag to the next one. */
+interface TaskVerificationOperationClause {
+  flag: string;
+  commandId?: string;
+  name?: string;
+  command?: string;
+  reason?: string;
+}
+
+const TASK_VERIFICATION_OPERATION_FLAGS = ["replace", "add-execution", "add-requirement", "retire", "restore", "annotate"] as const;
+/** The clauses that take a `--command`; the others refuse one. */
+const TASK_VERIFICATION_COMMAND_FLAGS = new Set(["replace", "add-execution", "add-requirement"]);
+const TASK_VERIFICATION_CONTINUATIONS: readonly VerificationAmendmentContinuation[] = ["review", "implementation", "none"];
+
+interface TaskVerificationAmendArgs extends TaskVerificationTarget {
+  reason: string;
+  operations: VerificationAmendmentOperation[];
+  requestedContinuation: VerificationAmendmentContinuation | null;
+  yes: boolean;
+  requestKey: string | undefined;
+  expectPlanDigest: string | undefined;
+}
+
+/**
+ * Parse an `amend` invocation into the §5.2 operation list.
+ *
+ * The shared tokenizer does the validating — unknown and abbreviated flags are
+ * already rejected before this function sees a token (§11 rule 2) — and this
+ * function only reads the SEQUENCE it recorded, because the grammar is
+ * order-sensitive: `--command` and `--op-reason` bind to the operation flag
+ * they follow, an operation flag closes the previous clause, and each of the
+ * six operation flags may appear more than once in one revision.
+ */
+function parseTaskVerificationAmendArgs(argv: string[]): TaskVerificationAmendArgs | { error: string } {
+  const tokenized = tokenizeArgs(argv, {
+    booleanFlags: ["yes", "add-requirement"],
+    valueFlags: [
+      "session-id",
+      "issue-number",
+      "reason",
+      "op-reason",
+      "continue",
+      "expect-plan-digest",
+      "request-key",
+      "replace",
+      "add-execution",
+      "retire",
+      "restore",
+      "annotate",
+      "command",
+      "sessions-path",
+      "db-path",
+    ],
+  });
+  if ("error" in tokenized) return { error: tokenized.error };
+  const target = taskVerificationTarget(tokenized.args);
+  if ("error" in target) return { error: target.error };
+
+  const reason = tokenized.args["reason"];
+  if (reason === undefined || reason.trim() === "") {
+    return { error: "--reason is required and must not be empty or whitespace-only" };
+  }
+
+  let requestedContinuation: VerificationAmendmentContinuation | null = null;
+  if (tokenized.args["continue"] !== undefined) {
+    const value = tokenized.args["continue"];
+    if (!TASK_VERIFICATION_CONTINUATIONS.includes(value as VerificationAmendmentContinuation)) {
+      return {
+        error: `--continue must be one of: ${TASK_VERIFICATION_CONTINUATIONS.join(" | ")}, got: ${value}`,
+      };
+    }
+    requestedContinuation = value as VerificationAmendmentContinuation;
+  }
+
+  const clauses: TaskVerificationOperationClause[] = [];
+  let current: TaskVerificationOperationClause | undefined;
+  for (const occurrence of tokenized.occurrences) {
+    if ((TASK_VERIFICATION_OPERATION_FLAGS as readonly string[]).includes(occurrence.name)) {
+      current = { flag: occurrence.name };
+      if (occurrence.name === "add-execution") current.name = occurrence.value;
+      else if (occurrence.name !== "add-requirement") current.commandId = occurrence.value;
+      clauses.push(current);
+      continue;
+    }
+    if (occurrence.name === "command") {
+      if (!current) {
+        return { error: "--command must follow an operation flag (--replace, --add-execution, or --add-requirement)" };
+      }
+      if (!TASK_VERIFICATION_COMMAND_FLAGS.has(current.flag)) {
+        return { error: `--command is not accepted by --${current.flag}` };
+      }
+      if (current.command !== undefined) return { error: `--${current.flag} already carries a --command` };
+      // §2: the CLI is an authoring surface, so command bytes are trimmed at
+      // the ends here — before the request and revision identities are derived
+      // from them — and otherwise passed through verbatim. Interior whitespace
+      // is data and stays untouched.
+      const command = (occurrence.value ?? "").trim();
+      if (command === "") return { error: "--command must not be empty or whitespace-only" };
+      current.command = command;
+      continue;
+    }
+    if (occurrence.name === "op-reason") {
+      // §11 rule 3: an `--op-reason` binds to the one open operation clause. One
+      // that precedes every operation flag, or follows an already-reasoned
+      // clause, or is empty, refuses the whole invocation.
+      if (!current) {
+        return { error: "--op-reason must follow the operation flag it binds to (§11 rule 3)" };
+      }
+      if (current.reason !== undefined) {
+        return { error: `--${current.flag} already carries an --op-reason` };
+      }
+      if ((occurrence.value ?? "").trim() === "") {
+        return { error: "--op-reason must not be empty or whitespace-only" };
+      }
+      current.reason = occurrence.value;
+      continue;
+    }
+  }
+
+  if (clauses.length === 0) {
+    return {
+      error:
+        "at least one operation is required: --replace <commandId> --command <bytes> | " +
+        "--add-execution <name> --command <bytes> | --add-requirement --command <bytes> | " +
+        "--retire <commandId> | --restore <commandId> | --annotate <commandId>",
+    };
+  }
+
+  const operations: VerificationAmendmentOperation[] = [];
+  for (const clause of clauses) {
+    // §5.2 rule 1: the revision-level `--reason` is the reason of every
+    // operation that carries none of its own, materialized onto it here so the
+    // persisted operation always states why it happened.
+    const operationReason = clause.reason ?? reason;
+    if (TASK_VERIFICATION_COMMAND_FLAGS.has(clause.flag) && clause.command === undefined) {
+      return { error: `--${clause.flag} requires a following --command <bytes>` };
+    }
+    if (clause.flag === "replace") {
+      operations.push({
+        kind: "replace",
+        commandId: clause.commandId as string,
+        command: clause.command as string,
+        reason: operationReason,
+      });
+    } else if (clause.flag === "add-execution") {
+      operations.push({
+        kind: "add",
+        layer: "execution",
+        name: clause.name as string,
+        command: clause.command as string,
+        reason: operationReason,
+      });
+    } else if (clause.flag === "add-requirement") {
+      operations.push({
+        kind: "add",
+        layer: "requirement",
+        command: clause.command as string,
+        reason: operationReason,
+      });
+    } else {
+      operations.push({
+        kind: clause.flag as "retire" | "restore" | "annotate",
+        commandId: clause.commandId as string,
+        reason: operationReason,
+      });
+    }
+  }
+
+  return {
+    ...target,
+    reason,
+    operations,
+    requestedContinuation,
+    yes: tokenized.flags.has("yes"),
+    requestKey: tokenized.args["request-key"],
+    expectPlanDigest: tokenized.args["expect-plan-digest"],
+  };
+}
+
+/** §11 rule 5: only operational refusals exit non-zero. */
+function taskVerificationAmendFailed(outcome: TaskVerificationAmendOutcome | TaskVerificationResetOutcome): boolean {
+  return outcome.status === "refused" || outcome.status === "stale" || outcome.status === "maintenance_locked";
+}
+
+/** How one proposed operation reads in the preview, bytes redacted. */
+function taskVerificationOperationLine(
+  operation: VerificationAmendmentOperation,
+  clean: (text: string) => string,
+): string {
+  if (operation.kind === "add") {
+    return operation.layer === "execution"
+      ? `add execution "${operation.name}": ${clean(operation.command)}`
+      : `add requirement: ${clean(operation.command)}`;
+  }
+  if (operation.kind === "replace") {
+    return `replace ${operation.commandId}: ${clean(operation.command)}`;
+  }
+  return `${operation.kind} ${operation.commandId}`;
+}
+
+function taskVerificationMutationPayload(
+  outcome: TaskVerificationAmendOutcome,
+  ctx: { target: TaskVerificationTarget; clean: (text: string) => string },
+): Record<string, unknown> {
+  const base = {
+    sessionId: ctx.target.sessionId,
+    issueNumber: ctx.target.issueNumber,
+    outcome: outcome.status,
+  };
+  if (outcome.status === "refused") {
+    return { ok: false, ...base, reasonCode: outcome.reason, applied: false, error: ctx.clean(outcome.detail) };
+  }
+  if (outcome.status === "stale") {
+    return {
+      ok: false,
+      ...base,
+      reasonCode: "stale",
+      applied: false,
+      observedTaskRevision: outcome.observedTaskRevision,
+      currentTaskRevision: outcome.currentTaskRevision ?? null,
+      observedPlanDigest: outcome.observedPlanDigest,
+      currentPlanDigest: outcome.currentPlanDigest ?? null,
+      error:
+        `the task moved while this amendment was being prepared; nothing was written. ` +
+        `Re-read the plan with \`task-verification show\` and re-issue.`,
+    };
+  }
+  if (outcome.status === "maintenance_locked") {
+    return {
+      ok: false,
+      ...base,
+      reasonCode: "maintenance_locked",
+      applied: false,
+      error: "the task store is under maintenance; nothing was written. Retry shortly.",
+    };
+  }
+  if (outcome.status === "replay") {
+    return {
+      ok: true,
+      ...base,
+      applied: false,
+      revisionId: outcome.revision.revisionId,
+      revisionOrdinal: outcome.revision.revisionOrdinal,
+      requestKey: outcome.revision.requestKey,
+      basePlanDigest: outcome.revision.basePlanDigest,
+      planDigest: outcome.revision.planDigest,
+    };
+  }
+  const { report: amendReport, basePlan, plan } = outcome;
+  const slotLines = (target: typeof plan): string[] => [
+    ...target.execution.map((slot) => taskVerificationSlotLine(slot, ctx.clean)),
+    ...target.requirement.map((slot) => taskVerificationSlotLine(slot, ctx.clean)),
+  ];
+  return {
+    ok: true,
+    ...base,
+    applied: outcome.status === "applied",
+    operations: amendReport.operations.map((operation) => taskVerificationOperationLine(operation, ctx.clean)),
+    operationKinds: amendReport.operations.map((operation) => operation.kind),
+    basePlanDigest: amendReport.basePlanDigest,
+    planDigest: amendReport.planDigest,
+    currentPlan: slotLines(basePlan),
+    resultingPlan: slotLines(plan),
+    requestKey: amendReport.requestKey,
+    revisionId: amendReport.revisionId,
+    continuation: amendReport.continuation,
+    requestedContinuation: amendReport.requestedContinuation,
+    defaultContinuation: amendReport.defaultContinuation,
+    ...(outcome.status === "applied"
+      ? {
+          revisionOrdinal: outcome.revision.revisionOrdinal,
+          // §9.2 (issue #1043): the explicit routing outcome — the re-queue
+          // the apply committed, or the statement that the accepted revision
+          // was recorded only and the task stays where its row keeps it.
+          taskStatus: outcome.task.status,
+          taskPhase: outcome.task.phase,
+          requeued:
+            amendReport.continuation === "none"
+              ? null
+              : { status: outcome.task.status, phase: outcome.task.phase },
+        }
+      : {}),
+  };
+}
+
+function renderTaskVerificationMutation(
+  command: string,
+  payload: Record<string, unknown>,
+  extraSections: Array<{ title: string; entries: readonly string[] }> = [],
+  // A reset derives its operations from the plan, so its own success erases the
+  // content its request key would be derived from: the apply it suggests names
+  // the key explicitly, which is what makes a lost-response retry a §5.3 rule 3
+  // replay rather than a stale refusal or a silent `no_change`.
+  options: { suggestRequestKey?: boolean } = {},
+): string {
+  const text = (key: string): string => (payload[key] === undefined ? "" : String(payload[key]));
+  const list = (key: string): string[] => (Array.isArray(payload[key]) ? (payload[key] as string[]) : []);
+  const outcome = text("outcome");
+  const lines: string[] = [
+    `${command} — issue #${text("issueNumber")} (session ${text("sessionId")})`,
+  ];
+  if (outcome === "refused" || outcome === "stale" || outcome === "maintenance_locked") {
+    lines.push(`  REFUSED (${text("reasonCode")}): ${text("error")}`);
+    lines.push("  Nothing was written; no revision ordinal was consumed.");
+    return lines.join("\n");
+  }
+  if (outcome === "replay") {
+    lines.push(
+      `  Replay: the request key already names revision ${text("revisionId")} ` +
+        `(ordinal ${text("revisionOrdinal")}). Nothing was written.`,
+    );
+    return lines.join("\n");
+  }
+  const section = (title: string, entries: readonly string[]): void => {
+    lines.push(`  ${title}: ${entries.length}`);
+    for (const entry of entries) lines.push(`    - ${entry}`);
+  };
+  for (const extra of extraSections) section(extra.title, extra.entries);
+  if (outcome === "no_change") {
+    lines.push(`  plan digest: ${text("planDigest")} (unchanged)`);
+    lines.push(`  ${text("message")}`);
+    return lines.join("\n");
+  }
+  section("current plan", list("currentPlan"));
+  section("operations", list("operations"));
+  section("resulting plan", list("resultingPlan"));
+  lines.push(`  plan digest: ${text("basePlanDigest")} -> ${text("planDigest")}`);
+  lines.push(`  revision: ${text("revisionId")} (request key ${text("requestKey")})`);
+  lines.push(taskVerificationContinuationLine(payload));
+  if (outcome === "preview") {
+    lines.push(
+      `  Preview only. Re-run with --yes --expect-plan-digest ${text("basePlanDigest")}` +
+        (options.suggestRequestKey === true ? ` --request-key ${text("requestKey")}` : "") +
+        ` to apply exactly this.`,
+    );
+  } else {
+    lines.push(`  Applied as revision ordinal ${text("revisionOrdinal")}.`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The §9.2 routing line of an amend/reset/refresh report (issue #1043): the
+ * continuation taken (or, on a preview, the one `--yes` would take) and the
+ * explicit re-queue-or-recorded-only outcome, so an accepted revision whose
+ * row withholds the re-queue is never mistaken for a routed one.
+ */
+function taskVerificationContinuationLine(payload: Record<string, unknown>): string {
+  const continuation = String(payload["continuation"] ?? "none");
+  const defaultContinuation = String(payload["defaultContinuation"] ?? "none");
+  const applied = payload["applied"] === true;
+  if (continuation === "none") {
+    const detail =
+      defaultContinuation === "none"
+        ? "the §9.2 row for this task takes no re-queue; it stays where its owning surface put it"
+        : "recorded only, by explicit --continue none";
+    return applied
+      ? `  continuation: none — revision recorded, task not re-queued (${detail})`
+      : `  continuation (on --yes): none — the revision would be recorded and the task not re-queued (${detail})`;
+  }
+  if (applied) {
+    const status = String(payload["taskStatus"] ?? "queued");
+    const phase = String(payload["taskPhase"] ?? continuation);
+    return `  continuation: ${continuation} — task re-queued {${status}, ${phase}}; stale missing-command state cleared, next claim resolves the amended plan`;
+  }
+  return `  continuation (on --yes): ${continuation} — would re-queue {queued, ${continuation}} in the same transaction that persists the plan`;
+}
+
+export async function runTaskVerificationAmend(argv: string[]): Promise<void> {
+  const parsed = parseTaskVerificationAmendArgs(argv);
+  if ("error" in parsed) die(parsed.error);
+  const { session, verification, clean } = await loadTaskVerificationSession(parsed);
+
+  const store = new SqliteTaskStore(parsed.dbPath);
+  try {
+    const now = new Date().toISOString();
+    const outcome = await amendTaskVerification(
+      { store, extract: extractIssueVerificationSections },
+      {
+        key: { sessionId: parsed.sessionId, issueNumber: parsed.issueNumber },
+        ...(verification !== undefined ? { sessionVerification: verification } : {}),
+        actorId: "admin",
+        reason: parsed.reason,
+        operations: parsed.operations,
+        requestedContinuation: parsed.requestedContinuation,
+        apply: parsed.yes,
+        requestKey: parsed.requestKey,
+        expectedPlanDigest: parsed.expectPlanDigest,
+        session,
+        runId: `admin-task-verification-amend-${now}`,
+        now,
+      },
+    );
+    const payload = taskVerificationMutationPayload(outcome, { target: parsed, clean });
+    report(payload, () => renderTaskVerificationMutation("task-verification amend", payload));
+    if (taskVerificationAmendFailed(outcome)) process.exitCode = 1;
+  } finally {
+    store.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// task-verification reset
+// ---------------------------------------------------------------------------
+
+interface TaskVerificationResetArgs extends TaskVerificationTarget {
+  reason: string;
+  allowRetire: boolean;
+  yes: boolean;
+  requestKey: string | undefined;
+  expectPlanDigest: string | undefined;
+}
+
+function parseTaskVerificationResetArgs(argv: string[]): TaskVerificationResetArgs | { error: string } {
+  const tokenized = tokenizeArgs(argv, {
+    booleanFlags: ["yes", "allow-retire"],
+    valueFlags: [
+      "session-id",
+      "issue-number",
+      "reason",
+      "request-key",
+      "expect-plan-digest",
+      "sessions-path",
+      "db-path",
+    ],
+  });
+  if ("error" in tokenized) return { error: tokenized.error };
+  const target = taskVerificationTarget(tokenized.args);
+  if ("error" in target) return { error: target.error };
+  const reason = tokenized.args["reason"];
+  if (reason === undefined || reason.trim() === "") {
+    return { error: "--reason is required and must not be empty or whitespace-only" };
+  }
+  return {
+    ...target,
+    reason,
+    allowRetire: tokenized.flags.has("allow-retire"),
+    yes: tokenized.flags.has("yes"),
+    requestKey: tokenized.args["request-key"],
+    expectPlanDigest: tokenized.args["expect-plan-digest"],
+  };
+}
+
+/** The three reset sections, rendered by identity and bytes. */
+function taskVerificationResetSections(
+  diff: TaskVerificationResetDiff,
+  withheld: readonly { commandId: string }[],
+  clean: (text: string) => string,
+  allowRetire: boolean,
+): Array<{ title: string; entries: string[] }> {
+  return [
+    { title: "restore", entries: diff.restores.map((entry) => `${entry.commandId} ${clean(entry.command)}`) },
+    {
+      title: "revert to origin bytes",
+      entries: diff.reverts.map(
+        (entry) => `${entry.commandId} ${clean(entry.command)} -> ${clean(entry.originCommand)}`,
+      ),
+    },
+    {
+      title:
+        allowRetire && withheld.length === 0
+          ? "retire (task-local additions)"
+          : "retire (task-local additions — withheld; pass --allow-retire to apply)",
+      entries: diff.retirements.map((entry) => `${entry.commandId} ${clean(entry.command)}`),
+    },
+  ];
+}
+
+export async function runTaskVerificationReset(argv: string[]): Promise<void> {
+  const parsed = parseTaskVerificationResetArgs(argv);
+  if ("error" in parsed) die(parsed.error);
+  const { session, verification, clean } = await loadTaskVerificationSession(parsed);
+
+  const store = new SqliteTaskStore(parsed.dbPath);
+  try {
+    const now = new Date().toISOString();
+    const result = await resetTaskVerification(
+      { store, extract: extractIssueVerificationSections },
+      {
+        key: { sessionId: parsed.sessionId, issueNumber: parsed.issueNumber },
+        ...(verification !== undefined ? { sessionVerification: verification } : {}),
+        actorId: "admin",
+        reason: parsed.reason,
+        allowRetire: parsed.allowRetire,
+        apply: parsed.yes,
+        requestKey: parsed.requestKey,
+        expectedPlanDigest: parsed.expectPlanDigest,
+        session,
+        runId: `admin-task-verification-reset-${now}`,
+        now,
+      },
+    );
+    const { outcome } = result;
+    const withheld: readonly { commandId: string }[] = result.withheldRetirements ?? [];
+    // The reset reports what it read for every outcome that resolved a plan, so
+    // the removals it is withholding are visible on a preview, on an apply, and
+    // on a no-change alike — never dropped from the output (§8.4).
+    const sections =
+      result.diff !== undefined
+        ? taskVerificationResetSections(result.diff, withheld, clean, parsed.allowRetire)
+        : [];
+    const resetFields =
+      result.diff !== undefined
+        ? {
+            restores: sections[0].entries,
+            reverts: sections[1].entries,
+            retirements: sections[2].entries,
+            withheldRetirements: withheld.map((entry) => entry.commandId),
+          }
+        : {};
+
+    const payload: Record<string, unknown> =
+      outcome.status === "no_change"
+        ? {
+            ok: true,
+            sessionId: parsed.sessionId,
+            issueNumber: parsed.issueNumber,
+            outcome: "no_change",
+            applied: false,
+            planDigest: outcome.planDigest,
+            ...resetFields,
+            message:
+              withheld.length > 0
+                ? "Nothing to apply: the only difference is a retirement of a task-local addition, which is withheld without --allow-retire. No revision was recorded."
+                : "The effective plan already matches its unamended baseline. No revision was recorded.",
+          }
+        : { ...taskVerificationMutationPayload(outcome, { target: parsed, clean }), ...resetFields };
+
+    report(payload, () =>
+      renderTaskVerificationMutation("task-verification reset", payload, sections, { suggestRequestKey: true }),
+    );
+    if (outcome.status !== "no_change" && taskVerificationAmendFailed(outcome)) process.exitCode = 1;
+  } finally {
+    store.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// task-verification refresh-from-issue
+// ---------------------------------------------------------------------------
+
+/**
+ * The resource-oriented entry to the §10 refresh shipped by issue #1041. Same
+ * parser, same runner, same outcomes and exit codes — only the reported command
+ * name differs, so an operator who found the plan through `task-verification
+ * show` never has to switch nouns to correct it from the Issue.
+ */
+export async function runTaskVerificationRefreshFromIssue(
+  argv: string[],
+  deps?: { source?: VerificationRefreshIssueSource },
+): Promise<void> {
+  await runReviewVerificationRefresh(argv, { ...deps, commandName: "task-verification refresh-from-issue" });
 }
 
 // ---------------------------------------------------------------------------
@@ -10193,12 +12493,6 @@ export async function runGithubAppReviewReturn(
 // is never executed by this tooling.
 // ---------------------------------------------------------------------------
 
-function readStoredToolRequest(task: { context: Record<string, unknown> }): Record<string, unknown> | undefined {
-  const tr = task.context["toolRequest"];
-  if (tr && typeof tr === "object" && !Array.isArray(tr)) return tr as Record<string, unknown>;
-  return undefined;
-}
-
 interface ToolRequestListArgs {
   sessionId: string;
   issueNumber: number | undefined;
@@ -10298,14 +12592,19 @@ async function runToolRequestList(argv: string[]): Promise<void> {
   }
 }
 
-const TOOL_REQUEST_ACTIONS = ["manual-done", "reject"] as const;
-type ToolRequestAction = (typeof TOOL_REQUEST_ACTIONS)[number];
-
+/**
+ * Argv-shaped arguments for `admin tool-request resolve`.
+ *
+ * Split in two on purpose (issue #1030): {@link ToolRequestResolveArgs.request}
+ * is the typed operation request `runToolRequestResolve` takes, and everything
+ * beside it is shell-only — where the session file and the database live, plus
+ * the preview flag that becomes `OperationContext.confirmed`. None of the
+ * shell-only fields is a parameter the core (or any other surface) can set.
+ */
 interface ToolRequestResolveArgs {
   sessionId: string;
   issueNumber: number;
-  action: ToolRequestAction;
-  message: string | undefined;
+  request: ToolRequestResolveRequest;
   sessionsPath: string;
   dbPath: string | undefined;
   dryRun: boolean;
@@ -10321,38 +12620,77 @@ function parseToolRequestResolveArgs(argv: string[]): ToolRequestResolveArgs | {
   if ("error" in opts) return { error: opts.error };
   const { args } = opts;
 
-  if (args["action"] === undefined) return { error: "--action is required" };
-  if (!TOOL_REQUEST_ACTIONS.includes(args["action"] as ToolRequestAction)) {
-    return { error: `--action must be one of: ${TOOL_REQUEST_ACTIONS.join(", ")}, got: ${args["action"]}` };
-  }
-  const action = args["action"] as ToolRequestAction;
-
-  const message = args["message"];
-  if (action === "reject" && (message === undefined || message.trim().length === 0)) {
-    return { error: "--message is required when --action reject is used" };
-  }
+  // The action/message vocabulary is the operation's, not the shell's, so it is
+  // checked by the core's own parser — one definition, byte-identical messages
+  // on both surfaces (issue #1030).
+  const params: Record<string, string> = {};
+  if (args["action"] !== undefined) params["action"] = args["action"];
+  if (args["message"] !== undefined) params["message"] = args["message"];
+  const parsedRequest = parseToolRequestResolveParams(params);
+  if ("error" in parsedRequest) return { error: parsedRequest.error };
 
   return {
     sessionId: opts.sessionId,
     issueNumber: opts.issueNumber!,
-    action,
-    message,
+    request: parsedRequest.request,
     sessionsPath: opts.sessionsPath,
     dbPath: opts.dbPath,
     dryRun: opts.dryRun,
   };
 }
 
-// Bounded storage for an operator-supplied resolution note. Operator-typed text
-// is trusted, but the note is still surfaced in a public GitHub comment, so it
-// is bounded and path-sanitized like any other comment content.
-const MAX_TOOL_REQUEST_MESSAGE_CHARS = 1_000;
+/**
+ * Build the injected operation context for one resolution (issue #1030).
+ *
+ * Everything the core is not allowed to construct for itself — stores, git
+ * probes, worktree resolution, the clock, the run id — is assembled by the
+ * shared runtime builder (issue #1031), so this surface and ChatOps drive the
+ * same core over the same seams. What stays here is the *trusted* half: an
+ * `admin-cli` invocation by the shell operator.
+ */
+function toolRequestResolveContext(options: {
+  session: ResolvedSession;
+  sessionId: string;
+  issueNumber: number;
+  confirmed: boolean;
+  requestId: string;
+  store: ToolRequestResolveTaskPort;
+  outboxStore: OutboxStore;
+}): ToolRequestResolveContext {
+  return toolRequestResolveOperationContext(
+    {
+      surface: "admin-cli",
+      actor: { kind: "human", id: "admin" },
+      sessionId: options.sessionId,
+      issueNumber: options.issueNumber,
+      requestId: options.requestId,
+      confirmed: options.confirmed,
+      deadlineMs: null,
+    },
+    {
+      session: options.session,
+      tasks: options.store,
+      outbox: options.outboxStore,
+      runIdPrefix: "admin-tool-request-resolve",
+    },
+  );
+}
 
-async function runToolRequestResolve(argv: string[]): Promise<void> {
+/**
+ * `admin tool-request resolve` — the CLI shell over the callable
+ * `tool-request.resolve` core (issue #1030).
+ *
+ * Argv parsing, session resolution, store construction, rendering and exit-code
+ * mapping live here; every business rule lives in `runToolRequestResolve`. A
+ * `rejected` or `failed` result becomes the same `die()` message (and the same
+ * exit code) the pre-extraction handler printed, and an `executed` result's
+ * `data` is the payload it emitted verbatim.
+ */
+async function runToolRequestResolveCommand(argv: string[]): Promise<void> {
   const parsed = parseToolRequestResolveArgs(argv);
   if ("error" in parsed) die(parsed.error);
 
-  const { sessionId, issueNumber, action, message, sessionsPath, dbPath, dryRun } = parsed;
+  const { sessionId, issueNumber, request, sessionsPath, dbPath, dryRun } = parsed;
 
   let registry: JsonSessionRegistry;
   try {
@@ -10366,670 +12704,33 @@ async function runToolRequestResolve(argv: string[]): Promise<void> {
     die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
-  const now = new Date().toISOString();
-  const boundedMessage = message !== undefined
-    ? sanitizeBody(boundedExcerpt(message.trim(), MAX_TOOL_REQUEST_MESSAGE_CHARS), sessionRedactionPaths(session))
-    : undefined;
-
   const store = new SqliteTaskStore(dbPath);
   const outboxStore = new SqliteOutboxStore(dbPath);
   try {
-    const task = await store.getTask({ sessionId, issueNumber });
-    if (!task) {
-      die(`Task not found: session "${sessionId}", issue #${issueNumber}`);
-    }
-
-    const existing = readStoredToolRequest(task);
-    if (!existing) {
-      die(`Issue #${issueNumber} in session "${sessionId}" has no Tool Request to resolve.`);
-    }
-    // issue #674: a plain `reject` only records the decision — it never runs a
-    // command, requeues the task, or touches the repo, so nothing about the
-    // task's recoverability is consumed. Exactly one subsequent `manual-done`
-    // may resume it (e.g. an operator rejected a Tool Request raised before the
-    // issue had a PR, not realizing rejection alone leaves the task parked at
-    // ready_for_human with no path back to implementation). Any other prior
-    // resolution (an earlier manual-done, or a grant's guided-run/grant outcome)
-    // already executed or requeued and must not be replayed — and once this
-    // exemption itself has been used, it must not fire again either, or the
-    // same stale rejected request could requeue an issue back into
-    // implementation after it has already reached done (issue #674 review).
-    // Computed ahead of the `resolved` gate below so it is also available to
-    // preserve the prior rejection when building `resolvedToolRequest` further
-    // down.
-    const priorResolution = existing["resolution"] as { action?: unknown } | undefined;
-    // The exemption below is one-shot: once a reject has already been resumed
-    // via manual-done, `existing["rejectRecoveryConsumed"]` is set (further
-    // down) so a second manual-done — or the same stale Tool Request
-    // requeuing a later, already-completed issue back into implementation —
-    // is refused instead of replayed indefinitely (issue #674 review).
-    // It also requires the task to still be parked at the original
-    // `ready_for_human` handoff: if the task has since progressed through
-    // any other recovery path (e.g. reached `done`), a stale rejected
-    // request must not be allowed to requeue completed work back to
-    // `queued` (issue #674 review follow-up).
-    // Status alone is not enough: a task can reach `ready_for_human` again
-    // later in a completely different phase (e.g. a review-phase human
-    // handoff) while the stale rejected toolRequest is still sitting in its
-    // context untouched. Requiring `task.phase === "implementation"` — the
-    // only phase that ever produces a Tool Request handoff — pins this
-    // exemption to the original handoff, so a later review-phase
-    // `ready_for_human` cannot be requeued into implementation by replaying
-    // it (issue #674 review, round 2).
-    const priorWasPlainReject =
-      existing["resolved"] === true &&
-      priorResolution?.action === "reject" &&
-      existing["rejectRecoveryConsumed"] !== true &&
-      task.status === "ready_for_human" &&
-      task.phase === "implementation";
-    if (existing["resolved"] === true) {
-      if (!(action === "manual-done" && priorWasPlainReject)) {
-        die(`Tool Request for issue #${issueNumber} in session "${sessionId}" is already resolved.`);
-      }
-    }
-    if (task.status === "claimed" || task.status === "running") {
-      die(
-        `Task #${issueNumber} in session "${sessionId}" is currently ${task.status}` +
-          (task.ownerRunId ? ` (owner: ${task.ownerRunId})` : "") +
-          `. Refusing to resolve an active task. Wait for it to complete or recover it first.`,
-      );
-    }
-
-    // issue #674 review: resuming a rejected pre-PR handoff via `manual-done` did
-    // not actually run the command or change the repository — only the task's
-    // requeue-eligibility is being consumed here. Replacing the stored `reject`
-    // resolution with a fresh `manual-done` one would misrepresent that history to
-    // the resumed implementation prompt: toolRequestResolutionPromptSection reads
-    // `resolution.action`, and for anything other than `reject` it tells the agent
-    // "the command has been run ... its effects are in the repository", which is
-    // false here and would make the agent trust repo state that was never
-    // produced. Preserve the original rejection (and its reason/message) as
-    // continuation context instead of overwriting it, but stamp
-    // `rejectRecoveryConsumed` so this same stored request cannot grant the
-    // exemption a second time (see `priorWasPlainReject` above).
-    const resumingAfterPlainReject = action === "manual-done" && priorWasPlainReject;
-    const resolvedToolRequest = resumingAfterPlainReject
-      ? { ...existing, rejectRecoveryConsumed: true }
-      : {
-          ...existing,
-          resolved: true,
-          resolution: {
-            action,
-            ...(boundedMessage !== undefined ? { message: boundedMessage } : {}),
-            resolvedAt: now,
-          },
-        };
-
-    // manual-done requeues the task to implementation so the agent retries now
-    // that the operator has performed the requested command externally. reject
-    // also requeues (issue #678): the operator's decision not to run the command
-    // is itself the continuation context — toolRequestResolutionPromptSection's
-    // "reject" branch delivers it to the agent as human feedback, so there is
-    // nothing further for a human to decide. A human handoff remains only when
-    // the safety guards below (dirty tree, unpushed base, no usable continuation
-    // point) refuse the requeue.
-    //
-    // manual-done and reject differ in what a blocked guard means, though: for
-    // manual-done the operator asserts real repo changes are waiting to be picked
-    // up, so a guard failure dies outright (unchanged from before #678) — silently
-    // recording "resolved" against a dirty/unsafe tree would strand the task. For
-    // reject nothing ever touched the repo, so the rejection itself is always safe
-    // to record; only the *requeue* is conditional. `requeueGuardFail` embodies
-    // that split: a blocked guard downgrades `requeue` to false for reject (the
-    // task simply stays a human handoff, exactly as it did before #678) instead of
-    // aborting the whole resolve.
-    let requeue = action === "manual-done" || action === "reject";
-    // `message` may embed raw probe() output (e.g. git fetch/remote stderr),
-    // which can carry credential-bearing remote URLs or other remote-provided
-    // diagnostics that `sanitizeBody` does not scrub (it only strips filesystem
-    // paths). `publicReason` is what is safe to post in the public work-item
-    // comment; it defaults to `message` for guard sites whose text never embeds
-    // raw command output, and is overridden with a controlled generic reason at
-    // any call site that does (issue #678 review).
-    class RequeueGuardBlocked extends Error {
-      publicReason: string;
-      constructor(message: string, publicReason: string) {
-        super(message);
-        this.publicReason = publicReason;
-      }
-    }
-    const requeueGuardFail = (message: string, publicReason?: string): never => {
-      if (action === "manual-done") die(message);
-      throw new RequeueGuardBlocked(message, publicReason ?? message);
-    };
-    // Captured from a blocked reject's guard (dirty checkout, ahead base, or no
-    // usable continuation point) so it can be surfaced in the comment/emit below
-    // instead of discarded — the public comment tells the operator that a
-    // blocking reason exists, so that must actually be present there (issue #678
-    // review). `requeueGuardBlockedMessage` (the full, possibly diagnostic-bearing
-    // text) is for CLI/audit surfaces only (emit output, the appended event);
-    // `requeueGuardPublicReason` (never contains raw probe output) is the only one
-    // that reaches the public GitHub comment.
-    let requeueGuardBlockedMessage: string | undefined;
-    let requeueGuardPublicReason: string | undefined;
-
-    // When the requeued implementation run is an initial implementation (no PR yet),
-    // its branch setup would `git checkout -b ai/issue-<n>` from the base. If the
-    // Tool Request side effects already live on that branch — created by the grant,
-    // or by the operator moving the changes there — recreating it collides and
-    // strands the work (issue #316 review). Record the work branch as the resume
-    // point, but only when it actually exists locally, so the implementation handler
-    // continues from it; a dropped/never-created branch stays unset and the run
-    // branches fresh from base as usual.
-    let toolRequestResumeBranch: string | undefined;
-
-    // A manual-done requeue drops the task straight back into the implementation
-    // lane, whose first step is a `git status --porcelain` preflight that aborts
-    // the run on a dirty worktree. The common Tool Request command mutates repo
-    // files (e.g. `npm install` rewriting package.json/lockfiles); if the operator
-    // ran it and left those edits uncommitted, requeueing here would mark the
-    // request resolved while every implementation retry immediately fails dirty —
-    // resolved request, stuck task (issue #291 review follow-up). Refuse up front
-    // and tell the operator to land the expected changed files so the requeued run
-    // starts clean. Only block on a positive dirty signal; if git can't be probed
-    // (e.g. repoRoot is not a checkout) proceed rather than guess.
-    if (requeue) {
-      try {
-      const expectedFiles = Array.isArray(existing["expectedFiles"])
-        ? (existing["expectedFiles"] as unknown[]).filter((f): f is string => typeof f === "string")
-        : [];
-      // The work branch the side effects must live on (issue #316): the existing
-      // PR head branch, else the conventional issue branch. Tool Request changes
-      // belong here, never on the session base branch.
-      const workBranch = resolveToolRequestWorkBranch(task, issueNumber);
-      const baseBranch = session.baseBranch ?? "main";
-
-      // Where the working-tree cleanliness check must run. The implementation phase
-      // (issue #732) checks `ai/issue-<n>` out in its own per-issue worktree
-      // UNCONDITIONALLY, and a Tool Request handoff (grant or manual run) left the
-      // command's side effects there, never in the canonical checkout. The requeued implementation
-      // run's dirty preflight runs in that same worktree (issue #454), so manual-done
-      // must validate cleanliness against it too: probing only `session.repoRoot`
-      // would pass a dirty issue worktree and requeue the task straight into a
-      // worktree-dirty preflight failure — resolved request, stuck task. Resolve the
-      // per-issue worktree and check there whenever one is actually registered for
-      // this issue; fall back to the canonical checkout only when no worktree entry
-      // exists yet (e.g. the run failed before Step 0.6 materialized one).
-      let dirtyCheckCwd = session.repoRoot;
-      {
-        let worktreeRoot: string;
-        try {
-          worktreeRoot = resolveWorktreeRoot({ sessionRoot: session.worktrees?.root });
-        } catch (err) {
-          requeueGuardFail(
-            `Refusing to resolve Tool Request for issue #${issueNumber} in session "${sessionId}": the session ` +
-              `enables per-issue worktrees but its worktree root is misconfigured: ` +
-              `${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        const worktreePath = canonicalizePath(issueWorktreePath(worktreeRoot!, sessionId, issueNumber));
-        const listed = listWorktrees(session.repoRoot);
-        const entry = listed.ok
-          ? listed.worktrees.find((w) => canonicalizePath(w.path) === worktreePath)
-          : undefined;
-        if (entry && !entry.prunable && existsSync(worktreePath)) {
-          dirtyCheckCwd = worktreePath;
-        }
-      }
-      const inWorktree = dirtyCheckCwd !== session.repoRoot;
-
-      const statusProbe = probe("git", ["status", "--porcelain"], dirtyCheckCwd);
-      if (statusProbe.ok && statusProbe.output.length > 0) {
-        requeueGuardFail(
-          `Refusing to requeue issue #${issueNumber} in session "${sessionId}": the ${inWorktree ? "issue worktree" : "session checkout"} ` +
-            `(${dirtyCheckCwd}) is dirty, so the implementation preflight would immediately abort it ` +
-            `as dirty and leave the request resolved but the task stuck.\n` +
-            `Commit the changes the requested command produced` +
-            (expectedFiles.length > 0 ? ` (expected: ${expectedFiles.join(", ")})` : "") +
-            ` on the issue branch '${workBranch}' and push that branch (never the base branch '${baseBranch}') so the ${inWorktree ? "worktree" : "checkout"} is clean, then re-run ` +
-            `this resolve. Do not stash them — the requeued run would not see them.\nWorktree:\n${statusProbe.output.slice(0, 300)}`,
-        );
-      }
-
-      // A clean worktree is not sufficient. An operator following the guidance to
-      // commit the requested changes can leave `git status --porcelain` empty while
-      // the session's local base branch sits ahead of origin. The implementation
-      // preflight checks out the base branch and `git pull --ff-only` (which a
-      // local-ahead branch passes cleanly), then branches each issue off that local
-      // base — so an unpushed base commit would leak into this and every later issue
-      // branch (issue #291 review follow-up). Refuse until the base is pushed. Only
-      // block on a positive signal; if the comparison can't be made (e.g. no
-      // origin/<base> tracking ref) proceed rather than guess.
-      //
-      // This guard only applies to the shared-checkout path. When the requeue
-      // resolves to a per-issue worktree (issue #454/#455), the implementation run
-      // executes in that worktree and starts from `origin/<base>` or the recorded
-      // resume branch — it never branches off the canonical checkout's local base —
-      // so an unrelated local commit on the canonical `main` cannot leak into the
-      // issue branch. Refusing here would block valid worktree sessions on unrelated
-      // canonical checkout state (issue #455 review).
-      if (!inWorktree) {
-        const aheadProbe = probe(
-          "git",
-          ["rev-list", "--count", `origin/${baseBranch}..${baseBranch}`],
-          session.repoRoot,
-        );
-        if (aheadProbe.ok) {
-          const aheadCount = Number.parseInt(aheadProbe.output.trim(), 10);
-          if (Number.isFinite(aheadCount) && aheadCount > 0) {
-            // The recovery is NEVER to push the base branch: committing Tool Request
-            // side effects to the base branch is the version-control error this guard
-            // exists to prevent (issue #316). Tell the operator to move those commits
-            // onto the issue branch, or drop them.
-            requeueGuardFail(
-              `Refusing to requeue issue #${issueNumber} in session "${sessionId}": the session's local base ` +
-                `branch '${baseBranch}' is ${aheadCount} commit(s) ahead of origin/${baseBranch}. The ` +
-                `implementation preflight branches each issue off this local base, so an unpushed base commit ` +
-                `would leak into this and later issue branches.\n` +
-                `Move those commit(s)` +
-                (expectedFiles.length > 0 ? ` (covering ${expectedFiles.join(", ")})` : "") +
-                ` onto the issue branch '${workBranch}', or drop them — do NOT push '${baseBranch}' — so the ` +
-                `requeued run branches from a clean base, then re-run this resolve.`,
-            );
-          }
-        }
-      }
-
-      // Worktree is clean and the base is not ahead. If the work branch exists
-      // the side effects are landed on it, so hand the implementation run a resume
-      // point instead of letting it collide on `git checkout -b` (issue #316). The
-      // new manual-done guidance tells operators to commit/push the issue branch,
-      // which they may do from another clone — leaving `ai/issue-<n>` on origin but
-      // absent from this checkout. Probe origin as well as local refs so a pushed
-      // issue branch still requeues with a resume point; missing it would branch a
-      // fresh run from base and discard the pushed side effects (issue #316 review).
-      const localBranchExists = probe(
-        "git",
-        ["rev-parse", "--verify", "--quiet", `refs/heads/${workBranch}`],
-        session.repoRoot,
-      ).ok;
-      const hasOrigin = probe("git", ["remote", "get-url", "origin"], session.repoRoot).ok;
-      if (localBranchExists && hasOrigin) {
-        // A local issue branch is only a safe resume point once its commits are
-        // on origin. The requeued implementation run can later hit ANOTHER Tool
-        // Request, whose non-fix cleanup deletes the issue branch with
-        // `git branch -D` (handlers/implementation.ts discardEditsToBase). If the
-        // operator committed the side effects locally but forgot to push, that
-        // local branch is the only ref to those commits and the drop would lose
-        // them (issue #316 review). The command help/docs require committed AND
-        // pushed side effects, so refuse a local-only or ahead branch here rather
-        // than record it as the resume point.
-        const remote = remoteHasBranch(session.repoRoot, workBranch);
-        if (remote === "unknown") {
-          requeueGuardFail(
-            `Refusing to resolve Tool Request for issue #${issueNumber} in session "${sessionId}": could not ` +
-              `determine whether origin has the issue branch '${workBranch}' (lookup failed). The local branch ` +
-              `must be confirmed pushed before requeueing, since a later Tool Request handoff deletes it with ` +
-              `'git branch -D' and would lose any commits that live only in this checkout. Restore connectivity ` +
-              `to origin and re-run this resolve.`,
-          );
-        }
-        if (remote === "no") {
-          requeueGuardFail(
-            `Refusing to resolve Tool Request for issue #${issueNumber} in session "${sessionId}": the issue branch ` +
-              `'${workBranch}' exists only in this checkout (${session.repoRoot}) — origin has no '${workBranch}'. A ` +
-              `later Tool Request handoff deletes the issue branch with 'git branch -D', so its Tool Request ` +
-              `side-effect commits would be lost. Push '${workBranch}' to origin (never the base branch ` +
-              `'${baseBranch}'), then re-run this resolve.`,
-          );
-        }
-        // origin has the branch; require the local branch not to be ahead of its
-        // pushed counterpart, so every side-effect commit is already on origin and
-        // survives a later `git branch -D`. Fetch the branch explicitly and compare
-        // against FETCH_HEAD rather than the remote-tracking ref origin/<workBranch>:
-        // fresh/single-branch clones never create refs/remotes/origin/<workBranch>
-        // (the fetch updates only FETCH_HEAD), so a tracking-ref compare would wrongly
-        // block manual-done even though the side-effect commits are pushed (issue #316
-        // review).
-        //
-        // This fetch writes .git/FETCH_HEAD and reaches the network/auth layer, so it
-        // must not run on the --dry-run preview path, which is advertised as
-        // non-persisting (issue #316 review). Defer the push-confirmation to the real
-        // resolve; the preview still records the resume branch from the read-only
-        // origin-presence check above.
-        if (!dryRun) {
-          const fetchedWorkBranch = probe("git", ["fetch", "origin", workBranch], session.repoRoot);
-          if (!fetchedWorkBranch.ok) {
-            // fetchedWorkBranch.output is raw `git fetch` stderr and may carry a
-            // credential-bearing remote URL or other remote-provided diagnostics —
-            // keep it in the detailed message (CLI/audit only) and give the public
-            // comment a controlled generic reason instead (issue #678 review).
-            requeueGuardFail(
-              `Refusing to resolve Tool Request for issue #${issueNumber} in session "${sessionId}": could not fetch ` +
-                `origin '${workBranch}' to confirm the local issue branch's commits are pushed ` +
-                `(git fetch origin ${workBranch} failed: ${fetchedWorkBranch.output}). Restore connectivity to origin ` +
-                `in ${session.repoRoot}, then re-run this resolve.`,
-              `Refusing to resolve Tool Request for issue #${issueNumber} in session "${sessionId}": could not fetch ` +
-                `origin '${workBranch}' to confirm the local issue branch's commits are pushed. Restore connectivity ` +
-                `to origin, then re-run this resolve.`,
-            );
-          }
-          const aheadOfOrigin = probe(
-            "git",
-            ["rev-list", "--count", `FETCH_HEAD..${workBranch}`],
-            session.repoRoot,
-          );
-          if (!aheadOfOrigin.ok) {
-            // The fetch above succeeded but the local branch cannot be compared
-            // against the fetched origin tip (FETCH_HEAD) — we cannot prove the local
-            // branch is not ahead. Fail closed rather than record a possibly
-            // local-ahead branch (issue #316 review).
-            requeueGuardFail(
-              `Refusing to resolve Tool Request for issue #${issueNumber} in session "${sessionId}": cannot compare the ` +
-                `local issue branch '${workBranch}' against the fetched origin tip (FETCH_HEAD), so its commits cannot ` +
-                `be confirmed pushed. Resolve the repository state in ${session.repoRoot}, then re-run this resolve.`,
-            );
-          }
-          const aheadCount = Number.parseInt(aheadOfOrigin.output.trim(), 10);
-          if (Number.isFinite(aheadCount) && aheadCount > 0) {
-            requeueGuardFail(
-              `Refusing to resolve Tool Request for issue #${issueNumber} in session "${sessionId}": the local issue ` +
-                `branch '${workBranch}' is ${aheadCount} commit(s) ahead of origin/${workBranch}, so its Tool Request ` +
-                `side-effect commits are not yet pushed. A later Tool Request handoff deletes the issue branch with ` +
-                `'git branch -D' and would lose them. Push '${workBranch}' to origin (never the base branch ` +
-                `'${baseBranch}'), then re-run this resolve.`,
-            );
-          }
-        }
-        toolRequestResumeBranch = workBranch;
-      } else if (localBranchExists) {
-        // No origin is configured, so there is no push target to reconcile
-        // against and the pushed-state check does not apply. Record the local
-        // branch as the resume point so the requeued run continues from the
-        // landed side effects rather than branching fresh from base.
-        toolRequestResumeBranch = workBranch;
-      } else if (hasOrigin) {
-        // Branch absent locally: it may live on origin because the operator
-        // committed/pushed it from another clone (the manual-done guidance allows
-        // that). Probe origin with the tri-state check: a transient ls-remote
-        // failure must NOT be collapsed to "branch absent" (issue #316 review). If it
-        // were, this resolve would leave `toolRequestResumeBranch` unset, the
-        // requeued implementation run would branch from the base, and the side
-        // effects the operator pushed from another clone would be discarded.
-        // Distinguish a definite no-match (leave the resume branch unset) from a
-        // lookup failure (refuse so the operator retries) instead.
-        const remote = remoteHasBranch(session.repoRoot, workBranch);
-        if (remote === "unknown") {
-          requeueGuardFail(
-            `Refusing to resolve Tool Request for issue #${issueNumber} in session "${sessionId}": could not ` +
-              `determine whether origin has the issue branch '${workBranch}' (lookup failed). Treating this as ` +
-              `"branch absent" would requeue the implementation run from the base branch and discard any Tool ` +
-              `Request side effects committed/pushed onto '${workBranch}' from another clone. Restore connectivity ` +
-              `to origin and re-run this resolve.`,
-          );
-        }
-        if (remote === "yes") {
-          toolRequestResumeBranch = workBranch;
-        }
-      }
-
-      // Issue #379: fail closed when the requested manual action left no usable
-      // continuation point. If the resolution above found no resume branch — the
-      // issue branch is absent both locally and on origin, and a fix-mode request
-      // has no PR head to resume — then requeueing would branch a fresh
-      // implementation run from the base with NONE of the prior attempt's state.
-      // The agent re-derives the same missing tool/dependency state and re-emits
-      // the SAME Tool Request, looping while the partial work stays discarded
-      // (the exact failure issue #379 fixes). Refuse and explain the recovery
-      // requirement instead of resolving the request into a dead loop. Only act on
-      // a positive git signal: when the session checkout cannot be probed
-      // (statusProbe not ok — e.g. repoRoot is not a checkout) we cannot prove the
-      // absence of state, so proceed rather than guess, mirroring the dirty/base
-      // guards above.
-      // For reject, no command ever ran, so there is nothing at risk when the
-      // prior implementation attempt had no diff to preserve in the first place
-      // (issue #678) — requeueing branches a fresh implementation run from base,
-      // which is exactly the normal starting point. The guard below still applies
-      // to reject when a patch/preserved branch exists (or capture failed): that
-      // prior implementation work predates and is independent of the rejected
-      // command, and still needs a usable continuation point to resume from.
-      const rejectWithNothingAtRisk = action === "reject" && existing["noPriorDiff"] === true;
-      if (statusProbe.ok && toolRequestResumeBranch === undefined && !rejectWithNothingAtRisk) {
-        // Tailor the recovery guidance to what the handoff actually preserved
-        // (issue #390), so operators are not told to look for a patch that was
-        // never produced. Three cases, distinguished by the stored request:
-        //   - a patch was captured  → reapply it, run the command, commit & push
-        //   - no diff was produced  → there is NO patch; just run the command on
-        //                             a fresh issue branch, commit & push
-        //   - capture failed        → a diff may have existed but no patch exists;
-        //                             rebuild from the artifacts, commit & push
-        // For `reject` the command was never approved to run at all (issue #678),
-        // so the "run the requested command" step is dropped from each case below.
-        const hasPatch = typeof existing["partialDiffArtifact"] === "string";
-        const noPriorDiff = existing["noPriorDiff"] === true;
-        const captureFailed = typeof existing["partialDiffCaptureFailed"] === "string";
-        const runCommandStep = action === "reject" ? "" : "run the requested command, then ";
-        const recovery = hasPatch
-          ? `apply the preserved partial-implementation patch from the failed run's artifact dir ` +
-            `(${String(existing["partialDiffArtifact"])}), ${runCommandStep}commit AND push `
-          : noPriorDiff
-            ? `the prior attempt produced no implementation diff, so there is NO partial-implementation ` +
-              `patch to apply — simply ${runCommandStep}commit AND push `
-            : captureFailed
-              ? `the prior attempt's partial-diff capture failed so no patch was written ` +
-                `(${String(existing["partialDiffCaptureFailed"]).slice(0, 200)}); reconstruct the change from ` +
-                `the failed run's artifacts, ${runCommandStep}commit AND push `
-              : `apply the preserved partial-implementation patch from the failed run's artifact dir ` +
-                `(partial-implementation.patch) if present, ${runCommandStep}commit AND push `;
-        const sideEffectsPhrase =
-          action === "reject"
-            ? `the command was rejected and never ran, and the prior implementation attempt's edits`
-            : `the requested command's side effects`;
-        requeueGuardFail(
-          `Refusing to requeue issue #${issueNumber} in session "${sessionId}": the previous Tool ` +
-            `Request attempt left no usable continuation point. The issue branch '${workBranch}' is ` +
-            `absent both locally and on origin, there is no PR to resume from, and ${sideEffectsPhrase}` +
-            (expectedFiles.length > 0 ? ` (expected: ${expectedFiles.join(", ")})` : "") +
-            ` are not committed anywhere reachable. Requeueing now would branch a fresh implementation ` +
-            `run from the base branch '${baseBranch}' with none of the prior work, so the agent would ` +
-            `hit the same blocker and re-request the same command — a Tool Request loop.\n` +
-            `Recover by landing the change on the issue branch '${workBranch}': in ${session.repoRoot}, ` +
-            recovery +
-            `'${workBranch}' to origin (never the base branch '${baseBranch}'). Re-run this resolve once ` +
-            `that branch exists.` +
-            (action === "reject" ? "" : ` If the request should not proceed, use 'tool-request resolve --action reject' instead.`),
-        );
-      }
-      } catch (err) {
-        // A blocked reject does not abort the resolve (see requeueGuardFail above):
-        // the rejection is still recorded below, just without an automatic requeue.
-        if (!(err instanceof RequeueGuardBlocked)) throw err;
-        requeue = false;
-        requeueGuardBlockedMessage = err.message;
-        requeueGuardPublicReason = err.publicReason;
-      }
-    }
-
-    const targetStatus = requeue ? "queued" : task.status;
-    const targetPhase: TaskPhase = requeue ? "implementation" : task.phase;
-
-    if (dryRun) {
-      emit({
-        ok: true,
-        dryRun: true,
+    const result = await runToolRequestResolve({
+      request,
+      context: toolRequestResolveContext({
+        session,
         sessionId,
         issueNumber,
-        action,
-        previousStatus: task.status,
-        previousPhase: task.phase,
-        wouldRequeue: requeue ? { status: targetStatus, phase: targetPhase } : null,
-        message: boundedMessage ?? null,
-      });
+        // Preview is trusted context, not a parameter: `--dry-run` is the CLI
+        // spelling of an unconfirmed invocation (contract §5.2).
+        confirmed: !dryRun,
+        requestId: `admin-cli:${sessionId}:${issueNumber}:tool-request-resolve`,
+        store,
+        outboxStore,
+      }),
+    });
+
+    if (result.status === "executed") {
+      emit((result.data ?? {}) as Record<string, unknown>);
       return;
     }
-
-    const result = await store.transitionTask(
-      { sessionId, issueNumber },
-      { status: task.status },
-      {
-        status: targetStatus,
-        phase: targetPhase,
-        ...(requeue ? { ownerRunId: undefined, leaseExpiresAt: undefined, lastError: undefined } : {}),
-        context: {
-          toolRequest: resolvedToolRequest,
-          // Always write the key, clearing it (undefined) when this resolve found
-          // no issue branch to resume from. Omitting it would let applyTaskPatch's
-          // context merge preserve a stale toolRequestResumeBranch from an earlier
-          // Tool Request, so the next implementation run would fetch/continue from
-          // the wrong branch (issue #316 review). JSON.stringify drops the
-          // undefined value, removing the key from the persisted context.
-          toolRequestResumeBranch,
-        },
-        now,
-      },
-    );
-    if (!result.ok) {
-      die(
-        `Failed to resolve Tool Request: ${result.code}` +
-          (result.current ? ` (current status: ${result.current.status})` : ""),
-      );
-    }
-
-    const runId = `admin-tool-request-resolve-${now}`;
-    const owner = session.githubOwner;
-    const repo = session.githubName;
-    // Route the label transitions and status comment below through the session's
-    // work-item provider so a non-GitHub session posts them to the work-item repo
-    // instead of stranding the legacy `gh:*` rows behind the dispatcher's failing
-    // GitHub runner; no-op passthrough for a GitHub session.
-    const workItemStore = workItemOutbox(outboxStore, session);
-
-    // On manual-done, swap the public labels back to the implementation lane:
-    // drop the ready-for-human marker and re-advertise the queue status (needs-fix
-    // for a fix-mode request, otherwise needs-implementation) + the implementation
-    // agent so a label-driven recovery/intake scan stays consistent with the
-    // requeued DB task. On reject the task stays a human handoff, so its
-    // ready-for-human labelling is left untouched.
-    if (requeue) {
-      const readyForHumanLabel = session.labels["readyForHuman"] as string | undefined;
-      // A Tool Request recorded from fix mode (mode: "fix", or with preserved
-      // review feedback on the task) must requeue under the fix-lane status label,
-      // not the implementation one. Re-advertising status:needs-implementation
-      // would present the resolved request as fresh implementation work — or, if a
-      // stale status:needs-fix lingered, leave both implementation statuses on the
-      // issue (issue #291 review follow-up). Mirrors handler fix-mode detection.
-      const isFixModeRequest =
-        existing["mode"] === "fix" ||
-        (typeof task.context["reviewFeedback"] === "string" &&
-          (task.context["reviewFeedback"] as string).trim().length > 0);
-      const queueStatusLabel = isFixModeRequest
-        ? ((session.labels["needsFix"] as string | undefined) ?? "status:needs-fix")
-        : ((session.labels["needsImplementation"] as string | undefined) ?? "status:needs-implementation");
-      // Resolve the implementation agent the same way phase handling does
-      // (assignment profile → task column → session default) so a legacy or manually
-      // enqueued task with no persisted assignment relabels with the session default
-      // implementation agent (e.g. codex/gemini) rather than always advertising
-      // agent:claude, which would misroute label-driven recovery/intake (issue #291
-      // review follow-up).
-      const resolvedImplAgentId = agentForPhase(task, session, "implementation");
-      const implAgentLabel = resolvedImplAgentId ? `agent:${resolvedImplAgentId}` : ((session.labels["agentImplementation"] as string | undefined) ?? "agent:claude");
-      const removeLabels = readyForHumanLabel ? [readyForHumanLabel] : [];
-      for (const label of removeLabels) {
-        await workItemStore.enqueue({
-          idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:remove", label),
-          topic: "gh:label:remove",
-          payload: { topic: "gh:label:remove", owner, repo, issueNumber, label },
-          now,
-        });
-      }
-      for (const label of [queueStatusLabel, implAgentLabel]) {
-        await workItemStore.enqueue({
-          idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:add", label),
-          topic: "gh:label:add",
-          payload: { topic: "gh:label:add", owner, repo, issueNumber, label },
-          now,
-        });
-      }
-    }
-
-    // Public status comment: announce the operator's decision. Uses the REDACTED
-    // display command (never the exact command — docs §2.4); the operator note is
-    // bounded and path-sanitized above. If no display form was stored (e.g. a
-    // legacy/manual DB row — readStoredToolRequest accepts any object), re-redact
-    // the exact command rather than posting it verbatim, since the later
-    // sanitizeBody only strips paths and would let token/secret flag values leak.
-    const displayCommand =
-      typeof existing["displayCommand"] === "string" && existing["displayCommand"].trim().length > 0
-        ? existing["displayCommand"]
-        : typeof existing["command"] === "string" && existing["command"].trim().length > 0
-          ? redactCommand(existing["command"])
-          : "(unspecified)";
-    // issue #674 review: `resumingAfterPlainReject` requeues the task, but the
-    // rejected command was never run and no side effects were ever produced or
-    // pushed — only the rejection's requeue-eligibility is being consumed (see
-    // the `resolvedToolRequest` comment above). Reporting this the same way as a
-    // real manual-done would falsely tell readers the operator ran the command
-    // and pushed its effects. Give it its own outcome label so the public
-    // comment, audit event, and machine-readable output all describe what
-    // actually happened: the branch is being resumed, not the command.
-    const resolutionOutcome = resumingAfterPlainReject
-      ? "requeued_after_rejection"
-      : action === "manual-done"
-        ? "manual_done"
-        : "rejected";
-    let commentBody = resumingAfterPlainReject
-      ? `🔁 **Tool Request rejection requeued for implementation.**\n\n` +
-        `Requested command: \`${displayCommand}\`\n\n` +
-        `The command was rejected and was never run — no side effects were produced. The existing pushed issue branch is being resumed as pre-PR implementation work, and the task has been re-queued for implementation.`
-      : action === "manual-done"
-        ? `✅ **Tool Request marked as manually completed by operator.**\n\n` +
-          `Requested command: \`${displayCommand}\`\n\n` +
-          `This does not approve the command for future automated runs. It signals that the operator has already run the command externally and made the side effects visible to the repository (committed and pushed). The task has been re-queued for implementation.\n\n` +
-          `If the agent re-requests the same command, the repository state still appears unchanged — verify that the expected changed files were committed and pushed before this resolve.`
-        : requeue
-          ? `🚫 **Tool Request rejected by operator — result returned to the agent.**\n\n` +
-            `Requested command: \`${displayCommand}\`\n\n` +
-            `The command will not be actioned automatically. The rejection has been delivered to the ` +
-            `requesting agent as continuation context and the task has been re-queued for implementation.`
-          : `🚫 **Tool Request rejected by operator — task remains parked for human review.**\n\n` +
-            `Requested command: \`${displayCommand}\`\n\n` +
-            `The command will not be actioned automatically. The rejection was recorded, but the task ` +
-            `could not be safely requeued for implementation and remains a human handoff.` +
-            (requeueGuardPublicReason !== undefined
-              ? `\n\n**Blocking reason:**\n\n> ${requeueGuardPublicReason.replace(/\n/g, "\n> ")}`
-              : "");
-    if (boundedMessage !== undefined) {
-      commentBody += `\n\n> ${boundedMessage.replace(/\n/g, "\n> ")}`;
-    }
-    commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-    await workItemStore.enqueue({
-      idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-resolve", action),
-      topic: "gh:comment",
-      payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-      now,
-    });
-
-    await store.appendEvent({
-      task: { sessionId, issueNumber },
-      type: "tool_request_resolved",
-      runId,
-      message: `Operator resolved Tool Request for issue #${issueNumber} (action: ${action}, outcome: ${resolutionOutcome})`,
-      data: {
-        action,
-        outcome: resolutionOutcome,
-        requeued: requeue,
-        previousStatus: task.status,
-        previousPhase: task.phase,
-        hasMessage: boundedMessage !== undefined,
-        ...(requeueGuardBlockedMessage !== undefined ? { requeueBlockedReason: requeueGuardBlockedMessage } : {}),
-      },
-      createdAt: now,
-    });
-
-    emit({
-      ok: true,
-      sessionId,
-      issueNumber,
-      action,
-      outcome: resolutionOutcome,
-      status: result.value.status,
-      phase: result.value.phase,
-      previousStatus: task.status,
-      previousPhase: task.phase,
-      requeued: requeue,
-      message: boundedMessage ?? null,
-      ...(requeueGuardBlockedMessage !== undefined ? { requeueBlockedReason: requeueGuardBlockedMessage } : {}),
-    });
+    // Both a definite refusal and an indeterminate post-resolution failure are
+    // exit-1 operator errors on this surface, exactly as they were when the
+    // handler called `die()` in place (the result's `reason`/`effect` split
+    // exists for the callers that must decide whether a retry is safe).
+    die(result.summary);
   } finally {
     store.close();
     outboxStore.close();
@@ -11060,41 +12761,23 @@ async function runToolRequestResolve(argv: string[]): Promise<void> {
 // event; public comments expose only the redacted command and the outcome.
 // ---------------------------------------------------------------------------
 
-// Execution budget and capture buffer for a granted command. The buffer matches
-// the verification/dependency-sync ceilings so a verbose-but-successful command
-// is not misreported as a failure by overflowing Node's default exec buffer.
-const GRANT_EXEC_DEFAULT_TIMEOUT_MS = 120_000;
-const GRANT_EXEC_MAX_BUFFER_BYTES = 80 * 1024 * 1024;
-
-/** Disposition for the changes a guided run produces (issue #430, redesign §4.3).
- *   - `keep`  : leave produced changes on the issue branch for the operator to
- *               handle (the pre-redesign behavior; the safe default).
- *   - `commit`: the orchestrator commits and pushes them on the issue branch and
- *               re-queues — the central improvement over the old `grant`.
- *   - `discard`: revert the produced changes (partial-diff snapshot preserved). */
-const GUIDED_RUN_DISPOSITIONS = ["keep", "commit", "discard"] as const;
-type GuidedRunDisposition = (typeof GUIDED_RUN_DISPOSITIONS)[number];
-
+/**
+ * Argv-shaped arguments for `admin tool-request run` / `grant`.
+ *
+ * Split in two on purpose (issue #1029): {@link ToolRequestGrantArgs.request} is
+ * the typed operation request `runToolRequestRun` takes, and everything beside
+ * it is shell-only — where the session file, the database, and the repo lock
+ * live, plus the preview flag that becomes `OperationContext.confirmed`. None of
+ * the shell-only fields is a parameter the core (or any other surface) can set.
+ */
 interface ToolRequestGrantArgs {
   sessionId: string;
   issueNumber: number;
-  command: string | undefined;
-  ttlSeconds: number | undefined;
-  maxUses: number | undefined;
-  disposition: GuidedRunDisposition;
+  request: ToolRequestRunRequest;
   sessionsPath: string;
   dbPath: string | undefined;
   lockDir: string | undefined;
   dryRun: boolean;
-  /** Operator-chosen outcome for changes the granted command leaves behind
-   * (issue #419). Undefined preserves the legacy behavior: changes are left on
-   * the issue branch for the operator to commit/push manually. */
-  onChanges: RepoChangeAction | undefined;
-  /** Required to proceed with the destructive `--on-changes discard`. */
-  confirmDiscard: boolean;
-  /** Allow `--on-changes commit` to include files outside the request's
-   * expected files (they are surfaced and refused without this). */
-  allowUnexpected: boolean;
 }
 
 function parseToolRequestGrantArgs(argv: string[]): ToolRequestGrantArgs | { error: string } {
@@ -11162,32 +12845,85 @@ function parseToolRequestGrantArgs(argv: string[]): ToolRequestGrantArgs | { err
   return {
     sessionId: opts.sessionId,
     issueNumber: opts.issueNumber!,
-    command: args["command"],
-    ttlSeconds,
-    maxUses,
-    disposition,
+    request: {
+      command: args["command"],
+      ttlSeconds,
+      maxUses,
+      disposition,
+      onChanges,
+      confirmDiscard: opts.flags.has("confirm-discard"),
+      allowUnexpected: opts.flags.has("allow-unexpected"),
+    },
     sessionsPath: opts.sessionsPath,
     dbPath: opts.dbPath,
     lockDir: args["lock-dir"],
     dryRun: opts.dryRun,
-    onChanges,
-    confirmDiscard: opts.flags.has("confirm-discard"),
-    allowUnexpected: opts.flags.has("allow-unexpected"),
   };
 }
 
+/**
+ * Build the injected operation context for one guided run (issue #1029).
+ *
+ * Everything the core is not allowed to construct for itself — stores, the repo
+ * lock, command execution, worktree resolution, artifact I/O, the clock — is
+ * assembled by the shared runtime builder (issue #1031), so this surface and
+ * ChatOps drive the same core over the same seams. What stays here is the
+ * *trusted* half: an `admin-cli` invocation by the shell operator.
+ */
+function toolRequestRunContext(options: {
+  session: ResolvedSession;
+  sessionId: string;
+  issueNumber: number;
+  confirmed: boolean;
+  requestId: string;
+  store: ToolRequestRunTaskPort;
+  outboxStore: OutboxStore;
+  lockStore: RepoLockStore;
+  responseAction: "guided-run" | "grant";
+}): ToolRequestRunContext {
+  return toolRequestRunOperationContext(
+    {
+      surface: "admin-cli",
+      actor: { kind: "human", id: "admin" },
+      sessionId: options.sessionId,
+      issueNumber: options.issueNumber,
+      requestId: options.requestId,
+      confirmed: options.confirmed,
+      deadlineMs: null,
+    },
+    {
+      session: options.session,
+      tasks: options.store,
+      outbox: options.outboxStore,
+      repoLock: options.lockStore,
+      responseAction: options.responseAction,
+      runIdPrefix: "admin-tool-request-grant",
+    },
+  );
+}
+
+/**
+ * `admin tool-request run` / `tool-request grant` — the CLI shell over the
+ * callable `tool-request.run` core (issue #1029).
+ *
+ * Argv parsing, session resolution, store construction, rendering and exit-code
+ * mapping live here; every business rule lives in `runToolRequestRun`. A
+ * `rejected` or `failed` result becomes the same `die()` message (and the same
+ * exit code) the pre-extraction handler printed, and an `executed` result's
+ * `data` is the payload it emitted verbatim.
+ */
 async function runToolRequestGrant(argv: string[], surface: "grant" | "run" = "grant"): Promise<void> {
   const parsed = parseToolRequestGrantArgs(argv);
   if ("error" in parsed) die(parsed.error);
 
-  const { sessionId, issueNumber, command, ttlSeconds, maxUses, disposition, sessionsPath, dbPath, lockDir, dryRun, onChanges, confirmDiscard, allowUnexpected } = parsed;
+  const { sessionId, issueNumber, request, sessionsPath, dbPath, lockDir, dryRun } = parsed;
 
   // The redesigned operator surface is the "guided run" (`tool-request run`,
   // issue #430); `tool-request grant` is retained as a deprecated alias. The two
-  // share this engine but tag their operator-response record differently so the
+  // share one core but tag their operator-response record differently so the
   // continuation prompt reads naturally ("guided-run (changes committed)" vs the
   // legacy "grant"). The grant scope/hash authorization primitive is unchanged.
-  const actionLabel = surface === "run" ? "guided-run" : "grant";
+  const responseAction = surface === "run" ? "guided-run" : "grant";
 
   let registry: JsonSessionRegistry;
   try {
@@ -11201,2448 +12937,38 @@ async function runToolRequestGrant(argv: string[], surface: "grant" | "run" = "g
     die(describeUnresolvedSessionId(registry, sessionId, sessionsPath));
   }
 
-  const now = new Date().toISOString();
   const store = new SqliteTaskStore(dbPath);
   const outboxStore = new SqliteOutboxStore(dbPath);
-
-  // Granted commands mutate the shared checkout, so they must respect the same
-  // single-worker concurrency control as workflow executions. The lock is
-  // acquired below (after validation, before the preflight) and held across the
-  // preflight, command execution, and post-probe. `releaseLock` is invoked both
-  // on the normal-completion paths (via the finally below) and before every
-  // die() inside the critical section (via `lockedDie`), since die() calls
-  // process.exit() which bypasses finally.
   const lockStore = new RepoLockStore(lockDir);
-  const GRANT_LOCK_CONTEXT_ID = "admin-tool-request-grant";
-  let lockHeld = false;
-  const releaseLock = (): void => {
-    if (lockHeld) {
-      lockStore.release(GRANT_LOCK_CONTEXT_ID, sessionId);
-      lockHeld = false;
-    }
-  };
-  // Declared as a function (not a const arrow) so TypeScript's never-return
-  // control-flow analysis narrows unions after `lockedDie(...)` calls the same
-  // way the imported `die` does (e.g. `if (!result.ok) lockedDie(...)` leaves
-  // `result` narrowed to the success branch below).
-  function lockedDie(message: string): never {
-    releaseLock();
-    die(message);
-  }
 
   try {
-    const task = await store.getTask({ sessionId, issueNumber });
-    if (!task) {
-      die(`Task not found: session "${sessionId}", issue #${issueNumber}`);
-    }
-
-    const existing = readStoredToolRequest(task);
-    if (!existing) {
-      die(`Issue #${issueNumber} in session "${sessionId}" has no Tool Request to grant.`);
-    }
-    if (existing["resolved"] === true) {
-      die(`Tool Request for issue #${issueNumber} in session "${sessionId}" is already resolved.`);
-    }
-    if (task.status === "claimed" || task.status === "running") {
-      die(
-        `Task #${issueNumber} in session "${sessionId}" is currently ${task.status}` +
-          (task.ownerRunId ? ` (owner: ${task.ownerRunId})` : "") +
-          `. Refusing to grant against an active task. Wait for it to complete or recover it first.`,
-      );
-    }
-
-    const requestedCommand = typeof existing["command"] === "string" ? existing["command"].trim() : "";
-    if (requestedCommand.length === 0) {
-      die(`Tool Request for issue #${issueNumber} has no recorded command to grant.`);
-    }
-
-    // The granted command defaults to the exact requested command. Grants are
-    // exact-command only (a non-goal of this feature is broad/wildcard approval),
-    // so an operator-supplied --command must be the SAME command (ignoring only
-    // insignificant whitespace) — never a different or broadened one.
-    const grantedCommand = (command ?? requestedCommand).trim();
-    if (grantedCommand.length === 0) {
-      die(`--command must not be empty.`);
-    }
-    if (normalizeCommand(grantedCommand) !== normalizeCommand(requestedCommand)) {
-      die(
-        `Grants are exact-command only: --command must equal the requested command for issue #${issueNumber}. ` +
-          `Requested (redacted): \`${redactCommand(requestedCommand)}\`. ` +
-          `If a different command is needed, reject this request and have the agent re-request it.`,
-      );
-    }
-
-    // Fail-closed: if the pre-request partial-diff capture failed during the
-    // implementation handoff, the source edits that prompted this Tool Request
-    // were NOT preserved on the issue branch or in a reappliable patch. Running
-    // the command now would execute against old source, and requeueing would
-    // cause the next implementation run to repeat the same edits and the same
-    // Tool Request indefinitely — exactly the loop observed in issue #629.
-    // The operator must recover the source edits (from any preserved branch or
-    // run artifacts), apply them to the issue branch, and re-request the command.
-    const pendingCaptureFailed =
-      typeof existing["partialDiffCaptureFailed"] === "string"
-        ? (existing["partialDiffCaptureFailed"] as string)
-        : null;
-    // A `partialDiffCaptureFailed` marker does not always mean the edits are
-    // lost: new-impl and worktree handoffs commit and push the staged work to
-    // `preservedBranch` even when the later diff/write step fails. When a
-    // preserved branch exists the subsequent grant path will check out that
-    // branch (line ~7793 `alreadyOnBranch`), so the command runs against the
-    // correct source. Only block when no usable preserved branch exists and the
-    // patch-capture path would therefore be the sole recovery mechanism.
-    const preservedBranchForGrant =
-      typeof existing["preservedBranch"] === "string"
-        ? (existing["preservedBranch"] as string)
-        : null;
-    if (pendingCaptureFailed !== null && preservedBranchForGrant === null) {
-      die(
-        `Refusing to execute the guided command for issue #${issueNumber}: the ` +
-          `pre-request partial-diff capture failed during the implementation handoff, ` +
-          `so the source edits that require this command were not preserved. Executing ` +
-          `the command without them would run against old source and re-queuing would ` +
-          `cause the next implementation to repeat the same work (issue #629).\n` +
-          `Capture failure: ${pendingCaptureFailed.slice(0, 300)}\n` +
-          `Recover the source edits from any preserved branch or run artifacts, apply ` +
-          `them to the issue branch, then re-request the command.`,
-      );
-    }
-
-    const candidate: GrantCandidate = {
-      sessionId,
-      issueNumber,
-      phase: task.phase,
-      repoRoot: session.repoRoot,
-      command: grantedCommand,
-    };
-
-    // Reuse guard: a grant for this exact command may already exist on the task
-    // (e.g. a prior grant whose execution failed left the request unresolved).
-    // Grants are one-shot, so a previously-issued grant for the same scoped
-    // command is never silently re-run — refuse and tell the operator to grant a
-    // corrected command or reject. A stored grant for a DIFFERENT command does
-    // not match (scope-mismatch) and does not block a fresh grant.
-    //
-    // Exception 1 (issue #419 review): a disposition-only retry. When the
-    // prior grant's command already ran and produced changes, but the guided
-    // `--on-changes` disposition was refused for a CORRECTABLE reason (a discard
-    // without `--confirm-discard`, or a commit with unexpected files but no
-    // `--allow-unexpected`), the side effects are already on disk and the operator
-    // just needs to re-pick/authorize the disposition. Re-running the command
-    // would duplicate its side effects and violate one-shot, so instead reuse the
-    // consumed grant and apply the freshly-supplied disposition to the existing
-    // changes WITHOUT re-executing — see `dispositionRetry` below.
-    //
-    // Exception 2 (issue #490): a fresh Tool Request instance with the same
-    // command. After a successful guided-run the task is requeued; the agent may
-    // then emit a new Tool Request for the same command after another fix pass.
-    // The stored grant was for the EARLIER request. If the current Tool Request's
-    // `requestedAt` is after the stored grant's `grantedAt`, it must be a new
-    // instance — the operator should be allowed to approve it with a fresh grant.
-    let dispositionRetry = false;
-    let reusableGrant: ToolRequestGrant | undefined;
-    const storedGrantRaw = task.context["toolRequestGrant"];
-    if (storedGrantRaw && typeof storedGrantRaw === "object" && !Array.isArray(storedGrantRaw)) {
-      const prior = storedGrantRaw as unknown as ToolRequestGrant;
-      const priorMatch = grantMatches(prior, candidate, now);
-      if (priorMatch.ok || priorMatch.reason !== "scope-mismatch") {
-        // Exception 2: the current Tool Request was submitted AFTER the stored
-        // grant was issued — it is a distinct instance, not a reuse attempt.
-        const currentRequestedAt =
-          typeof existing["requestedAt"] === "string" ? existing["requestedAt"] : "";
-        const isFreshToolRequest =
-          currentRequestedAt.length > 0 &&
-          new Date(currentRequestedAt).getTime() > new Date(prior.grantedAt).getTime();
-        if (!isFreshToolRequest) {
-          const priorChange = task.context["toolRequestChangeAction"];
-          const correctableRefusal =
-            priorChange !== null &&
-            typeof priorChange === "object" &&
-            !Array.isArray(priorChange) &&
-            (priorChange as Record<string, unknown>)["outcome"] === "refused" &&
-            (priorChange as Record<string, unknown>)["correctable"] === true;
-          if (onChanges !== undefined && correctableRefusal) {
-            dispositionRetry = true;
-            reusableGrant = prior;
-          } else {
-            die(
-              `A grant for this exact command was already issued for issue #${issueNumber} ` +
-                `(status: ${grantStatus(prior, now)}). Grants are one-shot and cannot be reused. ` +
-                `Grant a corrected command, or use 'tool-request resolve --action reject'.`,
-            );
-          }
-        }
-      }
-    }
-
-    const displayCommand =
-      typeof existing["displayCommand"] === "string" && existing["displayCommand"].trim().length > 0
-        ? existing["displayCommand"].trim()
-        : redactCommand(grantedCommand);
-
-    // A disposition-only retry reuses the already-consumed prior grant (the
-    // command is not re-run), so it must NOT mint a fresh grant.
-    const grant =
-      dispositionRetry && reusableGrant
-        ? reusableGrant
-        : createToolRequestGrant({
-            sessionId,
-            issueNumber,
-            phase: task.phase,
-            repoRoot: session.repoRoot,
-            command: grantedCommand,
-            displayCommand,
-            grantedBy: "admin",
-            ...(ttlSeconds !== undefined ? { ttlMs: ttlSeconds * 1000 } : {}),
-            ...(maxUses !== undefined ? { maxUses } : {}),
-            now,
-          });
-
-    // Sanity: the grant we just minted must authorize the candidate. (A failure
-    // here would indicate a hashing/scoping bug, not operator error.) Skipped for
-    // a disposition-only retry, which deliberately reuses an already-consumed (and
-    // possibly expired) grant — authorization to RUN the command is not required
-    // because the command is not re-run.
-    if (!dispositionRetry) {
-      const auth = grantMatches(grant, candidate, now);
-      if (!auth.ok) {
-        die(`Internal error: freshly created grant does not authorize the command (${auth.detail}).`);
-      }
-    }
-
-    // Take the repo lock before the preflight so the dirty-tree/base-ahead probes,
-    // the command execution, and the post-probe all run as one critical section.
-    // Refuse if another workflow execution for this session already holds it:
-    // running a checkout-mutating command alongside an active worker would race
-    // with its branch/dirty-tree operations and bypass single-worker concurrency.
-    const acquired = lockStore.acquire(GRANT_LOCK_CONTEXT_ID, sessionId, now);
-    if (!acquired.locked) {
-      die(
-        `Refusing to execute the granted command for issue #${issueNumber}: the repo lock for session ` +
-          `'${sessionId}' is held by context '${acquired.ownerContextId}' (since ${acquired.ownerStartedAt}). ` +
-          `A worker is active on this checkout; wait for it to finish, then re-run this grant.`,
-      );
-    }
-    lockHeld = true;
-
-    // Where the granted command and all its working-tree git operations run. The
-    // implementation phase (issue #732) checks `ai/issue-<n>` out in its own
-    // per-issue worktree UNCONDITIONALLY, and a Tool Request handoff committed the
-    // partial work there, so the issue branch is ALREADY checked out away from the
-    // canonical checkout. Running the grant in `session.repoRoot` would make
-    // `moveToToolRequestBranch`'s `git checkout ai/issue-<n>` fail — git refuses to
-    // check a branch out in two worktrees — and the command's side effects belong on
-    // the issue branch beside the agent's edits, not the canonical tree (issue #454
-    // review). Resolve the per-issue worktree and run there whenever one is actually
-    // registered for this issue; fall back to the canonical checkout only when no
-    // worktree entry exists yet (e.g. the run failed before Step 0.6 materialized
-    // one).
-    let grantRepoCwd = session.repoRoot;
-    {
-      let worktreeRoot: string;
-      try {
-        worktreeRoot = resolveWorktreeRoot({ sessionRoot: session.worktrees?.root });
-      } catch (err) {
-        lockedDie(
-          `Refusing to execute the granted command for issue #${issueNumber}: the session enables per-issue ` +
-            `worktrees but its worktree root is misconfigured: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      const worktreePath = canonicalizePath(issueWorktreePath(worktreeRoot, sessionId, issueNumber));
-      const listed = listWorktrees(session.repoRoot);
-      const entry = listed.ok
-        ? listed.worktrees.find((w) => canonicalizePath(w.path) === worktreePath)
-        : undefined;
-      if (entry && !entry.prunable && existsSync(worktreePath)) {
-        grantRepoCwd = worktreePath;
-      }
-    }
-    // True when the grant runs in a per-issue worktree rather than the canonical
-    // checkout — used to skip shared-checkout-only tidy-up (e.g. checking the base
-    // branch back out) that would fail or move the worktree off its issue branch.
-    const worktreeGrant = grantRepoCwd !== session.repoRoot;
-
-    // A clean worktree is required before execution: the granted command commonly
-    // mutates the repo (e.g. `npm install` rewriting lockfiles), and on success
-    // the task is re-queued into the implementation lane whose preflight aborts a
-    // dirty tree. Running on a dirty tree would also mix unrelated local edits
-    // into whatever the command produces. Only block on a positive dirty signal;
-    // if git can't be probed (repoRoot is not a checkout) proceed rather than guess.
-    // A disposition-only retry expects a dirty tree — it is the prior command's
-    // output that we are now dispositioning — so the clean-tree precondition does
-    // not apply (the command is not re-run on it).
-    const statusProbe = probe("git", ["status", "--porcelain"], grantRepoCwd);
-    if (!dispositionRetry && statusProbe.ok && statusProbe.output.length > 0) {
-      lockedDie(
-        `Refusing to execute the granted command for issue #${issueNumber}: the ${worktreeGrant ? "issue worktree" : "session checkout"} ` +
-          `(${grantRepoCwd}) is dirty. Commit or discard local changes so the command runs from a ` +
-          `clean tree, then re-run this grant.\nWorktree:\n${statusProbe.output.slice(0, 300)}`,
-      );
-    }
-    // A clean worktree is not sufficient when we will requeue on success: a local
-    // base branch ahead of origin would leak unpushed commits into later issue
-    // branches via the implementation preflight (mirrors tool-request resolve).
-    //
-    // Only on the shared-checkout path. When the grant runs in a per-issue worktree
-    // (issue #454/#455), the requeued implementation executes in that worktree and
-    // starts from `origin/<base>` or the recorded resume branch — it never branches
-    // off the canonical checkout's local base — so an unrelated commit on the
-    // canonical `main` cannot leak into the issue branch. The base-ahead comparison
-    // here reads the shared `main` ref (`origin/main..main`) regardless of
-    // `grantRepoCwd`, so leaving it active would refuse valid worktree grants solely
-    // because the canonical checkout's base is ahead (issue #455 review).
-    const baseBranch = session.baseBranch ?? "main";
-    if (!worktreeGrant) {
-      const aheadProbe = probe("git", ["rev-list", "--count", `origin/${baseBranch}..${baseBranch}`], grantRepoCwd);
-      if (aheadProbe.ok) {
-        const aheadCount = Number.parseInt(aheadProbe.output.trim(), 10);
-        if (Number.isFinite(aheadCount) && aheadCount > 0) {
-          // Never tell the operator to push the base branch: committing Tool Request
-          // side effects to the base is exactly the error this guard prevents (issue
-          // #316). Direct them to move the commits onto the issue branch, or drop them.
-          lockedDie(
-            `Refusing to execute the granted command for issue #${issueNumber}: the session's local base ` +
-              `branch '${baseBranch}' is ${aheadCount} commit(s) ahead of origin/${baseBranch}. A successful ` +
-              `grant re-queues the task and the implementation preflight branches each issue off this local ` +
-              `base, so an unpushed base commit would leak into later issue branches. Move those commit(s) ` +
-              `onto the issue branch, or drop them — do NOT push '${baseBranch}' — then re-run this grant.`,
-          );
-        }
-      }
-    }
-
-    // The granted command's side effects must land on the issue branch, never the
-    // base branch (issue #316): the existing PR head branch when one exists, else
-    // the conventional `ai/issue-<n>` branch (created from the base in the
-    // initial-implementation case where no PR exists yet).
-    const workBranch = resolveToolRequestWorkBranch(task, issueNumber);
-
-    if (dryRun) {
-      emit({
-        ok: true,
-        dryRun: true,
+    const result = await runToolRequestRun({
+      request,
+      context: toolRequestRunContext({
+        session,
         sessionId,
         issueNumber,
-        action: actionLabel,
-        branch: workBranch,
-        grant: {
-          phase: grant.phase,
-          repoRoot: grant.repoRoot,
-          commandHash: grant.commandHash,
-          displayCommand: grant.displayCommand,
-          expiresAt: grant.expiresAt,
-          maxUses: grant.maxUses,
-        },
-        disposition,
-        wouldExecute: true,
-      });
-      return;
-    }
-
-    // Move the checkout onto the issue branch before running anything, inside this
-    // same locked critical section. Creating/checking out the branch here is what
-    // keeps the side effects off the base branch (issue #316). Fail closed if the
-    // checkout cannot safely move there.
-    // In dependency-start-point mode the issue branch must be rebuilt on the
-    // blocker PR head, not the base branch (issue #316 review) — the implementation
-    // handler deleted the temporary branch at handoff and recorded the blocker head.
-    const depStartPoint = resolveToolRequestDependencyHead(task);
-    // Whether `workBranch` is the task's recorded PR head (vs the conventional
-    // `ai/issue-<n>` name). A recorded PR head that exists nowhere must fail
-    // closed rather than be rebuilt from the base (issue #316 review).
-    const { branch: recordedPrBranch } = resolvePrContext(task);
-    const fromRecordedPr = !!recordedPrBranch && recordedPrBranch.trim() === workBranch;
-    const moved = moveToToolRequestBranch(
-      grantRepoCwd,
-      workBranch,
-      baseBranch,
-      depStartPoint,
-      fromRecordedPr,
-    );
-    if (!moved.ok) {
-      lockedDie(
-        `Refusing to execute the granted command for issue #${issueNumber}: could not move the checkout ` +
-          `to the issue branch '${workBranch}' (so the command never runs on the base branch '${baseBranch}'). ` +
-          `${moved.error}`,
-      );
-    }
-    // HEAD on the work branch before the command runs, so we can tell afterwards
-    // whether the command committed onto the issue branch (clean tree but advanced
-    // HEAD) versus left only uncommitted changes versus was a true no-op.
-    const headBeforeProbe = probe("git", ["rev-parse", "HEAD"], grantRepoCwd);
-    // Base branch SHA before the command runs. The post-failure safety check
-    // (issue #678 review) cannot rely solely on `origin/<base>..<base>` being 0:
-    // a command that checks out the base, commits, pushes, then returns to the
-    // issue branch leaves that ahead-count at 0 because origin now includes the
-    // pushed commit, even though the base ref itself moved. Comparing against
-    // this snapshot catches that case regardless of origin's sync state.
-    // Captured by ref name, so it resolves correctly even though `grantRepoCwd`
-    // is not currently checked out onto `baseBranch`.
-    const baseShaBeforeProbe = probe("git", ["rev-parse", baseBranch], grantRepoCwd);
-    // Remote-tracking snapshot of the base branch before the command runs.
-    // Captured unconditionally, including in worktree mode: a command can move
-    // the remote base directly via a refspec push (e.g. `git push origin
-    // ai/issue-<n>:main`) without ever checking out or moving the *local* base
-    // branch, so it never needs the canonical checkout the worktree-mode skips
-    // above assume. After such a push Git updates the local `origin/<base>`
-    // tracking ref to match, while `origin/<base>..<base>` reads 0 (origin now
-    // contains the pushed commit) and the local base SHA is untouched — missing
-    // both existing safety checks entirely (issue #678 review). Comparing this
-    // snapshot against the post-command ref catches it.
-    const baseRemoteShaBeforeProbe = probe("git", ["rev-parse", `origin/${baseBranch}`], grantRepoCwd);
-
-    // Apply the preserved source-edit patch from the implementation handoff,
-    // if one was captured (shared-checkout mode, issue #629).
-    //
-    // In shared-checkout mode the handoff restores the worktree to base and
-    // deletes the issue branch after writing a patch; the source edits exist
-    // ONLY in that patch. The command may depend on those edits (e.g.
-    // `node gen-workbook.mjs` where gen-workbook.mjs was edited), so the patch
-    // must be applied — and staged — BEFORE the command runs so the command sees
-    // the edited source, and `--disposition commit` captures both source edits
-    // and command output in a single commit on the issue branch (criterion 4,
-    // issue #629).
-    //
-    // In worktree mode (`preservedBranch` is set) the WIP commit on the issue
-    // branch already carries the source edits, so no patch application is needed.
-    // A disposition-only retry skips the apply: the command already ran in the
-    // prior attempt and the edits are on disk.
-    // Hoist patchPath outside the dispositionRetry guard so the guided discard
-    // path (P1) and classification path (P2) below can reference it (issue #629).
-    const patchFilename =
-      typeof existing["partialDiffArtifact"] === "string"
-        ? (existing["partialDiffArtifact"] as string)
-        : null;
-    const handoffArtifactDir =
-      typeof task.context["artifactDir"] === "string"
-        ? (task.context["artifactDir"] as string)
-        : null;
-    const alreadyOnBranch = typeof existing["preservedBranch"] === "string";
-    const patchPath =
-      patchFilename !== null && handoffArtifactDir !== null && !alreadyOnBranch
-        ? join(handoffArtifactDir, patchFilename)
-        : null;
-    // Files the patch staged — used to classify them as pre-existing/known (P2)
-    // and to re-apply them after a discard removes command output (P1).
-    let appliedPatchFiles: string[] = [];
-    if (!dispositionRetry) {
-      if (patchPath !== null) {
-        if (!existsSync(patchPath)) {
-          lockedDie(
-            `Refusing to execute the guided command for issue #${issueNumber}: the ` +
-              `preserved source-edits patch (${patchPath}) does not exist. ` +
-              `Apply it manually before re-running this grant.`,
-          );
-        }
-        const patched = probe("git", ["apply", "--index", patchPath], grantRepoCwd);
-        if (!patched.ok) {
-          lockedDie(
-            `Refusing to execute the guided command for issue #${issueNumber}: ` +
-              `'git apply --index' of the source-edits patch failed: ${patched.output.slice(0, 300)}. ` +
-              `Apply the patch manually at ${patchPath} before re-running.`,
-          );
-        }
-        // Record which files the patch staged so guided change handling can
-        // treat them as known (not unexpected) and discard can re-apply them.
-        const patchedNamesProbe = probe("git", ["diff", "--cached", "--name-only"], grantRepoCwd);
-        if (patchedNamesProbe.ok && patchedNamesProbe.output.length > 0) {
-          appliedPatchFiles = patchedNamesProbe.output.split("\n").filter(Boolean);
-        }
-      }
-    }
-
-    // Execute the EXACT granted command — handler-owned, outside the agent tool
-    // surface. Run it through a shell so the operator's approved command is
-    // interpreted with normal shell semantics: leading environment assignments
-    // (e.g. `NPM_TOKEN=... npm install`), operators like `&&`/`|`, and quoting all
-    // behave as written. Tokenizing into an argv and running with execFileSync
-    // would instead try to exec a binary literally named `NPM_TOKEN=...` or pass
-    // `&&` as an argument, so the granted command would fail or behave differently
-    // from the request the operator approved.
-    const executedAt = new Date().toISOString();
-    // Use the both-streams runner so the artifact captures stderr even when the
-    // command exits 0 (the grant contract records stdout/stderr/exit code for the
-    // exact command regardless of outcome); execFileSync drops success stderr.
-    //
-    // A disposition-only retry must NOT re-run the command (one-shot): the prior
-    // grant already ran it and left the changes on disk. Synthesize a successful
-    // no-op result so the flow proceeds straight to guided change handling, and
-    // reuse the already-consumed grant unchanged (`uses` is not incremented).
-    const runResult: CommandRunResult = dispositionRetry
-      ? { exitCode: 0, stdout: "", stderr: "" }
-      : bothStreamsCommandRunner.run("/bin/sh", ["-c", grantedCommand], {
-          cwd: grantRepoCwd,
-          timeout: GRANT_EXEC_DEFAULT_TIMEOUT_MS,
-          maxBuffer: GRANT_EXEC_MAX_BUFFER_BYTES,
-        });
-    const consumedGrant: ToolRequestGrant = dispositionRetry
-      ? grant
-      : {
-          ...grant,
-          uses: grant.uses + 1,
-          lastResult: { exitCode: runResult.exitCode, executedAt },
-        };
-    const success = runResult.exitCode === 0;
-    // Captured execution result folded into the operator-response record so the
-    // next implementation prompt replays what the command produced (issue #430,
-    // redesign §7). For a no-op verification command this captured output is the
-    // deliverable the agent was missing. Bounded like the local artifact above.
-    const capturedResult = {
-      exitCode: runResult.exitCode,
-      stdout: boundVerificationOutput(runResult.stdout),
-      stderr: boundVerificationOutput(runResult.stderr),
-    };
-
-    // Capture stdout/stderr/exit code in a LOCAL artifact (never public). The
-    // exact command and full output stay here; only the redacted command and the
-    // exit code reach the task event / public comment.
-    const runId = `admin-tool-request-grant-${now}`;
-    const artifactDir = runArtifactDir(session.artifactRoot, runId);
-    try {
-      mkdirSync(artifactDir, { recursive: true });
-      writeFileSync(
-        join(artifactDir, "tool-request-grant.json"),
-        JSON.stringify(
-          {
-            sessionId,
-            issueNumber,
-            runId,
-            phase: grant.phase,
-            command: grantedCommand,
-            displayCommand,
-            commandHash: grant.commandHash,
-            // A disposition-only retry reuses the prior run's output without
-            // re-executing the command; mark it so the artifact is not misread as
-            // a second execution (its stdout/stderr are empty by construction).
-            dispositionRetry,
-            exitCode: runResult.exitCode,
-            success,
-            executedAt,
-            stdout: boundVerificationOutput(runResult.stdout),
-            stderr: boundVerificationOutput(runResult.stderr),
-            grant: consumedGrant,
-          },
-          null,
-          2,
-        ),
-        "utf8",
-      );
-    } catch {
-      // Best-effort: the outcome is still recorded in the DB event below.
-    }
-
-    // Drop this run's local artifact from the working tree before requeueing.
-    // The success paths that re-queue (true no-op, `--disposition commit`) hand
-    // the task back to the implementation lane, whose preflight runs a PLAIN
-    // `git status --porcelain` (it does NOT share the `:(exclude)` pathspec used
-    // for the dirtiness probe below). The artifact (`tool-request-grant.json`)
-    // was just written under `session.artifactDir`; when the target repo does not
-    // gitignore that directory it sits in the tree as an untracked file, so the
-    // requeued preflight would abort as dirty and strand the just-requeued Tool
-    // Request (issue #430 review). Remove this run's artifact subtree only when
-    // git reports it as a working-tree change — i.e. the dir is NOT gitignored;
-    // when it is gitignored the probe is empty, nothing is removed, and the local
-    // record is preserved as before. The pre-run preflight required a fully clean
-    // tree, so this run's artifact is the only untracked artifact to clear.
-    const cleanArtifactBeforeRequeue = (): void => {
-      const artifactStatus = probe("git", ["status", "--porcelain", "--", artifactDir], session.repoRoot);
-      if (artifactStatus.ok && artifactStatus.output.length > 0) {
-        try {
-          rmSync(artifactDir, { recursive: true, force: true });
-        } catch {
-          // Best-effort: the outcome is already recorded in the DB event and the
-          // resolution context, so continuation context survives even if the
-          // artifact lingers and the next preflight has to be re-run.
-        }
-      }
-    };
-
-    const owner = session.githubOwner;
-    const repo = session.githubName;
-    // Route the label transitions and status comments below through the session's
-    // work-item provider so a non-GitHub session posts them to the work-item repo
-    // instead of stranding the legacy `gh:*` rows behind the dispatcher's failing
-    // GitHub runner; no-op passthrough for a GitHub session.
-    const workItemStore = workItemOutbox(outboxStore, session);
-
-    if (success) {
-      // The command succeeded, and (issue #316) it ran on the issue branch
-      // `workBranch`, not the base branch. Whether we can safely re-queue now
-      // depends on what it left behind on that branch:
-      //   - true no-op (clean tree, HEAD unmoved) → resolve as a grant and
-      //     re-queue, mirroring manual-done.
-      //   - changes on the issue branch (dirty tree OR a new commit on the branch)
-      //     → keep the request open and hand back to the operator: the changes are
-      //     already on the issue branch and must be committed + pushed THERE (never
-      //     the base branch). `tool-request resolve --action manual-done` re-queues
-      //     once they are landed.
-      // Exclude the session artifact directory from the dirtiness check. The
-      // local run artifact (`tool-request-grant.json`) was just written under
-      // `session.artifactDir`; when the target repo does not gitignore that
-      // directory, a bare `git status --porcelain` would report it and make a
-      // genuine no-op command look like it produced changes — routing it off the
-      // documented no-op requeue path and (under `--disposition commit`) into an
-      // artifact-only commit that fails for having no real changes (issue #430
-      // review). The `:(exclude)` pathspec drops the artifact subtree; it is a
-      // silent no-op when the dir is gitignored and so never appears anyway.
-      const afterProbe = probe(
-        "git",
-        ["status", "--porcelain", "--", ".", `:(exclude)${session.artifactDir}`],
-        grantRepoCwd,
-      );
-      const dirtyAfter = afterProbe.ok && afterProbe.output.length > 0;
-      // Did the command commit onto the issue branch (clean tree but HEAD moved)?
-      const headAfterProbe = probe("git", ["rev-parse", "HEAD"], grantRepoCwd);
-      const committedOnBranch =
-        headBeforeProbe.ok && headAfterProbe.ok && headBeforeProbe.output !== headAfterProbe.output;
-      const producedChanges = dirtyAfter || committedOnBranch;
-
-      // Defense-in-depth: even though the command ran on the issue branch, it
-      // could have checked out the base and committed to it directly (e.g.
-      // `git checkout main && git commit ...`), advancing the local base past
-      // origin. That also moves HEAD, so `producedChanges` is true — re-probe the
-      // base UNCONDITIONALLY (not only for the true-no-op case) so the base-ahead
-      // handoff below still fires. Otherwise the "changes on issue branch" path
-      // would mislabel a base commit as issue work and release the repo lock with
-      // the local base ahead of origin, leaking the unpushed commit into later
-      // issue branches via the implementation preflight (issue #316 review).
-      //
-      // Shared-checkout path only. In worktree mode (issue #454/#455) this probe
-      // reads the shared `origin/<base>..<base>` ref — which reflects the canonical
-      // checkout's local base regardless of `grantRepoCwd` — so an unrelated commit
-      // on the canonical `main` would be misread as command-induced base
-      // contamination and route this clean no-op into the base-ahead handoff,
-      // refusing a valid requeue. The requeued implementation runs in the worktree
-      // and starts from `origin/<base>` or the recorded resume branch, never the
-      // canonical local base, so no unpushed canonical commit can leak into the
-      // issue branch; and the command cannot itself advance the base in the worktree
-      // (the base branch is checked out in the canonical worktree, so `git checkout
-      // <base>` there fails). Treat the base as not ahead (issue #455 review).
-      let baseAheadCountAfter = 0;
-      if (!worktreeGrant) {
-        const aheadAfterProbe = probe(
-          "git",
-          ["rev-list", "--count", `origin/${baseBranch}..${baseBranch}`],
-          grantRepoCwd,
-        );
-        if (aheadAfterProbe.ok) {
-          const parsed = Number.parseInt(aheadAfterProbe.output.trim(), 10);
-          if (Number.isFinite(parsed) && parsed > 0) {
-            baseAheadCountAfter = parsed;
-          }
-        }
-      }
-
-      // Defense-in-depth (2): a dirty worktree only counts as issue-branch work
-      // when HEAD is still on the issue branch. A command that ran
-      // `git checkout <base> && <edit>` (without committing) leaves `dirtyAfter`
-      // true while `baseAheadCountAfter` stays 0 — no commit advanced the base — so
-      // the changes-on-issue-branch path below would mislabel base contamination as
-      // issue work and release the repo lock with the dirty tree sitting on the base
-      // branch. Probe HEAD and, when it is no longer `workBranch`, fail closed via an
-      // operator handoff that says to move/drop the changes, never push the base
-      // (issue #316 review). Fail closed too when HEAD cannot be determined. A
-      // command that also *committed* onto the base advances the count, so leave
-      // those to the base-ahead handoff below (`baseAheadCountAfter === 0` here).
-      const currentBranchAfterProbe = probe("git", ["rev-parse", "--abbrev-ref", "HEAD"], grantRepoCwd);
-      const onWorkBranchAfter = currentBranchAfterProbe.ok && currentBranchAfterProbe.output === workBranch;
-      if (producedChanges && baseAheadCountAfter === 0 && !onWorkBranchAfter) {
-        const headLabel = currentBranchAfterProbe.ok
-          ? `\`${currentBranchAfterProbe.output}\``
-          : "an undetermined branch (could not read HEAD)";
-        const result = await store.transitionTask(
-          { sessionId, issueNumber },
-          { status: task.status },
-          { status: task.status, phase: task.phase, context: { toolRequestGrant: consumedGrant }, now },
-        );
-        if (!result.ok) {
-          lockedDie(`Failed to record grant: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-        }
-
-        let commentBody =
-          `✅ **Tool Request granted command executed by operator.**\n\n` +
-          `Approved command: \`${displayCommand}\`\n\n` +
-          `The command completed successfully but left changes while HEAD was on ${headLabel}, ` +
-          `not the issue branch \`${workBranch}\`. The task was **not** re-queued automatically to ` +
-          `avoid recording base-branch contamination as issue work. Move the changes onto the issue ` +
-          `branch \`${workBranch}\` (or drop them) — do NOT push \`${baseBranch}\` — then run ` +
-          `\`tool-request resolve --action manual-done\` to re-queue from a clean tree.`;
-        commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-        await workItemStore.enqueue({
-          idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "success-off-branch-changes"),
-          topic: "gh:comment",
-          payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-          now,
-        });
-
-        await store.appendEvent({
-          task: { sessionId, issueNumber },
-          type: "tool_request_grant_executed",
-          runId,
-          message: `Operator granted and executed Tool Request command for issue #${issueNumber} (exit 0, changes left off issue branch ${workBranch})`,
-          data: {
-            exitCode: 0,
-            success: true,
-            commandHash: grant.commandHash,
-            requeued: false,
-            dirtyAfter,
-            committedOnBranch,
-            branch: workBranch,
-            headAfter: currentBranchAfterProbe.ok ? currentBranchAfterProbe.output : undefined,
-            grantedBy: grant.grantedBy,
-          },
-          createdAt: now,
-        });
-
-        emit({
-          ok: true,
-          sessionId,
-          issueNumber,
-          action: actionLabel,
-          executed: true,
-          exitCode: 0,
-          success: true,
-          status: result.value.status,
-          phase: result.value.phase,
-          requeued: false,
-          dirtyAfter,
-          committedOnBranch,
-          branch: workBranch,
-          commandHash: grant.commandHash,
-        });
-        return;
-      }
-
-      // GUIDED REPOSITORY-CHANGE HANDLING (issue #419). When the operator passed
-      // `--on-changes`, take the explicit outcome they chose for the changes the
-      // command left in the working tree, instead of always handing back the
-      // legacy "commit/push it yourself" instructions. Scoped to the dirty
-      // working-tree case (the common Tool Request shape: `npm install` and
-      // friends leave uncommitted lockfile/artifact edits). A command that
-      // self-committed onto the issue branch (`committedOnBranch` with a clean
-      // tree) still falls through to the legacy handoff below. All guided outcomes
-      // keep the task a human handoff and defer the re-queue to `tool-request
-      // resolve`, which enforces the clean-tree/pushed-branch contract. Guarded by
-      // `baseAheadCountAfter === 0` so a base-contaminating command falls through to
-      // the base-ahead handoff below instead (reaching here past the off-branch
-      // guard with the base clean also guarantees HEAD is on the issue branch).
-      if (onChanges !== undefined && dirtyAfter && baseAheadCountAfter === 0) {
-        const expectedFiles = Array.isArray(existing["expectedFiles"])
-          ? (existing["expectedFiles"] as unknown[]).filter((f): f is string => typeof f === "string")
-          : [];
-        // Applied patch files are pre-existing known edits (preserved implementation
-        // work from the handoff), not command output. Add them to the expected set so
-        // classifyChangedFiles treats them as known rather than unexpected, preventing
-        // a spurious "unexpected-files" refusal for the operator (issue #629 P2).
-        const expectedFilesWithPatch =
-          appliedPatchFiles.length > 0 ? [...expectedFiles, ...appliedPatchFiles] : expectedFiles;
-        // Artifact files are local audit records, never issue work: keep them out
-        // of any commit or discard. `.n8n-artifacts` is the conventional name; add
-        // the session's configured artifact dir too when it lives inside the repo.
-        const relArtifact = relative(session.repoRoot, session.artifactRoot);
-        const artifactInsideRepo = relArtifact.length > 0 && !relArtifact.startsWith("..") && !isAbsolute(relArtifact);
-        const ignoredPrefixes = [".n8n-artifacts"];
-        if (artifactInsideRepo) ignoredPrefixes.push(relArtifact);
-
-        // Re-read the porcelain status WITHOUT trimming: `probe` returns
-        // `stdout.trim()`, which strips the first line's leading status column
-        // (e.g. ` M package.json` → `M package.json`) and would corrupt that
-        // file's parsed path. The status columns are significant here, so parse
-        // the raw output.
-        let rawPorcelain = "";
-        try {
-          rawPorcelain = execFileSync("git", ["status", "--porcelain"], {
-            cwd: grantRepoCwd,
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "pipe"],
-          }) as string;
-        } catch {
-          // Fall back to the (trimmed) probe output if the fresh read fails.
-          rawPorcelain = afterProbe.ok ? afterProbe.output : "";
-        }
-        const changedFiles = parsePorcelainStatus(rawPorcelain);
-        const classification = classifyChangedFiles(changedFiles, expectedFilesWithPatch, ignoredPrefixes);
-        const currentBranch = currentBranchAfterProbe.ok ? currentBranchAfterProbe.output : "";
-        const plan = planRepoChange({
-          action: onChanges,
-          classification,
-          currentBranch,
-          expectedBranch: workBranch,
-          baseBranch,
-          confirmDiscard,
-          allowUnexpected,
-        });
-        const summary = summarizeClassification(classification);
-
-        // Shared finisher: record the consumed grant, post a sanitized public
-        // comment (counts + redacted command only — never paths or raw output),
-        // append an event, and emit. Keeps the task a human handoff unless a
-        // `resolution` is supplied (reject), which closes the request.
-        const finishGuided = async (
-          changeOutcome: string,
-          commentBody: string,
-          extraEventData: Record<string, unknown>,
-          resolution?: { action: "reject"; resolvedAt: string; message: string },
-        ): Promise<void> => {
-          // A refusal whose cause the operator can fix by re-running with an extra
-          // flag (`--confirm-discard` for a destructive discard, `--allow-unexpected`
-          // for a commit with unexpected files) is CORRECTABLE: the command already
-          // ran and left its changes on disk, so the disposition can be retried
-          // without re-executing (see the disposition-only retry guard above). A
-          // wrong-branch/base-branch/nothing-to-do refusal is not flagged, so the
-          // one-shot grant stays terminal for those.
-          const refusalCode = extraEventData["refusalCode"];
-          const correctable =
-            changeOutcome === "refused" &&
-            (refusalCode === "needs-confirmation" || refusalCode === "unexpected-files");
-          const context: Record<string, unknown> = {
-            toolRequestGrant: consumedGrant,
-            // Durable record of the operator's guided disposition (issue #419) so
-            // it is auditable from task context, not just the event log.
-            toolRequestChangeAction: {
-              action: onChanges,
-              outcome: changeOutcome,
-              decidedAt: now,
-              ...(changeOutcome === "refused" && refusalCode !== undefined ? { refusalCode } : {}),
-              ...(correctable ? { correctable: true } : {}),
-            },
-          };
-          if (resolution) {
-            context["toolRequest"] = { ...existing, resolved: true, resolution };
-          }
-          const result = await store.transitionTask(
-            { sessionId, issueNumber },
-            { status: task.status },
-            { status: task.status, phase: task.phase, context, now },
-          );
-          if (!result.ok) {
-            lockedDie(
-              `Failed to record grant: ${result.code}` +
-                (result.current ? ` (current status: ${result.current.status})` : ""),
-            );
-          }
-          const body = sanitizeBody(commentBody, sessionRedactionPaths(session));
-          await workItemStore.enqueue({
-            idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", `changes-${changeOutcome}`),
-            topic: "gh:comment",
-            payload: { topic: "gh:comment", owner, repo, issueNumber, body },
-            now,
-          });
-          await store.appendEvent({
-            task: { sessionId, issueNumber },
-            type: "tool_request_grant_executed",
-            runId,
-            message: `Operator granted Tool Request command for issue #${issueNumber} (exit 0, changes ${changeOutcome})`,
-            data: {
-              exitCode: 0,
-              success: true,
-              commandHash: grant.commandHash,
-              requeued: false,
-              branch: workBranch,
-              changeAction: onChanges,
-              changeOutcome,
-              expectedFileCount: classification.expected.length,
-              unexpectedFileCount: classification.unexpected.length,
-              artifactFileCount: classification.ignored.length,
-              grantedBy: grant.grantedBy,
-              ...extraEventData,
-            },
-            createdAt: now,
-          });
-          emit({
-            ok: true,
-            sessionId,
-            issueNumber,
-            action: "grant",
-            executed: true,
-            exitCode: 0,
-            success: true,
-            status: result.value.status,
-            phase: result.value.phase,
-            requeued: false,
-            branch: workBranch,
-            changeAction: onChanges,
-            changeOutcome,
-            commandHash: grant.commandHash,
-            ...extraEventData,
-          });
-        };
-
-        if (!plan.ok) {
-          // Refused plan: nothing changed on disk. Surface WHY (e.g. unexpected
-          // files, missing confirmation, wrong branch) so the operator can correct
-          // course. The request stays open.
-          await finishGuided(
-            "refused",
-            `🛠️ **Tool Request granted command executed by operator — changes need attention.**\n\n` +
-              `Approved command: \`${displayCommand}\`\n\n` +
-              `The command completed successfully and produced changes (${summary}) on the issue branch ` +
-              `\`${workBranch}\`. The requested \`${onChanges}\` action was not applied: ${plan.reason}`,
-            { refusalCode: plan.code },
-          );
-          return;
-        }
-
-        if (plan.commit) {
-          // Stage EXACTLY the classified non-artifact files (never `git add -A`) so
-          // artifacts and any not-included unexpected files stay out of the commit.
-          // For a rename, stage BOTH the destination (`path`) and the source
-          // (`origPath`): staging only the destination would commit the new file
-          // but leave the source deletion dirty, partially landing the change while
-          // reporting success (issue #419 review).
-          const filesToStage = [
-            ...classification.expected,
-            ...(allowUnexpected ? classification.unexpected : []),
-          ].flatMap((f) => (f.origPath ? [f.path, f.origPath] : [f.path]));
-          // The approved command has already run and succeeded by this point, so a
-          // `git add`/`commit` failure must NOT exit via `lockedDie` before
-          // `finishGuided` records `consumedGrant`: that would leave the one-shot
-          // grant unconsumed and re-issuable, letting the same command run again and
-          // duplicate its side effects. Instead, persist the grant as consumed, leave
-          // the changes in place for recovery, and surface the failure (no raw output
-          // in the public comment).
-          //
-          // First reset the index to HEAD so nothing the granted command may have
-          // pre-staged (e.g. `git add .n8n-artifacts/run.json`) survives into the
-          // commit. Without this, those staged paths would be committed even though
-          // `filesToStage` excludes them, violating the guarantee that artifacts and
-          // unrelated dirty files are never committed. `git reset` is mixed by
-          // default: it unstages without touching the working tree, so the changes
-          // remain on disk for recovery.
-          const unstaged = bothStreamsCommandRunner.run("git", ["reset", "--", "."], { cwd: grantRepoCwd });
-          if (unstaged.exitCode !== 0) {
-            await finishGuided(
-              "commit-failed",
-              `🛠️ **Tool Request granted command executed by operator — commit failed.**\n\n` +
-                `Approved command: \`${displayCommand}\`\n\n` +
-                `The command completed successfully and produced changes (${summary}) on the issue branch ` +
-                `\`${workBranch}\`, but preparing them for commit failed. The changes are left in place for ` +
-                `recovery; commit and push \`${workBranch}\` manually, then run ` +
-                `\`tool-request resolve --action manual-done\` to re-queue.`,
-              { committed: false, commitFailed: true, failedStep: "unstage" },
-            );
-            return;
-          }
-          const added = bothStreamsCommandRunner.run("git", ["add", "--", ...filesToStage], { cwd: grantRepoCwd });
-          if (added.exitCode !== 0) {
-            await finishGuided(
-              "commit-failed",
-              `🛠️ **Tool Request granted command executed by operator — commit failed.**\n\n` +
-                `Approved command: \`${displayCommand}\`\n\n` +
-                `The command completed successfully and produced changes (${summary}) on the issue branch ` +
-                `\`${workBranch}\`, but staging them for commit failed. The changes are left in place for ` +
-                `recovery; commit and push \`${workBranch}\` manually, then run ` +
-                `\`tool-request resolve --action manual-done\` to re-queue.`,
-              { committed: false, commitFailed: true, failedStep: "stage" },
-            );
-            return;
-          }
-          const commitMsg = `chore: apply Tool Request command output for issue #${issueNumber}`;
-          const committed = bothStreamsCommandRunner.run("git", ["commit", "--no-verify", "-m", commitMsg], { cwd: grantRepoCwd });
-          if (committed.exitCode !== 0) {
-            await finishGuided(
-              "commit-failed",
-              `🛠️ **Tool Request granted command executed by operator — commit failed.**\n\n` +
-                `Approved command: \`${displayCommand}\`\n\n` +
-                `The command completed successfully and produced changes (${summary}) on the issue branch ` +
-                `\`${workBranch}\`, but committing them failed. The changes are left staged in place for ` +
-                `recovery; commit and push \`${workBranch}\` manually, then run ` +
-                `\`tool-request resolve --action manual-done\` to re-queue.`,
-              { committed: false, commitFailed: true, failedStep: "commit" },
-            );
-            return;
-          }
-          // Push best-effort. On failure the commit is kept locally on the issue
-          // branch so the operator can recover — never reset/discard it.
-          const pushed = bothStreamsCommandRunner.run("git", ["push", "origin", workBranch], { cwd: grantRepoCwd });
-          const pushFailed = pushed.exitCode !== 0;
-          if (pushFailed) {
-            await finishGuided(
-              "committed-push-failed",
-              `🛠️ **Tool Request granted command executed by operator — committed, push failed.**\n\n` +
-                `Approved command: \`${displayCommand}\`\n\n` +
-                `The command's expected changes (${summary}) were committed to the issue branch ` +
-                `\`${workBranch}\`, but pushing to origin failed. The commit is kept locally for recovery. ` +
-                `Push \`${workBranch}\` to origin, then run \`tool-request resolve --action manual-done\` ` +
-                `to re-queue.`,
-              { pushed: false },
-            );
-            return;
-          }
-          await finishGuided(
-            "committed",
-            `✅ **Tool Request granted command executed by operator — changes committed.**\n\n` +
-              `Approved command: \`${displayCommand}\`\n\n` +
-              `The command's expected changes (${summary}) were committed to the issue branch ` +
-              `\`${workBranch}\` and pushed to origin. Run \`tool-request resolve --action manual-done\` ` +
-              `to re-queue for implementation.`,
-            { pushed: true },
-          );
-          return;
-        }
-
-        if (plan.discard) {
-          // Destructive (confirmation already enforced by planRepoChange): reset
-          // tracked files (staged or not) back to the issue branch tip and remove
-          // untracked ones, except the artifact dir (this run's local records).
-          //
-          // Artifacts are local audit records and must survive a discard (issue
-          // #419 review): a command may stage/force-add a file under the artifact
-          // dir, and a bare `git reset --hard HEAD` would delete that staged
-          // artifact before the `git clean -e` exclusion below could protect it.
-          // First unstage any classified artifact paths so the hard reset (which
-          // never touches untracked files) leaves them on disk, then exclude every
-          // ignored prefix from the clean so they are preserved there too.
-          const artifactPaths = classification.ignored.map((f) => f.path);
-          const unstagedArtifacts =
-            artifactPaths.length > 0
-              ? bothStreamsCommandRunner.run("git", ["reset", "-q", "--", ...artifactPaths], { cwd: grantRepoCwd })
-              : ({ exitCode: 0, stdout: "", stderr: "" } as CommandRunResult);
-          const reset =
-            unstagedArtifacts.exitCode === 0
-              ? bothStreamsCommandRunner.run("git", ["reset", "--hard", "HEAD"], { cwd: grantRepoCwd })
-              : unstagedArtifacts;
-          const cleanArgs = ["clean", "-fd"];
-          for (const prefix of ignoredPrefixes) cleanArgs.push("-e", prefix);
-          // Only attempt the untracked-file clean if the reset succeeded.
-          const cleaned =
-            reset.exitCode === 0
-              ? bothStreamsCommandRunner.run("git", cleanArgs, { cwd: grantRepoCwd })
-              : undefined;
-          if (reset.exitCode !== 0 || (cleaned !== undefined && cleaned.exitCode !== 0)) {
-            // Fail closed: a failed reset/clean means generated changes may remain,
-            // so do NOT claim the branch is clean. The command already ran, so still
-            // record the grant as consumed (one-shot) — but report the failure and
-            // leave recovery to the operator.
-            await finishGuided(
-              "discard-failed",
-              `🛠️ **Tool Request granted command executed by operator — discard failed.**\n\n` +
-                `Approved command: \`${displayCommand}\`\n\n` +
-                `The command produced changes (${summary}) on the issue branch \`${workBranch}\`, but ` +
-                `discarding them failed and the working tree may still contain changes. Inspect and clean ` +
-                `\`${workBranch}\` manually before re-requesting or rejecting this Tool Request.`,
-              { discarded: false, discardFailed: true },
-            );
-            return;
-          }
-          // Command output was discarded. Now restore the pre-command source edits
-          // from the implementation patch so they survive the discard and are present
-          // for the next implementation run (issue #629 P1).
-          let sourceEditsCommitted = false;
-          if (patchPath !== null && existsSync(patchPath)) {
-            const reapplied = probe("git", ["apply", "--index", patchPath], grantRepoCwd);
-            if (!reapplied.ok) {
-              await finishGuided(
-                "discard-failed",
-                `🛠️ **Tool Request granted command executed by operator — discard failed.**\n\n` +
-                  `Approved command: \`${displayCommand}\`\n\n` +
-                  `The command's generated changes were removed from the issue branch \`${workBranch}\`, but ` +
-                  `restoring the preserved source edits (implementation patch) afterwards failed. The tree is ` +
-                  `clean but the source edits are missing. Apply the patch manually before re-requesting this ` +
-                  `Tool Request.`,
-                { discarded: false, discardFailed: true, failedStep: "patch-reapply" },
-              );
-              return;
-            }
-            // Commit the restored edits so the branch is left clean — staged changes
-            // block the next resolution or implementation preflight (issue #629 P1).
-            const patchCommitted = bothStreamsCommandRunner.run(
-              "git",
-              ["commit", "--no-verify", "-m", `chore: restore source edits for issue #${issueNumber} before Tool Request discard`],
-              { cwd: grantRepoCwd },
-            );
-            if (patchCommitted.exitCode !== 0) {
-              await finishGuided(
-                "discard-failed",
-                `🛠️ **Tool Request granted command executed by operator — discard failed.**\n\n` +
-                  `Approved command: \`${displayCommand}\`\n\n` +
-                  `The command's generated changes were removed from the issue branch \`${workBranch}\` and ` +
-                  `the preserved source edits were re-applied, but committing them failed. Commit the staged ` +
-                  `source edits and push \`${workBranch}\` manually before re-requesting this Tool Request.`,
-                { discarded: false, discardFailed: true, failedStep: "patch-commit" },
-              );
-              return;
-            }
-            const patchPushed = bothStreamsCommandRunner.run("git", ["push", "origin", workBranch], { cwd: grantRepoCwd });
-            if (patchPushed.exitCode !== 0) {
-              await finishGuided(
-                "discard-failed",
-                `🛠️ **Tool Request granted command executed by operator — discard failed.**\n\n` +
-                  `Approved command: \`${displayCommand}\`\n\n` +
-                  `The command's generated changes were removed from the issue branch \`${workBranch}\`, ` +
-                  `the preserved source edits were committed, but pushing to origin failed. Push ` +
-                  `\`${workBranch}\` manually before re-requesting this Tool Request.`,
-                { discarded: false, discardFailed: true, failedStep: "patch-push" },
-              );
-              return;
-            }
-            sourceEditsCommitted = true;
-          }
-          await finishGuided(
-            "discarded",
-            `🗑️ **Tool Request granted command executed by operator — changes discarded.**\n\n` +
-              `Approved command: \`${displayCommand}\`\n\n` +
-              `The command's generated changes (${summary}) were discarded` +
-              (sourceEditsCommitted
-                ? ` and the preserved source edits were committed to the issue branch \`${workBranch}\`.`
-                : `. The issue branch \`${workBranch}\` is clean again.`) +
-              ` Re-request or reject this Tool Request as appropriate.`,
-            {},
-          );
-          return;
-        }
-
-        if (onChanges === "reject") {
-          // Close the request as rejected and leave the changes in place for the
-          // operator to handle. Mirrors `tool-request resolve --action reject`:
-          // the task stays a human handoff and is not re-queued.
-          await finishGuided(
-            "rejected",
-            `🚫 **Tool Request rejected by operator.**\n\n` +
-              `Approved command: \`${displayCommand}\`\n\n` +
-              `The command ran and produced changes (${summary}) on the issue branch \`${workBranch}\`, ` +
-              `but the Tool Request was rejected. The changes are left in place for you to commit or ` +
-              `discard manually.`,
-            {},
-            {
-              action: "reject",
-              resolvedAt: executedAt,
-              message: "Rejected via guided Tool Request change handling.",
-            },
-          );
-          return;
-        }
-
-        if (onChanges === "abort") {
-          await finishGuided(
-            "aborted",
-            `⏸️ **Tool Request granted command executed by operator — no further action.**\n\n` +
-              `Approved command: \`${displayCommand}\`\n\n` +
-              `The command ran and produced changes (${summary}) on the issue branch \`${workBranch}\`. ` +
-              `No commit, push, or discard was performed; the changes are left exactly as the command ` +
-              `produced them.`,
-            {},
-          );
-          return;
-        }
-
-        // keep: leave the changes on the issue branch, explicitly recorded.
-        await finishGuided(
-          "kept",
-          `📌 **Tool Request granted command executed by operator — changes kept.**\n\n` +
-            `Approved command: \`${displayCommand}\`\n\n` +
-            `The command's changes (${summary}) were kept on the issue branch \`${workBranch}\`. ` +
-            `Commit and push them there (never the base branch \`${baseBranch}\`), then run ` +
-            `\`tool-request resolve --action manual-done\` to re-queue from a clean tree.`,
-          {},
-        );
-        return;
-      }
-
-      // Handle a contaminated base FIRST: when the command advanced the local base
-      // past origin, fall through to the base-ahead handoff below regardless of
-      // whether it also moved HEAD or dirtied the issue branch. Only treat changes
-      // as issue-branch work when the base is clean (issue #316 review).
-      if (producedChanges && baseAheadCountAfter === 0) {
-        // SUCCESS + CHANGES ON ISSUE BRANCH. Reaching here means HEAD is still on
-        // the issue branch and the base was not contaminated (the off-branch and
-        // base-ahead guards above already failed those closed). The redesign
-        // (issue #430, §4.3) lets the operator drive the disposition explicitly
-        // instead of being handed raw git steps:
-        //   - commit  → orchestrator commits + pushes on the issue branch, then
-        //               re-queues (the central improvement over the old grant);
-        //   - discard → revert the produced changes (partial-diff snapshot kept);
-        //   - keep    → the pre-redesign behavior (operator commits by hand).
-        if (disposition === "commit") {
-          // Every failure exit below happens AFTER the approved command has
-          // already run (and may have created a local commit). Persist the
-          // consumed one-shot grant on the task before failing so the
-          // authorization is recorded as used and the operator has task context
-          // showing the execution happened — otherwise the task would look as if
-          // the grant was never consumed and the same exact command could be
-          // granted and run again, violating the one-shot grant contract (issue
-          // #430 review). Mirrors the off-branch handoff above.
-          const dieAfterRecordingConsumedGrant = async (message: string): Promise<never> => {
-            await store.transitionTask(
-              { sessionId, issueNumber },
-              { status: task.status },
-              { status: task.status, phase: task.phase, context: { toolRequestGrant: consumedGrant }, now },
-            );
-            lockedDie(message);
-          };
-          // Stage + commit any uncommitted changes; a command that already
-          // committed onto the branch (committedOnBranch) leaves a clean tree, so
-          // only commit when the tree is dirty. The commit message uses the
-          // redacted display command so no secret embedded in the exact command
-          // leaks into git history.
-          if (dirtyAfter) {
-            // Stage all produced changes, then unstage the session artifact
-            // directory. The local run artifact (under `session.artifactDir`)
-            // holds the exact command plus full stdout/stderr; when the target
-            // repo does not gitignore that directory, a bare `git add -A` would
-            // stage it and the commit + push below would leak it onto the issue
-            // branch — or turn a no-op command into an artifact-only commit. We
-            // stage with a plain `git add -A` (so produced changes are captured
-            // regardless of the repo's ignore rules) and then `git reset` the
-            // artifact dir out of the index; the reset is a silent no-op when the
-            // dir is gitignored and so was never staged.
-            const added = probe("git", ["add", "-A"], grantRepoCwd);
-            if (!added.ok) {
-              await dieAfterRecordingConsumedGrant(
-                `Refusing to commit the guided-run changes for issue #${issueNumber}: 'git add -A' failed ` +
-                  `in ${grantRepoCwd}: ${added.output}`,
-              );
-            }
-            probe("git", ["reset", "-q", "--", session.artifactDir], grantRepoCwd);
-            const committed = probe(
-              "git",
-              ["commit", "--no-verify", "-m", `Tool Request guided run: ${displayCommand}`],
-              grantRepoCwd,
-            );
-            if (!committed.ok) {
-              await dieAfterRecordingConsumedGrant(
-                `Refusing to requeue issue #${issueNumber}: 'git commit' of the guided-run changes failed ` +
-                  `in ${grantRepoCwd}: ${committed.output}`,
-              );
-            }
-          }
-          // Push so the committed side effects survive a later Tool Request
-          // handoff's `git branch -D`, mirroring the manual-done resume-branch
-          // contract (issue #316). When no origin is configured there is nothing
-          // to push to; the local branch is then the resume point as-is.
-          const hasOrigin = probe("git", ["remote", "get-url", "origin"], grantRepoCwd).ok;
-          if (hasOrigin) {
-            const pushed = probe("git", ["push", "origin", workBranch], grantRepoCwd);
-            if (!pushed.ok) {
-              await dieAfterRecordingConsumedGrant(
-                `The guided-run changes for issue #${issueNumber} were committed on '${workBranch}' but ` +
-                  `'git push origin ${workBranch}' failed: ${pushed.output}. The task was NOT re-queued (a ` +
-                  `later handoff could delete the unpushed branch). Push '${workBranch}' (never '${baseBranch}'), ` +
-                  `then run 'tool-request resolve --action manual-done'.`,
-              );
-            }
-          }
-
-          // The produced changes are committed (and pushed); clear this run's
-          // local artifact so the requeued implementation preflight sees a clean
-          // tree (issue #430 review).
-          cleanArtifactBeforeRequeue();
-
-          const resolution = {
-            action: actionLabel,
-            resolvedAt: executedAt,
-            commandHash: grant.commandHash,
-            disposition: "committed",
-            capturedResult,
-          };
-          const resolvedToolRequest = { ...existing, resolved: true, resolution };
-
-          const result = await store.transitionTask(
-            { sessionId, issueNumber },
-            { status: task.status },
-            {
-              status: "queued",
-              phase: "implementation",
-              ownerRunId: undefined,
-              leaseExpiresAt: undefined,
-              lastError: undefined,
-              // The committed (and, when origin exists, pushed) issue branch is the
-              // resume point so the requeued run continues from the landed changes
-              // rather than branching fresh from base (issue #316).
-              context: { toolRequest: resolvedToolRequest, toolRequestGrant: consumedGrant, toolRequestResumeBranch: workBranch },
-              now,
-            },
-          );
-          if (!result.ok) {
-            lockedDie(`Failed to record guided run: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-          }
-
-          // Relabel back into the implementation lane (mirrors the no-op success
-          // path and manual-done).
-          const readyForHumanLabel = session.labels["readyForHuman"] as string | undefined;
-          const isFixModeRequest =
-            existing["mode"] === "fix" ||
-            (typeof task.context["reviewFeedback"] === "string" && (task.context["reviewFeedback"] as string).trim().length > 0);
-          const queueStatusLabel = isFixModeRequest
-            ? ((session.labels["needsFix"] as string | undefined) ?? "status:needs-fix")
-            : ((session.labels["needsImplementation"] as string | undefined) ?? "status:needs-implementation");
-          const resolvedImplAgentId = agentForPhase(task, session, "implementation");
-          const implAgentLabel = resolvedImplAgentId
-            ? `agent:${resolvedImplAgentId}`
-            : ((session.labels["agentImplementation"] as string | undefined) ?? "agent:claude");
-          for (const label of readyForHumanLabel ? [readyForHumanLabel] : []) {
-            await workItemStore.enqueue({
-              idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:remove", label),
-              topic: "gh:label:remove",
-              payload: { topic: "gh:label:remove", owner, repo, issueNumber, label },
-              now,
-            });
-          }
-          for (const label of [queueStatusLabel, implAgentLabel]) {
-            await workItemStore.enqueue({
-              idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:add", label),
-              topic: "gh:label:add",
-              payload: { topic: "gh:label:add", owner, repo, issueNumber, label },
-              now,
-            });
-          }
-
-          let commentBody =
-            `✅ **Tool Request guided run committed by operator.**\n\n` +
-            `Approved command: \`${displayCommand}\`\n\n` +
-            `The command completed successfully; its changes were committed on the issue branch ` +
-            `\`${workBranch}\` and the task has been re-queued for implementation.`;
-          commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-          await workItemStore.enqueue({
-            idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "success-committed"),
-            topic: "gh:comment",
-            payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-            now,
-          });
-
-          await store.appendEvent({
-            task: { sessionId, issueNumber },
-            type: "tool_request_grant_executed",
-            runId,
-            message: `Operator guided run for issue #${issueNumber} committed changes on ${workBranch} (exit 0)`,
-            data: { exitCode: 0, success: true, commandHash: grant.commandHash, requeued: true, disposition: "committed", branch: workBranch, grantedBy: grant.grantedBy },
-            createdAt: now,
-          });
-
-          emit({
-            ok: true,
-            sessionId,
-            issueNumber,
-            action: actionLabel,
-            executed: true,
-            exitCode: 0,
-            success: true,
-            status: result.value.status,
-            phase: result.value.phase,
-            requeued: true,
-            disposition: "committed",
-            branch: workBranch,
-            commandHash: grant.commandHash,
-          });
-          return;
-        }
-
-        if (disposition === "discard") {
-          // Snapshot the produced changes before reverting so nothing is lost
-          // irrecoverably (issue #379/#430 §4.3 partial-diff safeguard). Stage
-          // everything, then diff against the pre-run HEAD so newly added files
-          // are captured too. Best-effort: a capture failure still proceeds to
-          // revert, but is reported so the operator knows no patch was written.
-          const runId2 = runId;
-          let discardPatch: string | undefined;
-          let discardCaptureError: string | undefined;
-          let sourceEditsCommitted2 = false;
-          if (headBeforeProbe.ok) {
-            // Stage all produced changes, then unstage the session artifact
-            // directory so the snapshot diff is a faithful partial-diff of just
-            // the command's produced changes, never the local run artifact (which
-            // embeds the exact command + full output) when the repo does not
-            // ignore it. The plain `git add -A` captures the changes regardless of
-            // ignore rules; the follow-up `git reset` drops the artifact dir from
-            // the index (a silent no-op when it is gitignored and never staged).
-            const staged = probe("git", ["add", "-A"], grantRepoCwd);
-            if (staged.ok) {
-              probe("git", ["reset", "-q", "--", session.artifactDir], grantRepoCwd);
-              const diff = probe("git", ["diff", "--cached", headBeforeProbe.output], grantRepoCwd);
-              if (diff.ok && diff.output.length > 0) {
-                try {
-                  mkdirSync(artifactDir, { recursive: true });
-                  writeFileSync(join(artifactDir, "discarded-changes.patch"), diff.output, "utf8");
-                  discardPatch = "discarded-changes.patch";
-                } catch (err) {
-                  discardCaptureError = err instanceof Error ? err.message : String(err);
-                }
-              }
-            } else {
-              discardCaptureError = staged.output;
-            }
-            // Revert to the pre-run state: drop commits + staged/unstaged tracked
-            // changes, then remove untracked files/dirs the command created.
-            const resetProbe = probe("git", ["reset", "--hard", headBeforeProbe.output], grantRepoCwd);
-            // Exclude the session artifact directory from the sweep: the
-            // `discarded-changes.patch` snapshot above lives under it, and when
-            // the repo does not gitignore that directory `git clean -fd` would
-            // delete the snapshot we just wrote — reporting `discardPatch` while
-            // the partial-diff safeguard is silently lost.
-            const cleanProbe = probe("git", ["clean", "-fd", `--exclude=/${session.artifactDir}`], grantRepoCwd);
-            // Fail closed: a `reset --hard`/`clean` failure, or a tree that is
-            // still dirty after the sweep (e.g. a nested git repository that
-            // `git clean -fd` will not recurse into), means command-produced
-            // changes are still in the checkout. Recording `disposition:
-            // discarded` and telling the operator the branch was reverted would
-            // be a false claim — verify the tree is genuinely clean before
-            // proceeding, and bail otherwise so the operator handles it (issue
-            // #430 review). The artifact subtree is excluded to match the sweep:
-            // the `discarded-changes.patch` snapshot lives there by design and is
-            // not a leftover command change.
-            const verifyProbe = probe(
-              "git",
-              ["status", "--porcelain", "--", ".", `:(exclude)${session.artifactDir}`],
-              grantRepoCwd,
-            );
-            if (!resetProbe.ok || !cleanProbe.ok || !verifyProbe.ok || verifyProbe.output.length > 0) {
-              const reasons: string[] = [];
-              if (!resetProbe.ok) reasons.push(`git reset --hard failed: ${resetProbe.output.trim()}`);
-              if (!cleanProbe.ok) reasons.push(`git clean failed: ${cleanProbe.output.trim()}`);
-              if (verifyProbe.ok && verifyProbe.output.length > 0) {
-                reasons.push(`working tree still dirty after revert:\n${verifyProbe.output.trim()}`);
-              } else if (!verifyProbe.ok) {
-                reasons.push(`could not verify working tree is clean: ${verifyProbe.output.trim()}`);
-              }
-              lockedDie(
-                `Refusing to record discard for issue #${issueNumber}: the approved command's changes could ` +
-                  `not be fully reverted on branch ${workBranch}. The grant was NOT consumed and remains ` +
-                  `available. Manually restore the checkout to its pre-run state ` +
-                  `(${headBeforeProbe.output}) before retrying.\n${reasons.join("\n")}`,
-              );
-            }
-            // Command output was discarded. Now restore the pre-command source edits
-            // from the implementation patch so they survive the discard and are
-            // present for the next implementation run (issue #629 P1).
-            if (patchPath !== null && existsSync(patchPath)) {
-              const reapplied = probe("git", ["apply", "--index", patchPath], grantRepoCwd);
-              if (!reapplied.ok) {
-                lockedDie(
-                  `Refusing to record discard for issue #${issueNumber}: the command's changes were ` +
-                    `reverted on branch ${workBranch} but re-applying the preserved source-edits patch ` +
-                    `afterwards failed. The tree is clean but the source edits are missing. ` +
-                    `The grant was NOT consumed and remains available. Apply the patch manually ` +
-                    `before retrying.`,
-                );
-              }
-              // Commit the restored edits so the branch is left clean — staged changes
-              // block the next resolution or implementation preflight (issue #629 P1).
-              const patchCommitted = probe(
-                "git",
-                ["commit", "--no-verify", "-m", `chore: restore source edits for issue #${issueNumber} before Tool Request discard`],
-                grantRepoCwd,
-              );
-              if (!patchCommitted.ok) {
-                lockedDie(
-                  `Refusing to record discard for issue #${issueNumber}: the command's changes were ` +
-                    `reverted on branch ${workBranch}, the source-edits patch was re-applied, but ` +
-                    `committing the restored edits failed. Commit the staged source edits and push ` +
-                    `\`${workBranch}\` manually before retrying.`,
-                );
-              }
-              const patchPushed = probe("git", ["push", "origin", workBranch], grantRepoCwd);
-              if (!patchPushed.ok) {
-                lockedDie(
-                  `Refusing to record discard for issue #${issueNumber}: the source-edits patch was ` +
-                    `re-applied and committed on branch ${workBranch}, but pushing to origin failed. ` +
-                    `Push \`${workBranch}\` manually before retrying.`,
-                );
-              }
-              sourceEditsCommitted2 = true;
-            }
-          } else {
-            // No known-good pre-run revision to revert to, and nothing was
-            // reverted — the command's changes are still in the checkout. Fail
-            // closed rather than claim a discard that did not happen (issue #430
-            // review). The grant stays unconsumed so the operator can retry once
-            // the tree is restored manually.
-            lockedDie(
-              `Refusing to record discard for issue #${issueNumber}: could not read the pre-run HEAD on ` +
-                `branch ${workBranch}, so the approved command's changes were left in place and cannot be ` +
-                `safely reverted. The grant was NOT consumed and remains available. Manually restore the ` +
-                `checkout to its pre-run state before retrying.`,
-            );
-          }
-
-          // Discard leaves the request a human handoff (not re-queued; redesign
-          // §8): the produced changes were rejected, so there is nothing to land.
-          // Record the consumed grant so the same command cannot be silently re-run.
-          const result = await store.transitionTask(
-            { sessionId, issueNumber },
-            { status: task.status },
-            { status: task.status, phase: task.phase, context: { toolRequestGrant: consumedGrant }, now },
-          );
-          if (!result.ok) {
-            lockedDie(`Failed to record guided run: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-          }
-
-          let commentBody =
-            `↩️ **Tool Request guided run changes discarded by operator.**\n\n` +
-            `Approved command: \`${displayCommand}\`\n\n` +
-            `The command ran successfully but the operator discarded the changes it produced; the issue ` +
-            `branch \`${workBranch}\` was reverted to its pre-run state` +
-            (sourceEditsCommitted2 ? ` and the preserved source edits were committed to the branch` : ``) +
-            `. The task remains a human handoff.`;
-          commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-          await workItemStore.enqueue({
-            idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId2, "gh:comment", "tool-request-grant", "success-discarded"),
-            topic: "gh:comment",
-            payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-            now,
-          });
-
-          await store.appendEvent({
-            task: { sessionId, issueNumber },
-            type: "tool_request_grant_executed",
-            runId: runId2,
-            message: `Operator guided run for issue #${issueNumber} discarded its changes on ${workBranch} (exit 0)`,
-            data: {
-              exitCode: 0,
-              success: true,
-              commandHash: grant.commandHash,
-              requeued: false,
-              disposition: "discarded",
-              branch: workBranch,
-              ...(discardPatch ? { discardPatch } : {}),
-              ...(discardCaptureError ? { discardCaptureError } : {}),
-              grantedBy: grant.grantedBy,
-            },
-            createdAt: now,
-          });
-
-          emit({
-            ok: true,
-            sessionId,
-            issueNumber,
-            action: actionLabel,
-            executed: true,
-            exitCode: 0,
-            success: true,
-            status: result.value.status,
-            phase: result.value.phase,
-            requeued: false,
-            disposition: "discarded",
-            branch: workBranch,
-            ...(discardPatch ? { discardPatch } : {}),
-            commandHash: grant.commandHash,
-          });
-          return;
-        }
-
-        // disposition === "keep" (default): the pre-redesign behavior.
-        // SUCCESS + CHANGES ON ISSUE BRANCH: the command produced uncommitted
-        // changes and/or a commit on the issue branch. Record the consumed grant
-        // but keep the request open and the task a human handoff — the operator
-        // must commit/push the changes on the ISSUE branch (never the base branch),
-        // then resolve with manual-done to re-queue from a clean tree.
-        const result = await store.transitionTask(
-          { sessionId, issueNumber },
-          { status: task.status },
-          { status: task.status, phase: task.phase, context: { toolRequestGrant: consumedGrant }, now },
-        );
-        if (!result.ok) {
-          lockedDie(`Failed to record grant: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-        }
-
-        const changeDescription = dirtyAfter
-          ? `modified the working tree on the issue branch \`${workBranch}\``
-          : `committed changes onto the issue branch \`${workBranch}\``;
-        let commentBody =
-          `✅ **Tool Request granted command executed by operator.**\n\n` +
-          `Approved command: \`${displayCommand}\`\n\n` +
-          `The command completed successfully and ${changeDescription}. The task was **not** ` +
-          `re-queued automatically. Commit and push the produced changes on the issue branch ` +
-          `\`${workBranch}\` (never the base branch \`${baseBranch}\`), then run ` +
-          `\`tool-request resolve --action manual-done\` to re-queue from a clean tree.`;
-        commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-        await workItemStore.enqueue({
-          idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "success-branch-changes"),
-          topic: "gh:comment",
-          payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-          now,
-        });
-
-        await store.appendEvent({
-          task: { sessionId, issueNumber },
-          type: "tool_request_grant_executed",
-          runId,
-          message: `Operator granted and executed Tool Request command for issue #${issueNumber} (exit 0, changes on issue branch ${workBranch})`,
-          data: {
-            exitCode: 0,
-            success: true,
-            commandHash: grant.commandHash,
-            requeued: false,
-            dirtyAfter,
-            committedOnBranch,
-            branch: workBranch,
-            grantedBy: grant.grantedBy,
-          },
-          createdAt: now,
-        });
-
-        emit({
-          ok: true,
-          sessionId,
-          issueNumber,
-          action: actionLabel,
-          executed: true,
-          exitCode: 0,
-          success: true,
-          status: result.value.status,
-          phase: result.value.phase,
-          requeued: false,
-          dirtyAfter,
-          committedOnBranch,
-          branch: workBranch,
-          commandHash: grant.commandHash,
-        });
-        return;
-      }
-
-      if (baseAheadCountAfter > 0) {
-        // SUCCESS + BASE AHEAD: the tree is clean and the issue branch unchanged,
-        // but the command advanced the local base branch past origin. Record the
-        // consumed grant but keep the request open and the task a human handoff —
-        // requeueing now would leak the unpushed base commit into later issue
-        // branches. The operator must move the commit onto the issue branch (or
-        // drop it), then resolve with manual-done.
-        const result = await store.transitionTask(
-          { sessionId, issueNumber },
-          { status: task.status },
-          { status: task.status, phase: task.phase, context: { toolRequestGrant: consumedGrant }, now },
-        );
-        if (!result.ok) {
-          lockedDie(`Failed to record grant: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-        }
-
-        let commentBody =
-          `✅ **Tool Request granted command executed by operator.**\n\n` +
-          `Approved command: \`${displayCommand}\`\n\n` +
-          `The command completed successfully but advanced the local base branch ` +
-          `\`${baseBranch}\` ahead of origin. The task was **not** re-queued automatically to ` +
-          `avoid leaking an unpushed base commit into later issue branches. Move the commit onto ` +
-          `the issue branch \`${workBranch}\` (or drop it) — do NOT push \`${baseBranch}\` — then ` +
-          `run \`tool-request resolve --action manual-done\` to re-queue from a clean base.`;
-        commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-        await workItemStore.enqueue({
-          idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "success-base-ahead"),
-          topic: "gh:comment",
-          payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-          now,
-        });
-
-        await store.appendEvent({
-          task: { sessionId, issueNumber },
-          type: "tool_request_grant_executed",
-          runId,
-          message: `Operator granted and executed Tool Request command for issue #${issueNumber} (exit 0, base ahead of origin)`,
-          data: {
-            exitCode: 0,
-            success: true,
-            commandHash: grant.commandHash,
-            requeued: false,
-            dirtyAfter: false,
-            baseAheadAfter: baseAheadCountAfter,
-            branch: workBranch,
-            grantedBy: grant.grantedBy,
-          },
-          createdAt: now,
-        });
-
-        emit({
-          ok: true,
-          sessionId,
-          issueNumber,
-          action: actionLabel,
-          executed: true,
-          exitCode: 0,
-          success: true,
-          status: result.value.status,
-          phase: result.value.phase,
-          requeued: false,
-          dirtyAfter: false,
-          baseAheadAfter: baseAheadCountAfter,
-          branch: workBranch,
-          commandHash: grant.commandHash,
-        });
-        return;
-      }
-
-      {
-        // SUCCESS + TRUE NO-OP: clean tree, no commit on the issue branch, base not
-        // advanced. The command produced nothing, so where it ran does not matter
-        // for version control. Tidy up: return to the base branch and, if we had to
-        // invent the issue branch for this run, delete the now-empty branch so the
-        // requeued implementation run's new-branch preflight does not collide with
-        // it. If the branch pre-existed (we did not invent it), it stays in place.
-        // Skip this tidy-up entirely in worktree mode: the per-issue worktree is a
-        // durable checkout that stays on `ai/issue-<n>`, the canonical repo already
-        // holds the base branch (so `git checkout <base>` here would fail), and the
-        // issue branch is the worktree's resume point — never delete it (issue #454
-        // review). `moved.created` is already false there (the branch pre-existed,
-        // checked out in the worktree), so no invented branch needs cleanup.
-        if (!worktreeGrant) {
-          probe("git", ["checkout", baseBranch], session.repoRoot);
-          if (moved.created) {
-            probe("git", ["branch", "-D", workBranch], session.repoRoot);
-          }
-        }
-        // Hand the implementation run a resume point ONLY when the surviving branch
-        // is a *known* one — the recorded PR head or a branch on origin (pushed).
-        // A no-op grant produced no changes, so an arbitrary pre-existing local
-        // `ai/issue-<n>` branch is most likely a stale leftover from a prior failed
-        // run; adopting it as the resume point would silently fold its contents into
-        // the next PR. Leave the resume branch unset for that case so the
-        // implementation run's new-branch preflight collides and fails loudly on the
-        // unexpected leftover instead of trusting it (issue #316 review). When we
-        // deleted an invented branch, it is likewise unset so the requeue branches
-        // fresh from base. Then resolve as a grant and re-queue to implementation,
-        // exactly as a manual-done requeue would (labels included).
-        //
-        // Worktree mode (issue #454 review): the per-issue worktree is a durable
-        // checkout that stays on `ai/issue-<n>`, so the branch is the deliberate
-        // continuation point — not a stale leftover (`moved.created` is false there,
-        // the branch pre-existed in the worktree). The requeued implementation must
-        // resume from it so a valid no-op over the already-committed work continues
-        // instead of failing the diff check. But that resume only works when origin
-        // has the branch: the implementation run finds nothing to stage (the work is
-        // already committed), skips the push, and then `gh pr create --head
-        // ai/issue-<n>` fails if the branch is local-only — e.g. a prior handoff
-        // committed partial work but its best-effort push failed, leaving
-        // `moved.resumeSafe` false because origin lacks the branch. So before
-        // adopting the branch, make sure it is on origin: `moved.resumeSafe` already
-        // proves a pushed/PR branch; otherwise push it now. Record the resume branch
-        // only when the branch is confirmed on origin afterward — when the push
-        // cannot land it there (no origin, or the push failed), leave it unset so the
-        // requeued implementation fails loudly instead of stranding at PR creation,
-        // matching the shared-checkout gate that never resumes from an unpushed local
-        // branch.
-        let worktreeResumePushed = false;
-        if (worktreeGrant) {
-          if (moved.resumeSafe) {
-            worktreeResumePushed = true;
-          } else {
-            const pushed = probe("git", ["push", "origin", workBranch], grantRepoCwd);
-            worktreeResumePushed = pushed.ok && remoteHasBranch(grantRepoCwd, workBranch) === "yes";
-          }
-        }
-        const toolRequestResumeBranch = worktreeGrant
-          ? worktreeResumePushed
-            ? workBranch
-            : undefined
-          : !moved.created && moved.resumeSafe
-            ? workBranch
-            : undefined;
-
-        // The command produced nothing to commit; clear this run's local artifact
-        // so the requeued implementation preflight sees a clean tree (issue #430
-        // review). Done after the checkout/branch tidy-up above so it runs against
-        // the final working tree.
-        cleanArtifactBeforeRequeue();
-
-        // SUCCESS + TRUE NO-OP is the verification-command case (issue #430,
-        // redesign §4.3): there is nothing to commit, so the captured output is
-        // the deliverable. Record it on the resolution as continuation context so
-        // the requeued implementation pass has the answer the agent was missing.
-        const resolution = {
-          action: actionLabel,
-          resolvedAt: executedAt,
-          commandHash: grant.commandHash,
-          disposition: "no-op",
-          capturedResult,
-        };
-        const resolvedToolRequest = { ...existing, resolved: true, resolution };
-
-        // ── CONTINUATION ROUTING (issue #722) ────────────────────────────────
-        // `docs/unattended-tool-request-contract.md` rows 26–27: a resolution
-        // that left the task re-queueable goes to `implementation` — UNLESS
-        // `docs/verification-execution-contract.md` §10's evidence gate holds,
-        // in which case it goes straight to `review` and the no-op
-        // implementation pass (#404's survivable detour) is skipped entirely.
-        // All of the policy is the pure core helper's; everything here is
-        // evidence collection. Only this true-no-op path is a candidate: a
-        // guided run that produced repository changes is out of scope for #722
-        // even when its disposition later left the tree clean.
-        //
-        // Always write `toolRequestResumeBranch` so applyTaskPatch's context
-        // merge does not preserve a stale resume branch from an earlier Tool
-        // Request; JSON.stringify drops the undefined value, removing the key
-        // (matches manual-done; issue #316).
-        const continuationContext: Record<string, unknown> = {
-          toolRequest: resolvedToolRequest,
-          toolRequestGrant: consumedGrant,
-          toolRequestResumeBranch,
-        };
-        // Previewed so the review-admission check and the decision read exactly
-        // the state the transition below is about to persist — in particular a
-        // Tool Request that this resolution has just closed.
-        const continuationPreview = applyTaskPatch(task, { context: continuationContext, now });
-
-        // Eligibility first (#918 §10.2): a command no `session.verification`
-        // value covers is never direct-reviewed, so the repository probes below
-        // are skipped for it. The decision helper evaluates its checks in a
-        // fixed order, so an unprobed field can never change the recorded
-        // reason — the eligibility miss is reported before any of them is read.
-        const configuredVerification = resolveConfiguredVerification(grantedCommand, session.verification);
-        const { base: recordedReviewBase, missing: reviewBaseMissing } = resolveDependencyReviewBase(task.context);
-        let worktreeCleanAfterRun: boolean | undefined;
-        let issueBranchLocalSha: string | undefined;
-        let issueBranchRemoteSha: string | undefined;
-        let commitsSinceReviewBase: number | undefined;
-        if (configuredVerification !== undefined) {
-          // Clean worktree AFTER disposition handling and the artifact cleanup
-          // above, using the same plain porcelain the implementation preflight
-          // uses — never the `:(exclude)` relaxation the dirtiness probe needs.
-          const cleanProbe = probe("git", ["status", "--porcelain"], grantRepoCwd);
-          worktreeCleanAfterRun = cleanProbe.ok ? cleanProbe.output.length === 0 : undefined;
-          // Read the BRANCH ref rather than HEAD: the shared-checkout tidy-up
-          // above may have moved HEAD back to the base branch, and an invented
-          // branch it deleted simply fails to resolve here (fail closed).
-          const localShaProbe = probe("git", ["rev-parse", "--verify", `refs/heads/${workBranch}`], grantRepoCwd);
-          const localSha = localShaProbe.ok ? localShaProbe.output.trim() : "";
-          issueBranchLocalSha = /^[0-9a-f]{7,64}$/.test(localSha) ? localSha : undefined;
-          // Origin's own view of the branch, read straight from the remote so a
-          // stale remote-tracking ref can never stand in for an actual push.
-          const lsRemoteProbe = probe("git", ["ls-remote", "--heads", "origin", workBranch], grantRepoCwd);
-          if (lsRemoteProbe.ok) {
-            const remoteSha = ((lsRemoteProbe.output.split("\n")[0] ?? "").trim().split(/\s+/)[0] ?? "").trim();
-            issueBranchRemoteSha = /^[0-9a-f]{7,64}$/.test(remoteSha) ? remoteSha : undefined;
-          }
-          // Committed issue work relative to the RECORDED review base: the
-          // predecessor head for a dependency-started task (#667, #681 check 4),
-          // else the session base branch on origin.
-          if (issueBranchLocalSha !== undefined) {
-            const reviewBaseRef = recordedReviewBase?.sha ?? `origin/${baseBranch}`;
-            const countProbe = probe(
-              "git",
-              ["rev-list", "--count", `${reviewBaseRef}..refs/heads/${workBranch}`],
-              grantRepoCwd,
-            );
-            if (countProbe.ok) {
-              const parsedCount = Number.parseInt(countProbe.output.trim(), 10);
-              if (Number.isFinite(parsedCount)) commitsSinceReviewBase = parsedCount;
-            }
-          }
-        }
-
-        // The existing #681 admission contract decides admissibility; #722 never
-        // weakens it and adds no verification evidence to it (#918 §10.3 step 4).
-        const continuationAdmission = checkReviewAdmission(continuationPreview);
-        const { prUrl: recordedPrUrlForContinuation } = resolvePrContext(task);
-        const recordedPrNumber =
-          recordedPrUrlForContinuation !== undefined ? extractPrNumber(recordedPrUrlForContinuation) : undefined;
-        const continuationDecision = decideToolRequestContinuation({
-          guidedRun: {
-            exitCode: runResult.exitCode,
-            command: grantedCommand,
-            disposition: resolution.disposition,
-            producedChanges,
-          },
-          verificationCommands: session.verification,
-          phase: task.phase,
-          toolRequestUnresolved: hasUnresolvedToolRequest(continuationPreview.context),
-          pendingMarkers: collectPendingImplementationMarkers(task.context, {
-            preservedPatchPending: patchPath !== null,
-          }),
-          repository: {
-            worktreeClean: worktreeCleanAfterRun,
-            branch: workBranch,
-            localHeadSha: issueBranchLocalSha,
-            remoteHeadSha: issueBranchRemoteSha,
-            commitsSinceReviewBase,
-          },
-          durableContext: {
-            prRecorded: recordedPrNumber !== undefined && recordedPrNumber > 0,
-            prHeadBranch: recordedPrBranch,
-            reviewBaseRecorded: !reviewBaseMissing,
-          },
-          reviewAdmitted: continuationAdmission.ok,
-        });
-        const continuationRecord = buildToolRequestContinuationRecord(continuationDecision, actionLabel, now);
-        // Durable on BOTH routes: the selected phase, the stable reason code,
-        // and the bounded evidence summary (#919 §10.2).
-        continuationContext["toolRequestContinuation"] = continuationRecord;
-
-        if (continuationDecision.phase === "review") {
-          // Direct review (#919 row 26 / #918 §10.3 step 4): the exact
-          // `{queued, review}` vocabulary the shipped implementation→review
-          // success edge uses, with the normal implementation→review label
-          // effects. Transition and effects commit in ONE transaction so a
-          // maintenance lock (or any other failure) takes both or neither and
-          // the operator command stays safely repeatable.
-          const reviewPatch: TaskPatch = {
-            status: "queued",
-            phase: "review",
-            ownerRunId: undefined,
-            leaseExpiresAt: undefined,
-            lastError: undefined,
-            // Branch, PR, review-base and every other implementation-complete
-            // key survive untouched: the patch only merges the resolution,
-            // the consumed grant, the resume point, and the decision record.
-            context: continuationContext,
-            now,
-          };
-          const reviewPreview = applyTaskPatch(task, reviewPatch);
-          const effects = new OutboxEffectCollector();
-          await enqueueStatusLabelEffects(
-            effects,
-            session,
-            reviewPreview,
-            "queued",
-            "review",
-            runId,
-            now,
-            "implementation",
-            {
-              result: "success",
-              context: {
-                branch: workBranch,
-                ...(recordedPrUrlForContinuation !== undefined ? { prUrl: recordedPrUrlForContinuation } : {}),
-              },
-            },
-          );
-          // `queued` has no coarse-label entry, so the shared helper never drops
-          // the ready-for-human marker this park left on the issue; remove it
-          // explicitly, exactly as the implementation requeue below does.
-          const reviewEffectStore = workItemOutbox(effects, session);
-          const readyForHumanOnReview = session.labels["readyForHuman"] as string | undefined;
-          if (readyForHumanOnReview) {
-            await reviewEffectStore.enqueue({
-              idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:remove", readyForHumanOnReview),
-              topic: "gh:label:remove",
-              payload: { topic: "gh:label:remove", owner, repo, issueNumber, label: readyForHumanOnReview },
-              now,
-            });
-          }
-
-          // Public surface stays bounded and redacted: the display command and
-          // the high-level outcome only — never output, paths, or evidence
-          // detail beyond the branch already named by every other comment here.
-          let reviewCommentBody =
-            `✅ **Tool Request guided run completed — queued for review.**\n\n` +
-            `Approved command: \`${displayCommand}\`\n\n` +
-            `The command is a configured verification command and completed successfully; the issue branch ` +
-            `\`${workBranch}\` is pushed with its work committed and no changes left behind, so the task was ` +
-            `queued directly for review instead of another implementation pass.`;
-          reviewCommentBody = sanitizeBody(reviewCommentBody, sessionRedactionPaths(session));
-          await reviewEffectStore.enqueue({
-            idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "success-review"),
-            topic: "gh:comment",
-            payload: { topic: "gh:comment", owner, repo, issueNumber, body: reviewCommentBody },
-            now,
-          });
-
-          const reviewResult = await store.transitionTaskWithEffects(
-            { sessionId, issueNumber },
-            { status: task.status },
-            reviewPatch,
-            effects.effects,
-          );
-          if (!reviewResult.ok) {
-            lockedDie(
-              `Failed to record guided run: ${reviewResult.code}` +
-                (reviewResult.current ? ` (current status: ${reviewResult.current.status})` : ""),
-            );
-          }
-
-          await store.appendEvent({
-            task: { sessionId, issueNumber },
-            type: "tool_request_grant_executed",
-            runId,
-            message: `Operator granted and executed Tool Request command for issue #${issueNumber} (exit 0, queued for review)`,
-            data: {
-              exitCode: 0,
-              success: true,
-              commandHash: grant.commandHash,
-              requeued: true,
-              dirtyAfter: false,
-              branch: workBranch,
-              continuationPhase: "review",
-              grantedBy: grant.grantedBy,
-            },
-            createdAt: now,
-          });
-          await store.appendEvent({
-            task: { sessionId, issueNumber },
-            type: "tool_request_continuation_routed",
-            runId,
-            message: `Tool Request continuation for issue #${issueNumber} routed to review (${continuationDecision.reason})`,
-            data: {
-              destination: continuationRecord.destination,
-              reason: continuationRecord.reason,
-              surface: continuationRecord.surface,
-              resolutionAction: actionLabel,
-              evidence: continuationRecord.evidence,
-            },
-            createdAt: now,
-          });
-
-          emit({
-            ok: true,
-            sessionId,
-            issueNumber,
-            action: actionLabel,
-            executed: true,
-            exitCode: 0,
-            success: true,
-            status: reviewResult.value.status,
-            phase: reviewResult.value.phase,
-            requeued: true,
-            dirtyAfter: false,
-            branch: workBranch,
-            commandHash: grant.commandHash,
-            continuation: { destination: continuationRecord.destination, reason: continuationRecord.reason },
-          });
-          return;
-        }
-
-        const result = await store.transitionTask(
-          { sessionId, issueNumber },
-          { status: task.status },
-          {
-            status: "queued",
-            phase: "implementation",
-            ownerRunId: undefined,
-            leaseExpiresAt: undefined,
-            lastError: undefined,
-            context: continuationContext,
-            now,
-          },
-        );
-        if (!result.ok) {
-          lockedDie(`Failed to record grant: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-        }
-
-        // Swap public labels back to the implementation lane (mirrors tool-request
-        // resolve manual-done): drop ready-for-human, re-advertise the queue status
-        // (needs-fix for a fix-mode request, else needs-implementation) + the
-        // resolved implementation agent.
-        const readyForHumanLabel = session.labels["readyForHuman"] as string | undefined;
-        const isFixModeRequest =
-          existing["mode"] === "fix" ||
-          (typeof task.context["reviewFeedback"] === "string" && (task.context["reviewFeedback"] as string).trim().length > 0);
-        const queueStatusLabel = isFixModeRequest
-          ? ((session.labels["needsFix"] as string | undefined) ?? "status:needs-fix")
-          : ((session.labels["needsImplementation"] as string | undefined) ?? "status:needs-implementation");
-        const resolvedImplAgentId = agentForPhase(task, session, "implementation");
-        const implAgentLabel = resolvedImplAgentId
-          ? `agent:${resolvedImplAgentId}`
-          : ((session.labels["agentImplementation"] as string | undefined) ?? "agent:claude");
-        const removeLabels = readyForHumanLabel ? [readyForHumanLabel] : [];
-        for (const label of removeLabels) {
-          await workItemStore.enqueue({
-            idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:remove", label),
-            topic: "gh:label:remove",
-            payload: { topic: "gh:label:remove", owner, repo, issueNumber, label },
-            now,
-          });
-        }
-        for (const label of [queueStatusLabel, implAgentLabel]) {
-          await workItemStore.enqueue({
-            idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:add", label),
-            topic: "gh:label:add",
-            payload: { topic: "gh:label:add", owner, repo, issueNumber, label },
-            now,
-          });
-        }
-
-        let commentBody =
-          `✅ **Tool Request granted and executed by operator.**\n\n` +
-          `Approved command: \`${displayCommand}\`\n\n` +
-          `The command completed successfully and the task has been re-queued for implementation.`;
-        commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-        await workItemStore.enqueue({
-          idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "success"),
-          topic: "gh:comment",
-          payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-          now,
-        });
-
-        await store.appendEvent({
-          task: { sessionId, issueNumber },
-          type: "tool_request_grant_executed",
-          runId,
-          message: `Operator granted and executed Tool Request command for issue #${issueNumber} (exit 0)`,
-          data: { exitCode: 0, success: true, commandHash: grant.commandHash, requeued: true, dirtyAfter: false, branch: workBranch, grantedBy: grant.grantedBy },
-          createdAt: now,
-        });
-
-        // The same routing event the direct-review branch records, naming the
-        // check that sent this resolution back to implementation (#919 §10.2).
-        await store.appendEvent({
-          task: { sessionId, issueNumber },
-          type: "tool_request_continuation_routed",
-          runId,
-          message: `Tool Request continuation for issue #${issueNumber} routed to implementation (${continuationDecision.reason})`,
-          data: {
-            destination: continuationRecord.destination,
-            reason: continuationRecord.reason,
-            surface: continuationRecord.surface,
-            resolutionAction: actionLabel,
-            evidence: continuationRecord.evidence,
-          },
-          createdAt: now,
-        });
-
-        emit({
-          ok: true,
-          sessionId,
-          issueNumber,
-          action: actionLabel,
-          executed: true,
-          exitCode: 0,
-          success: true,
-          status: result.value.status,
-          phase: result.value.phase,
-          requeued: true,
-          dirtyAfter: false,
-          branch: workBranch,
-          commandHash: grant.commandHash,
-          continuation: { destination: continuationRecord.destination, reason: continuationRecord.reason },
-        });
-        return;
-      }
-
-    }
-
-    // FAILURE: a non-zero exit is diagnostic information for the implementation
-    // agent, not by itself a reason to stop at a human handoff (issue #678) — the
-    // motivating case is a verification command (e.g. `npm test`) that fails
-    // without touching any files. Whether the failure can be delivered
-    // automatically depends on what it left behind: a clean tree, with HEAD
-    // unmoved and still on the issue branch, means nothing is at risk, so the
-    // captured output is folded into the resolution and the task is re-queued
-    // exactly like a true no-op. When the command left changes behind, requeueing
-    // immediately would fail the implementation preflight's dirty-tree check —
-    // repository state genuinely cannot be preserved safely, so that case stays a
-    // human handoff, unchanged from before.
-    const afterFailureProbe = probe(
-      "git",
-      ["status", "--porcelain", "--", ".", `:(exclude)${session.artifactDir}`],
-      grantRepoCwd,
-    );
-    const dirtyAfterFailure = afterFailureProbe.ok && afterFailureProbe.output.length > 0;
-    const headAfterFailureProbe = probe("git", ["rev-parse", "HEAD"], grantRepoCwd);
-    const committedOnBranchAfterFailure =
-      headBeforeProbe.ok &&
-      headAfterFailureProbe.ok &&
-      headBeforeProbe.output !== headAfterFailureProbe.output;
-    const currentBranchAfterFailureProbe = probe("git", ["rev-parse", "--abbrev-ref", "HEAD"], grantRepoCwd);
-    const onWorkBranchAfterFailure =
-      currentBranchAfterFailureProbe.ok && currentBranchAfterFailureProbe.output === workBranch;
-    // A failing command can still commit to the base branch before checking back
-    // out onto the issue branch, leaving HEAD unmoved and the tree clean by the
-    // probes above while the local base sits ahead of origin. Repeat the success
-    // path's `origin/<base>..<base>` check (issue #678 review) so that
-    // contamination is caught here too — otherwise the cleanup below checks out
-    // the now-ahead base branch and the next implementation run branches off it,
-    // propagating the unintended base commit. Skipped in worktree mode for the
-    // same reason as the success path: the base branch cannot be checked out from
-    // the per-issue worktree, so the command cannot have advanced it.
-    let baseAheadCountAfterFailure = 0;
-    // The ahead-count probe alone is not sufficient: a command that checks out
-    // the base, commits, *pushes* it to origin, then returns to the issue branch
-    // leaves `origin/<base>..<base>` at 0 — origin now includes the pushed
-    // commit, so the pair reads as "in sync" even though the base moved. Compare
-    // against the SHA captured before the command ran to catch that case too;
-    // this check runs unconditionally (not skipped when origin happens to be in
-    // sync) because being in sync is exactly the state the pushed-mutation case
-    // produces (issue #678 review).
-    let baseMovedAfterFailure = false;
-    if (!worktreeGrant) {
-      const baseAheadAfterFailureProbe = probe(
-        "git",
-        ["rev-list", "--count", `origin/${baseBranch}..${baseBranch}`],
-        grantRepoCwd,
-      );
-      if (baseAheadAfterFailureProbe.ok) {
-        const parsed = Number.parseInt(baseAheadAfterFailureProbe.output.trim(), 10);
-        if (Number.isFinite(parsed) && parsed > 0) {
-          baseAheadCountAfterFailure = parsed;
-        }
-      }
-      const baseShaAfterFailureProbe = probe("git", ["rev-parse", baseBranch], grantRepoCwd);
-      baseMovedAfterFailure =
-        baseShaBeforeProbe.ok &&
-        baseShaAfterFailureProbe.ok &&
-        baseShaBeforeProbe.output !== baseShaAfterFailureProbe.output;
-    }
-    // A direct refspec push to the remote base (e.g. `git push origin
-    // ai/issue-<n>:main`) never touches the local base branch or requires
-    // checking it out, so it is invisible to both checks above — and can be run
-    // from inside a per-issue worktree just as easily as the canonical checkout
-    // (refs/remotes/* is shared across worktrees), so this check is not skipped
-    // for `worktreeGrant`. Comparing the `origin/<base>` tracking ref itself
-    // (updated locally by Git after a successful push, even a refspec-only one)
-    // catches it (issue #678 review).
-    const baseRemoteShaAfterFailureProbe = probe("git", ["rev-parse", `origin/${baseBranch}`], grantRepoCwd);
-    const baseRemoteMovedAfterFailure =
-      baseRemoteShaBeforeProbe.ok &&
-      baseRemoteShaAfterFailureProbe.ok &&
-      baseRemoteShaBeforeProbe.output !== baseRemoteShaAfterFailureProbe.output;
-    const safeToAutoResumeFailure =
-      !dirtyAfterFailure &&
-      !committedOnBranchAfterFailure &&
-      onWorkBranchAfterFailure &&
-      baseAheadCountAfterFailure === 0 &&
-      !baseMovedAfterFailure &&
-      !baseRemoteMovedAfterFailure;
-
-    if (baseAheadCountAfterFailure > 0 || baseMovedAfterFailure || baseRemoteMovedAfterFailure) {
-      const result = await store.transitionTask(
-        { sessionId, issueNumber },
-        { status: task.status },
-        { status: task.status, phase: task.phase, context: { toolRequestGrant: consumedGrant }, now },
-      );
-      if (!result.ok) {
-        lockedDie(`Failed to record grant: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-      }
-
-      const baseMutationDescription =
-        baseAheadCountAfterFailure > 0
-          ? `advanced the local base branch \`${baseBranch}\` ahead of origin`
-          : baseMovedAfterFailure
-            ? `moved the local base branch \`${baseBranch}\` (and pushed it to origin)`
-            : `pushed the remote base branch \`${baseBranch}\` directly (e.g. via a refspec push) without moving the local branch`;
-      let commentBody =
-        `🛠️ **Tool Request granted command failed** for issue #${issueNumber} — left for human review.\n\n` +
-        `Approved command: \`${displayCommand}\`\n\n` +
-        `The command exited with a non-zero status (exit ${runResult.exitCode}) but ${baseMutationDescription}. ` +
-        `The task was **not** re-queued automatically to avoid propagating an unintended base branch change ` +
-        `into later issue branches. Move the commit onto the issue branch \`${workBranch}\` (or drop/revert it) ` +
-        `— do NOT push further changes to \`${baseBranch}\` — then resolve with ` +
-        `\`tool-request resolve --action manual-done\` or reject/re-request this Tool Request.`;
-      commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-      await workItemStore.enqueue({
-        idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "failed-base-ahead"),
-        topic: "gh:comment",
-        payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-        now,
-      });
-
-      await store.appendEvent({
-        task: { sessionId, issueNumber },
-        type: "tool_request_grant_failed",
-        runId,
-        message: `Operator-granted Tool Request command for issue #${issueNumber} failed (exit ${runResult.exitCode}, base branch mutated)`,
-        data: {
-          exitCode: runResult.exitCode,
-          success: false,
-          commandHash: grant.commandHash,
-          requeued: false,
-          dirtyAfter: dirtyAfterFailure,
-          baseAheadAfter: baseAheadCountAfterFailure,
-          baseMovedAfter: baseMovedAfterFailure,
-          baseRemoteMovedAfter: baseRemoteMovedAfterFailure,
-          grantedBy: grant.grantedBy,
-        },
-        createdAt: now,
-      });
-
-      emit({
-        ok: true,
-        sessionId,
-        issueNumber,
-        action: actionLabel,
-        executed: true,
-        exitCode: runResult.exitCode,
-        success: false,
-        status: result.value.status,
-        phase: result.value.phase,
-        requeued: false,
-        dirtyAfter: dirtyAfterFailure,
-        baseAheadAfter: baseAheadCountAfterFailure,
-        baseMovedAfter: baseMovedAfterFailure,
-        baseRemoteMovedAfter: baseRemoteMovedAfterFailure,
-        branch: workBranch,
-        commandHash: grant.commandHash,
-      });
-      return;
-    }
-
-    if (safeToAutoResumeFailure) {
-      if (!worktreeGrant) {
-        probe("git", ["checkout", baseBranch], session.repoRoot);
-        if (moved.created) {
-          probe("git", ["branch", "-D", workBranch], session.repoRoot);
-        }
-      }
-      let worktreeResumePushedAfterFailure = false;
-      if (worktreeGrant) {
-        if (moved.resumeSafe) {
-          worktreeResumePushedAfterFailure = true;
-        } else {
-          const pushed = probe("git", ["push", "origin", workBranch], grantRepoCwd);
-          worktreeResumePushedAfterFailure = pushed.ok && remoteHasBranch(grantRepoCwd, workBranch) === "yes";
-        }
-      }
-      const toolRequestResumeBranch = worktreeGrant
-        ? worktreeResumePushedAfterFailure
-          ? workBranch
-          : undefined
-        : !moved.created && moved.resumeSafe
-          ? workBranch
-          : undefined;
-
-      cleanArtifactBeforeRequeue();
-
-      // The failed command's captured output IS the deliverable (issue #678):
-      // the agent needs the exit code and stdout/stderr to diagnose the failure,
-      // the same way a no-op's captured output answers a verification request.
-      const resolution = {
-        action: actionLabel,
-        resolvedAt: executedAt,
-        commandHash: grant.commandHash,
-        disposition: "failed",
-        capturedResult,
-      };
-      const resolvedToolRequest = { ...existing, resolved: true, resolution };
-
-      const result = await store.transitionTask(
-        { sessionId, issueNumber },
-        { status: task.status },
-        {
-          status: "queued",
-          phase: "implementation",
-          ownerRunId: undefined,
-          leaseExpiresAt: undefined,
-          lastError: undefined,
-          context: { toolRequest: resolvedToolRequest, toolRequestGrant: consumedGrant, toolRequestResumeBranch },
-          now,
-        },
-      );
-      if (!result.ok) {
-        lockedDie(`Failed to record grant: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-      }
-
-      const readyForHumanLabel = session.labels["readyForHuman"] as string | undefined;
-      const isFixModeRequest =
-        existing["mode"] === "fix" ||
-        (typeof task.context["reviewFeedback"] === "string" && (task.context["reviewFeedback"] as string).trim().length > 0);
-      const queueStatusLabel = isFixModeRequest
-        ? ((session.labels["needsFix"] as string | undefined) ?? "status:needs-fix")
-        : ((session.labels["needsImplementation"] as string | undefined) ?? "status:needs-implementation");
-      const resolvedImplAgentId = agentForPhase(task, session, "implementation");
-      const implAgentLabel = resolvedImplAgentId
-        ? `agent:${resolvedImplAgentId}`
-        : ((session.labels["agentImplementation"] as string | undefined) ?? "agent:claude");
-      const removeLabels = readyForHumanLabel ? [readyForHumanLabel] : [];
-      for (const label of removeLabels) {
-        await workItemStore.enqueue({
-          idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:remove", label),
-          topic: "gh:label:remove",
-          payload: { topic: "gh:label:remove", owner, repo, issueNumber, label },
-          now,
-        });
-      }
-      for (const label of [queueStatusLabel, implAgentLabel]) {
-        await workItemStore.enqueue({
-          idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:label:add", label),
-          topic: "gh:label:add",
-          payload: { topic: "gh:label:add", owner, repo, issueNumber, label },
-          now,
-        });
-      }
-
-      let commentBody =
-        `🛠️ **Tool Request granted command failed — result returned to the agent.**\n\n` +
-        `Approved command: \`${displayCommand}\`\n\n` +
-        `The command exited with a non-zero status (exit ${runResult.exitCode}) and left no repository changes. ` +
-        `The failure output has been delivered to the requesting agent as continuation context and the task ` +
-        `has been re-queued for implementation to diagnose and continue.`;
-      commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-      await workItemStore.enqueue({
-        idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "failed-requeued"),
-        topic: "gh:comment",
-        payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-        now,
-      });
-
-      await store.appendEvent({
-        task: { sessionId, issueNumber },
-        type: "tool_request_grant_failed",
-        runId,
-        message: `Operator-granted Tool Request command for issue #${issueNumber} failed (exit ${runResult.exitCode}) and was returned to the agent`,
-        data: { exitCode: runResult.exitCode, success: false, commandHash: grant.commandHash, requeued: true, grantedBy: grant.grantedBy },
-        createdAt: now,
-      });
-
-      emit({
-        ok: true,
-        sessionId,
-        issueNumber,
-        action: actionLabel,
-        executed: true,
-        exitCode: runResult.exitCode,
-        success: false,
-        status: result.value.status,
-        phase: result.value.phase,
-        requeued: true,
-        dirtyAfter: false,
-        branch: workBranch,
-        commandHash: grant.commandHash,
-      });
-      return;
-    }
-
-    // FAILURE, and the command left repository state that cannot be preserved
-    // safely (uncommitted changes, an advanced HEAD, or HEAD off the issue
-    // branch): surface a clear handoff state and do NOT requeue, so a failing
-    // granted command never loops silently against a dirty tree. The request is
-    // left UNRESOLVED, but the consumed grant is persisted so the same exact
-    // command cannot be re-run by another grant. Recovery is NOT "grant a
-    // corrected command": `--command` is rejected unless it equals the stored
-    // requested command, and re-granting that exact command is what the consumed
-    // grant now blocks. The operator must instead reject/re-request the Tool
-    // Request, or run a corrected command themselves and resolve it with
-    // `tool-request resolve --action manual-done`.
-    const result = await store.transitionTask(
-      { sessionId, issueNumber },
-      { status: task.status },
-      {
-        status: task.status,
-        phase: task.phase,
-        context: { toolRequestGrant: consumedGrant },
-        now,
-      },
-    );
-    if (!result.ok) {
-      lockedDie(`Failed to record grant: ${result.code}` + (result.current ? ` (current status: ${result.current.status})` : ""));
-    }
-
-    let commentBody =
-      `🛠️ **Tool Request granted command failed** for issue #${issueNumber} — left for human review.\n\n` +
-      `Approved command: \`${displayCommand}\`\n\n` +
-      `The command exited with a non-zero status (exit ${runResult.exitCode}) and left repository changes ` +
-      `behind, so the result could not be safely returned to the agent automatically. The task was **not** ` +
-      `re-queued. Review the local run artifact, then either reject/re-request this Tool Request, or run a ` +
-      `corrected command manually and resolve it as \`manual-done\`.`;
-    commentBody = sanitizeBody(commentBody, sessionRedactionPaths(session));
-    await workItemStore.enqueue({
-      idempotencyKey: makeOutboxKey(sessionId, issueNumber, runId, "gh:comment", "tool-request-grant", "failed"),
-      topic: "gh:comment",
-      payload: { topic: "gh:comment", owner, repo, issueNumber, body: commentBody },
-      now,
+        // Preview is trusted context, not a parameter: `--dry-run` is the CLI
+        // spelling of an unconfirmed invocation (contract §5.2).
+        confirmed: !dryRun,
+        requestId: `admin-cli:${sessionId}:${issueNumber}:${responseAction}`,
+        store,
+        outboxStore,
+        lockStore,
+        responseAction,
+      }),
     });
 
-    await store.appendEvent({
-      task: { sessionId, issueNumber },
-      type: "tool_request_grant_failed",
-      runId,
-      message: `Operator-granted Tool Request command for issue #${issueNumber} failed (exit ${runResult.exitCode})`,
-      data: { exitCode: runResult.exitCode, success: false, commandHash: grant.commandHash, requeued: false, dirtyAfter: dirtyAfterFailure, grantedBy: grant.grantedBy },
-      createdAt: now,
-    });
-
-    emit({
-      ok: true,
-      sessionId,
-      issueNumber,
-      action: actionLabel,
-      executed: true,
-      exitCode: runResult.exitCode,
-      success: false,
-      status: result.value.status,
-      phase: result.value.phase,
-      requeued: false,
-      dirtyAfter: dirtyAfterFailure,
-      commandHash: grant.commandHash,
-    });
+    if (result.status === "executed") {
+      emit((result.data ?? {}) as Record<string, unknown>);
+      return;
+    }
+    // Both a definite refusal and an indeterminate post-execution failure are
+    // exit-1 operator errors on this surface, exactly as they were when the
+    // handler called `die()` in place (the result's `reason`/`effect` split
+    // exists for the callers that must decide whether a retry is safe).
+    die(result.summary);
   } finally {
-    // Release on every normal-completion path (dry-run, success, failure). die()
-    // paths inside the critical section release via lockedDie() since
-    // process.exit() bypasses finally.
-    releaseLock();
     store.close();
     outboxStore.close();
   }
@@ -14619,18 +13945,57 @@ function deriveParentWorkflowIdentity(
 }
 
 /**
- * Run one planned command. No shell is involved: `file` and `args` are passed
- * to `spawnSync` separately, so a path or project ID containing a space or a
- * shell metacharacter is one argument and stays one argument.
+ * Backoff before re-attempting a deploy step the OS refused to spawn. Shared
+ * with `probe()` (see {@link TRANSIENT_SPAWN_RETRY_BACKOFF_MS}) because both
+ * wait on the same host condition and must not give up on it at different
+ * points.
  */
-function runN8nDeployCommand(command: N8nDeployCommand) {
-  const result = spawnSync(command.file, command.args, {
+const N8N_DEPLOY_SPAWN_RETRY_BACKOFF_MS = TRANSIENT_SPAWN_RETRY_BACKOFF_MS;
+
+/**
+ * Start one planned command once. No shell is involved: `file` and `args` are
+ * passed to `spawnSync` separately, so a path or project ID containing a space
+ * or a shell metacharacter is one argument and stays one argument.
+ */
+function spawnN8nDeployCommand(command: N8nDeployCommand) {
+  return spawnSync(command.file, command.args, {
     cwd: command.cwd,
     env: command.env === undefined ? process.env : { ...process.env, ...command.env },
     encoding: "utf8",
     timeout: command.timeoutMs,
     maxBuffer: 32 * 1024 * 1024,
   });
+}
+
+/**
+ * True when the OS refused to create the process for a reason that is about the
+ * HOST rather than this deploy — it ran out of process slots, descriptors, or
+ * memory. A loaded machine fails this identically whether the step would have
+ * succeeded or not, so reading it as a failed step sends the operator to debug a
+ * generator or an n8n install that was never reached. `probe()` draws the same
+ * line for CLI availability (issue #897) and shares the errno set.
+ *
+ * Requires the never-started shape (an error with neither an exit code nor a
+ * signal), which is also what makes a retry safe: the child wrote nothing, so
+ * re-running it cannot double an import or an activation.
+ */
+function isTransientN8nDeploySpawnRefusal(result: ReturnType<typeof spawnN8nDeployCommand>): boolean {
+  if (result.error === undefined || result.status !== null || result.signal !== null) return false;
+  const code = (result.error as NodeJS.ErrnoException).code;
+  return code !== undefined && TRANSIENT_SPAWN_ERROR_CODES.has(code);
+}
+
+/** Run one planned command, tolerating a host that could not fork right now. */
+function runN8nDeployCommand(command: N8nDeployCommand) {
+  let result = spawnN8nDeployCommand(command);
+  for (
+    let attempt = 0;
+    attempt < N8N_DEPLOY_SPAWN_RETRY_BACKOFF_MS.length && isTransientN8nDeploySpawnRefusal(result);
+    attempt += 1
+  ) {
+    sleepSync(N8N_DEPLOY_SPAWN_RETRY_BACKOFF_MS[attempt]);
+    result = spawnN8nDeployCommand(command);
+  }
   // Node reports an exit code for every process that ran and a signal for every
   // process it killed (the timeout above). A spawn that failed outright — no
   // such binary, or one that could not be executed — is the only case with an
@@ -15021,6 +14386,9 @@ const HUMAN_DEFAULT_COMMANDS = new Set([
   // facing preview/--yes commands; readable preview output without --json.
   "task cancel",
   "task reconcile-closed",
+  // Merged-PR reconciliation (issue #1048): the same operator-facing
+  // preview/--yes posture, run by hand while looking at a merged PR.
+  "task reconcile-merged",
   // L3 intervention aggregation (issue #588): operator-facing diagnostic,
   // human-readable by default; --json for machine consumption.
   "interventions",
@@ -15077,6 +14445,31 @@ const HUMAN_DEFAULT_COMMANDS = new Set([
   // preview/--yes posture and the same operator-facing default.
   "chain fork",
   "chain merge",
+  // Read-only agent runtime profile inspection/validation (issue #913): the
+  // §11.4 operator commands of docs/agent-runtime-profiles-contract.md. Run by
+  // hand while looking at (or about to edit) `agent-profiles.json`, so all
+  // three read as text by default; --json gives the stable machine payload.
+  // `refresh` (issue #914) joins them with the same preview/--yes posture the
+  // other state-changing operator commands share.
+  "agent-profile list",
+  "agent-profile show",
+  "agent-profile validate",
+  "agent-profile refresh",
+  // §13 refinement recovery (issue #980): an operator-facing preview/--yes
+  // command run by hand while looking at a stopped Issue. `refinement run`
+  // stays machine-default (JSON) — it is the lane's own execution entry.
+  "refinement recover",
+  // §10 verification refresh (issue #1041): the same preview/--yes posture,
+  // read by an operator looking at a corrected Issue. `review-verification
+  // resolve` stays machine-default (JSON) — it is called by tooling.
+  "review-verification refresh",
+  // The §11 task-scoped verification surface (issue #1042). All four are run by
+  // hand while looking at one stuck task, so all four read as text by default;
+  // --json is the stable payload n8n and scripts consume.
+  "task-verification show",
+  "task-verification amend",
+  "task-verification refresh-from-issue",
+  "task-verification reset",
 ]);
 
 export async function main(rawArgv: string[]): Promise<void> {
@@ -15164,7 +14557,14 @@ export async function main(rawArgv: string[]): Promise<void> {
       await runTaskReconcileClosed(argv.slice(2));
       return;
     }
-    die(`Unknown task action: ${action ?? "(none)"}. Expected: clear-delay | cancel | reconcile-closed`);
+    if (action === "reconcile-merged") {
+      await runTaskReconcileMerged(argv.slice(2));
+      return;
+    }
+    die(
+      `Unknown task action: ${action ?? "(none)"}. ` +
+        `Expected: clear-delay | cancel | reconcile-closed | reconcile-merged`,
+    );
   }
 
   if (subcommand === "issue") {
@@ -15223,6 +14623,27 @@ export async function main(rawArgv: string[]): Promise<void> {
     );
   }
 
+  if (subcommand === "agent-profile") {
+    const action = argv[1];
+    if (action === "list") {
+      await runAgentProfileList(argv.slice(2));
+      return;
+    }
+    if (action === "show") {
+      await runAgentProfileShow(argv.slice(2));
+      return;
+    }
+    if (action === "validate") {
+      await runAgentProfileValidate(argv.slice(2));
+      return;
+    }
+    if (action === "refresh") {
+      await runAgentProfileRefresh(argv.slice(2));
+      return;
+    }
+    die(`Unknown agent-profile action: ${action ?? "(none)"}. Expected: list | show | validate | refresh`);
+  }
+
   if (subcommand === "n8n") {
     const action = argv[1];
     if (action === "deploy") {
@@ -15247,13 +14668,40 @@ export async function main(rawArgv: string[]): Promise<void> {
     return;
   }
 
+  if (subcommand === "task-verification") {
+    const action = argv[1];
+    if (action === "show") {
+      await runTaskVerificationShow(argv.slice(2));
+      return;
+    }
+    if (action === "amend") {
+      await runTaskVerificationAmend(argv.slice(2));
+      return;
+    }
+    if (action === "refresh-from-issue") {
+      await runTaskVerificationRefreshFromIssue(argv.slice(2));
+      return;
+    }
+    if (action === "reset") {
+      await runTaskVerificationReset(argv.slice(2));
+      return;
+    }
+    die(
+      `Unknown task-verification action: ${action ?? "(none)"}. Expected: show | amend | refresh-from-issue | reset`,
+    );
+  }
+
   if (subcommand === "review-verification") {
     const action = argv[1];
     if (action === "resolve") {
       await runReviewVerificationResolve(argv.slice(2));
       return;
     }
-    die(`Unknown review-verification action: ${action ?? "(none)"}. Expected: resolve`);
+    if (action === "refresh") {
+      await runReviewVerificationRefresh(argv.slice(2));
+      return;
+    }
+    die(`Unknown review-verification action: ${action ?? "(none)"}. Expected: resolve | refresh`);
   }
 
   if (subcommand === "tool-request") {
@@ -15263,7 +14711,7 @@ export async function main(rawArgv: string[]): Promise<void> {
       return;
     }
     if (action === "resolve") {
-      await runToolRequestResolve(argv.slice(2));
+      await runToolRequestResolveCommand(argv.slice(2));
       return;
     }
     if (action === "run") {
@@ -15469,7 +14917,16 @@ export async function main(rawArgv: string[]): Promise<void> {
       await runRefinementRun(parsed, { store: new SqliteTaskStore(parsed.dbPath) });
       return;
     }
-    die(`Unknown refinement action: ${action ?? "(none)"}. Expected: run`);
+    // §13's operator recovery (issue #980). Same composition-root shape as
+    // `run`: the concrete store is constructed here and injected, so the
+    // command module itself never imports it (#613/P1).
+    if (action === "recover") {
+      const parsed = parseRefinementRecoverArgs(argv.slice(2));
+      if ("error" in parsed) die(parsed.error);
+      await runRefinementRecover(parsed, { store: new SqliteTaskStore(parsed.dbPath) });
+      return;
+    }
+    die(`Unknown refinement action: ${action ?? "(none)"}. Expected: run | recover`);
   }
 
   if (subcommand === "interventions") {
@@ -15541,12 +14998,37 @@ export async function main(rawArgv: string[]): Promise<void> {
   die(`Unknown command: ${subcommand}. Run "admin help" to see available commands.`);
 }
 
+/**
+ * The complete admin CLI run: dispatch plus the top-level failure contract that
+ * turns an unexpected throw into the same `die()` output any other failure
+ * produces.
+ *
+ * This is the whole of the executable's behaviour — `dist/cli/admin.js` invoked
+ * as a program does nothing but call this with `process.argv.slice(2)`. The
+ * in-process test harness (test/helpers/admin-cli.js) calls the same function
+ * with a swapped {@link CliIoSink}, so a harnessed case and a spawned case run
+ * identical code and differ only in where stdout/stderr/exit land (issue #1018).
+ */
+export async function runAdminCli(argv: string[]): Promise<void> {
+  try {
+    await main(argv);
+  } catch (err) {
+    // A sink that unwinds by throwing has already decided the outcome; re-raise
+    // it rather than relabelling a deliberate exit an unexpected error.
+    if (err instanceof CliExit) throw err;
+    die(`Unexpected error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 const isMain =
   process.argv[1] !== undefined &&
   fileURLToPath(import.meta.url) === process.argv[1];
 
 if (isMain) {
-  main(process.argv.slice(2)).catch((err) => {
-    die(`Unexpected error: ${err instanceof Error ? err.message : String(err)}`);
+  // Under the process sink die() calls process.exit(), so this promise settles
+  // only on the success path; the catch is a belt-and-braces net that keeps a
+  // hypothetical rejection from surfacing as an unhandled-rejection crash.
+  runAdminCli(process.argv.slice(2)).catch(() => {
+    process.exitCode = 1;
   });
 }

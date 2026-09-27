@@ -68,6 +68,67 @@ describe('docs/review-dispute-operations.md — configuration', () => {
     expect(doc).toMatch(/no `reviewDispute` key and a session with `"enabled": false` resolve to the same settings/);
   });
 
+  // Issue #965 promoted the feature to `config-gated`, which means an operator
+  // enabling it has to be told what it needs from the three providers and what
+  // it will then do on its own. Both are prerequisites for the promotion, so
+  // both are pinned rather than left to drift out of the document.
+  test('names the provider prerequisites for all three roles', () => {
+    expect(doc).toMatch(/### 1\.1 Provider prerequisites/);
+    for (const token of ['defaults.implementationAgent', 'defaults.reviewAgent', 'reviewDispute.arbiter.providers']) {
+      expect(doc).toContain(token);
+    }
+    // The reviewer answers the reconsideration with no tool surface, and an
+    // agent that cannot be invoked that way fails closed rather than being
+    // silently swapped for another provider.
+    expect(doc).toMatch(/no no-tools invocation fails closed as `profile_unavailable`/);
+  });
+
+  // Issue #965's real-handler qualification turned up the one prerequisite an
+  // operator cannot satisfy by configuring anything: §8.2 makes the runner the
+  // enforcement point of the no-tool boundary and this runner has a verified
+  // no-tools invocation for `claude` alone, so the parties the reviewer and
+  // evidence turns require leave §8.3 no acceptable arbiter at all. The document
+  // has to say so — an operator who reads "pick a third provider" and cannot
+  // make one work would otherwise be debugging their own session forever.
+  test('states that arbiter capability is checked before independence, and what that costs today', () => {
+    expect(doc).toMatch(/Today only `claude` has a verified no-tools invocation/);
+    expect(doc).toMatch(/no arbiter candidate is acceptable/);
+    expect(doc).toMatch(/`allowSameProvider` does not rescue it/);
+    // And that widening it is a change to the runner, never to a session.
+    expect(doc).toMatch(/adding a verified no-tools invocation for another CLI/);
+    // The consequence is a documented protocol row, not a crash or a park.
+    expect(doc).toMatch(/every upheld dispute escalates to a human \(§7 row 19\)/);
+  });
+
+  // Issue #965: the review phase already failed closed on an unresolvable block;
+  // the fix phase used to fall back to the contract maxima and carry on, which
+  // silently overrode a session that meant to lower a limit. Both stop now, and
+  // the document says so — an operator who sees one phase fail should not be
+  // wondering whether the other one quietly proceeded.
+  test('says an unresolvable block fails BOTH phases rather than degrading', () => {
+    expect(doc).toMatch(/fails the run\*\*, in the `review` phase and in the `implementation` phase alike/);
+    expect(doc).toMatch(/It is never read as "protocol disabled"/);
+  });
+
+  test('lists the turns the protocol runs on its own, and where each one runs', () => {
+    expect(doc).toMatch(/### 1\.2 What the protocol runs on its own/);
+    for (const turn of ['Fix disposition', 'Reviewer reconsideration', 'Runner arbitration', 'Evidence collection']) {
+      expect(doc).toContain(turn);
+    }
+    // The property that makes those sub-turns safe: a review run that takes one
+    // never reaches the review agent, so an ordinary review cannot discharge an
+    // open lineage.
+    expect(doc).toMatch(/never builds an ordinary review prompt and never invokes the review agent/);
+    expect(doc).toMatch(/one party per phase run/i);
+  });
+
+  test('the status command is documented as showing evidence-round party progress', () => {
+    expect(doc).toMatch(/evidence round 1: implementer=completed\(1\)@0/);
+    expect(doc).toMatch(/which party a partial round is still owed/);
+    // The boundedness claim the projection actually enforces.
+    expect(doc).toMatch(/neither are the evidence references themselves, their paths, their\s+quote digests, or any artifact name/);
+  });
+
   test('every documented default matches the contract constants', () => {
     expect(doc).toContain(`\`arbiter.minConfidence\` | \`${DEFAULT_ARBITER_MIN_CONFIDENCE}\``);
     // The two limits a session may legitimately set to zero, and only those.
@@ -113,6 +174,17 @@ describe('docs/review-dispute-operations.md — arbiter selection and doctor', (
   test('states that the role checks report only failures, so absence is the pass', () => {
     expect(doc).toMatch(/`implementationAgentCli` and `reviewAgentCli` appear \*\*only when the role is unusable\*\*/);
     expect(doc).toMatch(/the two candidate checks are \*skipped\* rather than failed/);
+  });
+
+  // Issue #1073: reconsideration support (D2) and independent-arbiter
+  // availability (§8.3) are different questions, and this doctor check must
+  // never let one be misread as the other.
+  test('documents reviewerReconsiderationCapability as distinct from the arbiter checks', () => {
+    expect(doc).toContain('`reviewerReconsiderationCapability`');
+    expect(doc).toMatch(/a different question than the three arbiter checks/);
+    expect(doc).toMatch(/being able to \*raise\* a finding is not being able to \*reconsider\* one/);
+    expect(doc).toMatch(/must never be read from these checks as "the dispute path does not work"/);
+    expect(doc).toMatch(/a different stop than `arbiterSelection`'s/);
   });
 });
 
@@ -208,7 +280,14 @@ describe('docs/review-dispute-operations.md — visibility, escalation, rollback
   test('states the escalated_human limitation instead of inventing a command', () => {
     expect(doc).toMatch(/G1 — an `escalated_human` lineage has no way back into automation/);
     expect(doc).toMatch(/there is no command that resolves an escalated lineage/);
-    expect(doc).toMatch(/G2 — the reviewer, evidence, and runner turns have no dispatcher/);
+    // Issue #964 gave the last §7.1 turn (evidence) its dispatcher, so G2 is no
+    // longer "a turn nobody runs" — it is the fail-closed stop for a turn this
+    // runtime could not answer, and it still has no protocol-level continuation.
+    // The document must say both halves: dispatchers exist, and the park stays.
+    expect(doc).toMatch(/G2 — no operator continuation for the undispatched-turn park/);
+    expect(doc).toMatch(/Every §7\.1 turn now has a dispatcher/);
+    expect(doc).toMatch(/issue #952[\s\S]{0,120}issue #955[\s\S]{0,120}issue #964/);
+    expect(doc).not.toMatch(/the evidence turn has no dispatcher/);
     // The same two gaps, in the document that owns them.
     expect(contract).toMatch(/G1 — no human-resolution transition out of `escalated_human`/);
     expect(contract).toMatch(/G2 — no operator continuation for the undispatched-turn park/);
@@ -235,6 +314,7 @@ describe('docs/review-dispute-operations.md — visibility, escalation, rollback
 
   test('the verification section names the suites that actually exist', () => {
     for (const suite of [
+      'test/review-dispute-qualification.test.js',
       'test/review-dispute-e2e.test.js',
       'test/review-dispute-rollout.test.js',
       'test/review-dispute-metrics.test.js',

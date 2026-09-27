@@ -77,6 +77,8 @@ import {
 } from "../core/issue-activation.js";
 import type { IssueActivationOutcome, IssueActivationStore } from "../core/issue-activation.js";
 import { acceptChainGraph, collectChainOwnership } from "../core/chain-acceptance.js";
+import { resolveChainOwnershipScopeFor } from "../core/chain-ownership-scope.js";
+import type { ChainOwnershipScope } from "../core/chain-ownership-scope.js";
 import type { ChainGraphAcceptance } from "../core/chain-acceptance.js";
 import { isValidChainAlias, isValidIssueNumber } from "../core/chain-registry.js";
 import type { ChainEdgeInput, ChainMemberInput } from "../core/chain-registry.js";
@@ -87,6 +89,7 @@ import {
   chainEditLockScopeKind,
   chainEditLockScopes,
   describeChainEditLockScope,
+  describeChainEditLockScopes,
 } from "../core/chain-edit-lock.js";
 import type { ChainEditLockHolder } from "../core/chain-edit-lock.js";
 import type { ChainGraphEdge } from "../core/chain-graph.js";
@@ -592,6 +595,13 @@ interface AdvancedContext {
   provider: WorkItemProvider;
   chainStore: SqliteChainRegistryStore;
   activationStore: IssueActivationStore;
+  /**
+   * The Issue-number space this operation's duplicate-ownership checks are
+   * asked over: every session bound to the same repository as `session` (issue
+   * #1045). Resolved once per run, so the plan and the acceptance it commits
+   * judge ownership over the same set of chains.
+   */
+  ownershipScope: ChainOwnershipScope;
   now: string;
   /** Absent for a preview, which claims nothing. */
   locks?: LockRuntime;
@@ -750,7 +760,7 @@ async function executeAdvancedOperation(
     kind: "lock_contended",
     transient: true,
     message:
-      `this operation no longer holds ${lost.map(describeChainEditLockScope).join(", ")}: another chain edit took ` +
+      `this operation no longer holds ${describeChainEditLockScopes(lost)}: another chain edit took ` +
       "the claim over while this one was running",
     remediation,
     recovery,
@@ -1166,6 +1176,9 @@ export async function runChainFork(argv: string[]): Promise<void> {
     } catch (err) {
       die(messageOf(err));
     }
+    // Repository-scoped, not session-scoped: an Issue number identifies an
+    // Issue only within the repository that issued it (issue #1045).
+    const ownershipScope = await resolveChainOwnershipScopeFor(session.sessionId, registry);
 
     const now = new Date().toISOString();
     const operationId = [
@@ -1202,6 +1215,14 @@ export async function runChainFork(argv: string[]): Promise<void> {
         sessionId: session.sessionId,
         issueNumbers: target.members.map((m) => m.issueNumber),
         ...(name === undefined ? {} : { name }),
+        // Claimed over the repository the ownership check is asked over, so two
+        // sessions sharing one repository cannot fork the same Issues at once
+        // (issue #1045) — and under each of those sessions, so an older build
+        // that only knows the session spelling collides too.
+        sessionIds: ownershipScope.sessionIds,
+        ...(ownershipScope.repositoryKey === undefined
+          ? {}
+          : { repositoryKey: ownershipScope.repositoryKey }),
       });
       const acquired = await locks.acquire({ scopes, operationId, now });
       if (!acquired.ok) {
@@ -1234,7 +1255,8 @@ export async function runChainFork(argv: string[]): Promise<void> {
     const observedIssues = [...new Set(target.members.map((m) => m.issueNumber))].sort((a, b) => a - b);
     const observation = await readObservation(provider, observedIssues);
     const ownership = await collectChainOwnership(chainStore, observedIssues, {
-      filter: { sessionId: session.sessionId },
+      filter: ownershipScope.filter,
+      repositoryBySessionId: ownershipScope.repositoryBySessionId,
       excludeChainId: target.chainId,
     });
     const frozenSnapshots = await chainStore.listFrozenPrefixes({ chainId: target.chainId });
@@ -1292,7 +1314,15 @@ export async function runChainFork(argv: string[]): Promise<void> {
       return;
     }
 
-    const context: AdvancedContext = { session, provider, chainStore, activationStore, now, locks };
+    const context: AdvancedContext = {
+      session,
+      provider,
+      chainStore,
+      activationStore,
+      ownershipScope,
+      now,
+      locks,
+    };
     const forkShape: ForkFrozenShape = {
       chainId: target.chainId,
       segmentIssues: plan.segmentIssues,
@@ -1359,7 +1389,8 @@ async function commitFork(
     edges: plan.remaining.edges,
     headIssueNumber: plan.remaining.headIssueNumber,
     expectedRev: resolved.rev,
-    ownershipScope: { sessionId: session.sessionId },
+    ownershipScope: context.ownershipScope.filter,
+    repositoryBySessionId: context.ownershipScope.repositoryBySessionId,
     commitGuard: ({ frozenPrefixes }) => checkForkFrozenPrefixes(forkShape, frozenPrefixes)?.message,
     source,
     now,
@@ -1430,7 +1461,8 @@ async function commitFork(
     edges: plan.segment.edges,
     headIssueNumber: plan.segment.headIssueNumber,
     expectedRev: created.value.chain.rev,
-    ownershipScope: { sessionId: session.sessionId },
+    ownershipScope: context.ownershipScope.filter,
+    repositoryBySessionId: context.ownershipScope.repositoryBySessionId,
     source,
     now,
   });
@@ -1541,6 +1573,8 @@ export async function runChainMerge(argv: string[]): Promise<void> {
     } catch (err) {
       die(messageOf(err));
     }
+    // See `runChainFork`: the scope is the repository, not the session.
+    const ownershipScope = await resolveChainOwnershipScopeFor(session.sessionId, registry);
 
     const now = new Date().toISOString();
     const operationId = [
@@ -1579,6 +1613,11 @@ export async function runChainMerge(argv: string[]): Promise<void> {
           ...target.members.map((m) => m.issueNumber),
           ...sourceChain.members.map((m) => m.issueNumber),
         ],
+        // See `runChainFork`: the claim is repository-scoped (issue #1045).
+        sessionIds: ownershipScope.sessionIds,
+        ...(ownershipScope.repositoryKey === undefined
+          ? {}
+          : { repositoryKey: ownershipScope.repositoryKey }),
       });
       const acquired = await locks.acquire({ scopes, operationId, now });
       if (!acquired.ok) {
@@ -1602,7 +1641,8 @@ export async function runChainMerge(argv: string[]): Promise<void> {
     const observation = await readObservation(provider, observedIssues);
     const ownership = (
       await collectChainOwnership(chainStore, observedIssues, {
-        filter: { sessionId: session.sessionId },
+        filter: ownershipScope.filter,
+        repositoryBySessionId: ownershipScope.repositoryBySessionId,
         excludeChainId: target.chainId,
       })
     ).filter((entry) => entry.chainId !== sourceChain.chainId);
@@ -1654,7 +1694,15 @@ export async function runChainMerge(argv: string[]): Promise<void> {
       return;
     }
 
-    const context: AdvancedContext = { session, provider, chainStore, activationStore, now, locks };
+    const context: AdvancedContext = {
+      session,
+      provider,
+      chainStore,
+      activationStore,
+      ownershipScope,
+      now,
+      locks,
+    };
     const payload = await executeAdvancedOperation(context, {
       operation: "merge",
       operationId,
@@ -1698,7 +1746,7 @@ async function commitMerge(
   plan: ChainMergeApply,
   now: string,
 ): Promise<CommitSuccess | { failure: ChainAdvancedFailure }> {
-  const { chainStore, session } = context;
+  const { chainStore } = context;
   const source = `${ADVANCED_SOURCE_PREFIX} merge`;
   const retirementRecovery = [
     `Chain ${plan.chainId} holds the merged graph; chain ${plan.sourceChainId} is still registered over the same ` +
@@ -1713,7 +1761,8 @@ async function commitMerge(
       edges: plan.merged.edges,
       headIssueNumber: plan.merged.headIssueNumber,
       expectedRev: resolvedTarget.rev,
-      ownershipScope: { sessionId: session.sessionId },
+      ownershipScope: context.ownershipScope.filter,
+      repositoryBySessionId: context.ownershipScope.repositoryBySessionId,
       // The source still records the members it is handing over; the claim
       // must bind every chain EXCEPT it.
       tolerateOwnerChainIds: [plan.sourceChainId],

@@ -35,11 +35,11 @@ function parse(result) {
 function initDb() {
   const store = new SqliteTaskStore(dbPath);
   store.close();
-  // Run the outbox claimed_at/cancelled_at migration up front: a DB touched
-  // only by SqliteTaskStore lacks those columns, and SqliteMaintenanceLock
-  // deliberately never migrates (issue #817 review — it must stay read-only
-  // so it can inspect a legacy or read-only database), so raw seeding below
-  // needs SqliteOutboxStore's own migration to have already run.
+  // Make sure the outbox claimed_at/cancelled_at columns exist before raw
+  // seeding: SqliteMaintenanceLock deliberately never migrates (issue #817
+  // review — it must stay read-only so it can inspect a legacy or read-only
+  // database). SqliteTaskStore migrates both itself now (issue #980 and its
+  // review), so this covers a file created by an older build too.
   new SqliteOutboxStore(dbPath).close();
 }
 

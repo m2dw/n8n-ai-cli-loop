@@ -13,6 +13,8 @@ import { SqliteOutboxStore } from '../dist/stores/sqlite-outbox-store.js';
 import { SqliteContextStore } from '../dist/index.js';
 import { SqliteMaintenanceLock } from '../dist/stores/sqlite-maintenance-lock.js';
 import { main } from '../dist/cli/dispatch-outbox.js';
+import { OUTBOX_TRANSPORT_TIMEOUT_PREFIX } from '../dist/core/outbox-transport-deadline.js';
+import { isIndeterminateProbeError } from './helpers/cli-probe.js';
 
 const CLI = new URL('../dist/cli/dispatch-outbox.js', import.meta.url).pathname;
 
@@ -66,6 +68,29 @@ function runCliWithEnv(extraEnv, ...args) {
 
 function parseOutput(result) {
   return JSON.parse(result.stdout.trim());
+}
+
+/**
+ * Does this dispatch run describe the HOST rather than the transport?
+ *
+ * The subprocess case below hands the CLI a two-line `#!/bin/sh` fake `gh` that
+ * exits immediately, so nothing it does can spend the 60s per-call deadline
+ * (issue #1064) or make a fork fail. A saturated parallel run — several full Jest
+ * runs at once, each forking children — can do both, and the dispatcher then
+ * reports exactly what it should: a deadline it enforced, or the spawn errno the
+ * host returned. Issue #897 draws that line for CLI probes and its errno test is
+ * reused here rather than restated.
+ *
+ * Reading either as "the row did not dispatch" would report a thrashing machine
+ * as a dispatcher defect, so the case asks again instead.
+ */
+function isHostStarvedDispatch(out) {
+  if ((out?.transportTimeouts ?? 0) > 0) return true;
+  return (out?.errors ?? []).some(
+    (entry) =>
+      typeof entry?.error === 'string'
+      && (entry.error.includes(OUTBOX_TRANSPORT_TIMEOUT_PREFIX) || isIndeterminateProbeError(entry.error)),
+  );
 }
 
 function okRunner() {
@@ -1121,28 +1146,44 @@ describe('dispatch-outbox CLI subprocess', () => {
     writeFileSync(fakeGh, '#!/bin/sh\nexit 0\n', 'utf8');
     chmodSync(fakeGh, 0o755);
 
-    // Enqueue an entry
-    const store = new SqliteOutboxStore(dbPath);
-    store.enqueue({ idempotencyKey: 'k1', topic: 'gh:comment', payload: COMMENT_PAYLOAD });
-    store.close();
+    const ATTEMPTS = 3;
+    let r;
+    let out = null;
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
+      // A fresh database per attempt. A failed row is rescheduled behind a retry
+      // backoff, so re-running against the same one would find nothing eligible
+      // and report a starved attempt as an empty dispatch run.
+      const attemptDb = join(tmpDir, `fake-gh-${attempt}.db`);
+      const store = new SqliteOutboxStore(attemptDb);
+      store.enqueue({ idempotencyKey: 'k1', topic: 'gh:comment', payload: COMMENT_PAYLOAD });
+      store.close();
 
-    // Override PATH so our fake gh is found first
-    const r = (() => {
-      try {
-        const stdout = execFileSync(process.execPath, [CLI, '--db-path', dbPath], {
-          encoding: 'utf8',
-          env: { ...process.env, PATH: `${tmpDir}:${process.env.PATH}` },
-        });
-        return { code: 0, stdout };
-      } catch (err) {
-        return { code: err.status ?? 1, stdout: err.stdout ?? '' };
-      }
-    })();
+      // Override PATH so our fake gh is found first
+      r = (() => {
+        try {
+          const stdout = execFileSync(process.execPath, [CLI, '--db-path', attemptDb], {
+            encoding: 'utf8',
+            env: { ...process.env, PATH: `${tmpDir}:${process.env.PATH}` },
+          });
+          return { code: 0, stdout };
+        } catch (err) {
+          return { code: err.status ?? 1, stdout: err.stdout ?? '' };
+        }
+      })();
+      if (r.code !== 0) break;
+      out = parseOutput(r);
+      if (!isHostStarvedDispatch(out)) break;
+      // Loud on purpose: a case that keeps re-running has to be visible in the
+      // run it happened in, not discovered later as a mysteriously slow file.
+      console.warn(
+        `dispatch-outbox fake-gh starved on attempt ${attempt}/${ATTEMPTS} — the host did not run the stub: `
+          + JSON.stringify(out.errors ?? []),
+      );
+    }
 
     expect(r.code).toBe(0);
-    const out = parseOutput(r);
     expect(out).toMatchObject({ ok: true, dispatched: 1, failed: 0 });
-  });
+  }, 300_000);
 });
 
 describe('dispatch-outbox — contextId-only resolution', () => {

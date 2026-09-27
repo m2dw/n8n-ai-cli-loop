@@ -36,7 +36,22 @@ import {
   REFINEMENT_CRITIC_VERDICTS,
   REFINEMENT_TOPOLOGY_DISPOSITIONS,
 } from "./issue-refinement.js";
-import type { RefinementSnapshot } from "./issue-refinement-snapshot.js";
+import type {
+  RefinementSnapshot,
+  RefinementSnapshotEvidence,
+} from "./issue-refinement-snapshot.js";
+import type { RefinementEvidenceGateRecord } from "./issue-refinement-evidence-preflight.js";
+import type {
+  NormalizedTopologyProposal,
+  RefinementRelationshipGraph,
+  RefinementTopologyNormalization,
+  RefinementTopologyRelationship,
+  TopologyNormalizationResult,
+} from "./issue-refinement-topology.js";
+import {
+  normalizeTopologyProposals,
+  validRefinementTopologyRelationship,
+} from "./issue-refinement-topology.js";
 import type { AgentId } from "./task.js";
 import { knownModel } from "./review-arbiter-profile.js";
 
@@ -98,6 +113,15 @@ export interface RefinementTopologyProposal {
   kind: RefinementTopologyKind;
   rationale: string;
   disposition: RefinementTopologyDisposition;
+  /**
+   * §7.1/§9.1 (issue #982) the structured edge a `dependency_*` proposal is
+   * about, so the runner can compare it against the authoritative relationship
+   * graph instead of taking the rationale's word for it. Optional because
+   * omitting it is not malformed — it makes the proposal unverifiable, which
+   * fails closed exactly like today. Ignored for `split` and `supersede`, which
+   * name no edge.
+   */
+  relationship?: RefinementTopologyRelationship;
 }
 
 /** §7.1 the refiner's structured result, validated closed. */
@@ -145,6 +169,26 @@ export interface RefinementObjection {
 }
 
 /**
+ * §7.2 (issue #1176) why a `block` needs a human rather than another draft —
+ * closed set, exactly five. Each names a defect the refiner cannot repair from
+ * the snapshot alone; an omission of a requirement the target Issue already
+ * states is deliberately NOT among them (that is `revise`).
+ */
+export const REFINEMENT_BLOCK_REASONS = [
+  /** The target Issue leaves open a decision only the operator can make. */
+  "missing_decision",
+  /** Authoritative inputs (Issue, predecessor evidence) conflict with each other. */
+  "authority_conflict",
+  /** Evidence needed to judge the draft is omitted or truncated. */
+  "evidence_unavailable",
+  /** Predecessor evidence invalidates the target Issue's premise. */
+  "premise_invalidated",
+  /** Refining would need a scope or topology change requiring operator choice. */
+  "scope_change",
+] as const;
+export type RefinementBlockReason = (typeof REFINEMENT_BLOCK_REASONS)[number];
+
+/**
  * §7.2 the critic's structured result.
  *
  * `topologyDispositions` keeps its RAW entries deliberately: §9 says an
@@ -157,6 +201,11 @@ export interface RefinementCritique {
   objections: RefinementObjection[];
   topologyDispositions: unknown[];
   confidence: RefinementConfidence;
+  /**
+   * §7.2 (issue #1176) the human blocker a `block` names; `null` when absent
+   * (always for `pass`/`revise`, and for a `block` that did not name one).
+   */
+  blockReason: RefinementBlockReason | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,14 +224,65 @@ function byteLength(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
 
+/** The characters a multiline `^`/`$` treats as line terminators. */
+function isLineTerminator(ch: string | undefined): boolean {
+  return ch === "\n" || ch === "\r" || ch === " " || ch === " ";
+}
+
+function skipBlanks(raw: string, index: number): number {
+  let i = index;
+  while (raw[i] === " " || raw[i] === "\t") i += 1;
+  return i;
+}
+
+/** Index just past a `` ```json `` opener line starting at `at`, or -1. */
+function openerBodyStart(raw: string, at: number): number {
+  let i = skipBlanks(raw, at + 3);
+  if (raw.slice(i, i + 4).toLowerCase() !== "json") return -1;
+  i = skipBlanks(raw, i + 4);
+  if (raw[i] === "\r") i += 1;
+  return raw[i] === "\n" ? i + 1 : -1;
+}
+
+type JsonFence = { bodyStart: number; bodyEnd: number; end: number };
+
 /**
- * Built fresh per call — a module-level global regex carries `lastIndex`
- * across calls. The closing fence is anchored to its own line so a fence
- * QUOTED inside a JSON string (which escapes its newlines) can never
- * terminate the block early. Same shape as the arbitration verdict scanner.
+ * The next fenced `json` block at or after `from`, or null. Same grammar as
+ * the arbitration verdict scanner's
+ * `/```[ \t]*json[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*(?=\r?\n|$)/gim`: the
+ * closing fence is anchored to its own line so a fence QUOTED inside a JSON
+ * string (which escapes its newlines) can never terminate the block early.
+ *
+ * Hand-written instead of that regex (issue #1192): on an opener with no
+ * valid close the regex re-scans the rest of the output from every later
+ * opener, which is quadratic in repeated unclosed fences over the runner's
+ * 16 MiB output ceiling. Here an opener without a close ends the scan — every
+ * later opener's body starts inside the same close-free tail, so none of them
+ * can close either — which keeps the whole extraction linear.
  */
-function jsonBlockPattern(): RegExp {
-  return /```[ \t]*json[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*(?=\r?\n|$)/gim;
+function nextJsonFence(raw: string, from: number): JsonFence | null {
+  let at = raw.indexOf("```", from);
+  while (at !== -1) {
+    const bodyStart = openerBodyStart(raw, at);
+    if (bodyStart !== -1) {
+      let lineStart = bodyStart;
+      while (lineStart <= raw.length) {
+        const fence = skipBlanks(raw, lineStart);
+        if (raw.startsWith("```", fence)) {
+          const end = skipBlanks(raw, fence + 3);
+          if (end === raw.length || isLineTerminator(raw[end])) {
+            return { bodyStart, bodyEnd: lineStart, end };
+          }
+        }
+        let next = lineStart;
+        while (next < raw.length && !isLineTerminator(raw[next])) next += 1;
+        lineStart = next + 1;
+      }
+      return null;
+    }
+    at = raw.indexOf("```", at + 1);
+  }
+  return null;
 }
 
 /**
@@ -197,12 +297,16 @@ function jsonBlockPattern(): RegExp {
 export function extractRefinementRecord(
   raw: string,
 ): { ok: true; record: Record<string, unknown> } | { ok: false; detail: string } {
-  const pattern = jsonBlockPattern();
   const records: Record<string, unknown>[] = [];
   let sawBlock = false;
-  for (let match = pattern.exec(raw); match !== null; match = pattern.exec(raw)) {
+  for (let fence = nextJsonFence(raw, 0); fence !== null; fence = nextJsonFence(raw, fence.end)) {
     sawBlock = true;
-    const body = match[1];
+    // UTF-8 never takes fewer bytes than UTF-16 code units, so an oversized
+    // span is refused before it is copied, measured or parsed.
+    if (fence.bodyEnd - fence.bodyStart > REFINEMENT_RECORD_MAX_BYTES) {
+      return { ok: false, detail: "payload-too-large" };
+    }
+    const body = raw.slice(fence.bodyStart, fence.bodyEnd);
     if (byteLength(body) > REFINEMENT_RECORD_MAX_BYTES) {
       return { ok: false, detail: "payload-too-large" };
     }
@@ -438,18 +542,40 @@ export function parseRefinerResponse(
     rawProposals.forEach((entry, index) => {
       if (
         !isRecord(entry)
-        || Object.keys(entry).some((k) => !["kind", "rationale", "disposition"].includes(k))
+        || Object.keys(entry).some(
+          (k) => !["kind", "rationale", "disposition", "relationship"].includes(k),
+        )
         || !validEnum(entry["kind"], REFINEMENT_TOPOLOGY_KINDS)
         || !validBoundedString(entry["rationale"], REFINEMENT_MAX_ITEM_BYTES)
         || !validEnum(entry["disposition"], REFINEMENT_TOPOLOGY_DISPOSITIONS)
+        // §7.1: `relationship` may be absent, but a PRESENT one that does not
+        // parse is malformed like any other field — an unreadable edge must not
+        // be silently downgraded to "unverifiable" when the agent did try to
+        // name it.
+        || (entry["relationship"] !== undefined
+          && !validRefinementTopologyRelationship(entry["relationship"]))
       ) {
         malformed.push(`invalid-field:topologyProposals[${index}]`);
         return;
       }
+      const relationship = entry["relationship"] as Record<string, unknown> | undefined;
       proposals.push({
         kind: entry["kind"] as RefinementTopologyKind,
         rationale: entry["rationale"] as string,
         disposition: entry["disposition"] as RefinementTopologyDisposition,
+        // Rebuilt field by field rather than carried over: the parsed object is
+        // agent-supplied, and only the three validated numbers may survive.
+        ...(relationship
+          ? {
+              relationship: {
+                blockedIssue: relationship["blockedIssue"] as number,
+                blockerIssue: relationship["blockerIssue"] as number,
+                ...(relationship["previousBlockerIssue"] === undefined
+                  ? {}
+                  : { previousBlockerIssue: relationship["previousBlockerIssue"] as number }),
+              },
+            }
+          : {}),
       });
     });
   }
@@ -481,7 +607,13 @@ export function parseRefinerResponse(
   return { ok: true, contract, renderedRegion, regionBytes };
 }
 
-const CRITIC_FIELDS = ["verdict", "objections", "topologyDispositions", "confidence"] as const;
+const CRITIC_FIELDS = [
+  "verdict",
+  "objections",
+  "topologyDispositions",
+  "confidence",
+  "blockReason",
+] as const;
 
 /** Validate one critic response (§7.2, §17). */
 export function parseCriticResponse(raw: string): CriticParse {
@@ -552,10 +684,18 @@ export function parseCriticResponse(raw: string): CriticParse {
     malformed.push(confidence === undefined ? "missing-field:confidence" : "invalid-field:confidence");
   }
 
+  // §7.2 (issue #1176): optional; JSON `null` reads as absent.
+  const rawBlockReason = record["blockReason"];
+  const blockReason = rawBlockReason === undefined || rawBlockReason === null ? null : rawBlockReason;
+  if (blockReason !== null && !validEnum(blockReason, REFINEMENT_BLOCK_REASONS)) {
+    malformed.push("invalid-field:blockReason");
+  }
+
   if (malformed.length === 0) {
     // §17 verdict-shape rules, checked only once the shape itself is sound.
     if (verdict === "pass" && objections.length > 0) malformed.push("pass-with-objections");
     if (verdict === "revise" && objections.length === 0) malformed.push("revise-without-objections");
+    if (verdict !== "block" && blockReason !== null) malformed.push("block-reason-without-block");
   }
 
   if (malformed.length > 0) return { ok: false, malformed };
@@ -566,8 +706,78 @@ export function parseCriticResponse(raw: string): CriticParse {
       objections,
       topologyDispositions: rawDispositions as unknown[],
       confidence: confidence as RefinementConfidence,
+      blockReason: blockReason as RefinementBlockReason | null,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// §7.2 verdict routing — repairable omissions go back to the refiner
+// ---------------------------------------------------------------------------
+
+/**
+ * What §12 does with a well-formed critique (rows 14–19): the critic's verdict
+ * as the runner acts on it.
+ *
+ *  - `pass` — the §9 topology combination decides (rows 14–16).
+ *  - `revise` — a bounded revision round, or `no_convergence` at the cap
+ *    (rows 17/18). `repairableBlock` is `true` when the critic said `block` but
+ *    the block is a repairable omission (see {@link routeCriticVerdict}).
+ *  - `block` — `critique_blocked` (row 19), carrying the critic's named reason.
+ */
+export type RefinementCriticRoute =
+  | { route: "pass" }
+  | { route: "revise"; repairableBlock: boolean }
+  | { route: "block"; blockReason: RefinementBlockReason | null };
+
+/**
+ * §5.1/§7.2: the snapshot's declared evidence is complete — every declared
+ * selection was captured, and none was cut. An Issue that declares nothing is
+ * trivially complete.
+ */
+export function refinementEvidenceComplete(
+  evidence: readonly Pick<RefinementSnapshotEvidence, "status" | "truncated">[] | undefined,
+): boolean {
+  return (evidence ?? []).every((entry) => entry.status === "captured" && !entry.truncated);
+}
+
+/**
+ * §7.2 (issue #1176): route one well-formed critique.
+ *
+ * A requirement the target Issue already states is not a missing human
+ * decision, so a draft that dropped one is repairable by the refiner. The
+ * critic is told to answer that with `revise`; this function also recognises
+ * the `block` shape an older critic prompt taught (the #1111 run: `block`,
+ * every objection `lost_requirement`) and routes it through the SAME bounded
+ * revision round instead of spending a human handoff on it.
+ *
+ * The recognition is deliberately narrow and fails closed — a `block` stays a
+ * `block` unless ALL of these hold:
+ *
+ *  - the critic named no `blockReason` (a named reason is the critic's
+ *    explicit statement that a human is needed, and is honoured verbatim);
+ *  - there is at least one objection, and every objection is
+ *    `lost_requirement` (any `contradicted`, `unsupported`, `out_of_scope`, or
+ *    `ambiguous` objection beside it may be the real blocker);
+ *  - the snapshot's declared evidence is complete (an omitted or truncated
+ *    selection means the critic may have been unable to judge the draft).
+ *
+ * Nothing about the round cap changes: the routed `revise` is row 17 below the
+ * cap and row 18 (`no_convergence`) at it, exactly like a literal `revise`.
+ */
+export function routeCriticVerdict(
+  critique: Pick<RefinementCritique, "verdict" | "objections" | "blockReason">,
+  evidence: readonly Pick<RefinementSnapshotEvidence, "status" | "truncated">[] | undefined,
+): RefinementCriticRoute {
+  if (critique.verdict === "pass") return { route: "pass" };
+  if (critique.verdict === "revise") return { route: "revise", repairableBlock: false };
+  const repairable =
+    critique.blockReason === null
+    && critique.objections.length > 0
+    && critique.objections.every((o) => o.kind === "lost_requirement")
+    && refinementEvidenceComplete(evidence);
+  if (repairable) return { route: "revise", repairableBlock: true };
+  return { route: "block", blockReason: critique.blockReason };
 }
 
 // ---------------------------------------------------------------------------
@@ -582,11 +792,26 @@ export interface EffectiveTopologyDisposition {
   /** `null` when no well-formed critic entry named this index. */
   criticDisposition: RefinementTopologyDisposition | null;
   effective: RefinementTopologyDisposition;
+  /** §9.1 (#982) the proposal measured against the authoritative graph. */
+  normalization: RefinementTopologyNormalization;
+  /** §9.1 closed literal explaining {@link normalization}; never agent prose. */
+  normalizationDetail: string;
+  /** §9.1 first proposal index describing the same edge, or `null`. */
+  duplicateOfIndex: number | null;
+  /**
+   * §9.1 whether this proposal still needs a human. `false` for an
+   * `already_satisfied` no-op whatever either party said about it; otherwise
+   * the §9 answer, taken over the collapsed duplicate group.
+   */
+  escalates: boolean;
 }
 
 export interface CombinedTopologyDispositions {
   effective: EffectiveTopologyDisposition[];
+  /** §9/§9.1: any proposal that still requires a human topology decision. */
   anyBlocking: boolean;
+  /** §9.1 audit record of the normalization pass (private metadata, §15). */
+  normalization: TopologyNormalizationResult;
 }
 
 /**
@@ -596,10 +821,18 @@ export interface CombinedTopologyDispositions {
  * unparseable entry, an index that does not exist, or either party saying
  * `blocking` makes it `blocking` — an unattributable entry cannot confirm
  * anything, so its presence fails every proposal closed.
+ *
+ * §9.1 (issue #982) then subtracts the no-ops: a proposal the authoritative
+ * relationship graph already satisfies changes nothing, so neither party's
+ * `blocking` can spend a human handoff on it. Every other classification —
+ * effective, invalid, unverifiable — keeps the paragraph above verbatim, and an
+ * absent `graph` argument makes every proposal unverifiable, which is the
+ * pre-#982 behavior exactly.
  */
 export function combineTopologyDispositions(
   proposals: readonly RefinementTopologyProposal[],
   dispositions: readonly unknown[],
+  graph: RefinementRelationshipGraph = { ok: false, reason: "not_supplied" },
 ): CombinedTopologyDispositions {
   let unattributable = false;
   const byIndex = new Map<number, RefinementTopologyDisposition[]>();
@@ -621,7 +854,11 @@ export function combineTopologyDispositions(
     byIndex.set(index, list);
   }
 
-  const effective = proposals.map((proposal, index): EffectiveTopologyDisposition => {
+  const normalization = normalizeTopologyProposals(proposals, graph);
+  const normalized = new Map<number, NormalizedTopologyProposal>();
+  for (const entry of normalization.entries) normalized.set(entry.index, entry);
+
+  const combined = proposals.map((proposal, index) => {
     const entries = byIndex.get(index) ?? [];
     const criticDisposition: RefinementTopologyDisposition | null =
       entries.length === 0 ? null : entries.includes("blocking") ? "blocking" : "advisory";
@@ -635,10 +872,36 @@ export function combineTopologyDispositions(
       rationale: proposal.rationale,
       refinerDisposition: proposal.disposition,
       criticDisposition,
-      effective: advisory ? "advisory" : "blocking",
+      effective: (advisory ? "advisory" : "blocking") as RefinementTopologyDisposition,
     };
   });
-  return { effective, anyBlocking: effective.some((e) => e.effective === "blocking") };
+
+  // §9.1: duplicates are ONE decision, and the collapsed group fails closed —
+  // a group blocks when any of its members does, so a repeated proposal cannot
+  // dilute a `blocking` judgement into an advisory one.
+  const groupBlocking = new Map<string, boolean>();
+  const groupKey = (index: number): string => {
+    const entry = normalized.get(index);
+    if (!entry || entry.key === null) return `index:${index}`;
+    return `${entry.key}@${entry.duplicateOfIndex ?? index}`;
+  };
+  for (const entry of combined) {
+    const key = groupKey(entry.index);
+    groupBlocking.set(key, (groupBlocking.get(key) ?? false) || entry.effective === "blocking");
+  }
+
+  const effective = combined.map((entry): EffectiveTopologyDisposition => {
+    const norm = normalized.get(entry.index);
+    const satisfied = norm?.normalization === "already_satisfied";
+    return {
+      ...entry,
+      normalization: norm?.normalization ?? "invalid_or_unverifiable",
+      normalizationDetail: norm?.detail ?? "unclassified",
+      duplicateOfIndex: norm?.duplicateOfIndex ?? null,
+      escalates: !satisfied && (groupBlocking.get(groupKey(entry.index)) ?? true),
+    };
+  });
+  return { effective, anyBlocking: effective.some((e) => e.escalates), normalization };
 }
 
 // ---------------------------------------------------------------------------
@@ -818,7 +1081,33 @@ export type RefinementLoopContextBlock = RefinementContextBlock & {
   execution?: RefinementExecutionRecord;
   accepted?: RefinementAcceptedRecord;
   pendingRetry?: RefinementPendingRetryRecord;
+  /**
+   * §5.2 (issue #1003): why the required-evidence preflight stopped this
+   * attempt. Written only on the `evidence_required` handoff, and cleared by
+   * §13 recovery with the reason it belongs to — the next attempt captures a
+   * fresh snapshot and re-decides from it.
+   */
+  evidenceGate?: RefinementEvidenceGateRecord;
+  /**
+   * §15 (issue #1176): what the critic blocked on. Written only on the
+   * `critique_blocked` handoff (row 19), so `admin task-status` can show WHICH
+   * human blocker the handoff names, and cleared by §13 recovery with the
+   * reason it belongs to.
+   */
+  criticBlock?: RefinementCriticBlockRecord;
 };
+
+/**
+ * §15 (issue #1176): the persisted half of a row 19 block — literals only. The
+ * objections' `detail` prose stays in the local critic transcript, exactly as
+ * the `refinement.escalated.human` event carries it.
+ */
+export interface RefinementCriticBlockRecord {
+  round: number;
+  blockReason: RefinementBlockReason | null;
+  objections: Array<{ field: RefinementObjectionField; kind: RefinementObjectionKind }>;
+  recordedAt: string;
+}
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -841,7 +1130,8 @@ const REFINER_SCHEMA_BLOCK = `{
   "topologyProposals": [
     { "kind": "split | dependency_add | dependency_remove | dependency_rewire | supersede",
       "rationale": "…",
-      "disposition": "advisory | blocking" }
+      "disposition": "advisory | blocking",
+      "relationship": { "blockedIssue": 123, "blockerIssue": 456, "previousBlockerIssue": 789 } }
   ],
   "unresolvedQuestions": ["…"],
   "confidence": "low | medium | high"
@@ -860,14 +1150,47 @@ const CRITIC_SCHEMA_BLOCK = `{
   "confidence": "low | medium | high"
 }`;
 
-/** The snapshot subset both agents see: the bounded target and predecessors. */
+// §7.2 (issue #1176): `blockReason` is shown apart from the schema above, not
+// inside it, because it belongs to `block` alone — a `pass` or `revise` that
+// copied it from the every-verdict schema would be malformed (§17).
+const CRITIC_BLOCK_REASON_FIELD = `"blockReason": "missing_decision | authority_conflict | evidence_unavailable | premise_invalidated | scope_change"`;
+
+/**
+ * The snapshot subset both agents see: the bounded target, predecessors, and
+ * §5.1 declared evidence. One serialization of one frozen object, embedded in
+ * both prompts verbatim — which is what makes the refiner's and the critic's
+ * evidence byte-identical rather than merely equivalent (issue #983).
+ */
 function snapshotDataBlock(snapshot: RefinementSnapshot): string {
   return JSON.stringify(
-    { target: snapshot.target, predecessors: snapshot.predecessors },
+    {
+      target: snapshot.target,
+      predecessors: snapshot.predecessors,
+      evidence: snapshot.evidence ?? [],
+    },
     null,
     2,
   );
 }
+
+// A predecessor only ever appears in the snapshot when §4 already classified it
+// usable, in one of exactly two shapes. Both prompts get this verbatim so
+// neither agent re-derives (or mis-derives) it from the raw `issueState` /
+// `pullRequest.state` literals: an `open_stack_ready` predecessor is the
+// repository's normal stacked-branch state, not an undelivered one.
+const PREDECESSOR_SHAPE_EXPLANATION = [
+  "Predecessor state: this repository uses a stacked-branch workflow. Each predecessor in the snapshot has a `shape` of either `merged` (its PR landed on the base branch) or `open_stack_ready` (its PR is still open and carries this session's configured stack-ready label, so its PR branch is the reviewed contract this Issue builds on; the predecessor's own Issue may be open or already closed independently of this).",
+  "An `open_stack_ready` predecessor's PR `state` being `open` is the EXPECTED, intentional state of a reviewed predecessor before the stack merges to the base branch — not evidence that the predecessor's work is missing, incomplete, or undelivered. Distinguish \"available on the reviewed stacked branch\" (`open_stack_ready`) from \"merged into the base branch\" (`merged`); do not treat one as a stand-in for the other, and do not treat unmerged-ness by itself as a contradiction.",
+].join(" ");
+
+// Both agents get the same reading of the §5.1 evidence entries, verbatim, so
+// neither invents content for an omission or treats captured bytes as anything
+// other than what the predecessor's authoritative branch actually says.
+const EVIDENCE_EXPLANATION = [
+  "Declared evidence: when the snapshot's `evidence` array is non-empty, each entry with status `captured` is bounded file content read from the named predecessor's authoritative branch at exactly the recorded `source.commitSha`; it is the AUTHORITATIVE statement of that predecessor's delivered code contract for the selected file, export, or line range, and it overrides any conflicting paraphrase in Issue or PR prose.",
+  "An entry with status `omitted` is evidence that was declared but could NOT be captured (`omissionReason` says why). Do not guess, reconstruct, or substitute its content, and do not treat its absence as evidence about the predecessor.",
+  "An entry with `truncated: true` is an incomplete excerpt; treat conclusions that depend on the missing remainder as unsupported.",
+].join(" ");
 
 export interface RefinerPromptInput {
   snapshot: RefinementSnapshot;
@@ -888,6 +1211,8 @@ export function buildRefinerPrompt(input: RefinerPromptInput): string {
     ? [
         "This is a REVISION round. Your previous draft and the critic's objections follow.",
         "Address every objection; change nothing the objections do not require.",
+        "The snapshot below — the target Issue and its predecessor evidence — remains the authority. The objections point at defects in your draft; they are not new requirements and do not override the snapshot.",
+        "For a `lost_requirement` objection, restore the requirement exactly as the target Issue states it; do not weaken, narrow, or reinterpret it. An independent critic reviews the revised draft again before anything is accepted.",
         "",
         "Previous draft:",
         "```json",
@@ -905,13 +1230,21 @@ export function buildRefinerPrompt(input: RefinerPromptInput): string {
     "You are the Issue contract REFINER in a chain-aware refinement lane.",
     "Rewrite the target Issue's contract so it reflects what its predecessor issues actually delivered, using ONLY the snapshot below as evidence.",
     "",
+    PREDECESSOR_SHAPE_EXPLANATION,
+    "",
+    EVIDENCE_EXPLANATION,
+    "",
     "Hard rules:",
     "- Respond with EXACTLY ONE fenced ```json code block matching the schema below, and nothing else of substance.",
     "- Every claim must be traceable to the snapshot. Every predecessorReferences entry must name a predecessor Issue and PR that appear in the snapshot.",
+    "- Preserve every requirement, constraint, limit, prohibition, and non-goal the target Issue states. Refinement sharpens the contract; it never drops or weakens what the Issue already requires.",
+    "- Every risk in `risks` must be grounded in the snapshot: the target Issue, a predecessor named in the snapshot, or another Issue/PR/defect that the target Issue's own content or a named predecessor's content actually references. Do not cite an Issue, PR, or defect with no such grounding in the snapshot.",
     "- Do not restate predecessor source code, quote file contents, or emit any absolute or repository-external filesystem path.",
     "- Do not emit HTML comment markers of any kind.",
     "- Do not propose label, milestone, assignee, or state changes; those fields are not in the schema.",
     "- Topology changes (split/dependency/supersede) go in topologyProposals only; they are recommendations, never applied automatically.",
+    "- Every dependency_add/dependency_remove/dependency_rewire proposal MUST carry `relationship` naming the edge by Issue number: `blockedIssue` is the Issue that would carry the `blocked by` edge, `blockerIssue` the predecessor it points at, and for a rewire `previousBlockerIssue` is the edge it replaces. Omit `relationship` for split and supersede.",
+    "- Do not propose a dependency edge the snapshot shows already exists, or the removal of one it shows is absent: the snapshot's predecessor list is the target Issue's complete current `blocked by` set.",
     `- This is round ${input.round}.`,
     "",
     "Result schema:",
@@ -942,17 +1275,27 @@ export function buildCriticPrompt(input: CriticPromptInput): string {
     "You are the independent CRITIC of a refined Issue contract.",
     "Judge whether the refiner's draft below is supported by the snapshot, preserves every requirement of the original Issue, and stays within the Issue's scope.",
     "",
+    PREDECESSOR_SHAPE_EXPLANATION,
+    "",
+    EVIDENCE_EXPLANATION,
+    "",
     "Hard rules:",
     "- Respond with EXACTLY ONE fenced ```json code block matching the schema below, and nothing else of substance.",
     "- You evaluate; you never author replacement prose. Do not include rewritten summaries, criteria, plans, or notes.",
-    "- verdict `pass` requires an empty objections list. verdict `revise` requires at least one objection. Use `block` when the draft contradicts predecessor evidence, drops a stated requirement, or the Issue's premise is invalidated.",
+    "- verdict `pass` requires an empty objections list. verdict `revise` requires at least one objection.",
+    "- Use `revise` for every defect the refiner can repair from the snapshot alone. In particular, a draft that drops, weakens, or reinterprets a requirement, constraint, limit, prohibition, or non-goal that the target Issue ALREADY STATES is a repairable omission, not a missing human decision: return `revise` with a `lost_requirement` objection whose detail names the requirement as the Issue states it, so the refiner can restore it. The same holds for unsupported claims, ambiguity, and scope creep the draft introduced.",
+    "- Use `block` ONLY when no revision of the draft could fix the problem from the snapshot, and then name why in `blockReason`: `missing_decision` (the Issue leaves open a decision only the operator can make), `authority_conflict` (the target Issue and predecessor evidence, or two authoritative requirements, conflict with each other), `evidence_unavailable` (evidence you need to judge the draft is omitted or truncated), `premise_invalidated` (predecessor evidence invalidates the Issue's premise), or `scope_change` (refining it needs a scope or topology change requiring operator choice). A `block` must carry `blockReason`; `pass` and `revise` must omit it.",
+    "- A predecessor's Issue or PR being `open` is NOT by itself predecessor evidence contradicting the draft when that predecessor's snapshot `shape` is `open_stack_ready`; that is the expected state of a reviewed, not-yet-merged predecessor. Only object or block on a predecessor's readiness when the snapshot actually shows it unusable (no usable shape at all), or when the draft's claim conflicts with what the snapshot's predecessor content actually says.",
+    "- Object with kind `unsupported` to any risk, claim, or objection you raise that cites an Issue, PR, or defect with no grounding in the snapshot — that is, it is not the target Issue, not one of its listed predecessors, and not referenced by the target's or a predecessor's own content in the snapshot. Your own risk-related judgement must stay grounded in snapshot evidence relevant to the target Issue; do not import concerns about unrelated Issues or defects absent from that content.",
     "- For EVERY entry in the draft's topologyProposals, return a topologyDispositions entry with its index and your own advisory/blocking judgement.",
     "- Do not emit HTML comment markers or any absolute or repository-external filesystem path.",
     "",
-    "Result schema:",
+    "Result schema (every verdict):",
     "```json",
     CRITIC_SCHEMA_BLOCK,
     "```",
+    "",
+    `For verdict \`block\` ONLY, add one more top-level field to that object — ${CRITIC_BLOCK_REASON_FIELD} — and for \`pass\` and \`revise\` leave it out entirely.`,
     "",
     "Refiner draft under review:",
     "```json",

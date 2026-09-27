@@ -23,7 +23,7 @@ import {
 } from "../core/retention.js";
 import { UNOBSERVABLE_L3_SIGNALS } from "../core/l3-intervention-aggregation.js";
 import { listL3InterventionEntries } from "../core/l3-intervention-entries.js";
-import { ARTIFACT_DIR_CONTEXT_FIELDS, isSafeArtifactDirAfterRun } from "../handlers/artifact-dir.js";
+import { collectArtifactDirReferences, isSafeArtifactDirAfterRun } from "../handlers/artifact-dir.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS retention_rollup_coverage (
@@ -657,20 +657,23 @@ export class SqliteRetentionStore {
       .run(sessionId, TASKS_DATA_CLASS, status, lastIssueNumber, now, now);
   }
 
+  /**
+   * Every artifact directory this task context still references — the
+   * top-level scalars AND the per-lineage dispute/reconsideration entries
+   * (issue #955 review, P1). A lineage whose rebuttal or reconsideration
+   * directory is only named by its nested entry is just as live as one named
+   * by a scalar: arbitration re-reads that directory when it selects the
+   * lineage, so treating it as unreferenced here would let retention retire a
+   * directory an open debate still needs.
+   */
   #extractArtifactDirs(contextJson: string): string[] {
-    let ctx: Record<string, unknown> = {};
+    let ctx: unknown = undefined;
     try {
-      const parsed = JSON.parse(contextJson) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ctx = parsed as Record<string, unknown>;
+      ctx = JSON.parse(contextJson) as unknown;
     } catch {
       return [];
     }
-    const dirs: string[] = [];
-    for (const field of ARTIFACT_DIR_CONTEXT_FIELDS) {
-      const value = ctx[field];
-      if (typeof value === "string" && value.length > 0) dirs.push(value);
-    }
-    return dirs;
+    return collectArtifactDirReferences(ctx).map((ref) => ref.dir);
   }
 
   #collectReferencedArtifactDirs(sessionId: string): Set<string> {

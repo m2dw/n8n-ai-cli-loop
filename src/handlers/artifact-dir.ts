@@ -1,5 +1,13 @@
 import { mkdirSync, writeFileSync, lstatSync, realpathSync } from "fs";
 import { join, relative, resolve } from "path";
+import { parseLineageProvenanceRecord } from "../core/review-dispute-lineage-provenance.js";
+import { REVIEW_DISPUTE_REBUTTALS_CONTEXT_FIELD } from "../core/review-dispute-rebuttals.js";
+import { REVIEW_DISPUTE_RECONSIDERATIONS_CONTEXT_FIELD } from "../core/review-dispute-reconsiderations.js";
+import { REVIEW_DISPUTE_ARBITRATIONS_CONTEXT_FIELD } from "../core/review-dispute-arbitrations.js";
+import {
+  REVIEW_DISPUTE_EVIDENCE_COLLECTIONS_CONTEXT_KEY,
+  collectEvidenceCollectionArtifactDirs,
+} from "../core/review-dispute-evidence-collections.js";
 
 export function runArtifactDir(artifactRoot: string, runId: string): string {
   return join(artifactRoot, "runs", runId);
@@ -13,6 +21,8 @@ export function runArtifactDir(artifactRoot: string, runId: string): string {
  * it from here — re-exports it unchanged.
  */
 export { ARTIFACT_DIR_PENDING_CONTEXT_FIELD } from "../core/artifact-dir-contract.js";
+export { DISPUTE_ARTIFACT_DIR_CONTEXT_FIELD } from "../core/artifact-dir-contract.js";
+export { RECONSIDERATION_ARTIFACT_DIR_CONTEXT_FIELD } from "../core/artifact-dir-contract.js";
 
 /**
  * Centralized list of `task.context` fields that name a
@@ -32,7 +42,93 @@ export const ARTIFACT_DIR_CONTEXT_FIELDS = [
   // retries (issue #837 review, P2) — must be validated/tracked the same as
   // every other artifact-directory reference above.
   "reviewArtifactDir",
+  // The equally dedicated reference to the FIX run that wrote the §10.2 dispute
+  // records the reviewer's reconsideration turn re-reads (issue #952).
+  "disputeArtifactDir",
+  // And to the REVIEWER sub-turn that wrote the §10.2 reconsideration records
+  // the arbitration bundle re-presents a phase run later (issue #955).
+  "reconsiderationArtifactDir",
 ] as const;
+
+/**
+ * Context fields holding a PER-LINEAGE provenance record
+ * (`core/review-dispute-lineage-provenance.ts`), whose entries each name the run
+ * directory that lineage's rebuttal, reconsideration, or arbitration verdict was
+ * written into.
+ *
+ * These are artifact-directory references exactly like the scalars above, but
+ * nested one level down, and they outlive them: the scalars describe only the
+ * LAST run of their kind, while a task with two disputed lineages keeps an
+ * earlier live lineage reachable only through its own entry here. Walking only
+ * the scalars would let a restore succeed after that earlier directory is gone,
+ * and would let retention treat it as unreferenced — either of which parks
+ * arbitration the moment it selects that lineage (issue #955 review, P1).
+ */
+export const LINEAGE_ARTIFACT_DIR_CONTEXT_FIELDS = [
+  REVIEW_DISPUTE_REBUTTALS_CONTEXT_FIELD,
+  REVIEW_DISPUTE_RECONSIDERATIONS_CONTEXT_FIELD,
+  // And the §8.1 verdict records (issue #964): the evidence turn a row-16
+  // `insufficient_evidence` verdict opens re-presents the record from the
+  // directory of the run that MINTED it, one or more phase runs earlier, so
+  // that directory is live for exactly as long as its lineage's entry is.
+  REVIEW_DISPUTE_ARBITRATIONS_CONTEXT_FIELD,
+] as const;
+
+/** One artifact-directory reference found in a task context. */
+export interface ArtifactDirReference {
+  /**
+   * Where the directory came from, as a dotted context path
+   * (`artifactDir`, `reviewDisputeRebuttals.lineages.<id>.artifactDir`, ...).
+   * Reported verbatim by restore, so a rejection names the exact reference.
+   */
+  field: string;
+  dir: string;
+  /** The plain `artifactDir` scalar, which alone can be marked never-created. */
+  isPendingEligible: boolean;
+}
+
+/**
+ * Every artifact directory a task context references — scalar, per-lineage, and
+ * the per-party evidence-collection record alike — the single enumeration
+ * restore validation and retention liveness both walk, so a newly added
+ * reference can never be tracked by one and not the other.
+ *
+ * The nested records are read through their own parser, so an entry this runner
+ * could not have written is skipped here for the same reason arbitration skips
+ * it: a dropped entry is one no turn will ever read a record out of, and failing
+ * a restore over unreadable bookkeeping would park a debate that is still
+ * resolvable from its fall-backs.
+ */
+export function collectArtifactDirReferences(context: unknown): ArtifactDirReference[] {
+  if (typeof context !== "object" || context === null || Array.isArray(context)) return [];
+  const ctx = context as Record<string, unknown>;
+  const refs: ArtifactDirReference[] = [];
+  for (const field of ARTIFACT_DIR_CONTEXT_FIELDS) {
+    const dir = ctx[field];
+    if (typeof dir !== "string" || dir.length === 0) continue;
+    refs.push({ field, dir, isPendingEligible: field === "artifactDir" });
+  }
+  for (const field of LINEAGE_ARTIFACT_DIR_CONTEXT_FIELDS) {
+    const record = parseLineageProvenanceRecord(ctx[field]);
+    for (const [lineageId, entry] of Object.entries(record.lineages)) {
+      refs.push({
+        field: `${field}.lineages.${lineageId}.artifactDir`,
+        dir: entry.artifactDir,
+        isPendingEligible: false,
+      });
+    }
+  }
+  for (const { party, dir } of collectEvidenceCollectionArtifactDirs(
+    ctx[REVIEW_DISPUTE_EVIDENCE_COLLECTIONS_CONTEXT_KEY],
+  )) {
+    refs.push({
+      field: `${REVIEW_DISPUTE_EVIDENCE_COLLECTIONS_CONTEXT_KEY}.${party}.artifactDir`,
+      dir,
+      isPendingEligible: false,
+    });
+  }
+  return refs;
+}
 
 function isPathWithinRoot(root: string, dir: string): boolean {
   if (dir === root) return true;

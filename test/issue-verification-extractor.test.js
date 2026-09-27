@@ -1,4 +1,7 @@
-import { extractIssueVerificationCommands } from '../dist/handlers/issue-verification-extractor.js';
+import {
+  extractIssueVerificationCommands,
+  extractIssueVerificationSections,
+} from '../dist/handlers/issue-verification-extractor.js';
 
 describe('extractIssueVerificationCommands', () => {
   test('returns empty array when body has no verification section', () => {
@@ -306,6 +309,166 @@ describe('extractIssueVerificationCommands', () => {
     expect(extractIssueVerificationCommands(body)).toEqual([]);
   });
 
+  describe('assignment-only detection is linear-time (issue #1190)', () => {
+    // The former assignment-only regex let each repetition end inside a
+    // whitespace-free run, so `A=A=…A= x` backtracked exponentially: ~320 ms
+    // at 24 repetitions, and hours at the 40 used here. The bound is generous
+    // so host load cannot flake it; a regression does not finish at all.
+    const MAX_MS = 2000;
+
+    function timed(fn) {
+      const start = Date.now();
+      const result = fn();
+      return { result, elapsed: Date.now() - start };
+    }
+
+    test('repeated A= assignments with a trailing malformed token in a bash fence', () => {
+      const adversarial = 'A='.repeat(40) + ' x';
+      const body = ['## Verification', '```bash', adversarial, 'npm test', '```'].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationCommands(body));
+      // Not assignment-only, so a tagged shell fence records it as a command.
+      expect(result).toEqual([adversarial, 'npm test']);
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+
+    test('repeated A= assignments with a trailing malformed token in an untagged fence', () => {
+      const adversarial = 'A='.repeat(40) + ' !';
+      const body = ['## Verification', '```', 'npm test', adversarial, 'npm run build', '```'].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationCommands(body));
+      // Not assignment-only and not a recognisable command: dropped, and it
+      // does not attach itself as setup to the following command.
+      expect(result).toEqual(['npm test', 'npm run build']);
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+
+    test('repeated A= assignments behind a transcript prompt', () => {
+      const adversarial = 'A='.repeat(40) + ' x';
+      const body = ['## Verification', '```console', `$ ${adversarial}`, '```'].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationCommands(body));
+      expect(result).toEqual([adversarial]);
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+
+    test('very long lines stay fast', () => {
+      const malformed = 'A='.repeat(50_000) + ' x';
+      const assignmentsOnly = 'A=1 '.repeat(20_000) + 'B=A=A=';
+      const prefixed = 'A=1 '.repeat(20_000) + 'npm test';
+      const body = ['## Verification', '```', malformed, assignmentsOnly, 'npm test', prefixed, '```'].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationCommands(body));
+      expect(result).toEqual([`${assignmentsOnly} && npm test`, prefixed]);
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+
+    test('assignment-only lines are deferred as setup, including chained and empty values', () => {
+      const body = [
+        '## Verification',
+        '```bash',
+        'A=1 B= C=x=y',
+        'npm test',
+        '```',
+      ].join('\n');
+      expect(extractIssueVerificationCommands(body)).toEqual(['A=1 B= C=x=y && npm test']);
+    });
+
+    test('a trailing non-assignment token makes the line a command, not setup', () => {
+      const body = [
+        '## Verification',
+        '```bash',
+        'A=1 B=2 npm test',
+        'A=1 1B=2',
+        '```',
+      ].join('\n');
+      // `1B=2` is not a valid assignment name, so the second line is an
+      // ordinary line of a tagged shell fence rather than deferred setup.
+      expect(extractIssueVerificationCommands(body)).toEqual(['A=1 B=2 npm test', 'A=1 1B=2']);
+    });
+
+    test('assignment-prefixed inline commands are still extracted', () => {
+      const body = [
+        '## Verification',
+        '- `CI=1 NODE_ENV=test npm test`',
+        '- `CI=1`',
+        '- `' + 'A='.repeat(40) + ' x`',
+      ].join('\n');
+      expect(extractIssueVerificationCommands(body)).toEqual(['CI=1 NODE_ENV=test npm test']);
+    });
+  });
+
+  describe('heading and npm echo detection is linear-time (issue #1199)', () => {
+    // The former `/^(#{1,6})\s+(.+)$/` and `/^\S+@\S*\s/` backtracked
+    // quadratically on these inputs; at 100 000 characters that is billions of
+    // steps. The bound is generous so host load cannot flake it.
+    const MAX_MS = 2000;
+    const N = 100_000;
+
+    function timed(fn) {
+      const start = Date.now();
+      const result = fn();
+      return { result, elapsed: Date.now() - start };
+    }
+
+    test('long whitespace ending in a line separator is not a heading', () => {
+      const body = [
+        '## Verification',
+        '- `npm test`',
+        '#' + ' '.repeat(N) + ' ',
+        '##' + '\t'.repeat(N) + ' ',
+        '## ' + ' '.repeat(N) + 'x\r',
+        '- `npm run lint`',
+      ].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationCommands(body));
+      // None of the adversarial lines closes the section.
+      expect(result).toEqual(['npm test', 'npm run lint']);
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+
+    test('long whitespace before a title still opens a verification section', () => {
+      const body = ['## Background', '- `npm run e2e`', '##' + ' '.repeat(N) + 'Verification', '- `npm test`'].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationSections(body));
+      expect(result).toEqual({ commands: ['npm test'], sectionFound: true });
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+
+    test('heading edge cases keep their former recognition', () => {
+      const body = [
+        '## Verification',
+        '- `npm test`',
+        // A lone space after the hashes is not a heading, and neither is a
+        // seven-hash run: the section stays open.
+        '## ',
+        '####### Verify',
+        '- `npm run lint`',
+        // Two or more whitespace characters form an empty-titled heading,
+        // which closes a section at its level.
+        '##  ',
+        '- `npm run e2e`',
+      ].join('\n');
+      expect(extractIssueVerificationCommands(body)).toEqual(['npm test', 'npm run lint']);
+    });
+
+    test('long runs of @ in transcript > lines stay fast and keep npm echo filtering', () => {
+      const body = [
+        '## Verification',
+        '```console',
+        '> x' + '@'.repeat(N),
+        '> npm test',
+        '> pkg' + '@'.repeat(N) + ' test',
+        '> jest',
+        '> ' + '@'.repeat(N) + ' test',
+        '> npm run build',
+        '$ npm run lint',
+        '```',
+      ].join('\n');
+      const { result, elapsed } = timed(() => extractIssueVerificationCommands(body));
+      // `x@@…` has no whitespace, so it is not a package echo and `npm test`
+      // is kept; `pkg@@… test` and `@@… test` are echoes (an `@` after the
+      // token's first character), so the `jest` and `npm run build` they echo
+      // are dropped.
+      expect(result).toEqual(['npm test', 'npm run lint']);
+      expect(elapsed).toBeLessThan(MAX_MS);
+    });
+  });
+
   test('cd line before real command is prepended to preserve execution context', () => {
     const body = [
       '## Verification',
@@ -394,5 +557,185 @@ describe('extractIssueVerificationCommands', () => {
     // `source .env && npm test` starts with `source` (a setup keyword) but the
     // compound form is self-contained and must be emitted rather than deferred.
     expect(extractIssueVerificationCommands(body)).toEqual(['source .env && npm test']);
+  });
+
+  test('issue #569/#993 regression: command marked "not required" in a trailing caveat is excluded', () => {
+    const body = [
+      '## Verification',
+      '',
+      '- `npm run typecheck`',
+      '- `npm test`',
+      '- `npm run validate`',
+      '- `npm run build`',
+      '- `node internal/qa/gen-workbook.mjs` when QA data is updated',
+      '',
+      '`npm run validate:release` may remain blocked by unresolved production data and is not required by this Issue.',
+    ].join('\n');
+    expect(extractIssueVerificationCommands(body)).toEqual([
+      'npm run typecheck',
+      'npm test',
+      'npm run validate',
+      'npm run build',
+      'node internal/qa/gen-workbook.mjs',
+    ]);
+  });
+
+  test('"out of scope" marker also excludes a caveat command from the required list', () => {
+    const body = [
+      '## Verification',
+      '- `npm test`',
+      '',
+      '`npm run e2e:prod` is out of scope for this Issue.',
+    ].join('\n');
+    expect(extractIssueVerificationCommands(body)).toEqual(['npm test']);
+  });
+
+  test('a command marked "not required" does not suppress the same command required elsewhere', () => {
+    const body = [
+      '## Verification',
+      '- `npm test`',
+      '',
+      '`npm test` is not required to be re-run manually here.',
+    ].join('\n');
+    // The marker line still wins: an author who wants a command required must
+    // not also describe it with "not required" elsewhere in the section.
+    expect(extractIssueVerificationCommands(body)).toEqual([]);
+  });
+
+  test('issue #993 follow-up: a fenced Markdown sample quoting "## Verification" inside a non-verification section extracts nothing', () => {
+    const body = [
+      '## Regression fixture',
+      '',
+      'Use the #569 shape:',
+      '',
+      '```md',
+      '## Verification',
+      '',
+      '- `npm run typecheck`',
+      '- `npm test`',
+      '- `npm run validate`',
+      '- `npm run build`',
+      '- `node internal/qa/gen-workbook.mjs` when QA data is updated',
+      '',
+      '`npm run validate:release` may remain blocked by unresolved production data and is not required by this Issue.',
+      '```',
+      '',
+      '## Acceptance criteria',
+      '- A regression test reproduces the #569 false positive.',
+    ].join('\n');
+    // The fenced sample is illustrative content inside "Regression fixture", not
+    // a real task-level Verification section — none of its commands (required
+    // or excluded) may be extracted for the enclosing Issue.
+    expect(extractIssueVerificationCommands(body)).toEqual([]);
+  });
+
+  test('issue #993 review follow-up: a nested ```md fence inside a four-backtick sample does not leak commands', () => {
+    const body = [
+      '## Regression fixture',
+      '',
+      'Use the #569 shape, quoted here as a four-backtick sample so it can',
+      'itself contain a fenced ```md block:',
+      '',
+      '````md',
+      'This is what the Issue body looks like:',
+      '',
+      '```md',
+      '## Verification',
+      '',
+      '- `npm test`',
+      '```',
+      '````',
+      '',
+      '## Acceptance criteria',
+      '- A regression test reproduces the nested-fence false positive.',
+    ].join('\n');
+    // The inner ```md fence must not be read as closing the outer four-backtick
+    // fence — the ## Verification heading and `npm test` command it contains
+    // are illustrative content, not a real task-level Verification section.
+    expect(extractIssueVerificationCommands(body)).toEqual([]);
+  });
+
+  test('issue #993 review follow-up: an inner "```md" line with an info string does not close an already-open same-length fence', () => {
+    const body = [
+      '## Regression fixture',
+      '',
+      'Use the #569 shape, quoted here:',
+      '',
+      '```',
+      'This is what the Issue body looks like:',
+      '',
+      '```md',
+      '## Verification',
+      '',
+      '- `npm test`',
+      '```',
+      '```',
+      '',
+      '## Acceptance criteria',
+      '- A regression test reproduces the false-close false positive.',
+    ].join('\n');
+    // A closing fence delimiter may only have whitespace after its backtick
+    // run (CommonMark). The nested "```md" line has an info string ("md"), so
+    // it must NOT close the already-open outer fence — the "## Verification"
+    // heading and `npm test` command inside it are illustrative content, not
+    // a real task-level Verification section.
+    expect(extractIssueVerificationCommands(body)).toEqual([]);
+  });
+
+  test('review feedback: a required command sharing a line with an unrelated caveat is still extracted', () => {
+    const body = [
+      '## Verification',
+      'Run `npm test` and `npm run lint`; `npm run e2e` is not required.',
+    ].join('\n');
+    // The not-required marker must be scoped to its own clause (after the
+    // `;`) so it does not sweep up the required commands earlier on the line.
+    expect(extractIssueVerificationCommands(body)).toEqual(['npm test', 'npm run lint']);
+  });
+
+  test('review feedback: an inline required command containing a semicolon is extracted intact', () => {
+    const body = [
+      '## Verification',
+      '- `npm run lint; npm test`',
+      '',
+      '`npm run validate:release` is not required by this Issue.',
+    ].join('\n');
+    // Clause splitting must not land inside the backtick span: the `;` inside
+    // `npm run lint; npm test` must not be treated as a clause boundary, or
+    // the command's opening and closing backticks end up in separate clauses
+    // and neither fragment matches the inline-code regex.
+    expect(extractIssueVerificationCommands(body)).toEqual(['npm run lint; npm test']);
+  });
+});
+
+// Issue #1041: the same scan, reporting whether a supported section existed.
+// A live refresh needs to tell "this Issue requires nothing" apart from "this
+// body has no verification section", because only the first is a removal.
+describe('extractIssueVerificationSections', () => {
+  test('returns the same commands as the command-only entry point', () => {
+    const body = ['## Verification', '- `npm test`', '- `npm run lint`'].join('\n');
+    const extraction = extractIssueVerificationSections(body);
+    expect(extraction.commands).toEqual(extractIssueVerificationCommands(body));
+    expect(extraction.sectionFound).toBe(true);
+  });
+
+  test('reports a section that lists no command as found', () => {
+    const body = ['## Verification', 'Nothing is required for this change.'].join('\n');
+    expect(extractIssueVerificationSections(body)).toEqual({ commands: [], sectionFound: true });
+  });
+
+  test('reports a body with no supported section as not found', () => {
+    const body = ['## Background', 'prose about `npm test` outside any section.'].join('\n');
+    expect(extractIssueVerificationSections(body)).toEqual({ commands: [], sectionFound: false });
+  });
+
+  test('a heading inside a fenced sample does not count as a section', () => {
+    const body = [
+      '## Background',
+      '```md',
+      '## Verification',
+      '- `npm test`',
+      '```',
+    ].join('\n');
+    expect(extractIssueVerificationSections(body).sectionFound).toBe(false);
   });
 });

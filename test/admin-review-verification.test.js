@@ -55,6 +55,23 @@ function writeSession(overrides = {}) {
   return session;
 }
 
+// Issue #1040: the reviewed HEAD and evidence-binding block a post-#1040
+// review escalation records. Tests representing a LEGACY escalation override
+// the block with `verificationEvidenceBinding: undefined`.
+const REVIEWED_HEAD = 'a'.repeat(40);
+const SEEDED_PLAN_DIGEST = 'b'.repeat(64);
+const SEEDED_COMMAND_ID = 'req:0123456789abcdef';
+
+function seededBindingBlock(overrides = {}) {
+  return {
+    headSha: REVIEWED_HEAD,
+    planDigest: SEEDED_PLAN_DIGEST,
+    planRevisionOrdinal: 0,
+    commandIds: { 'npm run export -- --dry-run': SEEDED_COMMAND_ID },
+    ...overrides,
+  };
+}
+
 async function seedReadyForHumanTask(issueNumber, contextExtra = {}) {
   const store = new SqliteTaskStore(dbPath);
   await store.enqueueTask({ sessionId: 'addon-dev', issueNumber, phase: 'review' });
@@ -68,6 +85,7 @@ async function seedReadyForHumanTask(issueNumber, contextExtra = {}) {
         branch: 'ai/issue-' + issueNumber,
         labels: ['ai:ready-for-human'],
         missingVerificationCommands: ['npm run export -- --dry-run'],
+        verificationEvidenceBinding: seededBindingBlock(),
         ...contextExtra,
       },
     },
@@ -275,6 +293,11 @@ describe('admin CLI — review-verification resolve: passing verification (exit 
       command: 'npm run export -- --dry-run',
       exitCode: 0,
       source: 'operator_input',
+      // Issue #1040: the entry is bound to the identities the escalation recorded.
+      headSha: REVIEWED_HEAD,
+      planDigest: SEEDED_PLAN_DIGEST,
+      planRevisionOrdinal: 0,
+      commandId: SEEDED_COMMAND_ID,
     });
     expect(typeof evidence[0].recordedAt).toBe('string');
   });
@@ -857,5 +880,245 @@ describe('admin CLI — review-verification resolve: failed verification (exit !
     // The still-missing command list (issue-required, safe-failure semantics)
     // is preserved rather than wiped or falsely marked resolved.
     expect(task.context.missingVerificationCommands).toEqual(['npm run lint']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Evidence binding (issue #1040): passing evidence is stamped with the plan
+// revision/digest, the slot identity, and the reviewed HEAD it attests, and
+// the resolve refuses rather than recording evidence a bound review could
+// never admit.
+// ---------------------------------------------------------------------------
+
+describe('admin CLI — review-verification resolve: evidence binding (issue #1040)', () => {
+  test('legacy escalation (no binding block) without --head-sha refuses and records nothing', async () => {
+    writeSession();
+    await seedReadyForHumanTask(50, { verificationEvidenceBinding: undefined });
+
+    const r = run(
+      'review-verification', 'resolve',
+      '--session-id', 'addon-dev',
+      '--issue-number', '50',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--command', 'npm run export -- --dry-run',
+      '--exit-code', '0',
+      '--output', 'Exported.',
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.stdout).toContain('--head-sha');
+
+    const task = await getTask(50);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.manualVerificationEvidence).toBeUndefined();
+    expect(task.context.missingVerificationCommands).toEqual(['npm run export -- --dry-run']);
+  });
+
+  test('legacy escalation resolves with an explicit --head-sha and derives the identity from the command bytes', async () => {
+    writeSession();
+    await seedReadyForHumanTask(51, { verificationEvidenceBinding: undefined });
+    const explicitHead = 'c'.repeat(40);
+
+    const r = run(
+      'review-verification', 'resolve',
+      '--session-id', 'addon-dev',
+      '--issue-number', '51',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--command', 'npm run export -- --dry-run',
+      '--exit-code', '0',
+      '--output', 'Exported.',
+      '--head-sha', explicitHead,
+    );
+    expect(r.code).toBe(0);
+    expect(parse(r)).toMatchObject({ ok: true, action: 'requeue_review' });
+
+    const task = await getTask(51);
+    const evidence = task.context.manualVerificationEvidence;
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0].headSha).toBe(explicitHead);
+    // No amendments on the task, so the identity is the §5.1 byte derivation.
+    expect(evidence[0].commandId).toMatch(/^req:[0-9a-f]{16}$/);
+    expect(evidence[0].planDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(evidence[0].planRevisionOrdinal).toBe(0);
+  });
+
+  test('--head-sha that is not a full commit SHA exits non-zero and mutates nothing', async () => {
+    writeSession();
+    await seedReadyForHumanTask(52);
+
+    const r = run(
+      'review-verification', 'resolve',
+      '--session-id', 'addon-dev',
+      '--issue-number', '52',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--command', 'npm run export -- --dry-run',
+      '--exit-code', '0',
+      '--output', 'Exported.',
+      '--head-sha', 'abc123',
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.stdout).toContain('--head-sha');
+
+    const task = await getTask(52);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.manualVerificationEvidence).toBeUndefined();
+  });
+
+  test('--head-sha differing from the recorded escalation block refuses and records nothing', async () => {
+    writeSession();
+    await seedReadyForHumanTask(53);
+    const explicitHead = 'd'.repeat(40);
+
+    const r = run(
+      'review-verification', 'resolve',
+      '--session-id', 'addon-dev',
+      '--issue-number', '53',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--command', 'npm run export -- --dry-run',
+      '--exit-code', '0',
+      '--output', 'Exported.',
+      '--head-sha', explicitHead,
+    );
+    // The escalation already bound the reviewed commit; an override could
+    // stamp evidence with a commit the review never examined, so the
+    // recorded value is authoritative and the mismatch fails closed.
+    expect(r.code).not.toBe(0);
+    expect(r.stdout).toContain(REVIEWED_HEAD);
+
+    const task = await getTask(53);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.manualVerificationEvidence).toBeUndefined();
+    expect(task.context.missingVerificationCommands).toEqual(['npm run export -- --dry-run']);
+  });
+
+  test('--head-sha restating the recorded escalation HEAD resolves with the recorded identities', async () => {
+    writeSession();
+    await seedReadyForHumanTask(56);
+
+    const r = run(
+      'review-verification', 'resolve',
+      '--session-id', 'addon-dev',
+      '--issue-number', '56',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--command', 'npm run export -- --dry-run',
+      '--exit-code', '0',
+      '--output', 'Exported.',
+      '--head-sha', REVIEWED_HEAD,
+    );
+    expect(r.code).toBe(0);
+
+    const task = await getTask(56);
+    const evidence = task.context.manualVerificationEvidence;
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0].headSha).toBe(REVIEWED_HEAD);
+    expect(evidence[0].commandId).toBe(SEEDED_COMMAND_ID);
+    expect(evidence[0].planDigest).toBe(SEEDED_PLAN_DIGEST);
+  });
+
+  test('a task carrying verification amendments refuses without a usable binding block', async () => {
+    writeSession();
+    await seedReadyForHumanTask(54, {
+      verificationEvidenceBinding: undefined,
+      verificationAmendments: { revisions: [], checkpoint: null },
+    });
+
+    const r = run(
+      'review-verification', 'resolve',
+      '--session-id', 'addon-dev',
+      '--issue-number', '54',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--command', 'npm run export -- --dry-run',
+      '--exit-code', '0',
+      '--output', 'Exported.',
+      '--head-sha', 'e'.repeat(40),
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.stdout).toContain('verification amendments');
+
+    const task = await getTask(54);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.manualVerificationEvidence).toBeUndefined();
+  });
+
+  test('a command the escalation recorded as ambiguous refuses with the disambiguation repair (issue #1043 review, P2)', async () => {
+    // Two active requirement slots carrying identical bytes cannot share one
+    // byte-keyed commandIds entry, so the escalation reports the bytes as
+    // ambiguous instead. Binding a single evidence entry would clear only
+    // whichever slot survived the overwrite; the resolve refuses and names
+    // the amend repair rather than deadlocking the manual-evidence flow.
+    writeSession();
+    await seedReadyForHumanTask(57, {
+      missingVerificationCommands: [
+        'npm run export -- --dry-run',
+        'npm run export -- --dry-run',
+      ],
+      verificationEvidenceBinding: seededBindingBlock({
+        commandIds: {},
+        ambiguousCommands: ['npm run export -- --dry-run'],
+      }),
+    });
+
+    const r = run(
+      'review-verification', 'resolve',
+      '--session-id', 'addon-dev',
+      '--issue-number', '57',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--command', 'npm run export -- --dry-run',
+      '--exit-code', '0',
+      '--output', 'Exported.',
+    );
+    expect(r.code).not.toBe(0);
+    expect(r.stdout).toContain('task-verification amend');
+
+    const task = await getTask(57);
+    expect(task.status).toBe('ready_for_human');
+    expect(task.context.manualVerificationEvidence).toBeUndefined();
+    expect(task.context.missingVerificationCommands).toEqual([
+      'npm run export -- --dry-run',
+      'npm run export -- --dry-run',
+    ]);
+  });
+
+  test('dry-run reports the binding that would be recorded', async () => {
+    writeSession();
+    await seedReadyForHumanTask(55);
+
+    const r = run(
+      'review-verification', 'resolve',
+      '--session-id', 'addon-dev',
+      '--issue-number', '55',
+      '--db-path', dbPath,
+      '--sessions-path', sessionsPath,
+      '--command', 'npm run export -- --dry-run',
+      '--exit-code', '0',
+      '--output', 'Exported.',
+      '--dry-run',
+    );
+    expect(r.code).toBe(0);
+    expect(parse(r)).toMatchObject({
+      ok: true,
+      dryRun: true,
+      binding: {
+        headSha: REVIEWED_HEAD,
+        commandId: SEEDED_COMMAND_ID,
+        planDigest: SEEDED_PLAN_DIGEST,
+        planRevisionOrdinal: 0,
+      },
+    });
+
+    const task = await getTask(55);
+    expect(task.context.manualVerificationEvidence).toBeUndefined();
+  });
+
+  test('help lists --head-sha', () => {
+    const r = run('help', 'review-verification resolve');
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('--head-sha');
   });
 });

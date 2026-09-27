@@ -376,6 +376,119 @@ describe('pruneTasks', () => {
     expect(result.artifactsSkipped).toEqual([dirShared]);
   });
 
+  test('tracks per-lineage rebuttal/reconsideration artifactDirs as live references (issue #955 review)', () => {
+    // The scalar `disputeArtifactDir`/`reconsiderationArtifactDir` keys name
+    // only the LAST fix/reviewer run. On a task whose active review still has
+    // an earlier lineage arbitration-pending, that lineage's directory is
+    // named ONLY by its nested per-lineage entry — retention must see it as
+    // live, or it retires a directory the next arbitration turn will read.
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const dirLiveRebuttal = join(artifactRoot, 'runs', 'fix-run-lineage-a');
+    const dirLiveReconsideration = join(artifactRoot, 'runs', 'reviewer-run-lineage-a');
+    const dirOrphaned = join(artifactRoot, 'runs', 'fix-run-orphaned');
+    for (const dir of [dirLiveRebuttal, dirLiveReconsideration, dirOrphaned]) mkdirSync(dir, { recursive: true });
+
+    // Deleted rows whose scalar keys name the two directories the surviving
+    // task still needs, plus one nothing references any more.
+    seedTask('s1', 1, {
+      status: 'done',
+      updatedAt: OLD_TERMINAL,
+      context: { disputeArtifactDir: dirLiveRebuttal, reconsiderationArtifactDir: dirLiveReconsideration },
+    });
+    seedTask('s1', 3, { status: 'done', updatedAt: OLD_TERMINAL, context: { artifactDir: dirOrphaned } });
+    // Active task: its scalar keys describe the LAST fix/reviewer run, so
+    // lineage-a's still-pending directories are named only per lineage.
+    seedTask('s1', 2, {
+      status: 'queued',
+      updatedAt: OLD_TERMINAL,
+      context: {
+        disputeArtifactDir: join(artifactRoot, 'runs', 'fix-run-lineage-b'),
+        reconsiderationArtifactDir: join(artifactRoot, 'runs', 'reviewer-run-lineage-b'),
+        reviewDisputeRebuttals: { lineages: { 'lineage-a': { version: 1, artifactDir: dirLiveRebuttal } } },
+        reviewDisputeReconsiderations: {
+          lineages: { 'lineage-a': { version: 1, artifactDir: dirLiveReconsideration } },
+        },
+      },
+    });
+    primeCoverage('s1');
+
+    const result = retentionStore.pruneTasks('s1', NOW, { artifactRoot });
+    expect(result.tasksDeleted).toBe(2);
+    expect(result.artifactsDeleted).toEqual([]);
+    // Only the genuinely unreferenced directory may be retired; the two the
+    // active task reaches through its lineage entries stay live.
+    expect(result.artifactsPending).toEqual([dirOrphaned]);
+    expect([...result.artifactsSkipped].sort()).toEqual([dirLiveRebuttal, dirLiveReconsideration].sort());
+    expect(existsSync(dirLiveRebuttal)).toBe(true);
+    expect(existsSync(dirLiveReconsideration)).toBe(true);
+  });
+
+  test('marks a per-lineage artifact directory pending once no surviving task references it (issue #955 review)', () => {
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const dirOrphaned = join(artifactRoot, 'runs', 'reviewer-run-orphaned');
+    mkdirSync(dirOrphaned, { recursive: true });
+
+    seedTask('s1', 1, {
+      status: 'done',
+      updatedAt: OLD_TERMINAL,
+      context: {
+        reviewDisputeReconsiderations: { lineages: { 'lineage-a': { version: 1, artifactDir: dirOrphaned } } },
+      },
+    });
+    primeCoverage('s1');
+
+    const result = retentionStore.pruneTasks('s1', NOW, { artifactRoot });
+    expect(result.tasksDeleted).toBe(1);
+    expect(result.artifactsDeleted).toEqual([]);
+    expect(result.artifactsPending).toEqual([dirOrphaned]);
+    expect(existsSync(dirOrphaned)).toBe(true);
+  });
+
+  test('keeps arbitration-lineage and party evidence-collection directories live while a surviving task names them (issue #975 review)', () => {
+    const artifactRoot = join(tmpDir, 'artifacts');
+    const dirArbitration = join(artifactRoot, 'runs', 'arbitration-run-lineage-a');
+    const dirEvidenceImplementer = join(artifactRoot, 'runs', 'evidence-run-implementer');
+    const dirOrphaned = join(artifactRoot, 'runs', 'evidence-run-orphaned');
+    for (const dir of [dirArbitration, dirEvidenceImplementer, dirOrphaned]) mkdirSync(dir, { recursive: true });
+
+    // Deleted rows whose scalar key named the two directories the surviving
+    // task still reads its verdict and admitted attachments out of.
+    seedTask('s1', 1, {
+      status: 'done',
+      updatedAt: OLD_TERMINAL,
+      context: { artifactDir: dirArbitration },
+    });
+    seedTask('s1', 4, {
+      status: 'done',
+      updatedAt: OLD_TERMINAL,
+      context: { artifactDir: dirEvidenceImplementer },
+    });
+    seedTask('s1', 3, { status: 'done', updatedAt: OLD_TERMINAL, context: { artifactDir: dirOrphaned } });
+    // Active task: an evidence turn is pending on the §8.1 verdict record, and a
+    // re-presented arbitration on the implementer's §10.2 evidence files.
+    seedTask('s1', 2, {
+      status: 'queued',
+      updatedAt: OLD_TERMINAL,
+      context: {
+        reviewDisputeArbitrations: {
+          lineages: { 'lineage-a': { version: 1, artifactDir: dirArbitration } },
+        },
+        reviewDisputeEvidenceCollections: {
+          implementer: { artifactDir: dirEvidenceImplementer },
+        },
+      },
+    });
+    primeCoverage('s1');
+
+    const result = retentionStore.pruneTasks('s1', NOW, { artifactRoot });
+    expect(result.tasksDeleted).toBe(3);
+    expect(result.artifactsDeleted).toEqual([]);
+    expect(result.artifactsPending).toEqual([dirOrphaned]);
+    expect([...result.artifactsSkipped].sort()).toEqual([dirArbitration, dirEvidenceImplementer].sort());
+    expect(existsSync(dirArbitration)).toBe(true);
+    expect(existsSync(dirEvidenceImplementer)).toBe(true);
+  });
+
   test('never deletes an artifact directory outside artifactRoot even if context claims one is there (symlink/escape safety)', () => {
     const artifactRoot = join(tmpDir, 'artifacts');
     mkdirSync(artifactRoot, { recursive: true });

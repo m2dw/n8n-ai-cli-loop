@@ -446,6 +446,52 @@ describe('intake refinement — §3.1 the marker stops an existing executable ta
     expect(out.refinementSuspended).toBe(0);
     expect((await readTask(867)).status).toBe('queued');
   });
+
+  test('a refused quality request does not bypass the guard (issue #905 review follow-up)', async () => {
+    await intake([issue(867, ['agent:claude', 'status:needs-implementation'])]);
+    expect((await readTask(867)).status).toBe('queued');
+
+    // The marker is clean, but the Issue also carries a malformed `quality:`
+    // label, so this poll refuses to admit the refinement task. That refusal
+    // decides only whether a NEW row is created: the live implementation row
+    // must still be parked, or it stays claimable under the marker.
+    const marked = [issue(867, ['status:needs-refinement', 'agent:claude', 'quality:xhigh'])];
+    const first = await intake(marked);
+    expect(first.refinementSuspended).toBe(1);
+    expect(first.refinementAdmitted).toBe(0);
+    expect(first.results).toEqual([
+      {
+        issueNumber: 867,
+        action: 'refinement_execution_suspended',
+        phase: 'implementation',
+        previousStatus: 'queued',
+        markerLabel: 'status:needs-refinement',
+        reason: 'execution_marker_conflict',
+      },
+    ]);
+    const parked = await readTask(867);
+    expect(parked.status).toBe('ready_for_human');
+    expect(parked.phase).toBe('implementation');
+
+    // With the row parked, the next poll reports the quality refusal and still
+    // admits nothing — the typo is repaired by an operator, not by intake.
+    const second = await intake(marked);
+    expect(second.refinementSuspended).toBe(0);
+    expect(second.refinementAdmitted).toBe(0);
+    expect(second.results).toEqual([
+      {
+        issueNumber: 867,
+        action: 'quality_request_refused',
+        phase: 'refinement',
+        title: 'Issue 867',
+        reason: 'invalid-quality-request',
+        message: expect.any(String),
+      },
+    ]);
+    const after = await readTask(867);
+    expect(after.phase).toBe('implementation');
+    expect(after.revision).toBe(parked.revision);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -559,6 +605,62 @@ describe('intake refinement — an old executable row does not block admission',
     // And it stays put from there: the third poll is the ordinary idempotent one.
     const third = await intake([issue(867, ['status:needs-refinement', 'agent:claude'])]);
     expect(third.results).toEqual([{ issueNumber: 867, action: 'already_exists', phase: 'refinement' }]);
+  });
+
+  test('a requeue between the two reads is suspended, not replaced (issue #905 review follow-up)', async () => {
+    // The steady state the race starts from: a parked implementation row, which
+    // the §3.1 guard at the top of the poll reads and steps aside from.
+    await intake([issue(867, ['agent:claude', 'status:needs-implementation'])]);
+    await intake([issue(867, ['status:needs-refinement', 'agent:claude'])]);
+    expect((await readTask(867)).status).toBe('ready_for_human');
+
+    // An operator requeues that row in the window between the guard's read and
+    // the admission path's own read of it. Modelled by mutating the row right
+    // after the guard's read returns the parked one, so the admission path
+    // below reads a LIVE implementation row — one whose CAS a replacement would
+    // win, discarding the lane's context and skipping the handoff.
+    const origGetTask = SqliteTaskStore.prototype.getTask;
+    let armed = true;
+    SqliteTaskStore.prototype.getTask = async function patchedGetTask(key) {
+      const row = await origGetTask.call(this, key);
+      if (armed && key.issueNumber === 867 && row?.status === 'ready_for_human') {
+        armed = false;
+        await withStore((store) =>
+          store.transitionTask(
+            { sessionId: 'addon-dev', issueNumber: 867 },
+            { status: 'ready_for_human' },
+            { status: 'queued' },
+          ),
+        );
+      }
+      return row;
+    };
+    let out;
+    try {
+      out = await intake([issue(867, ['status:needs-refinement', 'agent:claude'])]);
+    } finally {
+      SqliteTaskStore.prototype.getTask = origGetTask;
+    }
+
+    // The freshly live row is suspended rather than replaced, so the handoff is
+    // raised against it and the lane starts on a later poll as usual.
+    expect(out.refinementSuspended).toBe(1);
+    expect(out.refinementAdmitted).toBe(0);
+    expect(out.results).toEqual([
+      {
+        issueNumber: 867,
+        action: 'refinement_execution_suspended',
+        phase: 'implementation',
+        previousStatus: 'queued',
+        markerLabel: 'status:needs-refinement',
+        reason: 'execution_marker_conflict',
+      },
+    ]);
+    const after = await readTask(867);
+    expect(after.phase).toBe('implementation');
+    expect(after.status).toBe('ready_for_human');
+    // A replacement would have dropped every key the implementation lane wrote.
+    expect(after.context.implementationMode).toBe('new');
   });
 });
 
@@ -1230,6 +1332,71 @@ describe('intake refinement — the predecessor gate runs before the claim (issu
       },
     ]);
     expect((await readTask(956)).status).toBe('claimed');
+  });
+
+  test('a refused quality request does not bypass the hold reconciliation (issue #905 review follow-up)', async () => {
+    // Admitted while the labels were clean, so the row is `queued` and
+    // claimable — the shape every pre-#967 row has.
+    await intake([pir(956)]);
+    expect((await readTask(956)).status).toBe('queued');
+
+    // The Issue then acquires a malformed `quality:` label while its
+    // predecessor is still unusable. That refusal decides only that no NEW row
+    // is admitted this poll; the row the Issue already owns must still be
+    // parked, or the worker keeps claiming a task §4 does not admit yet.
+    const w = world({ edges: { 956: [955] } });
+    const marked = [issue(956, ['status:needs-refinement', 'agent:claude', 'quality:xhigh'])];
+    const first = await intake(marked, { eligibilitySource: w.source });
+    expect(first.refinementHeld).toBe(1);
+    expect(first.refinementAdmitted).toBe(0);
+    expect(first.results).toEqual([
+      {
+        issueNumber: 956,
+        action: 'refinement_held',
+        phase: 'refinement',
+        reason: 'predecessor_not_ready',
+        previousStatus: 'queued',
+        predecessors: [955],
+      },
+    ]);
+    const parked = await readTask(956);
+    expect(parked.status).toBe('blocked');
+    expect(parked.context.refinementPredecessorHold).toMatchObject({
+      reason: 'predecessor_not_ready',
+      predecessorIssueNumbers: [955],
+      previousStatus: 'queued',
+    });
+    expect(await claim()).toBeUndefined();
+
+    // With the row parked, the next poll reports the refusal itself and writes
+    // nothing: the typo is repaired by an operator, not by intake.
+    const second = await intake(marked, { eligibilitySource: w.source });
+    expect(second.refinementHeld).toBe(0);
+    expect(second.refinementAdmitted).toBe(0);
+    expect(second.results).toEqual([
+      {
+        issueNumber: 956,
+        action: 'quality_request_refused',
+        phase: 'refinement',
+        title: 'Issue 956',
+        reason: 'invalid-quality-request',
+        message: expect.any(String),
+      },
+    ]);
+    expect(await readTask(956)).toEqual(parked);
+
+    // Repairing the label leaves the hold exactly where it was: the row stays
+    // parked on the predecessor, not on the typo.
+    const repaired = await intake([pir(956)], { eligibilitySource: w.source });
+    expect(repaired.results).toEqual([
+      {
+        issueNumber: 956,
+        action: 'refinement_hold_unchanged',
+        phase: 'refinement',
+        reason: 'already_held',
+      },
+    ]);
+    expect((await readTask(956)).status).toBe('blocked');
   });
 
   test('--dry-run previews the hold instead of a claimable admission', async () => {

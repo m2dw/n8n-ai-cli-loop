@@ -45,10 +45,16 @@ import {
 } from "../core/research-evidence-protocol.js";
 import type { EvidenceBudgetSummary } from "../core/research-evidence-protocol.js";
 import { gitTrackedFileSource, nodeFileAccess } from "./research-evidence-source.js";
+import { parseAntigravityPrintTimeout } from "../core/antigravity-print-timeout.js";
+import type { ResolvedSession } from "../core/session.js";
+import { AGENT_RUNTIME_AUDIT_ARTIFACT_FILENAME, serializeAgentRuntimeAuditRecord } from "../core/agent-runtime-audit.js";
 import {
-  ANTIGRAVITY_PRINT_TIMEOUT_DEFAULT,
-  parseAntigravityPrintTimeout,
-} from "../core/antigravity-print-timeout.js";
+  legacyRuntimeSettingSource,
+  resolveAgentPhaseRuntime,
+  runtimeCmdSource,
+  withAgentRuntimeAudit,
+} from "./agent-runtime.js";
+import type { AgentPhaseRuntime, LegacyRuntimeSource } from "./agent-runtime.js";
 import {
   prepareAntigravityWorkspaceSettings,
   releaseAntigravityWorkspaceSettings,
@@ -807,70 +813,99 @@ export interface ResolvedResearchProfile {
   cmd: string;
   /** Sanitized argv — excludes prompt content (passed as positional arg and stdin). */
   argv: string[];
-  cmdSource: "env" | "cli-default";
-  modelSource: "cli-default" | "session-config";
-  /** Configured Antigravity model name, present only when modelSource is "session-config". */
+  /** Binary path source (issue #912) — the diagnostics boundary reads this. */
+  cmdSource: "env" | "cli-default" | "catalog-builtin" | "catalog-overlay";
+  modelSource: LegacyRuntimeSource | "cli-default";
+  /** Resolved Antigravity model name, absent when the CLI's own default applies. */
   model?: string;
   /**
    * `--print-timeout` value passed to `agy --print` (issue #861), e.g. `"15m"`.
-   * Always present: resolves to `ANTIGRAVITY_PRINT_TIMEOUT_DEFAULT` when the
-   * session does not configure `research.antigravity.printTimeout`.
+   * Since issue #912 it is the resolved profile's `providerOptions.printTimeout`
+   * (every built-in `google` profile carries `15m`); absent when an overlay
+   * unsets it, in which case no flag is passed and `agy`'s own default governs.
    */
-  printTimeout: string;
+  printTimeout?: string;
   /** The same value expressed in milliseconds, for diagnostics and bounds checks. */
-  printTimeoutMs: number;
-  printTimeoutSource: "cli-default" | "session-config";
+  printTimeoutMs?: number;
+  printTimeoutSource: "cli-default" | "catalog-builtin" | "catalog-overlay";
+  /** The catalog profile behind the concrete values above (§13.2). */
+  profileName?: string;
+  /** The task's persisted quality request (§8.2). */
+  requestedQuality?: string;
+  /** What this run resolved for the implementation class (§10.2). */
+  effectiveQuality?: string;
 }
 
-function researchCommand(
+/**
+ * Resolve the research runtime through the boundary's `research` lane (issue
+ * #912). Model and print timeout are profile settings now —
+ * `session.research.antigravity.model` / `.printTimeout` are no longer read
+ * by this lane (set them on a `google` profile in `agent-profiles.json`);
+ * `ANTIGRAVITY_BIN` keeps its break-glass meaning as the boundary's validated
+ * §8.1 layer-1 override. The returned `cmd`/`args` feed the same two
+ * transports as before: the prompt rides positionally AND on stdin on the
+ * first turn, and the evidence loop's later turns pass the fixed operand with
+ * the prompt on stdin only (§7.4's two declared transports).
+ */
+function researchRuntime(
+  task: AiTask,
+  session: ResolvedSession,
   agentId: string | undefined,
-  model: string | undefined,
-  printTimeoutConfig: string | undefined,
-): { cmd: string; args: string[]; resolvedProfile: ResolvedResearchProfile } | { error: string } {
+  sessionsPath: string | undefined,
+):
+  | { runtime: AgentPhaseRuntime; cmd: string; args: string[]; resolvedProfile: ResolvedResearchProfile }
+  | { error: string } {
   const agent = agentId ?? "gemini";
-  if (agent === "gemini") {
-    const envBin = process.env["ANTIGRAVITY_BIN"];
-    const bin = envBin ?? "agy";
-    const cmdSource: ResolvedResearchProfile["cmdSource"] = envBin ? "env" : "cli-default";
-    const modelSource: ResolvedResearchProfile["modelSource"] = model ? "session-config" : "cli-default";
-    const printTimeoutSource: ResolvedResearchProfile["printTimeoutSource"] =
-      printTimeoutConfig !== undefined ? "session-config" : "cli-default";
-    // Re-validated here even though json-session-registry.ts already validates
-    // `research.antigravity.printTimeout` at session load (mirrors the
-    // evidence-glob re-validation below): a caller that constructs a
-    // `ResolvedSession` outside that registry must not be able to smuggle a
-    // malformed duration into command argv.
-    let printTimeout: { raw: string; ms: number };
-    try {
-      printTimeout = parseAntigravityPrintTimeout(printTimeoutConfig ?? ANTIGRAVITY_PRINT_TIMEOUT_DEFAULT);
-    } catch (err) {
-      return {
-        error: `Research cannot run: session.research.antigravity.printTimeout ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-    // Model, then print-timeout, then --print — a stable order regardless of
-    // which of the two optional inputs are configured.
-    const argv: string[] = [
-      ...(model ? ["--model", model] : []),
-      "--print-timeout", printTimeout.raw,
-      "--print",
-    ];
-    const resolvedProfile: ResolvedResearchProfile = {
-      phase: "research", agentId: agent, cmd: bin, argv, cmdSource, modelSource,
-      ...(model ? { model } : {}),
-      printTimeout: printTimeout.raw,
-      printTimeoutMs: printTimeout.ms,
-      printTimeoutSource,
-    };
-    // --print forces non-interactive/TUI output, mirroring the legacy shell worker:
-    //   "$ANTIGRAVITY_BIN" --print "$(cat "$PROMPT")" > "$OUT" 2>&1
-    // --print-timeout raises Antigravity's own five-minute print-mode default
-    // (issue #861) so a large but valid research task is not cut off mid-run.
-    // No `timeout` is passed to the command runner below: the runner never
-    // imposes its own deadline, so it can never be shorter than this value.
-    return { cmd: bin, args: argv, resolvedProfile };
+  if (agent !== "gemini") {
+    return { error: `Unsupported research agent: ${agent}. Supported: gemini` };
   }
-  return { error: `Unsupported research agent: ${agent}. Supported: gemini` };
+  const resolution = resolveAgentPhaseRuntime({
+    task,
+    session,
+    phase: "research",
+    lane: "research",
+    agentId: agent,
+    sessionsPath,
+  });
+  if ("error" in resolution) {
+    return { error: `Research cannot run: ${resolution.error}` };
+  }
+  const runtime = resolution.runtime;
+  const resolved = runtime.resolved;
+  // The adapter already validated the option's format against the same parser
+  // (issue #861); this parse only recovers the millisecond value for
+  // diagnostics and never refuses what the boundary admitted.
+  const printTimeoutRaw = resolved.providerOptions["printTimeout"];
+  let printTimeout: { raw: string; ms: number } | undefined;
+  if (printTimeoutRaw !== undefined) {
+    printTimeout = parseAntigravityPrintTimeout(printTimeoutRaw);
+  }
+  const printTimeoutOptionSource = resolved.providerOptionSources["printTimeout"];
+  const resolvedProfile: ResolvedResearchProfile = {
+    phase: "research",
+    agentId: agent,
+    cmd: runtime.command,
+    argv: [...runtime.argv],
+    cmdSource: runtimeCmdSource(resolved),
+    modelSource:
+      resolved.model.value === undefined
+        ? "cli-default"
+        : legacyRuntimeSettingSource(resolved.model, resolved, runtime.quality),
+    ...(resolved.model.value !== undefined ? { model: resolved.model.value } : {}),
+    ...(printTimeout !== undefined
+      ? { printTimeout: printTimeout.raw, printTimeoutMs: printTimeout.ms }
+      : {}),
+    printTimeoutSource:
+      printTimeoutOptionSource === "catalog-overlay"
+        ? "catalog-overlay"
+        : printTimeoutOptionSource === "catalog-builtin"
+          ? "catalog-builtin"
+          : "cli-default",
+    profileName: resolved.profileName,
+    requestedQuality: runtime.quality.requested.quality,
+    effectiveQuality: runtime.quality.quality,
+  };
+  return { runtime, cmd: runtime.command, args: [...runtime.argv], resolvedProfile };
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,7 +1250,12 @@ export function createResearchHandler(
   worktreeOptions: ResearchWorktreeOptions = {},
 ): PhaseHandler {
   const worktreeRuntime = worktreeOptions.runtime ?? defaultResearchWorktreeRuntime;
-  return async (task: AiTask): Promise<PhaseHandlerResult> => {
+  const runResearchPhase = async (
+    task: AiTask,
+    // Records the runtime whose §13 audit pieces the outer wrapper folds into
+    // the returned result (issue #912).
+    setAgentRuntime: (runtime: AgentPhaseRuntime) => void,
+  ): Promise<PhaseHandlerResult> => {
     const { session, runId } = context;
     const artifactDir = runArtifactDir(session.artifactRoot, runId);
 
@@ -1229,11 +1269,10 @@ export function createResearchHandler(
       };
     }
 
-    // Determine research command
+    // Determine research command — resolved through the runtime boundary's
+    // `research` lane (issue #912).
     const agentId = agentForPhase(task, session, "research");
-    const antigravityModel = session.research?.antigravity?.model;
-    const antigravityPrintTimeout = session.research?.antigravity?.printTimeout;
-    const cmdSpec = researchCommand(agentId, antigravityModel, antigravityPrintTimeout);
+    const cmdSpec = researchRuntime(task, session, agentId, context.sessionsPath);
     if ("error" in cmdSpec) {
       writeAssignmentFailureArtifact(artifactDir, {
         phase: "research", agentId, sessionId: task.sessionId, issueNumber: task.issueNumber, runId, error: cmdSpec.error,
@@ -1249,6 +1288,9 @@ export function createResearchHandler(
       };
     }
     const resolvedProfile = cmdSpec.resolvedProfile;
+    // Hand the resolution to the outer wrapper so its §13 audit pieces ride
+    // the returned result on every path (issue #912).
+    setAgentRuntime(cmdSpec.runtime);
 
     // ---- Issue #855: detached per-run research worktree ----------------------
     // Research used to run the agent in `session.repoRoot`. That checkout is a
@@ -1473,6 +1515,19 @@ export function createResearchHandler(
     if (!isSafeArtifactDirAfterRun(session.artifactRoot, artifactDir)) {
       return { result: "failed", context: { resolvedProfile }, error: "Research cannot run: artifact directory is unsafe" };
     }
+
+    // §13.4: the run artifact carries the same record the context trail and
+    // the `agent.runtime.resolved` event persist (issue #912) — the outer
+    // wrapper folds those onto the returned result, but the artifact bytes are
+    // this handler's to write, before the agent is invoked so an interrupted
+    // run still records the billable resolution.
+    const runtimeAuditPath = join(artifactDir, AGENT_RUNTIME_AUDIT_ARTIFACT_FILENAME);
+    rejectSymlink(runtimeAuditPath);
+    writeFileSync(
+      runtimeAuditPath,
+      serializeAgentRuntimeAuditRecord(cmdSpec.runtime.record),
+      "utf8",
+    );
 
     // Write prompt artifact. On an evidence-enabled run this is the turn-0
     // prompt (base prompt plus the evidence-channel instructions); with
@@ -2329,5 +2384,12 @@ export function createResearchHandler(
       }
       releaseLock?.();
     }
+  };
+  return async (task: AiTask): Promise<PhaseHandlerResult> => {
+    let agentRuntime: AgentPhaseRuntime | undefined;
+    const result = await runResearchPhase(task, (runtime) => {
+      agentRuntime = runtime;
+    });
+    return withAgentRuntimeAudit(result, agentRuntime);
   };
 }

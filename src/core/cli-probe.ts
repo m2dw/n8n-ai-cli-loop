@@ -44,6 +44,12 @@ export type CliProbeStatus = (typeof CLI_PROBE_STATUSES)[number];
  * a loaded host that is out of process slots or file descriptors fails these
  * the same way whether the binary is healthy or missing.
  *
+ * `ETXTBSY` belongs here for the same reason even though it names a file: it
+ * means the executable was open for writing somewhere on the host at the
+ * instant of the exec, which is a moment in time rather than a property of the
+ * binary. The next attempt, once that writer has closed, runs the same file
+ * successfully.
+ *
  * `EACCES` is deliberately NOT here: a file that exists but is not executable
  * is a real, persistent misconfiguration, and retrying it forever would hide
  * the one thing the operator has to fix. It still classifies as `spawn-error`
@@ -54,7 +60,28 @@ export const TRANSIENT_SPAWN_ERROR_CODES: ReadonlySet<string> = new Set([
   "ENOMEM",
   "EMFILE",
   "ENFILE",
+  "ETXTBSY",
 ]);
+
+/**
+ * Backoff before re-attempting a spawn the OS refused, spaced so whatever the
+ * host ran out of (process slots, descriptors, memory) has a chance to free up.
+ *
+ * The schedule runs out to seconds rather than fractions of one because the
+ * condition it waits on is a *sustained* one: a host that cannot fork right now
+ * is usually a host mid-way through something that will hold those slots for
+ * more than a few hundred milliseconds. Every entry costs nothing on a healthy
+ * host — a retry loop stops at the first spawn that is not a transient refusal
+ * — and the whole schedule is still an order of magnitude under the timeouts
+ * the callers run inside.
+ *
+ * Shared so that every caller that draws the transient/determinate line with
+ * {@link TRANSIENT_SPAWN_ERROR_CODES} also waits the same way: a refused fork
+ * that `admin session-doctor` reports as an inaccessible CLI and one that an
+ * n8n deploy reports as a failed step are the same host condition, and giving
+ * up on it at different points is what makes one of them look flaky.
+ */
+export const TRANSIENT_SPAWN_RETRY_BACKOFF_MS: readonly number[] = [100, 300, 900, 2000];
 
 /** Bound on the diagnostic text carried out of a probe. */
 export const MAX_PROBE_DETAIL_CHARS = 300;

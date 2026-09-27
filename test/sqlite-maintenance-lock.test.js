@@ -291,11 +291,11 @@ describe('SqliteMaintenanceLock status/forceRelease (issue #817)', () => {
   });
 
   test('forceRelease() refuses while a non-stale outbox dispatch claim exists, and leaves the lock intact', () => {
-    // Run the outbox claimed_at migration up front: `store` above (a plain
-    // SqliteTaskStore) creates `outbox` without a claimed_at column, and
-    // SqliteMaintenanceLock deliberately never migrates (issue #817 review —
-    // it must stay read-only), so raw-seeding below needs
-    // SqliteOutboxStore's own migration to have already run.
+    // Make sure the outbox claim column exists before raw-seeding it:
+    // SqliteMaintenanceLock deliberately never migrates (issue #817 review — it
+    // must stay read-only). `store` above (a SqliteTaskStore) now creates and
+    // migrates the column itself (issue #980 review), so this is belt and
+    // braces on a file either store may have opened first.
     new SqliteOutboxStore(dbPath).close();
 
     const raw = new Database(dbPath);

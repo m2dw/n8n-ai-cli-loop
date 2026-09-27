@@ -136,6 +136,57 @@ export class GiteaRepoHostProvider implements RepoHostProvider {
     };
   }
 
+  findOpenPullRequestsByHead(head: string): ProviderRead<PullRequest[]> {
+    // Same missing-`head`-filter constraint as the convention lookup above: the
+    // matching is client-side over every page of open PRs. Unlike that lookup this
+    // one does NOT stop at the first match — the caller adopts a PR only when it is
+    // the sole one on the head, so a second match on a later page is precisely the
+    // evidence it needs, and short-circuiting would hide it.
+    const matches: PullRequest[] = [];
+    for (let page = 1; page <= MAX_LIST_PAGES; page++) {
+      let res: GiteaResponse;
+      try {
+        res = this.client.request({
+          method: "GET",
+          path: `/${this.repoPath}/pulls`,
+          query: { state: "open", limit: LIST_PAGE_SIZE, page },
+        });
+      } catch (err) {
+        return { ok: false, error: `gitea pulls list failed: ${errMessage(err)}` };
+      }
+
+      if (!ok(res.status)) {
+        return { ok: false, error: `gitea pulls list failed (HTTP ${res.status}): ${res.body.slice(0, 300)}` };
+      }
+
+      let prs: GiteaPullRequestJson[];
+      try {
+        prs = JSON.parse(res.body) as GiteaPullRequestJson[];
+      } catch {
+        return { ok: false, error: `gitea pulls list returned non-JSON output: ${res.body.slice(0, 200)}` };
+      }
+      if (!Array.isArray(prs)) {
+        return { ok: false, error: `gitea pulls list returned a non-array payload: ${res.body.slice(0, 200)}` };
+      }
+
+      for (const pr of prs) {
+        if (pr.head?.ref === head) matches.push(mapPullRequest(pr));
+      }
+
+      if (prs.length < LIST_PAGE_SIZE) {
+        return { ok: true, value: matches };
+      }
+    }
+
+    // Cap reached with every page full: the scan is incomplete, so the match set
+    // is unknown rather than empty. Fail rather than let a caller read a partial
+    // "exactly one match" (or "none") off a truncated listing.
+    return {
+      ok: false,
+      error: `gitea pulls list exceeded ${MAX_LIST_PAGES} pages (${MAX_LIST_PAGES * LIST_PAGE_SIZE} open PRs) without exhausting the open pull requests for head "${head}"`,
+    };
+  }
+
   createPullRequest(input: CreatePullRequestInput): ProviderRead<PullRequest> {
     let res: GiteaResponse;
     try {

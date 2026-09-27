@@ -17,6 +17,7 @@
  */
 
 import { execFileSync } from "child_process";
+import { randomUUID } from "crypto";
 import { existsSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -27,7 +28,7 @@ import {
   cancel as clackCancel,
   isCancel,
 } from "@clack/prompts";
-import { emit, die } from "./cli-io.js";
+import { emit, die, writeOut, exitProcess } from "./cli-io.js";
 import { SqliteTaskStore } from "../stores/sqlite-task-store.js";
 import type { TaskStore } from "../core/task-store.js";
 import { isClaimExpired } from "../core/transitions.js";
@@ -43,11 +44,36 @@ import type { GhRunner } from "../providers/github/gh-runner.js";
 import { tokenizeArgs } from "./admin-command.js";
 import { IssueWorktreeLock } from "../handlers/worktree.js";
 import { hasUnresolvedToolRequest } from "../core/tool-request.js";
+import { resolvePrContext } from "../core/pr-context.js";
 // Issue #848: the UI renders the SAME projection the non-interactive commands
 // do, and routes every dispute mutation back through `admin dispute reopen`
 // rather than writing protocol state itself.
 import { REVIEW_DISPUTE_CONTEXT_KEY } from "../core/review-dispute-commit.js";
 import { disputeReopenArgv, summarizeDisputeStatus } from "../core/review-dispute-status.js";
+import { formatEvidenceParty } from "../core/review-dispute-evidence-state.js";
+// Issue #977: the refinement lane's operator view. The UI renders the SAME
+// normalized model `admin task-status` does, through the same core helpers —
+// it maintains no interpretation of milestones, states, or deadlines of its own.
+// Issue #1044: the verification-plan view runs the SAME `admin
+// task-verification` commands an operator would type — it resolves no plan, and
+// writes no state, of its own.
+import {
+  VERIFICATION_AMENDMENTS_CONTEXT_KEY,
+  MAX_VERIFICATION_AMENDMENT_ACTOR_ID_CHARS,
+  MAX_VERIFICATION_AMENDMENT_COMMAND_CHARS,
+  MAX_VERIFICATION_AMENDMENT_NAME_CHARS,
+  MAX_VERIFICATION_AMENDMENT_OPERATIONS,
+  MAX_VERIFICATION_AMENDMENT_REASON_CHARS,
+  MAX_VERIFICATION_AMENDMENT_REVISIONS,
+  MAX_VERIFICATION_SESSION_BASELINE_ENTRIES,
+} from "../core/verification-amendment.js";
+import { MAX_VERIFICATION_PLAN_REQUIREMENTS } from "../core/verification-plan.js";
+import { REFINEMENT_CONTEXT_KEY } from "../core/issue-refinement.js";
+import {
+  renderRefinementCriticBlockLine,
+  summarizeRefinementStatus,
+} from "../core/issue-refinement-status.js";
+import { renderRefinementProgressLines } from "../core/issue-refinement-progress-status.js";
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-testable without a TTY)
@@ -184,19 +210,83 @@ export function isHumanReviewHandoff(task: AiTask): boolean {
   return (
     task.status === "ready_for_human" &&
     !isCapRecoverable(task) &&
-    !isToolRequestHandoff(task)
+    !isToolRequestHandoff(task) &&
+    !isRefinementRecoverable(task)
   );
 }
 
 /**
- * Collect active tasks across the given sessions, most-recently-updated first.
- * Read-only: this only reads from the store and never mutates task state.
+ * Whether `admin refinement recover` applies to this task (issue #980).
+ *
+ * A refinement handoff is `ready_for_human` like every other one, so without
+ * this it would route to the generic human-handoff view — whose two commands
+ * are both wrong for it. `human-review-return` records review feedback and
+ * swaps the review lane's labels, and generic `recover` would requeue the row
+ * with the failed attempt's rejected draft, counters, and handoff reason still
+ * on the block, which §13 forbids outright ("recovery restarts the attempt from
+ * `pending` or it does nothing"). The dedicated command is the only one that
+ * performs row 36.
+ *
+ * Uses the same evaluation the command itself does, minus the parts that need
+ * I/O (the live label shape, the issue lock), so the UI cannot offer an action
+ * the command would refuse on task state.
+ */
+export function isRefinementRecoverable(task: AiTask): boolean {
+  if (task.status !== "ready_for_human" || task.phase !== "refinement") return false;
+  const block = task.context?.[REFINEMENT_CONTEXT_KEY];
+  if (!block || typeof block !== "object" || Array.isArray(block)) return false;
+  return (block as Record<string, unknown>)["state"] === "escalated_human";
+}
+
+/**
+ * Statuses `admin task reconcile-merged` can write (issue #1048): the §7 rows
+ * that transition to `done` plus the two terminal rows that record the merge.
+ * `done` is a no-op, and `claimed`/`running` are never reconciled at all.
+ */
+const MERGED_PR_RECONCILABLE_STATUSES: TaskStatus[] = [
+  "queued",
+  "blocked",
+  "ready_for_human",
+  "failed",
+  "cancelled",
+];
+
+/**
+ * Whether `admin task reconcile-merged` could act on this task (issue #1048).
+ *
+ * Evaluated from task state alone — the same shape the other predicates here
+ * use — so the UI never offers a dead-end action: a task with no recorded
+ * `prUrl` is refused `missing-pr-identity` (the identity is never derived from
+ * the Issue number), and a `claimed`/`running`/`done` row has no writing
+ * outcome in the contract. Whether the recorded PR is actually MERGED is a live
+ * provider question, and answering it is exactly what the command's preview is
+ * for — which is why the UI surfaces the commands instead of running them.
+ */
+export function isMergedPrReconcilable(task: AiTask): boolean {
+  if (!MERGED_PR_RECONCILABLE_STATUSES.includes(task.status)) return false;
+  const { prUrl } = resolvePrContext(task);
+  return prUrl !== undefined && prUrl.length > 0;
+}
+
+/**
+ * Collect the tasks an operator can act on across the given sessions,
+ * most-recently-updated first. Read-only: this only reads from the store and
+ * never mutates task state.
+ *
+ * Active statuses, plus (issue #1048) a task the merged-PR reconciliation
+ * command could still write. In practice that second clause admits exactly one
+ * extra shape — a `cancelled` task with a recorded PR — because every other
+ * reconcilable status is already active. Without it the `reconcile-merged`
+ * action added to the task menu would be unreachable for the contract's
+ * `recorded-terminal` cancelled case: the menu is only ever built for a task
+ * this function returned. `done` is still excluded (it has no reconciliation
+ * outcome either), so the list keeps its "not finished" meaning.
  */
 export async function collectActiveTasks(store: TaskStore, sessionIds: string[]): Promise<AiTask[]> {
   const out: AiTask[] = [];
   for (const sid of sessionIds) {
     for (const task of await store.listSessionTasks(sid)) {
-      if (isActiveStatus(task.status)) out.push(task);
+      if (isActiveStatus(task.status) || isMergedPrReconcilable(task)) out.push(task);
     }
   }
   out.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
@@ -387,6 +477,37 @@ export function buildToolRequestListArgv(task: AiTask, dbPath?: string): string[
 }
 
 /**
+ * Argv for `admin refinement recover` for this task (issue #980).
+ *
+ * `--yes` is opt-in rather than baked in: the command previews by default, and
+ * the preview is the step that reports the live label shape §13 requires before
+ * a reset is allowed. The UI surfaces both forms and runs neither, for the same
+ * reason it does not run `tool-request` — the operator may still have a label
+ * to restore first.
+ */
+export function buildRefinementRecoverArgv(
+  task: AiTask,
+  dbPath?: string,
+  sessionsPath?: string,
+  options: { yes?: boolean } = {},
+): string[] {
+  const argv = [
+    "refinement",
+    "recover",
+    "--session-id",
+    task.sessionId,
+    "--issue-number",
+    String(task.issueNumber),
+  ];
+  if (options.yes) argv.push("--yes");
+  if (dbPath) argv.push("--db-path", dbPath);
+  // The command resolves the session (and its labels/repo) from the registry,
+  // so preserve a custom one the UI was launched with.
+  if (sessionsPath) argv.push("--sessions-path", sessionsPath);
+  return argv;
+}
+
+/**
  * Argv for `admin tool-request resolve` for this task. `reject` requires an
  * operator note, so a placeholder is surfaced for the operator to fill in.
  */
@@ -463,6 +584,525 @@ export function buildHumanReviewReturnArgv(
   // unless told otherwise, so preserve a custom registry the UI was launched with.
   if (sessionsPath) argv.push("--sessions-path", sessionsPath);
   return argv;
+}
+
+/**
+ * Argv for `admin task reconcile-merged` for this task (issue #1048).
+ *
+ * `--yes` is opt-in rather than baked in, for the same reason the refinement
+ * builder above leaves it out: the preview is the step that performs the live
+ * provider read and reports whether the recorded PR is actually MERGED. Running
+ * the apply straight from a menu would ask an operator to confirm a mutation
+ * whose eligibility nobody has seen yet.
+ */
+export function buildTaskReconcileMergedArgv(
+  task: AiTask,
+  dbPath?: string,
+  sessionsPath?: string,
+  options: { yes?: boolean } = {},
+): string[] {
+  const argv = [
+    "task",
+    "reconcile-merged",
+    "--session-id",
+    task.sessionId,
+    "--issue-number",
+    String(task.issueNumber),
+  ];
+  if (options.yes) argv.push("--yes");
+  if (dbPath) argv.push("--db-path", dbPath);
+  // The command resolves the session's repo host (and the comment's target
+  // repo) from the registry, so preserve a custom one the UI was launched with.
+  if (sessionsPath) argv.push("--sessions-path", sessionsPath);
+  return argv;
+}
+
+// ---------------------------------------------------------------------------
+// Verification plan amendment (issue #1044, docs/verification-amendment-contract.md §11)
+// ---------------------------------------------------------------------------
+//
+// The UI adds NO capability here (§17): every argv below is a command an
+// operator could type, every mutation previews before it applies, and the
+// decision logic — plan resolution, the §7 refusals, the §9.2 continuation, the
+// §12 audit and publication — stays in `admin task-verification`, reached
+// through the same spawn as every other state change. What the UI adds is the
+// part a command line cannot: the current plan in front of the operator while
+// they choose a slot, the previous reason prefilled while they write the next
+// one, and the plan digest they just read carried into the apply as a guard.
+
+/** The identity flags every `task-verification` action takes. */
+function taskVerificationArgv(
+  action: string,
+  task: AiTask,
+  dbPath?: string,
+  sessionsPath?: string,
+): string[] {
+  const argv = [
+    "task-verification",
+    action,
+    "--session-id",
+    task.sessionId,
+    "--issue-number",
+    String(task.issueNumber),
+  ];
+  if (dbPath) argv.push("--db-path", dbPath);
+  // Every action resolves the session for `session.verification` — the live
+  // execution layer of the plan (§6.1 step 1) — so a UI started on a custom
+  // registry must hand that registry to the command it runs.
+  if (sessionsPath) argv.push("--sessions-path", sessionsPath);
+  return argv;
+}
+
+/** Argv for the read-only `admin task-verification show`. */
+export function buildTaskVerificationShowArgv(
+  task: AiTask,
+  dbPath?: string,
+  sessionsPath?: string,
+  options: { json?: boolean } = {},
+): string[] {
+  const argv = taskVerificationArgv("show", task, dbPath, sessionsPath);
+  if (options.json) argv.push("--json");
+  return argv;
+}
+
+/**
+ * One operation clause of an `amend`, in the order the CLI's grammar reads it:
+ * the operation flag, then the value it names, then its `--command` and
+ * `--op-reason` when it takes them (§11 rule 3's binding rule).
+ */
+export interface VerificationAmendOperation {
+  flag:
+    | "--replace"
+    | "--add-execution"
+    | "--add-requirement"
+    | "--retire"
+    | "--restore"
+    | "--annotate";
+  /** The `commandId` (or, for `--add-execution`, the name) the flag takes. */
+  value?: string;
+  /** The bytes for the operations that take a `--command`. */
+  command?: string;
+  /** The per-operation `--op-reason`, when the operator supplied one. */
+  opReason?: string;
+}
+
+/**
+ * Argv for `admin task-verification amend`.
+ *
+ * The clause order is the contract: each `--command`/`--op-reason` binds to the
+ * operation flag it follows, so the operations are emitted in sequence and the
+ * revision-level `--reason` comes after all of them, where it cannot be mistaken
+ * for an operation's own.
+ */
+export function buildTaskVerificationAmendArgv(
+  task: AiTask,
+  options: {
+    operations: readonly VerificationAmendOperation[];
+    reason: string;
+    continueMode?: "review" | "implementation" | "none";
+    expectPlanDigest?: string;
+    requestKey?: string;
+    yes?: boolean;
+    json?: boolean;
+  },
+  dbPath?: string,
+  sessionsPath?: string,
+): string[] {
+  const argv = taskVerificationArgv("amend", task, dbPath, sessionsPath);
+  for (const operation of options.operations) {
+    argv.push(operation.flag);
+    if (operation.value !== undefined) argv.push(operation.value);
+    if (operation.command !== undefined) argv.push("--command", operation.command);
+    if (operation.opReason !== undefined) argv.push("--op-reason", operation.opReason);
+  }
+  argv.push("--reason", options.reason);
+  if (options.continueMode) argv.push("--continue", options.continueMode);
+  // The digest the operator was shown, carried into the apply: a plan that moved
+  // between the preview and the confirmation refuses (§7.3 rule 3) instead of
+  // amending something nobody read.
+  if (options.expectPlanDigest) argv.push("--expect-plan-digest", options.expectPlanDigest);
+  if (options.requestKey) argv.push("--request-key", options.requestKey);
+  if (options.yes) argv.push("--yes");
+  if (options.json) argv.push("--json");
+  return argv;
+}
+
+/** Argv for `admin task-verification refresh-from-issue` (§10). */
+export function buildTaskVerificationRefreshArgv(
+  task: AiTask,
+  options: {
+    reason: string;
+    allowRetire?: boolean;
+    expectIssueDigest?: string;
+    expectPlanDigest?: string;
+    requestKey?: string;
+    yes?: boolean;
+  },
+  dbPath?: string,
+  sessionsPath?: string,
+): string[] {
+  const argv = taskVerificationArgv("refresh-from-issue", task, dbPath, sessionsPath);
+  argv.push("--reason", options.reason);
+  if (options.allowRetire) argv.push("--allow-retire");
+  if (options.expectIssueDigest) argv.push("--expect-issue-digest", options.expectIssueDigest);
+  // The refresh's difference is derived from TWO inputs — the live Issue and the
+  // task's own effective plan — so an apply guarded on the Issue alone can still
+  // apply a different set of additions and retirements than the preview showed,
+  // if another revision moved the plan in between (issue #1044 review).
+  if (options.expectPlanDigest) argv.push("--expect-plan-digest", options.expectPlanDigest);
+  // A refresh's operations are DERIVED from its own read of the Issue, so a
+  // keyless one is recognized by re-deriving that key from what it recorded —
+  // matching any later keyless refresh of the same body (issue #1044 review,
+  // P1). An explicit key states which request this invocation IS: the apply line
+  // the UI prints replays exactly, on a claimed task too, because the
+  // supplied-key lookup precedes the §7.1 refusals, and a deliberate repeat of
+  // the same refresh stays a separate request.
+  if (options.requestKey) argv.push("--request-key", options.requestKey);
+  if (options.yes) argv.push("--yes");
+  return argv;
+}
+
+/**
+ * A `--request-key` for ONE interactive amendment flow — generated once, named
+ * on both the preview and the apply that follows it (§5.3 rule 2, issue #1044
+ * review, P1).
+ *
+ * Omitting the key makes the core derive one from the invocation's own content,
+ * which is right for a scripted caller and wrong here: an operator who retires a
+ * slot, restores it, and retires it again from this UI types the same operation
+ * with the same reason, so the derived key is the same key. The preview still
+ * shows the retirement — previews do not look up replays — and the apply is then
+ * answered as a replay of the FIRST retirement, reporting a revision that is
+ * already superseded and leaving the slot active after a confirmation that said
+ * otherwise.
+ *
+ * A fresh key per flow states the opposite: this is a deliberate repeat, not a
+ * retry. Retry-safety is not given up, because the SAME key reaches the apply and
+ * the UI prints the apply line it ran — re-running that exact line, which is the
+ * one retry an operator has, is recognized as the §5.3 replay it is rather than
+ * recording a second revision.
+ *
+ * Shaped to §5.3 rule 2's `/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/`: 40 characters,
+ * and `ui` marks the surface it came from in the recorded chain.
+ */
+export function newVerificationRequestKey(): string {
+  return `vreq-ui-${randomUUID().replace(/-/g, "")}`;
+}
+
+/**
+ * The `live Issue body digest:` line `refresh-from-issue` prints on every
+ * outcome that read the Issue.
+ *
+ * `refresh-from-issue` has no `--json`, so the digest an operator was shown is
+ * recovered from the rendered preview — which is the same text the operator
+ * reads on screen, so the value carried into the apply is literally the one they
+ * confirmed.
+ */
+export function parseRefreshIssueBodyDigest(stdout: string): string | null {
+  const match = /^\s*live Issue body digest:\s*(\S+)\s*$/m.exec(stdout);
+  return match === null ? null : match[1];
+}
+
+/**
+ * The BASE plan digest of a `plan digest: <base> -> <new>` preview line — the
+ * plan the previewed revision was authored against, which is what
+ * `--expect-plan-digest` names.
+ *
+ * Absent from an outcome that produced no revision (a `no_change`, a replay),
+ * where there is no revision to guard; a `no_change` reports the plan it
+ * resolved through {@link parsePreviewUnchangedPlanDigest} instead.
+ */
+export function parsePreviewBasePlanDigest(stdout: string): string | null {
+  const match = /^\s*plan digest:\s*(\S+)\s*->\s*\S+\s*$/m.exec(stdout);
+  return match === null ? null : match[1];
+}
+
+/**
+ * The plan digest of a `plan digest: <digest> (unchanged)` line — what a
+ * `no_change` preview reports in place of a `base -> new` pair.
+ *
+ * It is the plan THIS invocation resolved, which is the only digest an apply may
+ * be guarded on (issue #1044 review, P1). The digest a plan screen printed
+ * earlier is not a substitute: the plan can move between that screen and the
+ * preview, and a refresh that then finds no difference against the moved plan
+ * would be applied under a guard naming the plan nobody diffed — refusing when
+ * the move stands, and, if the plan happens to move back, applying operations
+ * against a plan the operator never previewed.
+ */
+export function parsePreviewUnchangedPlanDigest(stdout: string): string | null {
+  const match = /^\s*plan digest:\s*(\S+)\s*\(unchanged\)\s*$/m.exec(stdout);
+  return match === null ? null : match[1];
+}
+
+/**
+ * The `--request-key` of a previewed revision, from the
+ * `revision: <id> (request key <key>)` line.
+ *
+ * Only a `reset` needs it carried back (§11 rule 3): a reset derives its
+ * operations from the plan, so its own success erases the content a derived key
+ * would be recomputed from, and an apply whose response was lost would rerun
+ * into "nothing left to undo" — reported as `no_change` — instead of being
+ * recognized as the replay of the revision it already recorded.
+ */
+export function parsePreviewRequestKey(stdout: string): string | null {
+  const match = /^\s*revision:\s*\S+\s*\(request key\s+([^\s)]+)\)\s*$/m.exec(stdout);
+  return match === null ? null : match[1];
+}
+
+/**
+ * The revision ordinal an apply actually consumed, from the
+ * `Applied as revision ordinal <n>.` line every applying outcome prints — and
+ * only an applying outcome prints (issue #1044 review, P2).
+ *
+ * Exit code 0 is not the same question. A `no_change` refresh or reset, and an
+ * apply the core recognized as a §5.3 replay, both succeed and both write
+ * nothing: no revision, no §12.1 event, no §12.2 comment. Telling those apart
+ * from a recorded revision is what keeps the UI from promising an audit trail
+ * that does not exist.
+ */
+export function parseAppliedRevisionOrdinal(stdout: string): number | null {
+  const match = /^\s*Applied as revision ordinal\s+(\d+)\.\s*$/m.exec(stdout);
+  return match === null ? null : Number(match[1]);
+}
+
+/**
+ * Whether a command's bytes, as `task-verification show` PRINTED them, went
+ * through the session's redaction (issue #1044 review, P1).
+ *
+ * `show` sanitizes every command it reports, so a command naming a configured
+ * local path (or a secret-shaped token) reaches the UI as `<path>` /
+ * `[redacted]` rather than as its real bytes. Those are display text, never
+ * executable bytes: prefilling them into a replacement prompt would let an
+ * operator making a small edit — or simply accepting the default — store a
+ * placeholder as the command the loop runs, breaking the very verification the
+ * replacement was meant to correct.
+ */
+export function isRedactedCommandText(command: string): boolean {
+  return command.includes("<path>") || command.includes("[redacted]");
+}
+
+/** Argv for `admin task-verification reset` (§11's append-only reversal). */
+export function buildTaskVerificationResetArgv(
+  task: AiTask,
+  options: {
+    reason: string;
+    allowRetire?: boolean;
+    expectPlanDigest?: string;
+    requestKey?: string;
+    yes?: boolean;
+  },
+  dbPath?: string,
+  sessionsPath?: string,
+): string[] {
+  const argv = taskVerificationArgv("reset", task, dbPath, sessionsPath);
+  argv.push("--reason", options.reason);
+  if (options.allowRetire) argv.push("--allow-retire");
+  if (options.expectPlanDigest) argv.push("--expect-plan-digest", options.expectPlanDigest);
+  // A reset derives its operations from the plan, so a key derived from them
+  // cannot survive the reset's own success (§11 rule 3). Passing back the key
+  // the preview named is the only way an apply whose response was lost is
+  // recognized as a replay rather than reported as "nothing left to undo".
+  if (options.requestKey) argv.push("--request-key", options.requestKey);
+  if (options.yes) argv.push("--yes");
+  return argv;
+}
+
+/** The `--json` payload of `task-verification show`, as the UI reads it. */
+export interface VerificationPlanView {
+  ok: boolean;
+  outcome: string;
+  planDigest: string;
+  reconciliation: string;
+  amendable: boolean;
+  amendmentRefusal?: string;
+  defaultContinuation: string;
+  execution: VerificationPlanSlotView[];
+  requirement: VerificationPlanSlotView[];
+  revisions: VerificationPlanRevisionView[];
+  notes: string[];
+  drift?: string;
+  error?: string;
+}
+
+export interface VerificationPlanSlotView {
+  commandId: string;
+  state: string;
+  command: string;
+  origin: string;
+  amended: boolean;
+  /** Requirement layer only: `passed` | `not_run` | `retired` (§6.2 rule 3). */
+  status?: string;
+  revisionOrdinals: number[];
+}
+
+export interface VerificationPlanRevisionView {
+  revisionOrdinal: number;
+  revisionId: string;
+  source: string;
+  reason: string;
+  operations: string[];
+  continuation: string;
+  createdAt: string;
+}
+
+/**
+ * Read the `task-verification show --json` payload.
+ *
+ * Defensive rather than trusting: the UI spawns the command and gets a string
+ * back, and a refusal, a die(), or a future payload change must degrade to "no
+ * view" instead of a half-rendered screen. Returns `null` when the output is
+ * not a payload this build understands — the caller then shows the raw CLI
+ * output, which is the honest thing to put in front of an operator.
+ */
+export function parseVerificationPlanView(stdout: string): VerificationPlanView | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.trim());
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const raw = parsed as Record<string, unknown>;
+  const planDigest = raw.planDigest;
+  const error = raw.error;
+  if (typeof planDigest !== "string") {
+    // A refusal payload still carries enough to report; anything else does not.
+    if (raw.ok === false && typeof error === "string") {
+      return {
+        ok: false,
+        outcome: typeof raw.outcome === "string" ? raw.outcome : "refused",
+        planDigest: "",
+        reconciliation: "",
+        amendable: false,
+        defaultContinuation: "none",
+        execution: [],
+        requirement: [],
+        revisions: [],
+        notes: [],
+        error,
+      };
+    }
+    return null;
+  }
+  const slots = (key: string): VerificationPlanSlotView[] =>
+    (Array.isArray(raw[key]) ? (raw[key] as Record<string, unknown>[]) : []).map((row) => ({
+      commandId: String(row.commandId ?? ""),
+      state: String(row.state ?? ""),
+      command: String(row.command ?? ""),
+      origin: String(row.origin ?? ""),
+      amended: row.amended === true,
+      ...(typeof row.status === "string" ? { status: row.status } : {}),
+      revisionOrdinals: Array.isArray(row.revisionOrdinals)
+        ? (row.revisionOrdinals as unknown[]).filter((n): n is number => typeof n === "number")
+        : [],
+    }));
+  const refusal = (raw.amendmentRefusal ?? {}) as Record<string, unknown>;
+  const refusalDetail = refusal.detail;
+  const drift = raw.drift as Record<string, unknown> | undefined;
+  return {
+    ok: raw.ok !== false,
+    outcome: typeof raw.outcome === "string" ? raw.outcome : "ok",
+    planDigest,
+    reconciliation: String(raw.reconciliation ?? ""),
+    amendable: raw.amendable === true,
+    ...(typeof refusalDetail === "string" ? { amendmentRefusal: refusalDetail } : {}),
+    defaultContinuation: String(raw.defaultContinuation ?? "none"),
+    execution: slots("execution"),
+    requirement: slots("requirement"),
+    revisions: (Array.isArray(raw.revisions) ? (raw.revisions as Record<string, unknown>[]) : []).map(
+      (row) => ({
+        revisionOrdinal: typeof row.revisionOrdinal === "number" ? row.revisionOrdinal : 0,
+        revisionId: String(row.revisionId ?? ""),
+        source: String(row.source ?? ""),
+        reason: String(row.reason ?? ""),
+        operations: Array.isArray(row.operations)
+          ? (row.operations as unknown[]).map((kind) => String(kind))
+          : [],
+        continuation: String(row.continuation ?? ""),
+        createdAt: String(row.createdAt ?? ""),
+      }),
+    ),
+    notes: Array.isArray(raw.notes) ? (raw.notes as unknown[]).map((note) => String(note)) : [],
+    ...(drift !== undefined
+      ? {
+          drift:
+            `the session defaults moved since the recorded checkpoint ` +
+            `(${String(drift.previousPlanDigest)} -> ${String(drift.planDigest)})`,
+        }
+      : {}),
+  };
+}
+
+/**
+ * The plan screen: what an operator needs before they change anything —
+ * every slot's identity, ORIGIN, state and (for a requirement) its current
+ * EVIDENCE validity, the revisions that produced them, the digest the apply
+ * will be guarded on, and the continuation an applied revision would take.
+ */
+export function formatVerificationPlanDetail(view: VerificationPlanView): string[] {
+  if (view.error !== undefined) {
+    return [`  REFUSED (${view.outcome}): ${oneLine(view.error)}`];
+  }
+  const lines: string[] = [];
+  lines.push(
+    `  plan digest: ${view.planDigest} (${view.reconciliation})`,
+    `  amendable:   ${view.amendable ? "yes" : `NO — ${oneLine(view.amendmentRefusal ?? "")}`}`,
+    // The row's DEFAULT: a correction may route itself elsewhere, but only
+    // where this value says the §9.2 table permits a re-queue at all.
+    `  default continuation an applied revision would take: ${view.defaultContinuation}`,
+  );
+  const slotLine = (slot: VerificationPlanSlotView): string =>
+    `    - ${slot.commandId} [${slot.state}] ${truncate(oneLine(slot.command), 70)} ` +
+    `(${slot.origin}${slot.amended ? ", amended" : ""}` +
+    `${slot.revisionOrdinals.length > 0 ? ` rev ${slot.revisionOrdinals.join(",")}` : ""})` +
+    (slot.status !== undefined ? ` — ${slot.status}` : "");
+  lines.push(`  execution (${view.execution.length}):`);
+  for (const slot of view.execution) lines.push(slotLine(slot));
+  lines.push(`  requirement (${view.requirement.length}):`);
+  for (const slot of view.requirement) lines.push(slotLine(slot));
+  if (view.revisions.length > 0) {
+    lines.push(`  revisions (${view.revisions.length}):`);
+    for (const revision of view.revisions.slice(-5)) {
+      lines.push(
+        `    - ${revision.revisionOrdinal} ${revision.source} ${revision.operations.join(", ")} ` +
+          `→ ${revision.continuation}: ${truncate(oneLine(revision.reason), 60)}`,
+      );
+    }
+  }
+  for (const note of view.notes) lines.push(`  note: ${oneLine(note)}`);
+  if (view.drift !== undefined) {
+    lines.push(
+      `  DRIFT: ${view.drift}. The plan above is what resolves; the next applying`,
+      "         command re-anchors the checkpoint.",
+    );
+  }
+  return lines;
+}
+
+/** The reason of the newest revision, prefilled into the next one's prompt. */
+export function previousAmendmentReason(view: VerificationPlanView): string | undefined {
+  const latest = view.revisions[view.revisions.length - 1];
+  return latest === undefined || latest.reason.trim().length === 0 ? undefined : latest.reason;
+}
+
+/**
+ * Whether the task carries a recorded amendment chain (§5.5). Used only to
+ * label the menu entry — the view itself is offered for any task, because the
+ * plan exists whether or not anybody has amended it.
+ */
+export function hasVerificationAmendments(task: AiTask): boolean {
+  const block = task.context?.[VERIFICATION_AMENDMENTS_CONTEXT_KEY];
+  return typeof block === "object" && block !== null;
+}
+
+/**
+ * §7.1: the statuses on which an amendment is admitted at all. A `claimed` or
+ * `running` task (an owner holds a resolved plan) and a terminal task are
+ * refused by the command itself; the menu still offers the READ-ONLY view for
+ * them, and the view reports the refusal rather than pretending it is amendable.
+ */
+export function isVerificationAmendable(task: AiTask): boolean {
+  return task.status === "queued" || task.status === "blocked" || task.status === "ready_for_human";
 }
 
 /** Argv for `admin worktree release-lock` to free a per-issue worktree lock. */
@@ -606,6 +1246,18 @@ export function formatDisputeDetail(task: AiTask, events?: readonly TaskEvent[])
         (l.humanGate ? " humanGate" : "") +
         (l.reopenRequested ? " reopenRequested" : ""),
     );
+    // §7.1's in-flight evidence round (#956), on the same terms the CLI prints
+    // it: only where one exists, and counts and party states only.
+    const evidence = summary.evidenceCollection.find((e) => e.lineageId === l.lineageId);
+    if (evidence) {
+      lines.push(
+        `      evidence round ${evidence.round}: ` +
+          evidence.parties.map(formatEvidenceParty).join(" ") +
+          `  recorded=${evidence.attachmentsRecorded}` +
+          (evidence.complete ? " complete" : "") +
+          (evidence.recorded ? " rowApplied" : ""),
+      );
+    }
   }
   const r = summary.routing;
   lines.push(
@@ -622,12 +1274,90 @@ export function formatDisputeDetail(task: AiTask, events?: readonly TaskEvent[])
 }
 
 /**
+ * Whether a task carries §15 refinement state worth a UI block (issue #977).
+ * Every task outside the lane — and every task in a session with
+ * `issueRefinement.enabled: false` — answers false and the UI is unchanged.
+ */
+export function hasRefinementState(task: AiTask): boolean {
+  const block = task.context?.[REFINEMENT_CONTEXT_KEY];
+  return typeof block === "object" && block !== null && !Array.isArray(block);
+}
+
+/** The non-interactive `admin task-status` form for a task. */
+export function buildTaskStatusArgv(task: AiTask, dbPath?: string): string[] {
+  const argv = [
+    "task-status",
+    "--session-id",
+    task.sessionId,
+    "--issue-number",
+    String(task.issueNumber),
+  ];
+  if (dbPath) argv.push("--db-path", dbPath);
+  return argv;
+}
+
+/**
+ * The refinement-progress block of the task detail view (issue #977).
+ *
+ * Rendered from {@link summarizeRefinementStatus} + the shared progress
+ * renderer — the same normalized model `admin task-status` prints — so the UI
+ * cannot show a different disposition, round, retry deadline, or
+ * human-action flag than the non-interactive command does. It reads the task
+ * context and the persisted `refinement.progress.milestone` events only: no
+ * GitHub comment, no outbox row, no run artifact.
+ */
+export function formatRefinementDetail(
+  task: AiTask,
+  now: string,
+  events?: readonly TaskEvent[],
+): string[] {
+  const summary = summarizeRefinementStatus(task, events, now);
+  if (summary === null) return [];
+  const lines = [
+    "",
+    `Refinement: state=${summary.state}${summary.terminal ? " (terminal)" : ""}`
+      + (summary.handoffReason ? `  handoff=${summary.handoffReason}` : ""),
+    `  roles: refiner=${summary.refinerAgent ?? "-"} critic=${summary.criticAgent ?? "-"}`,
+  ];
+  if (summary.evidence) {
+    // §5.2 (issue #1003): a handoff raised before either agent ran says nothing
+    // in the progress view about WHICH declared selection stopped it. Same
+    // literals the `admin task-status` renderer prints — indexes and reasons,
+    // never a declared path.
+    const e = summary.evidence;
+    lines.push(
+      `  evidence: declared=${e.declared ?? "-"} captured=${e.captured ?? "-"}`
+      + ` optionalGaps=${e.optionalGaps ?? "-"} artifact=${e.artifact ?? "-"}`,
+    );
+    for (const gap of e.gaps) {
+      lines.push(
+        `    gap[${gap.index ?? "-"}]: ${gap.reason ?? "-"} (${gap.requirement ?? "-"})`
+        + (gap.predecessorIssueNumber === null ? "" : ` predecessor=#${gap.predecessorIssueNumber}`),
+      );
+    }
+  }
+  if (summary.criticBlock) {
+    // §15 (issue #1176): which human blocker a `critique_blocked` handoff names.
+    lines.push(renderRefinementCriticBlockLine(summary.criticBlock, "  "));
+  }
+  if (summary.progress) {
+    lines.push(...renderRefinementProgressLines(summary.progress, "  "));
+  } else {
+    // The caller read no events, so there is no milestone record to project.
+    // Saying so beats printing a progress view derived from nothing.
+    lines.push("  progress: (task events not read)");
+  }
+  return lines;
+}
+
+/**
  * Multi-line detail view for a selected task.
  *
- * `events` is optional and only feeds the issue #848 dispute block: without it
- * the lineage state and counters still render in full (they live in the task
- * context), and only the §7.1 routing intent — an event-only fact — is reported
- * as unavailable rather than guessed.
+ * `events` is optional and feeds the issue #848 dispute block and the issue
+ * #977 refinement-progress block: without it the lineage state, counters, and
+ * refinement block still render in full (they live in the task context), and
+ * only the event-only facts — the §7.1 routing intent and the §15 progress
+ * milestones — are reported as unavailable rather than guessed.
  */
 export function formatTaskDetail(
   task: AiTask,
@@ -660,6 +1390,7 @@ export function formatTaskDetail(
   }
   if (c.blocker) lines.push(`Blocker:    ${c.blocker}`);
   lines.push(...formatDisputeDetail(task, events));
+  lines.push(...formatRefinementDetail(task, now, events));
   return lines.join("\n");
 }
 
@@ -905,6 +1636,7 @@ export function nonTtyHelp(): string {
     "  admin recover-cap-handoff    --session-id <id> [--issue-number <n>] [--dry-run]",
     "  admin human-review-return    --session-id <id> --issue-number <n> --feedback-source issue-comment",
     "  admin worktree release-lock  --session-id <id> --issue-number <n>",
+    "  admin task-verification show --session-id <id> --issue-number <n>",
     "",
   ].join("\n");
 }
@@ -923,6 +1655,61 @@ export interface AdminRunResult {
 }
 
 /**
+ * How much a `--json` payload can grow per stored character once JSON escaping
+ * is applied. Command bytes are stored verbatim (§2) and nothing refuses a
+ * control character in them, so the widest escape a payload can carry is the
+ * six-byte `\uXXXX` form, not the two-byte `\"`.
+ */
+const JSON_ESCAPE_EXPANSION = 6;
+
+/**
+ * The largest number of slots one plan can carry: the two bounded input layers
+ * (§5.5 session baseline, §6.1 Issue requirements) plus every slot an
+ * append-only revision chain could add on top of them.
+ */
+const MAX_VERIFICATION_PLAN_SLOTS =
+  MAX_VERIFICATION_SESSION_BASELINE_ENTRIES +
+  MAX_VERIFICATION_PLAN_REQUIREMENTS +
+  MAX_VERIFICATION_AMENDMENT_REVISIONS * MAX_VERIFICATION_AMENDMENT_OPERATIONS;
+
+/** One `execution`/`requirement` row of the show payload, at its bound. */
+const MAX_VERIFICATION_PLAN_SLOT_BYTES =
+  MAX_VERIFICATION_AMENDMENT_COMMAND_CHARS * JSON_ESCAPE_EXPANSION +
+  MAX_VERIFICATION_AMENDMENT_NAME_CHARS +
+  // `revisionOrdinals` can name every revision that touched the slot.
+  MAX_VERIFICATION_AMENDMENT_REVISIONS * 8 +
+  // commandId, state, origin, amended, status, satisfiedBy and their keys.
+  1024;
+
+/** One `revisions` row of the show payload, at its bound. */
+const MAX_VERIFICATION_REVISION_BYTES =
+  MAX_VERIFICATION_AMENDMENT_REASON_CHARS * JSON_ESCAPE_EXPANSION +
+  // One operation kind per operation, plus its quoting and separator.
+  MAX_VERIFICATION_AMENDMENT_OPERATIONS * 64 +
+  MAX_VERIFICATION_AMENDMENT_ACTOR_ID_CHARS +
+  // revisionId, source, two digests, continuation, createdAt and their keys.
+  1024;
+
+/**
+ * Buffer bound for a spawned `admin` subcommand, derived from the verification
+ * contract's own limits rather than left at Node's 1 MiB default (issue #1044
+ * review, P2).
+ *
+ * `task-verification show --json` prints every slot and every revision, and a
+ * plan that stays entirely within the documented bounds — 200 revisions, 50
+ * operations each, 4,000-character commands — prints far more than 1 MiB. At
+ * the default the spawn dies with `ENOBUFS` and hands back truncated JSON, so
+ * the one task that most needs inspecting becomes the one the UI cannot show.
+ * `maxBuffer` is a ceiling, not an allocation: ordinary output still costs what
+ * it costs.
+ */
+export const ADMIN_COMMAND_MAX_BUFFER_BYTES =
+  MAX_VERIFICATION_PLAN_SLOTS * MAX_VERIFICATION_PLAN_SLOT_BYTES +
+  MAX_VERIFICATION_AMENDMENT_REVISIONS * MAX_VERIFICATION_REVISION_BYTES +
+  // Envelope, notes, drift, checkpoint and refusal detail.
+  256 * 1024;
+
+/**
  * Run an `admin` subcommand in a child process and capture its output. State
  * changes happen exclusively through this path, so every safeguard the
  * subcommand enforces stays intact.
@@ -931,10 +1718,22 @@ function runAdminCommand(argv: string[]): AdminRunResult {
   try {
     const stdout = execFileSync(process.execPath, [adminEntrypoint(), ...argv], {
       encoding: "utf8",
+      maxBuffer: ADMIN_COMMAND_MAX_BUFFER_BYTES,
     }) as string;
     return { code: 0, stdout };
   } catch (err: unknown) {
-    const e = err as { status?: number; stdout?: string; stderr?: string };
+    const e = err as { status?: number; code?: string; stdout?: string; stderr?: string };
+    // Output that overran even the derived ceiling is truncated mid-stream, so
+    // the bytes below are not a payload and not a refusal — say so rather than
+    // letting a parse failure read as "the command said something unparseable".
+    if (e.code === "ENOBUFS") {
+      return {
+        code: e.status ?? 1,
+        stdout:
+          `The command printed more than the ${ADMIN_COMMAND_MAX_BUFFER_BYTES}-byte capture limit, ` +
+          `so its output was truncated and cannot be read here. Run it directly to see it in full.\n`,
+      };
+    }
     return { code: e.status ?? 1, stdout: (e.stdout ?? "") + (e.stderr ?? "") };
   }
 }
@@ -962,7 +1761,7 @@ function runAdminCommand(argv: string[]): AdminRunResult {
 class UiCancelled extends Error {}
 
 function write(s: string): void {
-  process.stdout.write(s);
+  writeOut(s);
 }
 
 function clear(): void {
@@ -970,9 +1769,9 @@ function clear(): void {
 }
 
 /** Resolve a Clack prompt result, converting the cancel symbol into a throw. */
-function unwrap<T>(value: T | symbol): T {
+function unwrap<T>(value: T): Exclude<T, symbol> {
   if (isCancel(value)) throw new UiCancelled();
-  return value as T;
+  return value as Exclude<T, symbol>;
 }
 
 /**
@@ -1140,6 +1939,11 @@ async function runFilterMenu(current: UiFilter): Promise<UiFilter> {
       const statusOptions = [
         { value: "", label: "(clear status filter)" },
         ...ACTIVE_STATUSES.map((s) => ({ value: s, label: s })),
+        // Not an active status, but the list can carry a `cancelled` row while
+        // it is still merged-PR reconcilable (issue #1048), so the status filter
+        // has to be able to name it — otherwise those rows are unreachable
+        // through every filter the menu offers.
+        { value: "cancelled" as TaskStatus, label: "cancelled" },
       ];
       const val = unwrap(
         await clackSelect<string>({
@@ -1234,7 +2038,11 @@ type MenuAction =
   | "cap-reset"
   | "tool-request"
   | "human-review"
+  | "refinement-recover"
   | "dispute"
+  | "refinement"
+  | "verification"
+  | "reconcile-merged"
   | "lock-release"
   | "lock-force-release"
   | "status"
@@ -1408,6 +2216,95 @@ async function showToolRequestCommands(
 }
 
 /**
+ * Surface the merged-PR reconciliation commands for a task whose recorded PR may
+ * have been merged outside the loop (issue #1048,
+ * docs/merged-pr-reconciliation-contract.md).
+ *
+ * Read-only, and deliberately not auto-run. The preview is the step that reads
+ * the live PR state, and the answer is frequently "not merged" — a menu that
+ * jumped straight to `--yes` would ask the operator to confirm a mutation whose
+ * eligibility nobody has seen. The view also states what the command will NOT
+ * do, because the reason an operator arrives here is usually disk pressure, and
+ * the disk part of the job belongs to `worktree cleanup`.
+ */
+async function showReconcileMergedCommands(
+  task: AiTask,
+  dbPath?: string,
+  sessionsPath?: string,
+): Promise<void> {
+  clear();
+  write(`Reconcile an externally merged PR — ${task.sessionId} #${task.issueNumber}\n\n`);
+  const { prUrl } = resolvePrContext(task);
+  write(`Recorded pull request: ${prUrl ?? "(none)"}\n\n`);
+  write(
+    "If this PR was merged by hand, the task never learned about it and still\n" +
+      "carries a live status. The command below reads the live state of exactly\n" +
+      "this PR (never a branch guess) and, only if it is MERGED, completes the\n" +
+      "task: queued/blocked/ready_for_human become done, while failed/cancelled\n" +
+      "keep their status and record the merge.\n\n",
+  );
+  write("Preview (every read, no write — reports the live PR state and the outcome):\n");
+  write(`  ${formatAdminCommand(buildTaskReconcileMergedArgv(task, dbPath, sessionsPath))}\n\n`);
+  write("Apply it, once the preview shows the PR is MERGED and the task is eligible:\n");
+  write(
+    `  ${formatAdminCommand(buildTaskReconcileMergedArgv(task, dbPath, sessionsPath, { yes: true }))}\n\n`,
+  );
+  write(
+    "This writes lifecycle metadata only: the task row, one task event, and one\n" +
+      "comment on the work item. It never deletes a worktree or a branch and never\n" +
+      "touches a label. To reclaim disk space, run `admin worktree cleanup` first;\n" +
+      "reconcile here only if more space is still needed, then run cleanup again.\n",
+  );
+  await pause();
+}
+
+/**
+ * Surface the §13 recovery commands for a stopped Issue refinement (issue #980).
+ *
+ * Read-only, and deliberately not auto-run: §13 lets recovery apply only against
+ * the row-1 admissible label shape, and after some handoff reasons
+ * (`marker_precondition_failed` in particular) the operator has a label to
+ * restore FIRST. The preview is the step that reports which — running `--yes`
+ * for them would just produce a refusal they did not ask for.
+ */
+async function showRefinementRecoverCommands(
+  task: AiTask,
+  dbPath?: string,
+  sessionsPath?: string,
+): Promise<void> {
+  clear();
+  write(`Recover stopped Issue refinement — ${task.sessionId} #${task.issueNumber}\n\n`);
+  const summary = summarizeRefinementStatus(task);
+  write(
+    "This task stopped at a refinement handoff"
+      + (summary?.handoffReason ? ` (${summary.handoffReason})` : "")
+      + ". §13 of the refinement contract\n"
+      + "gives exactly one way back: the command below resets the attempt to `pending` and\n"
+      + "re-queues the row at phase refinement. Generic recover would requeue it with the\n"
+      + "failed attempt's draft and counters still on the block, which the contract forbids.\n\n",
+  );
+  write("Preview the reset (reports the task, the handoff reason, and the live labels):\n");
+  write(`  ${formatAdminCommand(buildRefinementRecoverArgv(task, dbPath, sessionsPath))}\n\n`);
+  write("Apply it, once the Issue carries status:needs-refinement and no executable status:*:\n");
+  write(`  ${formatAdminCommand(buildRefinementRecoverArgv(task, dbPath, sessionsPath, { yes: true }))}\n\n`);
+  write("To hand the Issue to implementation by hand instead, remove the refinement marker\n");
+  write("first, then add status:needs-implementation, and dispose of this row:\n");
+  const cancelArgv = [
+    "task",
+    "cancel",
+    "--session-id",
+    task.sessionId,
+    "--issue-number",
+    String(task.issueNumber),
+    "--yes",
+  ];
+  if (dbPath) cancelArgv.push("--db-path", dbPath);
+  if (sessionsPath) cancelArgv.push("--sessions-path", sessionsPath);
+  write(`  ${formatAdminCommand(cancelArgv)}\n`);
+  await pause();
+}
+
+/**
  * Surface the safe commands for returning a plain `ready_for_human` handoff. The
  * UI does not run these directly: a review return needs operator-supplied
  * feedback, and the target lane is an operator decision — so this is a read-only
@@ -1522,6 +2419,611 @@ async function showDisputeCommands(
 }
 
 /**
+ * Surface the §15 refinement progress of a task (issue #977).
+ *
+ * Strictly read-only, and deliberately offers no command that acts on the lane:
+ * refinement advances on its own scheduler turn, and the operator questions this
+ * view answers — is it moving, when does it wake up, does it need me — are all
+ * answered by the normalized model itself. It prints the same projection
+ * `admin task-status` prints, plus the exact non-interactive form of it.
+ *
+ * Nothing here reads a GitHub comment. The append-only progress notes on the
+ * Issue are a one-way human-facing projection of these milestones (§16); the
+ * task row and the persisted milestone events are the state.
+ */
+async function showRefinementProgress(
+  task: AiTask,
+  now: string,
+  events: readonly TaskEvent[],
+  dbPath?: string,
+): Promise<void> {
+  clear();
+  write(`Issue refinement — ${task.sessionId} #${task.issueNumber}\n\n`);
+  const detail = formatRefinementDetail(task, now, events);
+  if (detail.length === 0) {
+    write("This task carries no refinement state.\n");
+    await pause();
+    return;
+  }
+  write(detail.join("\n").trimStart() + "\n\n");
+  write("Full state (same projection, non-interactive):\n");
+  write(`  ${formatAdminCommand(buildTaskStatusArgv(task, dbPath))}\n`);
+  write(`  ${formatAdminCommand([...buildTaskStatusArgv(task, dbPath), "--json"])}\n\n`);
+  write(
+    "SQLite task state and the persisted refinement.progress.milestone events are\n"
+      + "authoritative; the progress comments on the Issue are a one-way projection of them.\n",
+  );
+  await pause();
+}
+
+// ---------------------------------------------------------------------------
+// The verification plan view (issue #1044, §11 / §12)
+// ---------------------------------------------------------------------------
+
+/** Prompt for a non-empty line, refusing empty/whitespace-only input. */
+async function requireText(message: string, initialValue?: string): Promise<string> {
+  return unwrap(
+    await clackText({
+      message,
+      ...(initialValue !== undefined ? { initialValue } : {}),
+      validate: (value) =>
+        value === undefined || value.trim().length === 0 ? "Required — cannot be empty." : undefined,
+    }),
+  ).trim();
+}
+
+/** Choose one slot of the plan, showing its state and origin in the label. */
+async function selectSlot(
+  message: string,
+  slots: readonly VerificationPlanSlotView[],
+): Promise<VerificationPlanSlotView | null> {
+  if (slots.length === 0) return null;
+  const value = unwrap(
+    await clackSelect<string>({
+      message,
+      options: slots.map((slot) => ({
+        value: slot.commandId,
+        label: `${slot.commandId} [${slot.state}] ${truncate(oneLine(slot.command), 50)} (${slot.origin})`,
+      })),
+      maxItems: DEFAULT_PAGE_SIZE,
+    }),
+  );
+  return slots.find((slot) => slot.commandId === value) ?? null;
+}
+
+/**
+ * Run a `task-verification` mutation the way the contract expects an operator to
+ * run it: preview first (no `--yes`, nothing written), show exactly what the
+ * apply would do, and apply only on an explicit confirmation — with the plan
+ * digest the operator just read carried into the apply, so a plan that moved
+ * between the two refuses rather than amending something nobody saw (§7.3 rule
+ * 3, §11 rule 1).
+ */
+async function previewThenApply(
+  task: AiTask,
+  previewArgv: string[],
+  // A function when the apply has to carry something the operator was SHOWN —
+  // the refresh's live Issue digest, which only the preview knows. Returning a
+  // string refuses the apply with that explanation rather than falling back to
+  // an unguarded invocation.
+  applyArgvFor: string[] | ((previewStdout: string) => string[] | string),
+): Promise<void> {
+  clear();
+  write(`Verification plan — ${task.sessionId} #${task.issueNumber}\n\n`);
+  write("Preview (writes nothing):\n\n");
+  write(`  ${formatAdminCommand(previewArgv)}\n\n`);
+  const preview = runAdminCommand(previewArgv);
+  write(preview.stdout.trim() + "\n\n");
+  if (preview.code !== 0) {
+    write(`The preview exited ${preview.code}; nothing was applied.\n`);
+    await pause();
+    return;
+  }
+  const resolved = typeof applyArgvFor === "function" ? applyArgvFor(preview.stdout) : applyArgvFor;
+  if (typeof resolved === "string") {
+    write(`${resolved}\n`);
+    await pause();
+    return;
+  }
+  const applyArgv = resolved;
+  write("Applying would run:\n\n");
+  write(`  ${formatAdminCommand(applyArgv)}\n`);
+  const ok = await confirm("\nApply this revision?");
+  if (!ok) {
+    write("\nCancelled. No changes made.\n");
+    await pause();
+    return;
+  }
+  const applied = runAdminCommand(applyArgv);
+  clear();
+  write("Ran command:\n\n");
+  write(`  ${formatAdminCommand(applyArgv)}\n\n`);
+  write(`Exit code: ${applied.code}\n\n`);
+  write("Result:\n");
+  write(applied.stdout.trim() + "\n\n");
+  // What the exit code alone cannot say (issue #1044 review, P2): a `no_change`
+  // and a recognized replay both exit 0 having written nothing, so announcing an
+  // event and a comment on every success would promise an audit trail that this
+  // invocation did not produce. The ordinal is printed only by an outcome that
+  // consumed one.
+  if (applied.code === 0) {
+    const ordinal = parseAppliedRevisionOrdinal(applied.stdout);
+    write(
+      ordinal !== null
+        ? "That revision posts one bounded comment on the work item through the outbox\n" +
+            "(keyed on the revision, so a retry never double-posts) and records one\n" +
+            "verification.amendment.applied task event.\n"
+        : "No revision was recorded by this run — read the result above for whether it\n" +
+            "found nothing to apply or replayed a revision it had already recorded. Either\n" +
+            "way this invocation wrote no task event and queued no comment.\n",
+    );
+  }
+  await pause();
+}
+
+type VerificationMenuAction =
+  | "add-requirement"
+  | "add-execution"
+  | "replace"
+  | "retire"
+  | "restore"
+  | "annotate"
+  | "refresh"
+  | "reset"
+  | "copy"
+  | "back";
+
+/**
+ * The `--continue` values this task's row may be routed to (§9.2 rule 3), as
+ * the menu offers them.
+ *
+ * The override chooses WHICH re-queueable lane an amendment returns the task
+ * to; it is never a way to acquire a re-queue the table withholds. So a row
+ * whose default is `none` — a `queued` task, or one parked outside the review
+ * lane — offers nothing: an explicit `review` or `implementation` there refuses
+ * and mutates nothing, and an explicit `none` is what the row already does. The
+ * empty list is the signal to skip the prompt rather than to put three choices
+ * in front of an operator of which two only produce a refusal.
+ */
+export function verificationContinuationChoices(
+  view: Pick<VerificationPlanView, "defaultContinuation">,
+): { value: "review" | "implementation" | "none"; label: string }[] {
+  const fallback = view.defaultContinuation;
+  if (fallback !== "review" && fallback !== "implementation") return [];
+  const suffix = (mode: string): string => (mode === fallback ? " — the default for this task's row" : "");
+  return [
+    {
+      value: "review",
+      label: `review — re-queue {queued, review} so the amended plan is verified now${suffix("review")}`,
+    },
+    {
+      value: "implementation",
+      label:
+        "implementation — re-queue {queued, implementation}: the code, not the requirement, is what is wrong"
+        + suffix("implementation"),
+    },
+    {
+      value: "none",
+      label: "none — record the revision and route nothing; the task stays where it is",
+    },
+  ];
+}
+
+/**
+ * Surface one task's effective verification plan and the operator corrections
+ * available on it (issue #1044, docs/verification-amendment-contract.md §11).
+ *
+ * Everything here goes through `admin task-verification`: the view is that
+ * command's own `--json` payload, and every mutation is the same command an
+ * operator could type, previewed before it applies. The UI resolves no plan,
+ * derives no operation, and writes no state — so the §7 refusals, the §5.3
+ * replay recognition, the §9.2 continuation, the §12.1 event, and the §12.2
+ * public comment are produced exactly once, by the core, whichever surface the
+ * operator came from.
+ */
+async function showVerificationPlan(
+  task: AiTask,
+  dbPath?: string,
+  sessionsPath?: string,
+): Promise<void> {
+  for (;;) {
+    const showArgv = buildTaskVerificationShowArgv(task, dbPath, sessionsPath, { json: true });
+    const shown = runAdminCommand(showArgv);
+    const view = parseVerificationPlanView(shown.stdout);
+    clear();
+    write(`Verification plan — ${task.sessionId} #${task.issueNumber}\n\n`);
+    if (view === null) {
+      write("Could not read the effective verification plan:\n\n");
+      write(shown.stdout.trim() + "\n\n");
+      write("Read it non-interactively with:\n");
+      write(`  ${formatAdminCommand(buildTaskVerificationShowArgv(task, dbPath, sessionsPath))}\n`);
+      await pause();
+      return;
+    }
+    write(formatVerificationPlanDetail(view).join("\n") + "\n\n");
+    if (view.error !== undefined) {
+      write(
+        "A stored plan that reconciles against neither the live session defaults nor the\n" +
+          "recorded baseline is refused rather than repaired (§11 rule 6). Inspect the\n" +
+          "amendment record before acting.\n",
+      );
+      await pause();
+      return;
+    }
+
+    const actions: { action: VerificationMenuAction; label: string }[] = [];
+    if (view.amendable) {
+      actions.push(
+        { action: "add-requirement", label: "Add a required verification command" },
+        { action: "add-execution", label: "Add a task-local execution command" },
+        { action: "replace", label: "Replace a command's bytes (fix a typo — keeps its identity)" },
+        { action: "retire", label: "Retire a command (removes a check — reported, never a pass)" },
+        { action: "restore", label: "Restore a retired command" },
+        {
+          action: "annotate",
+          label: "Annotate a command (records a reason against it — changes no bytes, no state)",
+        },
+        { action: "refresh", label: "Refresh the requirements from the live Issue" },
+        { action: "reset", label: "Reset the plan to its unamended baseline" },
+      );
+    }
+    actions.push(
+      { action: "copy", label: "Show exact non-interactive task-verification commands" },
+      { action: "back", label: "Back to the task menu" },
+    );
+    const idx = await selectMenu({
+      header: view.amendable
+        ? "Choose a correction (every one previews before it applies):"
+        : "This task is not amendable right now; the plan above is read-only.",
+      items: actions,
+      render: (a) => a.label,
+    });
+    const choice = actions[idx].action;
+    if (choice === "back") return;
+
+    if (choice === "copy") {
+      clear();
+      write(`Non-interactive verification commands — ${task.sessionId} #${task.issueNumber}\n\n`);
+      write("Read the effective plan:\n");
+      write(`  ${formatAdminCommand(buildTaskVerificationShowArgv(task, dbPath, sessionsPath))}\n\n`);
+      write("Correct a command (preview; add --yes to apply):\n");
+      write(
+        `  ${formatAdminCommand(
+          buildTaskVerificationAmendArgv(
+            task,
+            {
+              operations: [
+                { flag: "--replace", value: "<commandId>", command: "<corrected command>" },
+              ],
+              reason: "<why>",
+            },
+            dbPath,
+            sessionsPath,
+          ),
+        )}\n\n`,
+      );
+      write("Re-import the Issue's verification section:\n");
+      write(
+        `  ${formatAdminCommand(
+          buildTaskVerificationRefreshArgv(task, { reason: "<why>" }, dbPath, sessionsPath),
+        )}\n\n`,
+      );
+      write("Return the plan to its unamended baseline:\n");
+      write(
+        `  ${formatAdminCommand(
+          buildTaskVerificationResetArgv(task, { reason: "<why>" }, dbPath, sessionsPath),
+        )}\n`,
+      );
+      await pause();
+      continue;
+    }
+
+    // The reason is mandatory on every applying invocation (§11 rule 3), and the
+    // previous revision's reason is offered as the starting point: a correction
+    // usually continues the story the last one started, and retyping it from
+    // scratch is how an audit trail fills up with "fix".
+    const previousReason = previousAmendmentReason(view);
+
+    if (choice === "refresh") {
+      const reason = await requireText("Why re-read the Issue's verification section?", previousReason);
+      const allowRetire = await confirm(
+        "Also apply retirements for requirements the live Issue no longer names?\n" +
+          "(Without this they are previewed and withheld — a removal is never implicit.)",
+      );
+      // A refresh derives its operations from TWO inputs, so the apply carries
+      // both guards. The Issue digest binds it to the text just read: without it
+      // the apply re-reads the Issue and applies whatever it says now, which —
+      // with `--allow-retire` — can retire a requirement the operator never saw
+      // proposed. The base plan digest binds it to the plan that text was
+      // diffed against (issue #1044 review): a concurrent `amend` moves the
+      // difference while leaving the Issue body, and its digest, untouched.
+      // Both are read back out of the preview the operator just confirmed, so
+      // either one moving refuses (§10) instead of applying a different diff.
+      const requestKey = newVerificationRequestKey();
+      await previewThenApply(
+        task,
+        buildTaskVerificationRefreshArgv(
+          task,
+          { reason, allowRetire, requestKey },
+          dbPath,
+          sessionsPath,
+        ),
+        (previewStdout) => {
+          const expectIssueDigest = parseRefreshIssueBodyDigest(previewStdout);
+          if (expectIssueDigest === null) {
+            return (
+              "The preview did not report a live Issue body digest, so the apply cannot be bound\n"
+              + "to the Issue you just read. Nothing was applied. Re-run the preview, or apply it\n"
+              + "non-interactively with an explicit --expect-issue-digest."
+            );
+          }
+          // Both digests come from THIS preview — the `base -> new` pair a
+          // proposed revision prints, or the `(unchanged)` digest a `no_change`
+          // prints (issue #1044 review, P1). The digest the plan screen showed
+          // is never substituted: it describes the plan as of that screen, and a
+          // plan another revision moved in between is exactly what this guard
+          // exists to catch. A preview that reports neither is not a plan this
+          // apply may be bound to, so it is refused rather than guessed at.
+          const expectPlanDigest =
+            parsePreviewBasePlanDigest(previewStdout)
+            ?? parsePreviewUnchangedPlanDigest(previewStdout);
+          if (expectPlanDigest === null) {
+            return (
+              "The preview did not report the plan digest it resolved, so the apply cannot be\n"
+              + "bound to the plan the difference above was computed against. Nothing was applied.\n"
+              + "Re-run the preview, or apply it non-interactively with an explicit\n"
+              + "--expect-plan-digest."
+            );
+          }
+          return buildTaskVerificationRefreshArgv(
+            task,
+            { reason, allowRetire, expectIssueDigest, expectPlanDigest, requestKey, yes: true },
+            dbPath,
+            sessionsPath,
+          );
+        },
+      );
+      continue;
+    }
+
+    if (choice === "reset") {
+      const reason = await requireText("Why revert the amendments?", previousReason);
+      const allowRetire = await confirm(
+        "Also retire the task-local commands the amendments added?\n" +
+          "(Without this they are previewed and withheld.)",
+      );
+      // The apply carries an explicit request key, named on the preview too
+      // (§11 rule 3, issue #1044 review). A reset's operations are derived from
+      // the plan, so a key derived from THEM is a key this reset's own success
+      // erases: it identifies "undo the amendments this plan carries", which is
+      // no longer true of any later invocation, and two resets separated by a
+      // round of amendments would collide on it or miss each other by accident.
+      // A key minted for this flow identifies the request instead of its
+      // content, so the exact apply line the UI prints is replayable — re-running
+      // it names the revision it already recorded rather than recording a second
+      // one — while a later reset stays a separate request.
+      //
+      // The preview's own key still wins when it names one, so the apply carries
+      // exactly what the operator was shown; they agree by construction here.
+      const resetRequestKey = newVerificationRequestKey();
+      await previewThenApply(
+        task,
+        buildTaskVerificationResetArgv(
+          task,
+          { reason, allowRetire, expectPlanDigest: view.planDigest, requestKey: resetRequestKey },
+          dbPath,
+          sessionsPath,
+        ),
+        (previewStdout) => {
+          const requestKey = parsePreviewRequestKey(previewStdout) ?? resetRequestKey;
+          return buildTaskVerificationResetArgv(
+            task,
+            {
+              reason,
+              allowRetire,
+              expectPlanDigest: view.planDigest,
+              requestKey,
+              yes: true,
+            },
+            dbPath,
+            sessionsPath,
+          );
+        },
+      );
+      continue;
+    }
+
+    let operation: VerificationAmendOperation | null = null;
+    // Which layer the chosen slot belongs to, taken from the view's own split
+    // rather than from the `exec:`/`req:` prefix, so the wording below follows
+    // what the operator was shown (issue #1044 review, P1).
+    const executionCommandIds = new Set(view.execution.map((slot) => slot.commandId));
+    let selectedIsExecution = false;
+    if (choice === "add-requirement") {
+      operation = { flag: "--add-requirement", command: await requireText("Required command:") };
+    } else if (choice === "add-execution") {
+      const name = await requireText("Name for the execution command (e.g. lint):");
+      operation = {
+        flag: "--add-execution",
+        value: name,
+        command: await requireText(`Command bytes for \`${name}\`:`),
+      };
+    } else if (choice === "replace") {
+      const slot = await selectSlot(
+        "Which command's bytes are wrong?",
+        [...view.execution, ...view.requirement],
+      );
+      if (slot === null) {
+        clear();
+        write("\nThis plan has no slot to replace.\n");
+        await pause();
+        continue;
+      }
+      // The bytes the plan screen showed came through the session's redaction,
+      // so a command naming a configured local path reads `<path>` here (issue
+      // #1044 review, P1). Prefilling that would store the placeholder as the
+      // command the loop runs — a "correction" that breaks the check it was
+      // meant to fix — so a redacted slot is retyped in full instead.
+      const redacted = isRedactedCommandText(slot.command);
+      if (redacted) {
+        write(
+          "\nThe stored bytes of this command contain a local path or a secret-shaped token,\n" +
+            "which the plan view redacts before printing. The redacted text is not executable,\n" +
+            "so it is not offered as a starting point: type the corrected command in full.\n\n",
+        );
+      }
+      operation = {
+        flag: "--replace",
+        value: slot.commandId,
+        command: await requireText(
+          redacted
+            ? "Corrected command (type it in full — the stored bytes are redacted above):"
+            : "Corrected command:",
+          redacted ? undefined : slot.command,
+        ),
+      };
+    } else if (choice === "retire") {
+      // The prompt names the RECORDED plan rather than promising that the
+      // command stops being checked (issue #1044 review, P1). That promise holds
+      // for a requirement slot and not for an execution one: review Step 4 still
+      // executes this session's configured commands, so an execution retirement
+      // changes the record and nothing about what runs. The layer-specific
+      // statement is made in the confirmation below, once the slot is known.
+      const slot = await selectSlot(
+        "Which command should be retired from this task's recorded plan?",
+        [...view.execution, ...view.requirement].filter((s) => s.state === "active"),
+      );
+      if (slot === null) {
+        clear();
+        write("\nThis plan has no active slot to retire.\n");
+        await pause();
+        continue;
+      }
+      selectedIsExecution = executionCommandIds.has(slot.commandId);
+      operation = { flag: "--retire", value: slot.commandId };
+    } else if (choice === "restore") {
+      const slot = await selectSlot(
+        "Which retired command should this task's recorded plan carry again?",
+        [...view.execution, ...view.requirement].filter((s) => s.state === "retired"),
+      );
+      if (slot === null) {
+        clear();
+        write("\nThis plan carries no retired slot to restore.\n");
+        await pause();
+        continue;
+      }
+      selectedIsExecution = executionCommandIds.has(slot.commandId);
+      // The symmetric half of the retirement wording (issue #1044 review, P1):
+      // retiring an execution entry never stopped anything, so restoring one
+      // starts nothing. An operator told they had "restored a check" would read
+      // the next verification pass as evidence this restore produced.
+      if (selectedIsExecution) {
+        write(
+          "\nThis is an execution-layer entry, so the restore changes the recorded plan only:\n" +
+            "the review step runs this session's own verification configuration, which this\n" +
+            "restore does not touch.\n\n",
+        );
+      }
+      operation = { flag: "--restore", value: slot.commandId };
+    } else if (choice === "annotate") {
+      // An annotation is offered on every slot, retired ones included: "this
+      // check stays retired because …" is exactly the note §5.2 gives the
+      // operation for, and it changes neither bytes, state, nor position (§6.1
+      // step 2), so no state filter and no layer wording applies.
+      const slot = await selectSlot(
+        "Which command should the note be recorded against?",
+        [...view.execution, ...view.requirement],
+      );
+      if (slot === null) {
+        clear();
+        write("\nThis plan has no slot to annotate.\n");
+        await pause();
+        continue;
+      }
+      operation = { flag: "--annotate", value: slot.commandId };
+    }
+    if (operation === null) continue;
+
+    if (choice === "retire") {
+      // §8.4: a removal is the one correction a reader of the Issue must never
+      // have to discover afterwards, so it is confirmed on its own terms before
+      // the preview — and the published comment names it either way.
+      //
+      // The claim it makes follows the LAYER (issue #1044 review, P1). Retiring
+      // a requirement really does remove a check the loop runs and gates on.
+      // Retiring an execution entry does not: Step 4 executes this session's own
+      // verification configuration and reads no amendment, so an operator told
+      // they had removed "a check this task currently runs" would believe they
+      // had stopped something. The prompt does not claim the reverse either —
+      // that the entry keeps running — because a task-local entry this task
+      // added under a name the session configuration does not hold was never
+      // run by the loop at all.
+      const sure = selectedIsExecution
+        ? await confirm(
+            "Retiring an execution-layer entry changes this task's RECORDED plan only.\n" +
+              "The review step runs this session's own verification configuration, which this\n" +
+              "retirement does not touch: a command that configuration names keeps running and\n" +
+              "keeps being reported as run, and one it does not name was never run. The\n" +
+              "retirement is published on the work item. Continue?",
+          )
+        : await confirm(
+            "Retiring a command removes a check this task currently runs.\n" +
+              "It is reported `retired` — never as a passing result — and is published on the\n" +
+              "work item. Continue?",
+          );
+      if (!sure) continue;
+    }
+
+    // An annotation's reason IS the annotation — there is no other change to
+    // explain — so the prompt asks for it in those terms rather than for the
+    // "why" of a plan change that is not happening.
+    const reason = await requireText(
+      choice === "annotate"
+        ? "The note to record against this command (recorded and published):"
+        : "Reason for this revision (recorded and published):",
+      previousReason,
+    );
+    // Which lane the applied revision returns the task to (§9.2 rule 3). The
+    // choice is offered only on a row the table lets a revision re-queue: on
+    // any other row the override reaches no further than the table does, so
+    // `review` and `implementation` would refuse and `none` is already what
+    // happens. Leaving it unanswered — or having no choice to make — sends no
+    // `--continue`, so the row's own default applies exactly as before.
+    const continuations = verificationContinuationChoices(view);
+    let continueMode: "review" | "implementation" | "none" | undefined;
+    if (continuations.length > 0) {
+      const continuationIdx = await selectMenu({
+        header:
+          `This task's row re-queues on an applied revision (default: ${view.defaultContinuation}).\n`
+          + "Where should this correction send it?",
+        items: continuations,
+        render: (c) => c.label,
+      });
+      continueMode = continuations[continuationIdx].value;
+    }
+    // One key for this flow, named on the preview and on the apply (issue #1044
+    // review, P1). Without it the core derives the key from the invocation's own
+    // content, and an operator who retires a slot, restores it, and retires it
+    // again types identical content each time: the third invocation would derive
+    // the first retirement's key and be answered as its replay — reporting a
+    // superseded revision and leaving the slot active — while the preview, which
+    // performs no replay lookup, showed the retirement going through.
+    const options = {
+      operations: [operation],
+      reason,
+      ...(continueMode !== undefined ? { continueMode } : {}),
+      expectPlanDigest: view.planDigest,
+      requestKey: newVerificationRequestKey(),
+    } as const;
+    await previewThenApply(
+      task,
+      buildTaskVerificationAmendArgv(task, options, dbPath, sessionsPath),
+      buildTaskVerificationAmendArgv(task, { ...options, yes: true }, dbPath, sessionsPath),
+    );
+  }
+}
+
+/**
  * The action menu for a task. A `ready_for_human` task whose handoff is a
  * review-loop cap is requeued via `recover-cap-handoff`, which clears
  * `reviewLoopCapReached`/`reviewCycles`. The generic `recover` path would
@@ -1572,6 +3074,11 @@ export function buildTaskMenuActions(
       action: "tool-request",
       label: "Resolve Tool Request handoff (admin tool-request resolve/grant)",
     });
+  } else if (isRefinementRecoverable(task)) {
+    actions.push({
+      action: "refinement-recover",
+      label: "Recover stopped Issue refinement (admin refinement recover)",
+    });
   } else if (isHumanReviewHandoff(task)) {
     actions.push({
       action: "human-review",
@@ -1582,6 +3089,42 @@ export function buildTaskMenuActions(
   }
   if (hasDisputeState(task)) {
     actions.push({ action: "dispute", label: "Review dispute state / actions (admin dispute)" });
+  }
+  // Issue #977, on the same terms: additive, read-only, and offered beside
+  // whatever recovery action applies. It answers a different question ("where is
+  // this Issue in refinement, and does it need me?") and mutates nothing, so it
+  // cannot conflict with the recovery action next to it.
+  if (hasRefinementState(task)) {
+    actions.push({
+      action: "refinement",
+      label: "Issue refinement progress (admin task-status)",
+    });
+  }
+  // Issue #1044, additive on the same terms: the verification plan is a
+  // different question from recovery ("does this task check the right things,
+  // and did anyone change that?"), and the entry leads with the plan — a
+  // read-only view — before any correction. It is offered for a task an
+  // amendment could apply to (§7.1) and for one that already carries a chain,
+  // so an amended `claimed`/`running`/terminal task can still be INSPECTED,
+  // with the view reporting why it is not amendable rather than hiding it.
+  if (isVerificationAmendable(task) || hasVerificationAmendments(task)) {
+    actions.push({
+      action: "verification",
+      label: hasVerificationAmendments(task)
+        ? "Verification plan — AMENDED (admin task-verification)"
+        : "Verification plan / corrections (admin task-verification)",
+    });
+  }
+  // Issue #1048, additive for the same reason: a task whose recorded PR was
+  // merged outside the loop needs the merged-PR reconciliation command, and
+  // that question ("was this finished elsewhere?") is orthogonal to whichever
+  // recovery action the row's status suggests. The entry is a read-only command
+  // view — it runs nothing — so it cannot conflict with the action beside it.
+  if (isMergedPrReconcilable(task)) {
+    actions.push({
+      action: "reconcile-merged",
+      label: "Reconcile an externally merged PR (admin task reconcile-merged)",
+    });
   }
   // `held` and `stale` are mutually exclusive (IssueLockReader reports a lock as
   // `locked = !stale`). A stale lock (past its TTL) releases with `--yes`, but a
@@ -1635,14 +3178,16 @@ async function taskMenu(
 
   // Issue #848: the §7.1 routing intent and the undispatched-turn stop reason are
   // event-only facts, so the detail view needs the task's events to report them.
-  // Read only for a task that actually carries protocol state — a legacy task
-  // costs no extra query and renders exactly as before.
-  const disputeEvents = hasDisputeState(task)
+  // Issue #977 needs the same log for the §15 progress milestones. One read
+  // serves both — a task carrying both blocks must not pay for the log twice —
+  // and a task carrying neither costs no extra query and renders exactly as
+  // before.
+  const detailEvents = hasDisputeState(task) || hasRefinementState(task)
     ? await store.listEvents({ sessionId: task.sessionId, issueNumber: task.issueNumber })
     : undefined;
 
   clear();
-  const header = formatTaskDetail(task, now, lockState, disputeEvents) + "\n\n" + "Choose an action:";
+  const header = formatTaskDetail(task, now, lockState, detailEvents) + "\n\n" + "Choose an action:";
   const idx = await selectMenu({
     header,
     items: actions,
@@ -1665,8 +3210,20 @@ async function taskMenu(
     case "human-review":
       await showHumanReviewReturnCommands(task, dbPath, sessionsPath);
       return "back";
+    case "refinement-recover":
+      await showRefinementRecoverCommands(task, dbPath, sessionsPath);
+      return "back";
     case "dispute":
-      await showDisputeCommands(task, disputeEvents ?? [], dbPath, sessionsPath);
+      await showDisputeCommands(task, detailEvents ?? [], dbPath, sessionsPath);
+      return "back";
+    case "refinement":
+      await showRefinementProgress(task, now, detailEvents ?? [], dbPath);
+      return "back";
+    case "verification":
+      await showVerificationPlan(task, dbPath, sessionsPath);
+      return "back";
+    case "reconcile-merged":
+      await showReconcileMergedCommands(task, dbPath, sessionsPath);
       return "back";
     case "lock-release":
       await runStateChange(task, buildLockReleaseArgv(task));
@@ -2004,8 +3561,8 @@ export async function runAdminUi(argv: string[]): Promise<void> {
   // Degrade gracefully before touching sessions or the DB: a non-TTY caller can
   // never interact, so print the equivalent commands and exit non-zero.
   if (!isInteractive()) {
-    process.stdout.write(nonTtyHelp());
-    process.exit(2);
+    writeOut(nonTtyHelp());
+    exitProcess(2);
   }
 
   let sessionIds: string[];
@@ -2072,7 +3629,7 @@ export async function runAdminUi(argv: string[]): Promise<void> {
     if (err instanceof UiCancelled) {
       clackCancel("Interrupted — no changes made.");
       process.stdin.pause();
-      process.exit(130);
+      exitProcess(130);
     }
     throw err;
   }

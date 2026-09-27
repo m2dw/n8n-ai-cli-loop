@@ -21,7 +21,7 @@
 import type { AiTask, TaskKey, TaskPhase, TaskStatus } from "./task.js";
 import type { ResolvedSession, WorkItemProviderKind } from "./session.js";
 import type { OutboxStore, OutboxEnqueueInput, OutboxEntry } from "./outbox.js";
-import type { OutboxEffect, TaskStore } from "./task-store.js";
+import type { OutboxEffect, OutboxEffectCancelPending, TaskStore } from "./task-store.js";
 import type { PhaseDelayKind, PhaseHandlerResult } from "./phase-runner.js";
 import type { AgentFailureKind } from "./agent-diagnostics.js";
 import { makeOutboxKey } from "./outbox.js";
@@ -32,12 +32,30 @@ import { boundedExcerpt, fencedDetailsExcerpt, sanitizeBody } from "./text-sanit
 import { realpathSync } from "fs";
 import { resolveWorktreeRoot } from "./worktree-paths.js";
 import { renderPrSummary, PR_SUMMARY_MARKER } from "./pr-summary.js";
+import { decideStackReadyPublication, FINAL_STAGE_VERIFICATION_CONTEXT_KEY } from "./final-stage-gate.js";
+import { resolveStagedVerificationSettings } from "./staged-verification-config.js";
+// Issue #1125. A pure, leaf module (its own imports are the review-dispute
+// schema and validator), so this value import closes no cycle back here.
+import { readNoChangeContinuation } from "./implementation-no-change.js";
+import { canonicalizeGiteaEndpoint } from "./chatops-identity.js";
 import {
   PUBLICATION_WITHHOLD_PHRASES,
   RESEARCH_PUBLICATION_FAILED_STATUS,
 } from "./research-publication.js";
 import type { PublicationWithholdReason } from "./research-publication.js";
-import { renderHumanGateSummary, HUMAN_GATE_MARKER } from "./human-gate-summary.js";
+import {
+  humanGateFinalStageOf,
+  renderHumanGateAmendmentSupersededSummary,
+  renderHumanGateSummary,
+  HUMAN_GATE_MARKER,
+} from "./human-gate-summary.js";
+// A value import is safe here for the same reason the persistence slice can
+// take one: `verification-amendment-publication.ts` is a pure renderer with no
+// value imports of its own, so it closes no cycle back through this module.
+import {
+  publicSafeVerificationAmendmentGateSummary,
+  type VerificationAmendmentGateSummary,
+} from "./verification-amendment-publication.js";
 import type { DisputeTransitionApplication } from "./review-dispute-transition.js";
 import {
   disputeOutcomeIdempotencyKey,
@@ -53,6 +71,20 @@ import {
   refinementHandoffIdempotencyKey,
   renderRefinementHandoffComment,
 } from "./issue-refinement-publication.js";
+import type { RefinementHandoffReason } from "./issue-refinement.js";
+import { readRefinementContextBlock } from "./issue-refinement.js";
+import {
+  refinementRecoveryCount,
+  refinementRecoveryIdempotencyKey,
+} from "./issue-refinement-recovery.js";
+import type { RefinementProgressMilestone } from "./issue-refinement-progress.js";
+import type { RefinementProgressCommentRefusal } from "./issue-refinement-progress-publication.js";
+import {
+  publishableRefinementProgressComment,
+  refinementProgressCommentIdempotencyKey,
+  refinementProgressCommentMarker,
+  renderRefinementProgressComment,
+} from "./issue-refinement-progress-publication.js";
 import type { DiffClassification } from "./review-diff-context.js";
 import type { IssueRequiredVerification } from "../handlers/verification.js";
 
@@ -233,7 +265,7 @@ export function workItemOutbox(outboxStore: OutboxStore, session: ResolvedSessio
     // without this wrapper.
     ...(enqueueEffects
       ? {
-          enqueueEffects: (effects: OutboxEffect[]) =>
+          enqueueEffects: (effects: readonly OutboxEffect[]) =>
             enqueueEffects(
               effects.map((effect) =>
                 effect.kind === "enqueue"
@@ -289,6 +321,38 @@ const ALL_COARSE_LABEL_KEYS: Array<keyof Pick<ResolvedSession["labels"], "active
 // match the default passed to resolveDependencyExecutionPlan() in
 // src/handlers/implementation.ts.
 const STACK_READY_LABEL_DEFAULT = "status:stack-ready";
+
+/**
+ * Clear the stack-ready marker from a delayed release (issue #1103 review, P1).
+ *
+ * A delayed review release takes none of {@link enqueueStatusLabelEffects}'s
+ * branches, so a final stage that ends without a verdict — interrupted, a host
+ * failure, or a grant whose head no longer binds — would otherwise leave a
+ * marker an EARLIER approval published live while the task waits to re-run.
+ * The phase runner commits this removal in the same transaction as the release
+ * (§7 rule 2). Removal of an absent label is a no-op for the dispatcher.
+ */
+export async function enqueueStackReadyWithdrawalEffect(
+  outboxStore: OutboxStore,
+  session: ResolvedSession,
+  task: Pick<AiTask, "issueNumber">,
+  runId: string,
+  now: string,
+): Promise<void> {
+  const stackReadyLabel = (session.labels["stackReady"] as string | undefined) ?? STACK_READY_LABEL_DEFAULT;
+  await workItemOutbox(outboxStore, session).enqueue({
+    idempotencyKey: makeOutboxKey(session.sessionId, task.issueNumber, runId, "gh:label:remove", stackReadyLabel),
+    topic: "gh:label:remove",
+    payload: {
+      topic: "gh:label:remove",
+      owner: session.githubOwner,
+      repo: session.githubName,
+      issueNumber: task.issueNumber,
+      label: stackReadyLabel,
+    },
+    now,
+  });
+}
 
 export async function enqueueStatusLabelEffects(
   outboxStore: OutboxStore,
@@ -349,7 +413,23 @@ export async function enqueueStatusLabelEffects(
   // success-only marker excludes those escalations (issue #208 review follow-up).
   const isReviewSuccess = phase === "review" && result?.result === "success";
   const stackReadyLabel = (session.labels["stackReady"] as string | undefined) ?? STACK_READY_LABEL_DEFAULT;
-  if (isReviewSuccess) {
+  // Staged verification (issue #1103, docs/staged-verification-contract.md §7
+  // rule 1 / §8 step 5): for an opted-in session a passing review alone no
+  // longer earns the marker. It is published only when THIS completion's
+  // context records a complete, passed, full-set final bundle bound to the
+  // approved head and this run declared the grant — and since `task` is the
+  // post-transition preview of the same `completePhaseWithEffects` call, the
+  // grant and its evidence commit together or not at all. A withheld grant takes
+  // the non-passing branch below, which clears any live marker (§7 rule 2).
+  // Un-opted-in sessions read `legacy` and keep the shipped behavior.
+  const stackReadyPublication = isReviewSuccess
+    ? decideStackReadyPublication({
+        stagedVerification: session.stagedVerification,
+        context: task.context,
+        runId,
+      })
+    : undefined;
+  if (isReviewSuccess && stackReadyPublication?.kind !== "withhold") {
     await outboxStore.enqueue({
       idempotencyKey: makeOutboxKey(session.sessionId, task.issueNumber, runId, "gh:label:add", stackReadyLabel),
       topic: "gh:label:add",
@@ -1432,7 +1512,19 @@ export async function enqueueHandlerCommentEffect(
       const prUrl = typeof ctx.prUrl === "string" ? ctx.prUrl : "(no PR URL)";
       const prNum = typeof ctx.prUrl === "string" ? extractPrNumberFromUrl(ctx.prUrl) : undefined;
       const subjectRef = prNum !== undefined ? `PR #${prNum}` : `issue #${task.issueNumber}`;
-      body = `✅ **Implementation complete** for ${subjectRef}.\n\nPR: ${prUrl}`;
+      // Issue #1125: a fix turn that committed nothing is a different event from
+      // one that pushed an implementation, and neither is a review approval.
+      // Saying "Implementation complete" about a run that changed no files would
+      // tell an Issue reader that new work landed when none did.
+      const noChange = readNoChangeContinuation(ctx);
+      body = noChange
+        ? `✅ **No additional changes — verified and returned for review** for ${subjectRef}.\n\n`
+          + `The implementer reported that the feedback it was answering needs no further edit `
+          + `(reason: \`${noChange.reason}\`). The configured verification commands were run by the runner and `
+          + `passed on \`${noChange.revision.slice(0, 12)}\`, so the PR is queued for review again. `
+          + `This is not a review approval and resolves no outstanding finding — the reviewer decides whether the `
+          + `explanation answers the feedback.\n\nPR: ${prUrl}`
+        : `✅ **Implementation complete** for ${subjectRef}.\n\nPR: ${prUrl}`;
     } else if (result.result === "failed") {
       body = `❌ **Implementation failed** for issue #${task.issueNumber}.\n\nError: ${result.error}`;
     } else if (result.result === "blocked") {
@@ -1896,6 +1988,28 @@ export async function enqueuePrSummaryEffect(
     }
   }
 
+  // Issue #1154 (docs/changed-file-verification-contract.md §5): with the
+  // operator's suite binding, a passing implementation or review Step 4 ran only
+  // Stage 1's changed and retained test files. The suite entry is never reported
+  // as passed until Stage 2 granted stack-ready for this completion — the same
+  // decision the stack-ready label applies.
+  let pendingFullSuiteName: string | undefined;
+  const stagedSettings = resolveStagedVerificationSettings(session.stagedVerification);
+  const testSuiteKey = stagedSettings.enabled ? stagedSettings.testSuite?.key : undefined;
+  if (testSuiteKey !== undefined && verificationPassed === true && verificationNames?.includes(testSuiteKey)) {
+    const fullSuiteGranted =
+      phase === "review" &&
+      result.result === "success" &&
+      decideStackReadyPublication({ stagedVerification: session.stagedVerification, context: ctx, runId }).kind ===
+        "grant";
+    if (!fullSuiteGranted) {
+      pendingFullSuiteName = testSuiteKey;
+      const rest = verificationNames.filter((name) => name !== testSuiteKey);
+      verificationNames = rest.length > 0 ? rest : undefined;
+      if (rest.length === 0) verificationPassed = undefined;
+    }
+  }
+
   // Only include the issue title when the work-item tracker is on the same
   // public surface as the PR (both GitHub). In split-provider sessions the
   // work-item title comes from a private tracker and must not be published on
@@ -1916,6 +2030,7 @@ export async function enqueuePrSummaryEffect(
     diffClassification: rawDiffClassification,
     verificationNames,
     verificationPassed,
+    ...(pendingFullSuiteName !== undefined ? { pendingFullSuiteName } : {}),
     ...(rawIssueRequiredVerifications !== undefined &&
       session.workItemProvider.provider === "github-issues"
       ? { issueRequiredVerifications: rawIssueRequiredVerifications }
@@ -1940,7 +2055,10 @@ export async function enqueuePrSummaryEffect(
  *
  * Fires only when an AI review passes (`phase === "review"` and
  * `result.result === "success"`), which is the moment the task transitions to
- * `ready_for_human`. The comment is updated rather than duplicated on repeated
+ * `ready_for_human`. With staged verification enabled, a `blocked` or
+ * `needs_fix` review completion that carries a final-stage record (issue #1107)
+ * is also published, so a withheld or failed final stage replaces an earlier
+ * passing body. The comment is updated rather than duplicated on repeated
  * review passes via `replacePendingPrSummary` + a distinct `HUMAN_GATE_MARKER`.
  * Silently no-ops when no PR URL is available.
  */
@@ -1954,9 +2072,57 @@ export async function enqueueHumanGateSummaryEffect(
   now: string,
   durationMs?: number,
 ): Promise<void> {
-  if (phase !== "review" || result.result !== "success") return;
+  if (phase !== "review") return;
 
   const ctx = result.context ?? {};
+
+  // Issue #1107: for an opted-in session, state whether the full required set
+  // passed at this head, separately from the review approval. Read from the
+  // completion's own public record (#1103), so a replayed completion renders the
+  // same body under the same idempotency key.
+  const projectedFinalStage = resolveStagedVerificationSettings(session.stagedVerification).enabled
+    ? humanGateFinalStageOf(ctx[FINAL_STAGE_VERIFICATION_CONTEXT_KEY])
+    : undefined;
+
+  // Review feedback (P2): a passed final bundle is not permission to publish.
+  // Stack-ready is stated only when this completion is a success AND the same
+  // decision `enqueueStatusLabelEffects` applies grants — a later guard that
+  // clears the grant marker (unconfirmed mergeability, truncated diff) keeps the
+  // passed record but must not read "stack-ready granted" here.
+  const stackReady =
+    projectedFinalStage !== undefined &&
+    result.result === "success" &&
+    decideStackReadyPublication({ stagedVerification: session.stagedVerification, context: ctx, runId }).kind ===
+      "grant";
+
+  // Review feedback (P2): a review approval whose final stage did not reach a
+  // verdict releases `delayed` with `withdrawStackReady`. That is the real
+  // pending-final-verification path; it rewrites the sticky summary so an
+  // earlier passing body does not outlive the withdrawn marker.
+  const pendingFinalStage =
+    projectedFinalStage !== undefined && result.result === "delayed" && result.withdrawStackReady === true;
+
+  const finalStage =
+    projectedFinalStage === undefined
+      ? undefined
+      : {
+          ...projectedFinalStage,
+          ...(projectedFinalStage.status === "recorded" ? { stackReady } : {}),
+          ...(pendingFinalStage ? { pending: true } : {}),
+        };
+
+  // An approved review whose final stage withheld stack-ready (operator
+  // intervention, exhausted recovery) completes `blocked`, and one whose final
+  // stage found a code failure completes `needs_fix`. Both must still rewrite
+  // the sticky summary: otherwise an earlier passing body stays next to the
+  // merge button. Only completions carrying a final-stage record are admitted —
+  // every other blocked/needs_fix review still publishes nothing here.
+  const finalStageCompletion =
+    pendingFinalStage ||
+    (finalStage !== undefined &&
+      finalStage.status !== "absent" &&
+      (result.result === "blocked" || result.result === "needs_fix"));
+  if (result.result !== "success" && !finalStageCompletion) return;
   const rawPrUrl =
     typeof ctx.prUrl === "string"
       ? ctx.prUrl
@@ -1966,8 +2132,12 @@ export async function enqueueHumanGateSummaryEffect(
   const prNumber = rawPrUrl ? extractPrNumberFromUrl(rawPrUrl) : undefined;
   if (prNumber === undefined) return;
 
-  const owner = session.githubOwner;
-  const repo = session.githubName;
+  // The code repo the configured repo host serves, not the work-item repo: for
+  // `gitea` those are unrelated coordinates (issue #1044 review, P1). The
+  // amendment supersede path rewrites this same sticky comment under the same
+  // marker, and `replacePendingPrSummary` matches pending rows on the address,
+  // so the two must resolve the target identically.
+  const { owner, repo } = repoHostCommentTarget(session);
 
   const rawDiffClassification =
     typeof ctx.diffClassification === "object" && ctx.diffClassification !== null
@@ -1984,10 +2154,13 @@ export async function enqueueHumanGateSummaryEffect(
 
   // Verification info: review succeeds only when all configured verification
   // commands passed in Step 4 (same derivation as enqueuePrSummaryEffect).
+  // Only a successful review supports that aggregate: a blocked, needs_fix or
+  // delayed final-stage completion leaves it unstated, and the final-stage line
+  // below reports the recorded evidence instead (issue #1107 review, P2).
   let verificationNames: string[] | undefined;
   let verificationPassed: boolean | undefined;
   const v = session.verification;
-  if (v) {
+  if (v && result.result === "success") {
     const names = Object.keys(v).filter((k) => Boolean(v[k]));
     if (names.length > 0) {
       verificationNames = names;
@@ -1995,16 +2168,39 @@ export async function enqueueHumanGateSummaryEffect(
     }
   }
 
-  // Only include the issue title when the work-item tracker is on the same
-  // public surface as the PR (both GitHub). In split-provider sessions the
-  // work-item title comes from a private tracker and must not be published.
+  // Whether the work-item tracker is on the same surface as this PR. In
+  // split-provider sessions the work item lives on a separate, private tracker,
+  // and nothing derived from its text may be published here. A same-repository
+  // Gitea pair is NOT such a session (issue #1044 review, P2); see
+  // {@link workItemSharesRepoHostSurface}.
+  const workItemIsPubliclyVisibleHere = workItemSharesRepoHostSurface(session);
+
   const issueTitle =
-    session.workItemProvider.provider === "github-issues" &&
-    session.repoHostProvider.provider === "github" &&
+    workItemIsPubliclyVisibleHere &&
     typeof task.context?.title === "string" &&
     task.context.title.trim().length > 0
       ? task.context.title.trim()
       : undefined;
+
+  // Issue #1044 (§12.2): the amendment projection the review handler derived
+  // from the reconciled plan it gated on. Read from the completion context
+  // rather than re-derived here — resolving a plan is the handler's job, and a
+  // second derivation could disagree with the one that actually gated.
+  //
+  // Its reason and its command labels are work-item text, exactly like the title
+  // above (issue #1044 review, P1): the operator's own words and, for a
+  // requirement slot, the private Issue's verification section. On a split
+  // surface only the public-safe aggregate is published — every count and digest
+  // kept, so the merge decision still states that the plan moved and how much of
+  // it is no longer checked, and every name left on the work item.
+  const contextVerificationAmendment =
+    typeof ctx.verificationAmendment === "object" && ctx.verificationAmendment !== null
+      ? (ctx.verificationAmendment as VerificationAmendmentGateSummary)
+      : undefined;
+  const rawVerificationAmendment =
+    contextVerificationAmendment === undefined || workItemIsPubliclyVisibleHere
+      ? contextVerificationAmendment
+      : publicSafeVerificationAmendmentGateSummary(contextVerificationAmendment);
 
   const body = renderHumanGateSummary({
     issueNumber: task.issueNumber,
@@ -2017,6 +2213,10 @@ export async function enqueueHumanGateSummaryEffect(
     diffClassification: rawDiffClassification,
     verificationNames,
     verificationPassed,
+    ...(rawVerificationAmendment !== undefined
+      ? { verificationAmendment: rawVerificationAmendment }
+      : {}),
+    ...(finalStage !== undefined ? { finalStage } : {}),
     reviewAgentUsed,
     classifierReason,
     resolvedProfile,
@@ -2029,6 +2229,93 @@ export async function enqueueHumanGateSummaryEffect(
     repo,
     prNumber,
     idempotencyKey: makeOutboxKey(session.sessionId, task.issueNumber, runId, "repohost:human-gate"),
+    marker: HUMAN_GATE_MARKER,
+    body,
+    configuredPaths: sessionRedactionPaths(session),
+    now,
+  });
+}
+
+/**
+ * Supersede a stale Human Gate Decision Summary whose plan an amendment moved
+ * under it (issue #1044 review, P1).
+ *
+ * The §9.2 record-only continuation (`--continue none`) applies a revision and
+ * leaves the task exactly where it was. On a `ready_for_human` review task the
+ * handoff therefore stays actionable — the labels do not move, no review is
+ * re-queued — while the sticky summary next to the merge button keeps reporting
+ * the verification pass of the plan as it was BEFORE the amendment, and keeps
+ * omitting whatever the revision just retired. That is the stale merge gate
+ * §12.2 exists to prevent, reached by the one path that changes no status.
+ *
+ * So the amendment rewrites that sticky comment under the same
+ * {@link HUMAN_GATE_MARKER}: same PR address and same marker as
+ * {@link enqueueHumanGateSummaryEffect}, so the delivery EDITS the stale body
+ * rather than appending an invalidation the reader has to find. The next passing
+ * review renders the full summary over it again.
+ *
+ * Silently no-ops without a PR (nothing to supersede). The caller decides that
+ * the amendment routed nowhere AND that it actually moved the plan digest — a
+ * revision that changes no bytes, state or position leaves the parked pass
+ * describing the effective plan, so superseding it would retract a live handoff
+ * over a claim that is not true. This builder is addressing, not policy.
+ * The split-provider projection is the same one the summary itself uses: on a
+ * private work-item tracker only the public-safe aggregate crosses over.
+ */
+export async function enqueueVerificationAmendmentGateSupersededEffect(
+  outboxStore: OutboxStore,
+  session: ResolvedSession,
+  task: AiTask,
+  summary: VerificationAmendmentGateSummary,
+  revisionId: string,
+  now: string,
+): Promise<void> {
+  const rawPrUrl = typeof task.context?.prUrl === "string" ? task.context.prUrl : undefined;
+  const prNumber = rawPrUrl ? extractPrNumberFromUrl(rawPrUrl) : undefined;
+  if (prNumber === undefined) return;
+
+  // The same predicate the summary this supersedes uses, so both bodies make
+  // the same statements about the same plan (issue #1044 review, P2).
+  const workItemIsPubliclyVisibleHere = workItemSharesRepoHostSurface(session);
+  const issueTitle =
+    workItemIsPubliclyVisibleHere &&
+    typeof task.context?.title === "string" &&
+    task.context.title.trim().length > 0
+      ? task.context.title.trim()
+      : undefined;
+  const projected = workItemIsPubliclyVisibleHere
+    ? summary
+    : publicSafeVerificationAmendmentGateSummary(summary);
+  const branch = typeof task.context?.branch === "string" ? task.context.branch : undefined;
+
+  const body = renderHumanGateAmendmentSupersededSummary({
+    issueNumber: task.issueNumber,
+    ...(issueTitle !== undefined ? { issueTitle } : {}),
+    prNumber,
+    ...(branch !== undefined ? { branch } : {}),
+    verificationAmendment: projected,
+  });
+
+  // The repo the configured repo host actually serves, resolved exactly as the
+  // summary this supersedes now resolves it (issue #1044 review, P1). Both rows
+  // MUST agree: `replacePendingPrSummary` supersedes a pending sticky row by
+  // (owner, repo, prNumber, marker), so addressing this one differently would
+  // leave a still-pending stale gate summary to be delivered on top of it.
+  const target = repoHostCommentTarget(session);
+
+  await enqueueRepoHostPrSummary(outboxStore, {
+    provider: session.repoHostProvider.provider,
+    owner: target.owner,
+    repo: target.repo,
+    prNumber,
+    // Keyed on the REVISION, never on a run: the same rule the §12.2 comment
+    // follows, so a re-derived enqueue after a crash dedupes against itself.
+    idempotencyKey: makeOutboxKey(
+      session.sessionId,
+      task.issueNumber,
+      revisionId,
+      "repohost:human-gate:superseded",
+    ),
     marker: HUMAN_GATE_MARKER,
     body,
     configuredPaths: sessionRedactionPaths(session),
@@ -2061,6 +2348,79 @@ function repoHostCommentTarget(session: ResolvedSession): { owner: string; repo:
   const rh = session.repoHostProvider;
   if (rh.provider === "gitea" && rh.gitea) return { owner: rh.gitea.owner, repo: rh.gitea.repo };
   return { owner: session.githubOwner, repo: session.githubName };
+}
+
+/**
+ * `url` without its trailing `/` characters. A backward scan rather than
+ * `/\/+$/`, which retries from every slash of a long run and is quadratic in
+ * its length (issue #1200).
+ */
+function stripTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === 0x2f) end -= 1;
+  return url.slice(0, end);
+}
+
+/**
+ * Two Gitea base URLs addressing the same instance.
+ *
+ * Normalized only where normalization is certain: a trailing slash, surrounding
+ * whitespace, and the case of the scheme and host, which are case-insensitive by
+ * RFC 3986. A mount path is compared verbatim, because a server may serve
+ * `/gitea` and `/Gitea` as different places — and treating two URLs as different
+ * only costs the summary its names.
+ */
+export function sameGiteaInstance(a: string, b: string): boolean {
+  const normalize = (url: string): string =>
+    stripTrailingSlashes(url.trim())
+      .replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]*)/, (origin) => origin.toLowerCase());
+  return normalize(a) === normalize(b);
+}
+
+/**
+ * Whether the session's work item and its pull requests live on ONE surface, so
+ * text taken from the work item may be published beside the merge button.
+ *
+ * The question is never "is this GitHub" but "would a reader of the PR already
+ * be able to read the Issue" — a split-provider session tracks work on a private
+ * instance whose titles, operator reasons, and verification command names must
+ * not cross over to a public code host.
+ *
+ * `github-issues` + `github` is one surface: both are derived from `githubRepo`.
+ * So is a self-hosted pair whose two blocks name the same instance, owner, and
+ * repository (issue #1044 review, P2) — the two blocks are declared
+ * independently *because* they may differ, not because they must, and reading
+ * a matching pair as "separate and private" is what stripped every amendment
+ * label and reason out of the merge gate and then told the reader they were
+ * withheld for a privacy boundary that does not exist there.
+ *
+ * Compared on the coordinates rather than the provider kind, because those are
+ * what decide visibility. Base URLs are compared as
+ * {@link sameGiteaInstance} normalizes them; owner and repo are compared
+ * verbatim, so anything this cannot prove identical stays split, and the
+ * projection keeps withholding. That is the safe direction: a false split loses
+ * names from a summary that still states every count, while a false join
+ * publishes private text irreversibly.
+ */
+function workItemSharesRepoHostSurface(session: ResolvedSession): boolean {
+  const wi = session.workItemProvider;
+  const rh = session.repoHostProvider;
+  if (wi.provider === "github-issues" && rh.provider === "github") return true;
+  const workItemGitea = wi.gitea;
+  const repoHostGitea = rh.gitea;
+  if (
+    wi.provider === "gitea-issues" &&
+    rh.provider === "gitea" &&
+    workItemGitea !== undefined &&
+    repoHostGitea !== undefined
+  ) {
+    return (
+      sameGiteaInstance(workItemGitea.baseUrl, repoHostGitea.baseUrl) &&
+      workItemGitea.owner === repoHostGitea.owner &&
+      workItemGitea.repo === repoHostGitea.repo
+    );
+  }
+  return false;
 }
 
 /**
@@ -2156,15 +2516,121 @@ export async function enqueueDisputeOutcomeEffects(
 }
 
 // ---------------------------------------------------------------------------
+// Refinement progress comments (issue #976, §15 progress milestones / §16)
+// ---------------------------------------------------------------------------
+
+/**
+ * Enqueue one append-only GitHub comment per newly committed refinement
+ * progress milestone (issue #975's contract, published).
+ *
+ * The input is the committed milestone list — NOT the task, not the block, and
+ * not the fine-grained `refinement.*` events. That is the whole boundary: #975
+ * already decided which transitions are progress, deduplicated them against the
+ * durable ledger, bounded and sanitized every field, and stamped the
+ * authoritative retry deadline. A poll, an eligibility hold, a predecessor wait,
+ * an idle run, and an unchanged retry check produce no milestone, so they cannot
+ * reach this builder at all, and there is no second suppression list here to
+ * drift from theirs.
+ *
+ * Three properties carry the delivery contract:
+ *
+ *  - **One transaction with the milestone.** The caller collects these effects
+ *    into the same `completePhaseWithEffects` call that commits the milestone
+ *    events and the task transition, so a milestone cannot commit without its
+ *    comment effect, and a lost claim publishes neither.
+ *  - **Keyed on the milestone, not on the run.** `refinementProgressCommentIdempotencyKey`
+ *    derives the key from the deterministic `milestoneId` plus this projection's
+ *    fixed name/version. A replayed phase completion, a process restart, and an
+ *    operator `outbox retry` all re-derive the same key, so the outbox dedupes
+ *    the row; the body's `dedupeMarker` closes the remaining window on the
+ *    delivery side, where a dispatcher posted the comment and then lost its
+ *    claim before `markSent`.
+ *  - **Fails closed, visibly.** A milestone this build cannot render — a newer
+ *    schema version, an unknown kind, a `retry_scheduled` with no committed
+ *    deadline — enqueues NOTHING and is returned as a refusal, which the caller
+ *    commits as a task event beside the milestone. Nothing is guessed into a
+ *    public comment.
+ *
+ * Routed through {@link workItemOutbox} like every other work-item effect, so a
+ * non-GitHub work-item session publishes to its own tracker instead of stranding
+ * a `gh:*` row behind a failing GitHub runner.
+ */
+export async function enqueueRefinementProgressCommentEffects(
+  outboxStore: OutboxStore,
+  session: ResolvedSession,
+  task: Pick<AiTask, "issueNumber">,
+  /** The milestones this transition is committing, in emission order. */
+  milestones: readonly RefinementProgressMilestone[] | undefined,
+  now: string,
+): Promise<RefinementProgressCommentRefusal[]> {
+  if (!milestones || milestones.length === 0) return [];
+
+  const workItemStore = workItemOutbox(outboxStore, session);
+  const configuredPaths = sessionRedactionPaths(session);
+  const refusals: RefinementProgressCommentRefusal[] = [];
+
+  for (const milestone of milestones) {
+    const projection = publishableRefinementProgressComment(milestone);
+    if (!projection.publishable) {
+      refusals.push(projection.refusal);
+      continue;
+    }
+    // A milestone addressed at a different Issue than the task committing it is
+    // not this task's to publish: the row would comment on somebody else's
+    // Issue under this task's session key, and no reading of that is safe.
+    if (projection.comment.issueNumber !== task.issueNumber) {
+      refusals.push({
+        code: "malformed_milestone",
+        detail:
+          "progress milestone names a different Issue than the task committing it; "
+          + "refusing to publish it against either",
+        milestoneId: milestone.milestoneId,
+        issueNumber: projection.comment.issueNumber,
+      });
+      continue;
+    }
+    const idempotencyKey = refinementProgressCommentIdempotencyKey({
+      sessionId: session.sessionId,
+      issueNumber: task.issueNumber,
+      milestoneId: milestone.milestoneId,
+    });
+    const marker = refinementProgressCommentMarker(idempotencyKey);
+    // `sanitizeBody` is defence in depth rather than the bound (§16): the body is
+    // rendered from closed-set literals, counters, and #975-validated
+    // identifiers, so there is nothing here for it to redact unless a session
+    // configured an agent id or model that looks like a path.
+    await workItemStore.enqueue({
+      idempotencyKey,
+      topic: "gh:comment",
+      payload: {
+        topic: "gh:comment",
+        owner: session.githubOwner,
+        repo: session.githubName,
+        issueNumber: task.issueNumber,
+        body: sanitizeBody(renderRefinementProgressComment(projection.comment, marker), configuredPaths),
+        dedupeMarker: marker,
+      },
+      now,
+    });
+  }
+
+  return refusals;
+}
+
+// ---------------------------------------------------------------------------
 // Terminal refinement handoffs (issue #936, §13 items 3–4)
 // ---------------------------------------------------------------------------
 
 /**
  * Enqueue the public half of a terminal refinement handoff: the session's
- * ready-for-human label, then one bounded comment carrying the handoff reason.
+ * ready-for-human label, then one bounded comment carrying the handoff reason,
+ * then — for a session that configures one — the messenger notification every
+ * other `ready_for_human` transition already sends (issue #981, see
+ * {@link enqueueRefinementHandoffNotificationEffect}).
  *
- * This is the ONLY effect the refinement lane enqueues. §13 is explicit that
- * everything else about the lane stays local until the application walk performs
+ * With the §15 progress comments above (issue #976), this is the whole of what
+ * the refinement lane enqueues. §13 is explicit that everything else about the
+ * lane stays local until the application walk performs
  * its own writes through the apply port, and the phase runner keeps the generic
  * completion builders (handler comment, coarse status labels, PR summary,
  * human-gate summary) off this phase for exactly that reason. A handoff is the
@@ -2175,7 +2641,7 @@ export async function enqueueDisputeOutcomeEffects(
  *
  * Three properties are load-bearing:
  *
- *  - **Same transaction as the transition.** Both effects are collected into the
+ *  - **Same transaction as the transition.** Every effect is collected into the
  *    completion the block rides in, so a handoff cannot commit without its
  *    publication being durable alongside it (issue #701's transactional-outbox
  *    guarantee).
@@ -2183,16 +2649,24 @@ export async function enqueueDisputeOutcomeEffects(
  *    is deliberately left where it is, and adding `status:needs-implementation`
  *    beside it would produce the both-markers combination §3 refuses. This
  *    builder therefore only ever ADDS the ready-for-human label.
- *  - **Retry-safe by key, not by luck.** Both keys are run-independent
+ *  - **Retry-safe by key, not by luck.** Every key is run-independent
  *    (`refinementHandoffIdempotencyKey`), so a phase re-run after a lost CAS
- *    re-derives the same two rows and the outbox dedupes them. A dispatch
+ *    re-derives the same rows and the outbox dedupes them. A dispatch
  *    failure leaves a visible pending/delayed/dead row for `admin outbox list`,
  *    which §13 prefers over a silently omitted notice: the handoff itself
  *    already stands on its local record.
  *
- * Routed through {@link workItemOutbox} like every other work-item effect, so a
- * non-GitHub work-item session publishes to its own tracker rather than
- * stranding a `gh:*` row behind a failing GitHub runner.
+ * The two work-item rows are routed through {@link workItemOutbox} like every
+ * other work-item effect, so a non-GitHub work-item session publishes to its own
+ * tracker rather than stranding a `gh:*` row behind a failing GitHub runner. The
+ * notification is not a work-item write and does not travel through it.
+ *
+ * Returns the cancellations this publication needs alongside its own rows —
+ * see {@link refinementHandoffSupersessionEffects}. They cannot be enqueued
+ * through the store like the rows above (a cancellation addresses an existing
+ * row rather than inserting one), so the caller folds them into the same effect
+ * set it commits the transition with. An empty list on every path but a handoff
+ * raised after a §13 recovery.
  */
 export async function enqueueRefinementHandoffEffects(
   outboxStore: OutboxStore,
@@ -2206,9 +2680,14 @@ export async function enqueueRefinementHandoffEffects(
    */
   context: Record<string, unknown> | undefined,
   now: string,
-): Promise<void> {
+): Promise<OutboxEffectCancelPending[]> {
   const publication = publishableRefinementHandoffFromContext(task.issueNumber, context);
-  if (publication === null) return;
+  if (publication === null) return [];
+
+  // §13's attempt discriminator (issue #980). Read from the block rather than
+  // carried on the publication: it is addressing, not content — §16 caps what a
+  // handoff comment may SAY, and a recovery ordinal is not on that list.
+  const recoveries = refinementRecoveryCount(readRefinementContextBlock(context));
 
   const workItemStore = workItemOutbox(outboxStore, session);
   const owner = session.githubOwner;
@@ -2225,6 +2704,7 @@ export async function enqueueRefinementHandoffEffects(
         issueNumber: task.issueNumber,
         reason: publication.reason,
         effect: "label",
+        recoveries,
       }),
       topic: "gh:label:add",
       payload: {
@@ -2254,6 +2734,7 @@ export async function enqueueRefinementHandoffEffects(
     issueNumber: task.issueNumber,
     reason: publication.reason,
     effect: "comment",
+    recoveries,
   });
   const marker = refinementHandoffCommentMarker(commentKey);
   await workItemStore.enqueue({
@@ -2266,6 +2747,354 @@ export async function enqueueRefinementHandoffEffects(
       issueNumber: task.issueNumber,
       body: sanitizeBody(renderRefinementHandoffComment(publication, marker), sessionRedactionPaths(session)),
       dedupeMarker: marker,
+    },
+    now,
+  });
+
+  // Issue #981: the session's configured transition notification, in the same
+  // effect set as the two rows above. Enqueued on the RAW store rather than
+  // `workItemStore` — a notification is not a work-item write, and the payload's
+  // owner/repo are the session's own GitHub coordinates, which the dispatcher's
+  // session-scoped filter keys on (see `SlackNotificationPayload`).
+  await enqueueRefinementHandoffNotificationEffect(
+    outboxStore, session, task.issueNumber, publication.reason, recoveries, now,
+  );
+
+  return refinementHandoffSupersessionEffects(session, task, recoveries, now);
+}
+
+/**
+ * The public browser URL of a session's work item, resolved through the provider
+ * that actually holds it (issue #981 review).
+ *
+ * A handoff notification exists to send an operator somewhere, so the link has to
+ * follow the work item rather than the session's GitHub fields: a `gitea-issues`
+ * session's Issue #697 is on its own instance, and pointing at
+ * `github.com/<githubRepo>/issues/697` would hand the reader a link to a
+ * different Issue — or to nothing. Both supported trackers publish enough
+ * non-secret coordinates to build the URL exactly (`baseUrl` is the instance's
+ * web root; Gitea's web path for an Issue is `/{owner}/{repo}/issues/{n}`, the
+ * API path being a separate, API-only concern).
+ *
+ * Returns `undefined` rather than a guess whenever the coordinates are not there
+ * to build one — an unrecognised provider kind, a `gitea-issues` session missing
+ * its connection block, or a `baseUrl` that {@link canonicalizeGiteaEndpoint}
+ * rejects. That last case is also why the throwing canonicalizer is used instead
+ * of string concatenation: it refuses a base URL embedding `user:password@host`,
+ * so a misconfigured instance URL yields no link rather than a credential posted
+ * into a chat channel. Callers treat the absence as "no link", never as failure:
+ * the rest of a notification is provider-independent and still goes out.
+ */
+export function workItemIssueUrl(session: ResolvedSession, issueNumber: number): string | undefined {
+  const wi = session.workItemProvider;
+  if (wi.provider === "github-issues") {
+    if (!session.githubOwner || !session.githubName) return undefined;
+    return `https://github.com/${session.githubOwner}/${session.githubName}/issues/${issueNumber}`;
+  }
+  if (wi.provider === "gitea-issues") {
+    const gitea = wi.gitea;
+    if (!gitea?.baseUrl || !gitea.owner || !gitea.repo) return undefined;
+    let base: string;
+    try {
+      base = canonicalizeGiteaEndpoint(gitea.baseUrl);
+    } catch {
+      return undefined;
+    }
+    return `${base}/${encodeURIComponent(gitea.owner)}/${encodeURIComponent(gitea.repo)}/issues/${issueNumber}`;
+  }
+  return undefined;
+}
+
+/**
+ * Enqueue the provider-neutral messenger notification for a terminal refinement
+ * handoff (issue #981).
+ *
+ * The GitHub half of a handoff has been published since issue #936, but the lane
+ * skips the phase runner's generic completion builders — including
+ * {@link enqueueSlackNotificationEffect} — so a PIR escalation was the one
+ * `ready_for_human` transition in the system that reached a correct Issue and a
+ * silent notifier. A handoff waits for a human by definition, so it is precisely
+ * the transition an operator must not have to discover by opening GitHub.
+ *
+ * Three things make this the same notification every other lane sends rather
+ * than a PIR-specific channel:
+ *
+ *  - **The same topic and the same payload.** `slack:notification` with the
+ *    fields #465 defined, so the messenger stays an adapter: nothing here knows
+ *    what a Slack block looks like, and a second provider added to
+ *    `session.notifications` inherits this transition for free.
+ *  - **The same visibility rules.** Every field is a literal, a configured
+ *    identifier, or a public work-item URL. `reason` is a closed-set §13 handoff
+ *    literal — never agent output, never provider error text — and `sanitizeBody`
+ *    still runs over it as defence in depth, exactly as the handoff comment does
+ *    for its own literals. No artifact path, no worktree path, no run id.
+ *  - **The same transaction.** It is built into the caller's effect collector, so
+ *    the notification is durable with the transition or neither exists. Delivery
+ *    is then the outbox's problem: a webhook failure retries and dead-letters on
+ *    its own budget and can no more undo the handoff than a failed comment can
+ *    (§13, "the handoff stands even when its comment cannot be delivered").
+ *
+ * Keyed on the handoff's own identity — session, Issue, reason, §13 recovery
+ * ordinal — rather than on a run id, so a completion whose CAS is lost and
+ * re-derived notifies once, while a lane RECOVERED (`admin refinement recover`)
+ * and escalated again mints a fresh key and notifies again. That is the same
+ * identity the label and comment carry, which is what keeps the three effects of
+ * one handoff either all-new or all-deduped.
+ *
+ * A session with no `notifications.slack` block, or one with `enabled: false`,
+ * enqueues nothing and the handoff completes exactly as it did before this
+ * existed.
+ */
+export async function enqueueRefinementHandoffNotificationEffect(
+  outboxStore: OutboxStore,
+  session: ResolvedSession,
+  issueNumber: number,
+  reason: RefinementHandoffReason,
+  /** §13 recovery ordinal of the attempt raising this handoff; 0 = never recovered. */
+  recoveries: number,
+  now: string,
+): Promise<void> {
+  const slack = session.notifications?.slack;
+  if (!slack?.enabled || !slack.webhookUrlEnv) return;
+
+  // The link to the work item that stopped — built from the coordinates of the
+  // provider that actually holds it, never from the session's GitHub fields when
+  // the work lives elsewhere (issue #981 review).
+  const issueUrl = workItemIssueUrl(session, issueNumber);
+
+  await outboxStore.enqueue({
+    idempotencyKey: refinementHandoffIdempotencyKey({
+      sessionId: session.sessionId,
+      issueNumber,
+      reason,
+      effect: "notification",
+      recoveries,
+    }),
+    topic: "slack:notification",
+    payload: {
+      topic: "slack:notification",
+      owner: session.githubOwner,
+      repo: session.githubName,
+      webhookUrlEnv: slack.webhookUrlEnv,
+      sessionId: session.sessionId,
+      issueNumber,
+      // The phase is what tells the reader this is Issue refinement and not one
+      // of the implementation lane's own handoffs.
+      phase: "refinement",
+      transition: "ready_for_human",
+      reason: sanitizeBody(reason, sessionRedactionPaths(session)).trim(),
+      ...(issueUrl !== undefined ? { issueUrl } : {}),
+    },
+    now,
+  });
+}
+
+/**
+ * Retire the §13 recovery removal this handoff contradicts (issue #980 review) —
+ * the mirror image of {@link refinementRecoverySupersessionEffects}.
+ *
+ * Recovery enqueued a `gh:label:remove` for the ready-for-human label, because
+ * the row it was undoing had it on. If that removal's dispatch failed once, it
+ * is sitting behind a backoff while the recovered attempt runs — and if that
+ * attempt escalates again, the label ADD above and the old REMOVE are live at
+ * the same time with nothing ordering them. The add dispatches, the remove
+ * retries afterwards, and the Issue loses the "a human is needed here" marker on
+ * a task that is once more `ready_for_human`: the same divergence recovery's own
+ * supersession exists to prevent, pointing the other way.
+ *
+ * Keyed on the recovery ordinal the block currently carries, which is exactly
+ * the ordinal that minted the removal (recovery N sets `recoveries = N`, and
+ * every handoff raised afterwards reads N until another recovery runs). An
+ * attempt that has never been recovered has no removal to retire and returns
+ * `[]`, as does a session with no ready-for-human label configured — the same
+ * no-op the label add itself takes.
+ *
+ * Cancelled unconditionally rather than only when the two rows name the same
+ * label. They differ only if `labels.readyForHuman` was renamed between the
+ * recovery and this handoff, and in that case both dispositions are benign — the
+ * stale removal would take off a label this add did not apply — while the
+ * same-label case, which is every other run, is the divergence above.
+ *
+ * Deliberately WITHOUT `refuseWhileClaimed`, which is the one place this mirror
+ * is not symmetric (issue #980 review). Its twin refuses rather than cancel a
+ * row a dispatcher is holding, because the caller there is an operator command
+ * that can simply be re-run; the caller here is a phase completion, and refusing
+ * it would roll back a finished attempt's whole transition — a far larger loss
+ * than the single missed removal it would be avoiding, which the next handoff or
+ * recovery re-derives anyway.
+ *
+ * Returns effects rather than enqueueing them for the reason given on
+ * {@link refinementRecoverySupersessionEffects}: a cancellation has no
+ * `OutboxStore` method to travel through, and it must land in the transition's
+ * own transaction rather than beside it.
+ */
+export function refinementHandoffSupersessionEffects(
+  session: ResolvedSession,
+  task: Pick<AiTask, "issueNumber">,
+  /** The §13 recovery ordinal of the attempt raising this handoff; 0 = never recovered. */
+  recoveries: number,
+  now: string,
+): OutboxEffectCancelPending[] {
+  if (recoveries <= 0) return [];
+  const readyForHumanLabel = session.labels["readyForHuman"] as string | undefined;
+  if (!readyForHumanLabel) return [];
+  return [
+    {
+      kind: "cancelPending",
+      idempotencyKey: refinementRecoveryIdempotencyKey({
+        sessionId: session.sessionId,
+        issueNumber: task.issueNumber,
+        recoveries,
+      }),
+      now,
+    },
+  ];
+}
+
+/**
+ * Retire the handoff publication this recovery is undoing (issue #980 review).
+ *
+ * The removal below is a COMPENSATING effect: it takes a label off that the
+ * handoff's own `gh:label:add` row put on. That is only sound while the add has
+ * already been delivered — and it need not have been. An add whose dispatch
+ * failed sits pending behind a backoff (`nextAttemptAt`), so the two rows are
+ * live at the same time and nothing orders them: the remove can dispatch first
+ * and the add's retry then re-applies "a human is needed here" to a task that
+ * row 36 has already returned to `queued`. The recovered attempt runs, and the
+ * Issue says it is parked.
+ *
+ * So the add is cancelled rather than compensated for — in the SAME transaction
+ * as the reset and the removal, which is what makes "the label add will not
+ * happen" and "the task is queued again" one fact instead of two that can
+ * disagree. Cancelling is safe whatever state the row is in: an already-sent add
+ * is untouched (the removal handles it), a never-enqueued one matches nothing,
+ * and a delivered-but-unmarked one is covered by the removal too. See
+ * `OutboxEffectCancelPending` in core/task-store.ts for why a claimed row is
+ * cancelled here where `admin outbox cancel` would refuse it.
+ *
+ * The handoff COMMENT is deliberately left to deliver. It is a dated record of
+ * an attempt that really did stop for that reason — §13 item 4's notice, not a
+ * state marker — and the recovered attempt raises its own handoff under its own
+ * key (the `recovery-N` discriminator) if it stops again. Only the label makes a
+ * claim about the row's CURRENT state, and only the label is retracted.
+ *
+ * Returns the effects rather than writing them: a cancellation addresses an
+ * existing row by key, so it has nothing for {@link workItemOutbox} to rewrite
+ * and no `OutboxStore` method to travel through. `[]` whenever there is nothing
+ * to retire — no label was ever added (none recorded on the block and none
+ * configured), or a block that recorded no handoff reason and therefore never
+ * published a label add.
+ */
+export function refinementRecoverySupersessionEffects(
+  session: ResolvedSession,
+  task: Pick<AiTask, "issueNumber">,
+  /** The handoff being undone: its reason, the recovery ordinal it was raised at, and the label it added. */
+  handoff: {
+    reason: RefinementHandoffReason | null;
+    recoveries: number;
+    /**
+     * The label the handoff recorded as having added (issue #980 review). Only
+     * its PRESENCE matters here — the row is addressed by key, not by payload —
+     * so it stands in for "an add was published" on a block whose session has
+     * since dropped the label from config. Omitted falls back to that config,
+     * which is what a pre-record block's handoff read.
+     */
+    appliedLabel?: string | null;
+  },
+  now: string,
+): OutboxEffectCancelPending[] {
+  const readyForHumanLabel =
+    handoff.appliedLabel ?? (session.labels["readyForHuman"] as string | undefined);
+  if (!readyForHumanLabel || handoff.reason === null) return [];
+  return [
+    {
+      kind: "cancelPending",
+      idempotencyKey: refinementHandoffIdempotencyKey({
+        sessionId: session.sessionId,
+        issueNumber: task.issueNumber,
+        reason: handoff.reason,
+        effect: "label",
+        recoveries: handoff.recoveries,
+      }),
+      now,
+      // Cancelling is not enough when the add is being dispatched RIGHT NOW: the
+      // request already on the wire can land after this recovery's removal
+      // dispatched, and `markSent` accepts the claimed row afterwards, so the
+      // label stays on a task that has been requeued and nothing schedules
+      // another removal (issue #980 review). The recovery is refused instead —
+      // it is an operator command that previews, mutates only with `--yes`, and
+      // is re-run in seconds, so "wait for the attempt in flight to finish" is a
+      // cheap answer where committing a divergence is not.
+      refuseWhileClaimed: true,
+    },
+  ];
+}
+
+/**
+ * The PUBLIC half of §13's operator recovery (issue #980, §12 row 36): the
+ * ready-for-human label the handoff added comes off the Issue.
+ *
+ * One effect and one only. §13 is explicit about what recovery must NOT touch:
+ * `status:needs-refinement` stays (it is what row 1 admits the retry on, and the
+ * label-shape precondition has already established that it is there), no
+ * executable `status:*` is added (that is the both-markers shape §3 refuses),
+ * and no comment is posted — recovery is an operator's own deliberate action on
+ * a row they are already looking at, not news for the Issue's readers. What the
+ * ready-for-human label says is "a human is needed here", and the whole point of
+ * the command is that one has been and is done.
+ *
+ * Enqueued as an ordinary outbox effect inside the SAME transaction as the reset
+ * (`completePhaseWithEffects`), so the label removal is durable and retryable on
+ * the outbox's own budget: an operator whose GitHub call fails at that instant
+ * still gets a committed reset and a pending row, rather than a requeued task
+ * wearing a stale handoff label.
+ *
+ * Routed through {@link workItemOutbox} like every other work-item effect. A
+ * session with no `readyForHuman` label configured — and no label recorded on
+ * the block either — enqueues nothing, which is the same no-op the handoff's own
+ * label add takes.
+ *
+ * One effect, but not the whole set: the caller commits this alongside
+ * {@link refinementRecoverySupersessionEffects}, which retires the handoff's own
+ * label ADD so it cannot retry after this removal has dispatched.
+ */
+export async function enqueueRefinementRecoveryEffects(
+  outboxStore: OutboxStore,
+  session: ResolvedSession,
+  task: Pick<AiTask, "issueNumber">,
+  /** The §13 recovery ordinal this command is committing (1 for the first). */
+  recoveries: number,
+  now: string,
+  /**
+   * The label the handoff being undone actually ADDED, as recorded on its block
+   * (issue #980 review). This removal compensates for that specific add, so the
+   * recorded label wins over the session's current `labels.readyForHuman`: the
+   * two differ when the label was renamed between the escalation and this
+   * command, and removing the currently-configured name would leave the label
+   * the Issue is really wearing in place while taking off one it never had.
+   * `null`/omitted on a block written before this field existed, which falls
+   * back to session config — the same value that block's handoff used.
+   */
+  appliedLabel?: string | null,
+): Promise<void> {
+  const readyForHumanLabel =
+    appliedLabel ?? (session.labels["readyForHuman"] as string | undefined);
+  if (!readyForHumanLabel) return;
+
+  const workItemStore = workItemOutbox(outboxStore, session);
+  await workItemStore.enqueue({
+    idempotencyKey: refinementRecoveryIdempotencyKey({
+      sessionId: session.sessionId,
+      issueNumber: task.issueNumber,
+      recoveries,
+    }),
+    topic: "gh:label:remove",
+    payload: {
+      topic: "gh:label:remove",
+      owner: session.githubOwner,
+      repo: session.githubName,
+      issueNumber: task.issueNumber,
+      label: readyForHumanLabel,
     },
     now,
   });

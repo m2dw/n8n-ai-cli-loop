@@ -23,6 +23,14 @@ import type {
 /** Fields requested for a PR read — the superset all callers consume. */
 const PR_FIELDS = "number,url,headRefName,state,baseRefName,mergeable,mergeStateStatus,isCrossRepository";
 
+/**
+ * Page size for the exact-head listing (issue #998). Larger than 1 on purpose:
+ * the caller must be able to SEE a second open PR on the same head in order to
+ * refuse it, which a `--limit 1` query hides. Ten is far beyond any real count
+ * (GitHub allows one open PR per head/base pair) while keeping the response small.
+ */
+const HEAD_LIST_LIMIT = 10;
+
 export class GhRepoHostProvider implements RepoHostProvider {
   constructor(
     private readonly runner: GhRunner,
@@ -63,6 +71,39 @@ export class GhRepoHostProvider implements RepoHostProvider {
     }
 
     return { kind: "found", pullRequest: prs[0] };
+  }
+
+  findOpenPullRequestsByHead(head: string): ProviderRead<PullRequest[]> {
+    const result = this.runner.run(
+      [
+        "pr", "list",
+        "--repo", this.githubRepo,
+        "--head", head,
+        "--state", "open",
+        "--json", PR_FIELDS,
+        "--limit", String(HEAD_LIST_LIMIT),
+      ],
+      { cwd: this.cwd },
+    );
+
+    if (result.exitCode !== 0) {
+      return {
+        ok: false,
+        error: `gh pr list failed (exit ${result.exitCode}): ${(result.stderr || result.stdout).slice(0, 300)}`,
+      };
+    }
+
+    let prs: PullRequest[];
+    try {
+      prs = JSON.parse(result.stdout.trim()) as PullRequest[];
+    } catch {
+      return { ok: false, error: `gh pr list returned non-JSON output: ${result.stdout.slice(0, 200)}` };
+    }
+    if (!Array.isArray(prs)) {
+      return { ok: false, error: `gh pr list returned a non-array payload: ${result.stdout.slice(0, 200)}` };
+    }
+
+    return { ok: true, value: prs };
   }
 
   createPullRequest(input: CreatePullRequestInput): ProviderRead<PullRequest> {

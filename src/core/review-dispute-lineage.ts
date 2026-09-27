@@ -670,6 +670,27 @@ export function reconsiderationRunnerErrorArtifactName(lineageId: string): strin
   return lineageArtifactName("reconsideration-runner-error", lineageId, "txt");
 }
 
+/**
+ * The reviewer-reconsideration run's PROGRESS EVENTS, for a lane whose CLI
+ * separates them from the answer (issue #1085).
+ *
+ * A fourth file, and only ever written by the `read-bounded` lane: `codex exec
+ * --json` puts JSONL progress on stdout and the reviewer's actual answer in the
+ * `--output-last-message` file, so stdout there is not the transcript the three
+ * files above describe. Persisted because it is still the agent's own output and
+ * an operator diagnosing a turn that produced no final message has nothing else
+ * to read; never parsed for a verdict, which is the whole reason the answer has
+ * its own channel. The `.jsonl` extension states the shape the CLI documents,
+ * not a shape this protocol validates — the bytes are captured verbatim and
+ * bounded, whatever they turn out to be.
+ *
+ * The `no-tools` lane never writes it: its stdout IS the answer, and it is
+ * already the raw transcript.
+ */
+export function reconsiderationEventsArtifactName(lineageId: string): string {
+  return lineageArtifactName("reconsideration-events", lineageId, "jsonl");
+}
+
 export function arbitrationArtifactName(lineageId: string): string {
   return lineageArtifactName("arbitration", lineageId);
 }

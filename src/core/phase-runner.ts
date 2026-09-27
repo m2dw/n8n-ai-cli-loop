@@ -2,16 +2,21 @@ import type { AiTask, ClaimNextTaskRequest, TaskEvent, TaskExpected, TaskKey, Ta
 import type { OutboxEffect, TaskStore } from "./task-store.js";
 import type { ResolvedSession } from "./session.js";
 import type { OutboxEnqueueInput, OutboxEntry, OutboxStore } from "./outbox.js";
+import { cancelPendingOutboxEntriesByKey } from "./outbox.js";
 import type { AgentFailureKind } from "./agent-diagnostics.js";
 import type { RunLedgerEntryInput, RunLedgerOutcome, SessionPauseState } from "./session-control.js";
 import { extractRunMetadata } from "./session-control.js";
 import { applyTaskPatch, leaseExpiry, nextPhaseAfter } from "./transitions.js";
-import { enqueueHandlerCommentEffect, enqueueStatusLabelEffects, enqueueQuotaDelayCommentEffect, enqueueSlackNotificationEffect, enqueuePrSummaryEffect, enqueueHumanGateSummaryEffect, enqueueDisputeOutcomeEffects, enqueueRefinementHandoffEffects } from "./outbox-effects.js";
+import { enqueueHandlerCommentEffect, enqueueStatusLabelEffects, enqueueQuotaDelayCommentEffect, enqueueSlackNotificationEffect, enqueuePrSummaryEffect, enqueueHumanGateSummaryEffect, enqueueDisputeOutcomeEffects, enqueueRefinementHandoffEffects, enqueueRefinementProgressCommentEffects, enqueueStackReadyWithdrawalEffect } from "./outbox-effects.js";
 import { readResolvedAssignment } from "./assignment.js";
 import type { ResolvedAssignment } from "./assignment.js";
 import { resolveQuotaRetryDelayMs } from "./quota-classifier.js";
 import type { DisputeTransitionApplication } from "./review-dispute-transition.js";
 import { disputeContextPatch, disputeTransitionEvent, routedPhaseCompletion } from "./review-dispute-commit.js";
+import type { RefinementProgressCommit, RefinementProgressResult } from "./issue-refinement-progress.js";
+import { prepareRefinementProgressCommit, refinementProgressEvent } from "./issue-refinement-progress.js";
+import { refinementProgressCommentUnpublishableEvent } from "./issue-refinement-progress-publication.js";
+import { withRecordedRefinementHandoffLabel } from "./issue-refinement-publication.js";
 
 /**
  * `OutboxStore` adapter that records every `enqueue`/`replacePendingPrSummary`
@@ -120,6 +125,24 @@ export interface PhaseHandlerContext {
   runId: string;
   workerId: string;
   contextId?: string;
+  /**
+   * The sessions-registry file `session` was loaded from, when the runner
+   * knows it (issue #911 review). The agent-profile catalog's default
+   * location is `agent-profiles.json` beside this file
+   * (docs/agent-runtime-profiles-contract.md §9.1), so a run started with a
+   * custom `--sessions-path` must see that path here for runtime resolution
+   * to honor the sibling-file lookup; absent, the catalog loader falls back
+   * to the default sessions location.
+   */
+  sessionsPath?: string;
+  /**
+   * The task store this run claimed from, for the one handler write that must be
+   * durable BEFORE the completion: a final verification stage's run allocation
+   * (issue #1103 review, P2 — #1096 §7.1 rule 2). Everything else a handler
+   * produces still rides its completion. Absent, the handler keeps that write in
+   * the completion as well.
+   */
+  taskStore?: Pick<TaskStore, "getTask" | "completePhaseWithEffects">;
 }
 
 /**
@@ -188,7 +211,10 @@ export type PhaseHandlerResult =
   // agent-failure reading every pre-#897 caller assumes; a handler that delayed
   // for a reason the agent had no part in must say so, or the public status
   // comment attributes a quota condition to an agent that never ran.
-  | { result: "delayed"; context?: Record<string, unknown>; message?: string; retryAfterMs?: number; category?: AgentFailureKind; delayKind?: PhaseDelayKind; extraEvents?: PhaseHandlerEvent[] }
+  // `withdrawStackReady` (issue #1103) clears a live `status:stack-ready`
+  // marker in the same transaction as the release: a review whose final stage
+  // is being re-run no longer stands behind a grant an earlier approval published.
+  | { result: "delayed"; context?: Record<string, unknown>; message?: string; retryAfterMs?: number; category?: AgentFailureKind; delayKind?: PhaseDelayKind; extraEvents?: PhaseHandlerEvent[]; withdrawStackReady?: boolean }
   | { result: "failed"; context?: Record<string, unknown>; error: string };
 
 /**
@@ -340,6 +366,15 @@ export interface RunNextPhaseOptions {
    */
   lockContentionDelayMs?: number;
   /**
+   * Millisecond clock used to measure how long the phase handler ran
+   * (`durationMs`), and — for a `delayed` result (issue #1065) — to anchor the
+   * relative retry delay on when the result was actually observed rather than
+   * on the pre-handler claim timestamp. Defaults to `Date.now`. Inject a step
+   * function in tests to cover long-running handlers deterministically,
+   * without a real sleep.
+   */
+  clockMs?: () => number;
+  /**
    * Optional per-issue worktree execution-context resolver (issue #438). When
    * provided, it runs after the task transitions to `running` and BEFORE the phase
    * handler, so a repo-working phase resolves/creates the issue worktree and
@@ -481,6 +516,78 @@ async function recordRunLedgerEntry(
       // swallow — the phase outcome is already persisted; this logging is best-effort
     }
   }
+}
+
+/**
+ * The refinement progress milestones one phase transition crosses (issue #975,
+ * docs/issue-refinement-contract.md §15).
+ *
+ * This lives in the runner rather than in the refinement handler for the two
+ * reasons the contract names. First, the authoritative retry deadline: a
+ * `retry_scheduled` milestone must state the `notBefore` the task row REALLY
+ * commits, and only the layer that computes the delay knows it — a
+ * handler-side estimate would disagree with the row an operator reads.
+ * Second, durability: the milestones, the dedupe ledger that suppresses their
+ * replay, and the task-state transition they describe have to be one commit.
+ * A milestone published for a transition that then loses its claim, or that a
+ * held maintenance lock refuses, would be a progress report for something that
+ * never happened.
+ *
+ * Every other phase contributes nothing — the projection is deliberately not
+ * generalized (issue #975 out of scope), and a non-refinement phase carries no
+ * refinement block to read anyway.
+ *
+ * A refinement `failed` falls back to the block the task ALREADY holds when
+ * the result carries no context patch of its own. That case is not exotic: a
+ * handler that threw authors no patch at all ({@link runHandler} synthesizes
+ * the `failed` result from the error), and the lane's own refusals return the
+ * error without one — yet every one of them moves the task to `failed`, which
+ * is precisely the terminal boundary an observer most needs recorded. The
+ * milestone describes the TRANSITION rather than a block change, so the
+ * committed block is the honest source for the identity it needs; the ledger
+ * rides back on a one-key `{ refinement }` patch, exactly the shape the
+ * handlers themselves use, so nothing else in the context is restated.
+ */
+function refinementProgress(
+  phase: TaskPhase,
+  result: PhaseHandlerResult,
+  notBefore: string | null,
+  now: string,
+  issueNumber: number,
+  committedContext: Record<string, unknown> | undefined,
+): RefinementProgressCommit | null {
+  if (phase !== "refinement") return null;
+  const committedBlock = committedContext?.["refinement"];
+  const context =
+    result.context
+    ?? (result.result === "failed" && committedBlock !== undefined
+      ? { refinement: committedBlock }
+      : undefined);
+  return prepareRefinementProgressCommit({
+    issueNumber,
+    context,
+    // A `failed` result carries no handler-authored audit events by type, and
+    // that is exactly right: its one milestone comes from the transition.
+    events: result.result === "failed" ? [] : result.extraEvents ?? [],
+    result: result.result === "delayed"
+      ? "delayed"
+      : result.result === "failed"
+        ? "failed"
+        : (phaseResultToProgress(result.result)),
+    notBefore,
+    now,
+  });
+}
+
+/**
+ * Map the delivered handler results onto the two the projection distinguishes.
+ * `blocked` is the refinement lane's handoff outcome (§13); every other
+ * delivered result is an ordinary success as far as progress is concerned.
+ */
+function phaseResultToProgress(
+  result: "success" | "needs_fix" | "conflict" | "blocked" | "tool_request",
+): RefinementProgressResult {
+  return result === "blocked" ? "blocked" : "success";
 }
 
 export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseRunOutcome> {
@@ -749,7 +856,8 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     }
   }
 
-  const phaseStartMs = Date.now();
+  const clockNow = options.clockMs ?? Date.now;
+  const phaseStartMs = clockNow();
   // A rejected admission, or a lock/worktree prep failure, surfaces as a synthetic
   // result so it flows through the SAME completion path as a handler failure
   // (status transition, phase.completed event, escalation labels/comment). The
@@ -760,36 +868,80 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     : prepFailure
       ? { result: "failed", error: prepFailure }
       : await runHandler(handler, active);
-  durationMs = Date.now() - phaseStartMs;
+  durationMs = clockNow() - phaseStartMs;
 
   // Quota/rate-limit exhaustion (issue #25). Release the task back to `queued`
   // with a future `notBefore` so claimNextTask skips it until the quota window
   // is likely reset, instead of failing the task or escalating to a human. The
   // phase is unchanged (the same work is retried), the original output artifact
-  // is preserved via the handler's context, and NO GitHub label side effects are
-  // enqueued — SQLite alone owns the delayed-retry timing.
+  // is preserved via the handler's context, and NO coarse GitHub label side
+  // effects are enqueued — SQLite alone owns the delayed-retry timing. (The one
+  // label effect a delayed release may carry is a review's stack-ready
+  // withdrawal, issue #1103.)
   if (result.result === "delayed") {
     const delayMs = result.retryAfterMs ?? options.quotaRetryDelayMs ?? resolveQuotaRetryDelayMs();
-    // Anchor the cool-down on `now` (the logical claim timestamp the caller
-    // passes in). Mixing in the handler's real wall-clock duration here would
-    // cross clock domains — `now` is caller-supplied while durationMs comes from
-    // Date.now() — yielding a nondeterministic notBefore that drifts by a few ms
-    // even for instant handlers. The lease bounds how long a handler may hold the
-    // task, so `now + delayMs` is the correct, reproducible cool-down window.
-    const notBefore = leaseExpiry(now, delayMs);
+    // Anchor the cool-down on the RESULT-OBSERVED time, not the pre-handler
+    // claim timestamp (issue #1065): a handler that runs longer than its own
+    // relative delay must not have that delay already exhausted by the time
+    // the retry is scheduled — a multi-minute provider invocation must not eat
+    // into a short `retryAfterMs`. `durationMs` is the handler's measured
+    // wall-clock cost (from `clockNow`, real time by default), folded into the
+    // SAME `now + N` arithmetic `leaseExpiry` already does for the lease
+    // itself — one clock domain, not two: `now` is caller-supplied, and both
+    // `durationMs` and `delayMs` are plain millisecond offsets from it.
+    const notBefore = leaseExpiry(now, durationMs + delayMs);
     const delayedExpected: TaskExpected = {
       status: "running",
       phase: running.value.phase,
       ownerRunId: request.runId,
     };
+    // Issue #975: the refinement progress milestones this release crosses —
+    // in practice the §12 rows 38/40 role retry, whose `retry_scheduled`
+    // milestone must carry the notBefore the row ACTUALLY commits, which is
+    // the value computed one line above and known nowhere else. The returned
+    // patch carries the updated dedupe ledger, so the milestones and the
+    // record that suppresses their replay commit together or not at all.
+    const progress = refinementProgress(
+      running.value.phase, result, notBefore, now, key.issueNumber, running.value.context,
+    );
     const delayedPatch: TaskPatch = {
       status: "queued",
       ownerRunId: undefined,
       leaseExpiresAt: undefined,
       notBefore,
-      context: result.context,
+      context: progress?.context ?? result.context,
       now,
     };
+    // Issue #976: the append-only Issue comment for each milestone this release
+    // commits — in practice the single `retry_scheduled` note carrying the
+    // authoritative deadline computed above. Collected here so the row and the
+    // milestone ride the SAME transaction: a delayed transition that then loses
+    // its claim publishes nothing, and a committed retry is never left without
+    // the comment that states when the Issue wakes up. It is enqueued once, by
+    // the transition that commits the delay — not by each scheduler pass, which
+    // crosses no boundary and projects no milestone.
+    const delayedEffects = new OutboxEffectCollector();
+    const delayedRefusals =
+      outboxStore && session && running.value.phase === "refinement"
+        ? await enqueueRefinementProgressCommentEffects(
+            delayedEffects, session, running.value, progress?.milestones, now,
+          )
+        : [];
+    // Issue #1103 review (P1): a review releasing to re-run its final stage no
+    // longer stands behind a stack-ready marker an earlier approval published.
+    // The removal rides this release's transaction, so the task cannot sit
+    // queued for a re-run while downstream intake still reads the marker.
+    const withdrawStackReady =
+      outboxStore !== undefined && session !== undefined
+      && running.value.phase === "review" && result.withdrawStackReady === true;
+    if (withdrawStackReady && session !== undefined) {
+      await enqueueStackReadyWithdrawalEffect(delayedEffects, session, running.value, request.runId, now);
+      // Issue #1107 review (P2): the sticky gate summary is rewritten in the same
+      // release, stating the retained approval as pending final verification.
+      await enqueueHumanGateSummaryEffect(
+        delayedEffects, session, running.value, running.value.phase, result, request.runId, now, durationMs,
+      );
+    }
     // Handler-authored audit events (issue #869) for a delayed outcome — e.g.
     // the refinement loop's eligibility-hold or agent process-failure event.
     // They are the only record of WHY the released context now carries its
@@ -800,7 +952,19 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     // consumes the position and never re-emits the event. Ordered ahead of
     // `phase.delayed` so the log reads cause before effect; that event stays
     // best-effort below, as on every other delayed path.
-    const handlerEvents = (result.extraEvents ?? []).map(
+    const delayedHandlerEvents: PhaseHandlerEvent[] = [
+      ...(result.extraEvents ?? []),
+      // Ordered AFTER the fine-grained audit events they project from, so the
+      // log reads as the detail followed by the milestone it crossed.
+      ...(progress?.milestones ?? []).map(refinementProgressEvent),
+      // A milestone this build could not render publishes nothing and says so
+      // in the same transaction as the milestone itself.
+      ...delayedRefusals.map(refinementProgressCommentUnpublishableEvent),
+      // The withdrawal's own record, which also routes this release through
+      // `completePhaseWithEffects` so the removal commits with it.
+      ...(withdrawStackReady ? [{ type: "stack_ready.withdrawn", data: { phase: running.value.phase } }] : []),
+    ];
+    const handlerEvents = delayedHandlerEvents.map(
       (extra): TaskEvent => ({
         task: key,
         type: extra.type,
@@ -811,6 +975,20 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
       }),
     );
     const [firstHandlerEvent, ...restHandlerEvents] = handlerEvents;
+    // Same ordering trade the completion path makes, for the same reason: a
+    // separately-backed outbox has no shared transaction, so its rows are
+    // written before the release rather than after it. A maintenance refusal
+    // that left the outbox untouched hands the claim back intact; anything else
+    // is recorded below and the release still commits.
+    const delayedSeparate = await writeSeparatelyBackedEffects(
+      store, outboxStore, delayedEffects.effects,
+    );
+    if (!delayedSeparate.ok && delayedSeparate.maintenanceLocked) {
+      return {
+        status: "maintenance_locked",
+        task: await requeueClaimForMaintenance(store, key, running.value, request.runId, priorAttempts, now),
+      };
+    }
     const delayed = firstHandlerEvent
       ? await store.completePhaseWithEffects(
           {
@@ -820,7 +998,7 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
             event: firstHandlerEvent,
             ...(restHandlerEvents.length > 0 ? { extraEvents: restHandlerEvents } : {}),
           },
-          [],
+          delayedEffects.effects,
         )
       : await store.transitionTask(key, delayedExpected, delayedPatch);
     // A held maintenance lock refuses the whole transactional release (issue
@@ -834,6 +1012,30 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
       };
     }
     if (!delayed.ok) return { status: "claim_lost", task: delayed.current };
+
+    // A non-maintenance failure from the separately-backed effect write above is
+    // recorded once the release has committed, so the gap it may have left — a
+    // committed milestone whose comment row never reached the outbox — is
+    // diagnosable from the task's event log. Logged here rather than at the call
+    // site because until this point the release could still have been refused,
+    // in which case there would be no gap to report.
+    if (!delayedSeparate.ok) {
+      try {
+        await store.appendEvent({
+          task: key,
+          type: "outbox.enqueue.failed",
+          runId: request.runId,
+          message:
+            delayedSeparate.error instanceof Error
+              ? delayedSeparate.error.message
+              : String(delayedSeparate.error),
+          data: { phase: running.value.phase, result: result.result },
+          createdAt: now,
+        });
+      } catch {
+        // swallow — the release itself already committed; this logging is best-effort
+      }
+    }
 
     await store.appendEvent({
       task: key,
@@ -910,12 +1112,22 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     result.result === "failed"
       ? { status: "failed" as const, phase: running.value.phase }
       : nextPhaseAfter(running.value.phase, result.result, running.value, admissionResult !== undefined);
+  // Issue #975: the refinement progress milestones a DELIVERED (or failed)
+  // refinement transition crosses. No `notBefore` here — this path commits no
+  // delay, so a `retry_scheduled` milestone would have no authoritative
+  // deadline to state and is dropped by the preparation rather than published
+  // with an invented one. The returned context carries the dedupe ledger, so
+  // it stands in for the handler's own patch from here on.
+  const completionProgress = refinementProgress(
+    running.value.phase, result, null, now, key.issueNumber, running.value.context,
+  );
+  const resultContext = completionProgress?.context ?? result.context;
   // Merge the handler's own context patch with any bookkeeping patch from
   // nextPhaseAfter (e.g. the content_review needs_fix cycle counter) so neither
   // clobbers the other.
   const baseContextPatch =
-    result.context || ("contextPatch" in transition && transition.contextPatch)
-      ? { ...result.context, ...("contextPatch" in transition ? transition.contextPatch : undefined) }
+    resultContext || ("contextPatch" in transition && transition.contextPatch)
+      ? { ...resultContext, ...("contextPatch" in transition ? transition.contextPatch : undefined) }
       : undefined;
 
   // Issue #840: the review-dispute transition this run applied, folded into THIS
@@ -932,9 +1144,10 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
   //    the committed block and the event describing it cannot disagree;
   //  - §7.1 routing overrides the ordinary `nextPhaseAfter` destination when it
   //    names one (rules 1 and 2), parks the task for a human when rule 2 selects
-  //    a turn this runner cannot dispatch — the reconsideration, evidence, and
-  //    arbitration runs, none of which an ordinary review run may finish — and
-  //    defers to it only for rules 3/4;
+  //    a turn this runner cannot dispatch — the evidence and arbitration runs,
+  //    neither of which an ordinary review run may finish — and defers to it
+  //    only for rules 3/4. (The reconsideration run left that set in issue #952:
+  //    the review phase takes it as an internal sub-turn.)
   //  - the one bounded §10.3 audit event is appended in the same transaction.
   //
   // A replayed delivery folds in NOTHING but the routing: the application is
@@ -963,12 +1176,29 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
       ? { status: refinementActivation.targetStatus, phase: refinementActivation.targetPhase }
       : transition;
 
+  // Issue #980 review: a completion that is about to publish a §13 handoff
+  // records the ready-for-human label it applies, in the same transaction as the
+  // block that escalated. `labels.readyForHuman` is session config an operator
+  // can rename, and the recovery that undoes this handoff must remove the label
+  // the add actually used rather than whatever config holds by then.
+  //
+  // Gated on the phase as well as on the publication, exactly like the effects
+  // below: only a refinement completion publishes a handoff, so only a
+  // refinement completion has a label to record. Everything else — including a
+  // refinement completion that escalated on an earlier run — is returned
+  // unchanged, by the same gate the label add itself takes.
+  const handoffLabelledContext = session && running.value.phase === "refinement"
+    ? withRecordedRefinementHandoffLabel(
+        key.issueNumber, contextPatch, session.labels["readyForHuman"] as string | undefined,
+      )
+    : contextPatch;
+
   const patch = {
     status: routed.status,
     phase: routed.phase,
     ownerRunId: undefined,
     leaseExpiresAt: undefined,
-    context: contextPatch,
+    context: handoffLabelledContext,
     lastError: result.result === "failed" ? result.error : undefined,
     now,
   };
@@ -983,8 +1213,15 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
   // Handler-authored audit events (issue #869) ride in the same transaction as
   // the completion, before any dispute-transition event. A `failed` result has
   // no `extraEvents` field by type, so only delivered outcomes contribute.
-  const handlerEvents: PhaseHandlerEvent[] =
-    result.result === "failed" ? [] : result.extraEvents ?? [];
+  //
+  // The progress milestones (issue #975) ride behind them, and unlike the
+  // audit events they are contributed by a `failed` completion too: a
+  // refinement that ends non-retryably is exactly the boundary an observer
+  // most needs recorded, and the transition committing it is authoritative.
+  const handlerEvents: PhaseHandlerEvent[] = [
+    ...(result.result === "failed" ? [] : result.extraEvents ?? []),
+    ...(completionProgress?.milestones ?? []).map(refinementProgressEvent),
+  ];
   const extraEvents: TaskEvent[] = [
     ...handlerEvents.map(
       (e): TaskEvent => ({
@@ -1024,12 +1261,48 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
   // without them leaves an Issue that looks — from GitHub — like it is still
   // waiting its turn. `enqueueRefinementHandoffEffects` builds only those two
   // rows, only for a completion whose own context patch reached
-  // `escalated_human`, and adds no executable status label (§13 item 2).
+  // `escalated_human`, and adds no executable status label (§13 item 2). It also
+  // builds the session's configured transition notification for that same
+  // completion (issue #981) — the generic `enqueueSlackNotificationEffect` below
+  // never runs on this lane, so a handoff would otherwise be the one
+  // `ready_for_human` transition the notifier never heard about.
+  //
+  // The other exception is the progress comments (issue #976): one append-only
+  // comment per milestone this completion commits, built from the #975 contract
+  // above and collected here so a committed milestone and its comment row share
+  // the transaction — a milestone whose completion then loses its CAS publishes
+  // nothing. They are enqueued BEFORE the handoff effects so the Issue reads in
+  // the order the lane moved: the boundary that was crossed, then (for a
+  // terminal one) the handoff notice that says what an operator does about it.
   const effectCollector = new OutboxEffectCollector();
   if (outboxStore && session && running.value.phase === "refinement") {
-    await enqueueRefinementHandoffEffects(
+    const refusals = await enqueueRefinementProgressCommentEffects(
+      effectCollector, session, running.value, completionProgress?.milestones, now,
+    );
+    // A milestone this build cannot render publishes nothing, and the note
+    // saying so commits with the milestone itself — the outbox never saw a row,
+    // so no dead-lettered entry would carry the diagnostic instead.
+    for (const refusal of refusals) {
+      const event = refinementProgressCommentUnpublishableEvent(refusal);
+      extraEvents.push({
+        task: key,
+        type: event.type,
+        runId: request.runId,
+        message: event.message,
+        data: event.data,
+        createdAt: now,
+      });
+    }
+    // The handoff's own two rows go through the collector; its cancellations
+    // come back as a return value (a cancellation addresses an existing row, so
+    // it has no `enqueue` to travel through) and are folded into the same set.
+    // Position in the array is immaterial — the whole set is one transaction,
+    // and the key it retires is a §13 recovery removal's, which nothing else
+    // here enqueues (issue #980 review).
+    const handoffSupersessions = await enqueueRefinementHandoffEffects(
       effectCollector, session, running.value, result.context, now,
     );
+    effectCollector.effects.push(...handoffSupersessions);
   } else if (outboxStore && session) {
     // `preview` mirrors what completePhaseWithEffects will persist for `patch`
     // (same `applyTaskPatch` over the same pre-transition task): the effect
@@ -1073,97 +1346,18 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
     }
   }
 
-  // `completePhaseWithEffects` commits the transition, the event, and every
-  // effect in ONE transaction — but only over the backend `store` itself writes
-  // to. The public API still accepts a `store`/`outboxStore` pair that does NOT
-  // share a backend (a MemoryTaskStore alongside a real SqliteOutboxStore, or
-  // any other OutboxStore implementation), and that pairing has no cross-store
-  // transaction to lean on: the effects have to be written to `outboxStore`
-  // separately, so SOME failure interleaving is unavoidable and the only real
-  // choice is which side of it fails.
-  //
-  // Writing them BEFORE the transition is that choice (issue #818 review
-  // follow-up). The previous ordering — commit, then replay behind a pre-check
-  // — left the unrecoverable direction exposed: a maintenance lock acquired
-  // between the pre-check and the replay made every enqueue throw *after* the
-  // task had already completed, so the run reported success while its
-  // comments/labels/notifications were gone for good, with no way to replay
-  // them from a task that is no longer at that phase. No read can close that
-  // gap, only ordering can. Enqueuing first inverts it: the refusal lands while
-  // nothing has transitioned, so the claim is handed back and the phase re-runs
-  // intact. The residual exposure is effects that outlive a transition which
-  // then fails its CAS — recoverable by construction, since every effect is
-  // idempotency-keyed and the re-run re-derives the same ones.
-  //
-  // The write is all-or-nothing wherever the store can make it so: `enqueueEffects`
-  // (issue #818 review follow-up) puts the whole set in ONE transaction behind one
-  // in-transaction lock read. Writing effect-by-effect instead lets a lock acquired
-  // part-way through leave the earlier rows durable while this run reports
-  // retryable contention — and once maintenance releases, the dispatcher publishes
-  // a completion comment or status label for a phase that never committed and is
-  // about to re-run, possibly to a different result. `written` tracks that case for
-  // the stores that cannot batch: a partially written set is NOT safely retryable,
-  // so it falls through to the best-effort branch below, which commits the
-  // completion the already-durable rows announce and records the gap.
-  //
-  // A shared backend takes none of this: `backendId` equality proves the
-  // transaction below already covers these effects atomically (and refuses them
-  // atomically under a lock), so writing them here would put rows in the outbox
-  // ahead of — and independently of — the very transition they belong to,
-  // exactly the divergence #701 exists to prevent.
-  const outboxSharesStoreBackend =
-    outboxStore !== undefined && store.backendId !== undefined && store.backendId === outboxStore.backendId;
-  let separateOutboxError: unknown;
-  if (outboxStore && !outboxSharesStoreBackend && effectCollector.effects.length > 0) {
-    let written = 0;
-    try {
-      if (outboxStore.enqueueEffects) {
-        await outboxStore.enqueueEffects(effectCollector.effects);
-        written = effectCollector.effects.length;
-      } else {
-        for (const effect of effectCollector.effects) {
-          if (effect.kind === "enqueue") {
-            await outboxStore.enqueue(effect.input);
-          } else {
-            await outboxStore.replacePendingPrSummary(effect.input, effect.key);
-          }
-          written += 1;
-        }
-      }
-    } catch (outboxErr) {
-      // A held maintenance lock is retryable contention, not a phase failure:
-      // nothing has transitioned yet, so hand the claim back and report it as
-      // its own outcome. Matched on the typed `code` carried by
-      // MaintenanceLockedError (stores/maintenance-lock-guard.ts) rather than by
-      // importing it, since core must not depend on the store layer.
-      //
-      // `written === 0` is what makes that honest — the refusal has to have left
-      // the outbox exactly as it found it. A refusal that landed mid-set (only
-      // possible on a store without `enqueueEffects`) already put effects in the
-      // outbox for this completion, so re-running the phase is no longer the
-      // clean retry this outcome advertises; that case takes the best-effort
-      // branch instead.
-      if (isMaintenanceLockedError(outboxErr) && written === 0) {
-        return {
-          status: "maintenance_locked",
-          task: await requeueClaimForMaintenance(store, key, running.value, request.runId, priorAttempts, now),
-        };
-      }
-      // Anything else — including a maintenance refusal that arrived with part
-      // of the set already durable — keeps the long-standing best-effort
-      // treatment: the completion still commits and the failure is recorded as
-      // an event below. For the partial-set case that is the safer direction:
-      // committing makes the rows already in the outbox belong to a phase that
-      // really did complete, whereas handing the claim back would have them
-      // announce a completion that never happened.
-      // A `store`/`outboxStore` pair with no shared backend is also the shape a
-      // caller uses to pass a deliberately inert sink (the outbox rows then come
-      // from the task store's own transaction), so an unrecognized error here is
-      // not evidence the effects were lost — unlike the maintenance refusal,
-      // which is a definitive "this write will not happen".
-      separateOutboxError = outboxErr;
-    }
+  // Effects for a separately-backed outbox are written HERE, before the
+  // transition — see {@link writeSeparatelyBackedEffects} for why that ordering
+  // is the safe side of an interleaving that cannot be avoided, and why a shared
+  // backend must take none of it.
+  const separate = await writeSeparatelyBackedEffects(store, outboxStore, effectCollector.effects);
+  if (!separate.ok && separate.maintenanceLocked) {
+    return {
+      status: "maintenance_locked",
+      task: await requeueClaimForMaintenance(store, key, running.value, request.runId, priorAttempts, now),
+    };
   }
+  const separateOutboxError: unknown = separate.ok ? undefined : separate.error;
 
   const completed = await store.completePhaseWithEffects(
     {
@@ -1236,6 +1430,113 @@ export async function runNextPhase(options: RunNextPhaseOptions): Promise<PhaseR
       }
     }
   }
+}
+
+/**
+ * Write a run's collected effects to an outbox that does NOT share the task
+ * store's backend, before the transition they belong to commits.
+ *
+ * `completePhaseWithEffects` commits the transition, the events, and the effects
+ * in one transaction — but only over the backend the store itself writes to. The
+ * public API still accepts a `store`/`outboxStore` pair that does not share one
+ * (a MemoryTaskStore alongside a real SqliteOutboxStore, or any other
+ * OutboxStore implementation), and that pairing has no cross-store transaction
+ * to lean on: the effects have to be written separately, so SOME failure
+ * interleaving is unavoidable and the only real choice is which side of it
+ * fails.
+ *
+ * Writing them BEFORE the transition is that choice (issue #818 review
+ * follow-up). The previous ordering — commit, then replay behind a pre-check —
+ * left the unrecoverable direction exposed: a maintenance lock acquired between
+ * the pre-check and the replay made every enqueue throw *after* the task had
+ * already completed, so the run reported success while its comments/labels/
+ * notifications were gone for good, with no way to replay them from a task that
+ * is no longer at that phase. No read can close that gap, only ordering can.
+ * Enqueuing first inverts it: the refusal lands while nothing has transitioned,
+ * so the claim is handed back and the phase re-runs intact. The residual
+ * exposure is effects that outlive a transition which then fails its CAS —
+ * recoverable by construction, since every effect is idempotency-keyed and the
+ * re-run re-derives the same ones.
+ *
+ * The write is all-or-nothing wherever the store can make it so: `enqueueEffects`
+ * puts the whole set in ONE transaction behind one in-transaction lock read.
+ * Writing effect-by-effect instead lets a lock acquired part-way through leave
+ * the earlier rows durable while this run reports retryable contention — and
+ * once maintenance releases, the dispatcher publishes a completion comment or
+ * status label for a phase that never committed and is about to re-run, possibly
+ * to a different result. `written` tracks that case for the stores that cannot
+ * batch: a partially written set is NOT safely retryable, so it is reported as an
+ * ordinary error instead, and the caller commits the completion the
+ * already-durable rows announce and records the gap.
+ *
+ * A shared backend takes none of this: `backendId` equality proves the caller's
+ * transaction already covers these effects atomically (and refuses them
+ * atomically under a lock), so writing them here would put rows in the outbox
+ * ahead of — and independently of — the very transition they belong to, exactly
+ * the divergence #701 exists to prevent.
+ *
+ * Shared by the completion and the delayed paths (issue #976): a delayed
+ * transition now carries effects of its own — the `retry_scheduled` progress
+ * comment — and it must make the same trade with them that a completion does.
+ */
+async function writeSeparatelyBackedEffects(
+  store: Pick<TaskStore, "backendId">,
+  outboxStore: OutboxStore | undefined,
+  effects: readonly OutboxEffect[],
+): Promise<{ ok: true } | { ok: false; maintenanceLocked: boolean; error: unknown }> {
+  const sharesBackend =
+    outboxStore !== undefined && store.backendId !== undefined && store.backendId === outboxStore.backendId;
+  if (!outboxStore || sharesBackend || effects.length === 0) return { ok: true };
+  let written = 0;
+  try {
+    if (outboxStore.enqueueEffects) {
+      await outboxStore.enqueueEffects(effects);
+      written = effects.length;
+    } else {
+      for (const effect of effects) {
+        if (effect.kind === "enqueue") {
+          await outboxStore.enqueue(effect.input);
+        } else if (effect.kind === "replacePendingPrSummary") {
+          await outboxStore.replacePendingPrSummary(effect.input, effect.key);
+        } else {
+          // Issue #980 review: expressed with the store's own public
+          // lookup/cancel pair rather than a new interface method, so a store
+          // that predates this effect kind still honours it.
+          await cancelPendingOutboxEntriesByKey(outboxStore, effect.idempotencyKey, effect.now);
+        }
+        written += 1;
+      }
+    }
+  } catch (outboxErr) {
+    // A held maintenance lock is retryable contention, not a phase failure:
+    // nothing has transitioned yet, so the caller hands the claim back and
+    // reports it as its own outcome. Matched on the typed `code` carried by
+    // MaintenanceLockedError (stores/maintenance-lock-guard.ts) rather than by
+    // importing it, since core must not depend on the store layer.
+    //
+    // `written === 0` is what makes that honest — the refusal has to have left
+    // the outbox exactly as it found it. A refusal that landed mid-set (only
+    // possible on a store without `enqueueEffects`) already put effects in the
+    // outbox for this transition, so re-running the phase is no longer the clean
+    // retry that outcome advertises; that case is reported as an ordinary error.
+    //
+    // Anything else keeps the long-standing best-effort treatment: the
+    // transition still commits and the failure is recorded as an event. For the
+    // partial-set case that is the safer direction: committing makes the rows
+    // already in the outbox belong to a phase that really did move, whereas
+    // handing the claim back would have them announce something that never
+    // happened. A `store`/`outboxStore` pair with no shared backend is also the
+    // shape a caller uses to pass a deliberately inert sink (the outbox rows
+    // then come from the task store's own transaction), so an unrecognized error
+    // here is not evidence the effects were lost — unlike the maintenance
+    // refusal, which is a definitive "this write will not happen".
+    return {
+      ok: false,
+      maintenanceLocked: isMaintenanceLockedError(outboxErr) && written === 0,
+      error: outboxErr,
+    };
+  }
+  return { ok: true };
 }
 
 /**
