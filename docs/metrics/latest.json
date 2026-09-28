@@ -1,23 +1,26 @@
 {
-  "generated": "2026-08-19T06:12:14.101Z",
+  "generated": "2026-09-28T09:46:01.121Z",
   "src": {
-    "files": 169,
-    "lines": 126908,
-    "nonBlankLines": 119217
+    "files": 255,
+    "lines": 200853,
+    "nonBlankLines": 189511
   },
   "tests": {
-    "files": 219,
-    "suites": 1603,
-    "cases": 9034
+    "files": 319,
+    "suites": 2295,
+    "cases": 13059
   },
   "coverage": {
-    "lines": 81.46,
-    "statements": 81.46,
-    "functions": 85.09,
-    "branches": 86.65
+    "lines": 90.26,
+    "statements": 90.26,
+    "functions": 92.14,
+    "branches": 85.64
   },
   "dependencies": {
-    "circularCycles": 0,
-    "filesInCycles": []
+    "circularCycles": 1,
+    "filesInCycles": [
+      "handlers/stage-verification",
+      "handlers/test-stage-verification"
+    ]
   }
 }

@@ -1,34 +1,39 @@
 # Project Metrics
 
-Generated: 2026-08-19T06:12:14.101Z
+Generated: 2026-09-28T09:46:01.121Z
 
 ## Source
 
 | Metric | Value |
 |--------|-------|
-| TypeScript files | 169 |
-| Total lines | 126908 |
-| Non-blank lines | 119217 |
+| TypeScript files | 255 |
+| Total lines | 200853 |
+| Non-blank lines | 189511 |
 
 ## Tests
 
 | Metric | Value |
 |--------|-------|
-| Test files | 219 |
-| Suites (describe blocks) | 1603 |
-| Cases (test/it calls) | 9034 |
+| Test files | 319 |
+| Suites (describe blocks) | 2295 |
+| Cases (test/it calls) | 13059 |
 
 ## Coverage
 
 | Metric | Value |
 |--------|-------|
-| Lines | 81.46% |
-| Statements | 81.46% |
-| Functions | 85.09% |
-| Branches | 86.65% |
+| Lines | 90.26% |
+| Statements | 90.26% |
+| Functions | 92.14% |
+| Branches | 85.64% |
 
 ## Dependencies
 
 | Metric | Value |
 |--------|-------|
-| Circular dependency cycles | 0 |
+| Circular dependency cycles | 1 |
+
+### Files in Cycles
+
+- `handlers/stage-verification`
+- `handlers/test-stage-verification`
