@@ -1,5 +1,5 @@
 {
-  "generated": "2026-09-28T09:46:01.121Z",
+  "generated": "2026-10-05T10:24:57.473Z",
   "src": {
     "files": 255,
     "lines": 200853,
@@ -14,7 +14,7 @@
     "lines": 90.26,
     "statements": 90.26,
     "functions": 92.14,
-    "branches": 85.64
+    "branches": 85.65
   },
   "dependencies": {
     "circularCycles": 1,
